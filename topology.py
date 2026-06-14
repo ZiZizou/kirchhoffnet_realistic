@@ -1,0 +1,959 @@
+"""Topology generators for the differential KirchhoffNet.
+
+Three-layer API:
+  1. Primitives: line_graph, ring_graph, grid_graph, cluster_graph, empty_graph
+  2. Connectors: connect_bipartite, connect_projection
+  3. Composer:   StageTopologyBuilder, MultiStageTopology.from_config()
+
+Key design: input/output edges are NOT ODE edges. They are write-path
+initialization and readout taps. The ODE core only evolves hidden + projection
+nodes. topology_to_stage() remaps global node IDs to compact 0..N-1 for the
+stage's internal state.
+
+All presets come from config.PRESETS.
+"""
+
+from __future__ import annotations
+
+import random
+from dataclasses import dataclass, field
+from typing import Iterable
+
+import torch
+import torch.nn as nn
+
+from config import PRESETS, Z_INDEX
+from differential_stage import DifferentialStage
+from cell_library import IdealizedCellLibrary
+
+
+__all__ = [
+    "SparseTopology",
+    "line_graph",
+    "ring_graph",
+    "grid_graph",
+    "cluster_graph",
+    "empty_graph",
+    "connect_bipartite",
+    "connect_projection",
+    "StageTopologyBuilder",
+    "MultiStageTopology",
+    "validate_topology",
+    "validate_topology_degrees",
+    "topology_to_stage",
+    "build_net_from_preset",
+    "build_net_from_config",
+    "prune_stage",
+    "prune_network",
+]
+
+
+EDGE_TYPE_INPUT = "input"
+EDGE_TYPE_HIDDEN = "hidden"
+EDGE_TYPE_PROJ = "proj"
+EDGE_TYPE_OUTPUT = "output"
+
+NODE_KIND_INPUT = "input"
+NODE_KIND_HIDDEN = "hidden"
+NODE_KIND_PROJ = "proj"
+NODE_KIND_OUTPUT = "output"
+
+
+@dataclass
+class SparseTopology:
+    """Universal sparse graph representation for a stage.
+
+    src/dst are parallel lists of node IDs in the global stage node space
+    (input + hidden + proj + output). They are NOT yet remapped to a stage's
+    internal compact space.
+    """
+
+    num_nodes: int
+    src: list[int] = field(default_factory=list)
+    dst: list[int] = field(default_factory=list)
+    edge_type: list[str] = field(default_factory=list)
+    node_kind: list[str] = field(default_factory=list)
+    input_node_ids: list[int] = field(default_factory=list)
+    output_node_ids: list[int] = field(default_factory=list)
+    hidden_node_ids: list[int] = field(default_factory=list)
+    proj_node_ids: list[int] = field(default_factory=list)
+
+    def num_edges(self) -> int:
+        return len(self.src)
+
+
+# ---------- primitives ----------
+
+def line_graph(n_nodes: int, radius: int = 1, bidirectional: bool = True) -> SparseTopology:
+    """1D chain; node i connects to i+1..i+radius."""
+    if n_nodes <= 0:
+        raise ValueError("n_nodes must be positive")
+    if radius < 1:
+        raise ValueError("radius must be >= 1")
+    src, dst = [], []
+    for i in range(n_nodes):
+        for r in range(1, radius + 1):
+            j = i + r
+            if j < n_nodes:
+                src.append(i); dst.append(j)
+                if bidirectional:
+                    src.append(j); dst.append(i)
+    return SparseTopology(
+        num_nodes=n_nodes,
+        src=src, dst=dst,
+        edge_type=[EDGE_TYPE_HIDDEN] * len(src),
+        node_kind=[NODE_KIND_HIDDEN] * n_nodes,
+        hidden_node_ids=list(range(n_nodes)),
+    )
+
+
+def ring_graph(n_nodes: int, radius: int = 1) -> SparseTopology:
+    """1D ring with wrap-around; useful for periodic signals."""
+    if n_nodes <= 0:
+        raise ValueError("n_nodes must be positive")
+    if radius < 1:
+        raise ValueError("radius must be >= 1")
+    if radius * 2 >= n_nodes:
+        raise ValueError("radius * 2 must be < n_nodes for ring_graph")
+    src, dst = [], []
+    for i in range(n_nodes):
+        for r in range(1, radius + 1):
+            j = (i + r) % n_nodes
+            src.append(i); dst.append(j)
+            src.append(j); dst.append(i)
+    return SparseTopology(
+        num_nodes=n_nodes,
+        src=src, dst=dst,
+        edge_type=[EDGE_TYPE_HIDDEN] * len(src),
+        node_kind=[NODE_KIND_HIDDEN] * n_nodes,
+        hidden_node_ids=list(range(n_nodes)),
+    )
+
+
+def grid_graph(height: int, width: int, kernel_size: int = 3) -> SparseTopology:
+    """2D local grid; node id = row * width + col.
+
+    Edges are bidirectional: each neighbor pair (i, j) yields both (i->j) and (j->i).
+    This matches an undirected electrical network where a branch between two nodes
+    can carry current in either direction. Other primitives (line, ring, cluster)
+    also produce bidirectional edges for the same physical reason.
+    """
+    if height <= 0 or width <= 0:
+        raise ValueError("height and width must be positive")
+    if kernel_size < 1 or kernel_size % 2 == 0:
+        raise ValueError("kernel_size must be a positive odd integer")
+    n = height * width
+    pad = kernel_size // 2
+    raw_src, raw_dst = [], []
+    for r in range(height):
+        for c in range(width):
+            i = r * width + c
+            for dr in range(-pad, pad + 1):
+                for dc in range(-pad, pad + 1):
+                    if dr == 0 and dc == 0:
+                        continue
+                    nr, nc = r + dr, c + dc
+                    if 0 <= nr < height and 0 <= nc < width:
+                        j = nr * width + nc
+                        if j > i:
+                            raw_src.append(i); raw_dst.append(j)
+    src: list[int] = []
+    dst: list[int] = []
+    for s, d in zip(raw_src, raw_dst):
+        src.append(s); dst.append(d)
+        src.append(d); dst.append(s)
+    return SparseTopology(
+        num_nodes=n,
+        src=src, dst=dst,
+        edge_type=[EDGE_TYPE_HIDDEN] * len(src),
+        node_kind=[NODE_KIND_HIDDEN] * n,
+        hidden_node_ids=list(range(n)),
+    )
+
+
+def cluster_graph(n_nodes: int, edge_prob: float = 0.3, seed: int = 0) -> SparseTopology:
+    """Erdős-Rényi-like sparse graph, symmetric, no self-loops."""
+    if n_nodes <= 0:
+        raise ValueError("n_nodes must be positive")
+    if not (0.0 <= edge_prob <= 1.0):
+        raise ValueError("edge_prob must be in [0, 1]")
+    rng = random.Random(seed)
+    src, dst = [], []
+    for i in range(n_nodes):
+        for j in range(i + 1, n_nodes):
+            if rng.random() < edge_prob:
+                src.append(i); dst.append(j)
+                src.append(j); dst.append(i)
+    return SparseTopology(
+        num_nodes=n_nodes,
+        src=src, dst=dst,
+        edge_type=[EDGE_TYPE_HIDDEN] * len(src),
+        node_kind=[NODE_KIND_HIDDEN] * n_nodes,
+        hidden_node_ids=list(range(n_nodes)),
+    )
+
+
+def empty_graph(n_nodes: int) -> SparseTopology:
+    """No edges. Useful for ablation or pure projection-node stages."""
+    return SparseTopology(
+        num_nodes=n_nodes,
+        src=[], dst=[], edge_type=[],
+        node_kind=[NODE_KIND_HIDDEN] * n_nodes,
+        hidden_node_ids=list(range(n_nodes)),
+    )
+
+
+# ---------- connectors ----------
+
+def connect_bipartite(
+    src_ids: Iterable[int],
+    dst_ids: Iterable[int],
+    pattern: str = "all_to_all",
+) -> tuple[list[int], list[int]]:
+    """Connect two disjoint node sets with the given pattern.
+
+    pattern: 'all_to_all', 'one_to_one', 'none'.
+    """
+    src_ids = list(src_ids)
+    dst_ids = list(dst_ids)
+    src, dst = [], []
+    if pattern == "all_to_all":
+        for s in src_ids:
+            for d in dst_ids:
+                src.append(s); dst.append(d)
+    elif pattern == "one_to_one":
+        if len(src_ids) != len(dst_ids):
+            raise ValueError(
+                f"one_to_one requires equal-length lists, got {len(src_ids)} vs {len(dst_ids)}"
+            )
+        for s, d in zip(src_ids, dst_ids):
+            src.append(s); dst.append(d)
+    elif pattern == "none":
+        pass
+    else:
+        raise ValueError(f"Unsupported bipartite pattern: {pattern!r}")
+    return src, dst
+
+
+def connect_projection(
+    hidden_ids: Iterable[int],
+    proj_ids: Iterable[int],
+    pattern: str = "all_to_all",
+) -> tuple[list[int], list[int]]:
+    """Bidirectional bipartite between hidden and projection nodes."""
+    s1, d1 = connect_bipartite(hidden_ids, proj_ids, pattern)
+    s2, d2 = connect_bipartite(proj_ids, hidden_ids, pattern)
+    return s1 + s2, d1 + d2
+
+
+# ---------- composer ----------
+
+class StageTopologyBuilder:
+    """Assembles a full stage from input, hidden, projection, and output sub-graphs.
+
+    Node ID allocation:
+        [0 .. n_in-1]                     = inputs
+        [n_in .. n_in+n_h-1]              = hidden
+        [n_in+n_h .. n_in+n_h+n_p-1]      = projection
+        [n_in+n_h+n_p .. N-1]             = outputs
+    """
+
+    def __init__(self, num_inputs: int, num_outputs: int, num_hidden: int, num_proj: int = 0) -> None:
+        if min(num_inputs, num_outputs, num_hidden, num_proj) < 0:
+            raise ValueError("Negative node counts not allowed")
+        self.n_in = int(num_inputs)
+        self.n_out = int(num_outputs)
+        self.n_h = int(num_hidden)
+        self.n_p = int(num_proj)
+
+        self.in_ids = list(range(num_inputs))
+        self.hid_ids = list(range(num_inputs, num_inputs + num_hidden))
+        self.proj_ids = list(
+            range(num_inputs + num_hidden, num_inputs + num_hidden + num_proj)
+        )
+        self.out_ids = list(
+            range(
+                num_inputs + num_hidden + num_proj,
+                num_inputs + num_hidden + num_proj + num_outputs,
+            )
+        )
+        self.total_nodes = num_inputs + num_hidden + num_proj + num_outputs
+
+    def build(
+        self,
+        hidden_topo: SparseTopology,
+        input_pattern: str = "one_to_one",
+        output_pattern: str = "all_to_all",
+        proj_pattern: str = "all_to_all",
+    ) -> SparseTopology:
+        if hidden_topo.num_nodes != self.n_h:
+            raise ValueError(
+                f"hidden_topo has {hidden_topo.num_nodes} nodes, expected {self.n_h}"
+            )
+
+        src, dst = [], []
+        edge_type = []
+        node_kind = (
+            [NODE_KIND_INPUT] * self.n_in
+            + [NODE_KIND_HIDDEN] * self.n_h
+            + [NODE_KIND_PROJ] * self.n_p
+            + [NODE_KIND_OUTPUT] * self.n_out
+        )
+
+        offset = self.n_in
+        for s, d in zip(hidden_topo.src, hidden_topo.dst):
+            src.append(s + offset)
+            dst.append(d + offset)
+            edge_type.append(EDGE_TYPE_HIDDEN)
+
+        s, d = connect_bipartite(self.in_ids, self.hid_ids, input_pattern)
+        src.extend(s); dst.extend(d); edge_type.extend([EDGE_TYPE_INPUT] * len(s))
+
+        if self.n_p > 0:
+            s, d = connect_projection(self.hid_ids, self.proj_ids, proj_pattern)
+            src.extend(s); dst.extend(d); edge_type.extend([EDGE_TYPE_PROJ] * len(s))
+
+        if self.n_out > 0:
+            source_pool = self.hid_ids + self.proj_ids
+            s, d = connect_bipartite(source_pool, self.out_ids, output_pattern)
+            src.extend(s); dst.extend(d); edge_type.extend([EDGE_TYPE_OUTPUT] * len(s))
+
+        return SparseTopology(
+            num_nodes=self.total_nodes,
+            src=src, dst=dst, edge_type=edge_type, node_kind=node_kind,
+            input_node_ids=list(self.in_ids),
+            output_node_ids=list(self.out_ids),
+            hidden_node_ids=list(self.hid_ids),
+            proj_node_ids=list(self.proj_ids),
+        )
+
+
+class MultiStageTopology:
+    """Holds a list of SparseTopology objects, one per stage."""
+
+    def __init__(self, stage_topologies: list[SparseTopology]) -> None:
+        self.stages = list(stage_topologies)
+
+    def __len__(self) -> int:
+        return len(self.stages)
+
+    def __getitem__(self, idx: int) -> SparseTopology:
+        return self.stages[idx]
+
+    @staticmethod
+    def from_config(configs: list[dict]) -> "MultiStageTopology":
+        """Build a multi-stage topology from a list of per-stage config dicts."""
+        topologies = []
+        for cfg in configs:
+            builder = StageTopologyBuilder(
+                num_inputs=cfg["num_inputs"],
+                num_outputs=cfg["num_outputs"],
+                num_hidden=cfg["num_hidden"],
+                num_proj=cfg.get("num_proj", 0),
+            )
+            family = cfg.get("hidden_family", "cluster")
+            hidden_kwargs = dict(cfg.get("hidden_kwargs", {}))
+            if family == "line":
+                hid = line_graph(cfg["num_hidden"], **hidden_kwargs)
+            elif family == "ring":
+                hid = ring_graph(cfg["num_hidden"], **hidden_kwargs)
+            elif family == "grid":
+                hid = grid_graph(**hidden_kwargs)
+            elif family == "cluster":
+                hid = cluster_graph(cfg["num_hidden"], **hidden_kwargs)
+            elif family == "empty":
+                hid = empty_graph(cfg["num_hidden"])
+            else:
+                raise ValueError(f"Unknown hidden_family: {family!r}")
+            topo = builder.build(
+                hid,
+                input_pattern=cfg.get("input_pattern", "one_to_one"),
+                output_pattern=cfg.get("output_pattern", "all_to_all"),
+                proj_pattern=cfg.get("proj_pattern", "all_to_all"),
+            )
+            topologies.append(topo)
+        return MultiStageTopology(topologies)
+
+
+# ---------- pruning support (CP-5) ----------
+
+def _bfs_undirected(num_nodes: int, src_list, dst_list, sources):
+    """BFS over the undirected graph defined by (src, dst) edge list.
+
+    Returns a list of (parent, distance) per node, where parent=-1 indicates
+    source. If sources is empty, returns all -1 distances.
+    """
+    adj: list[list[int]] = [[] for _ in range(num_nodes)]
+    for s, d in zip(src_list, dst_list):
+        s = int(s); d = int(d)
+        if 0 <= s < num_nodes and 0 <= d < num_nodes and s != d:
+            adj[s].append(d)
+            adj[d].append(s)
+    parent = [-1] * num_nodes
+    dist = [-1] * num_nodes
+    queue = []
+    for src in sources:
+        if 0 <= src < num_nodes and dist[src] < 0:
+            dist[src] = 0
+            queue.append(src)
+    head = 0
+    while head < len(queue):
+        u = queue[head]; head += 1
+        for v in adj[u]:
+            if dist[v] < 0:
+                dist[v] = dist[u] + 1
+                parent[v] = u
+                queue.append(v)
+    return parent, dist
+
+
+def _connected_components(num_nodes: int, src_list, dst_list):
+    """Return a list of node-id sets, one per connected component."""
+    adj: list[list[int]] = [[] for _ in range(num_nodes)]
+    for s, d in zip(src_list, dst_list):
+        s = int(s); d = int(d)
+        if 0 <= s < num_nodes and 0 <= d < num_nodes and s != d:
+            adj[s].append(d)
+            adj[d].append(s)
+    seen = [False] * num_nodes
+    components = []
+    for start in range(num_nodes):
+        if seen[start]:
+            continue
+        comp = []
+        queue = [start]
+        seen[start] = True
+        head = 0
+        while head < len(queue):
+            u = queue[head]; head += 1
+            comp.append(u)
+            for v in adj[u]:
+                if not seen[v]:
+                    seen[v] = True
+                    queue.append(v)
+        components.append(set(comp))
+    return components
+
+
+def validate_topology_degrees(
+    src: list[int],
+    dst: list[int],
+    num_nodes: int,
+    write_idx: list[int] | None,
+    read_idx: list[int] | None,
+) -> None:
+    """Hard-error check: every (write_idx, read_idx) pair must be >1 hop apart.
+
+    A 1-hop edge from a write_idx node to a read_idx node creates a direct
+    input-to-output bypass that defeats capacitor dynamics. Built topologies
+    that violate this must be redesigned (use a different graph, or pick
+    different write_idx/read_idx).
+
+    This check is silent if either write_idx or read_idx is None.
+    """
+    if write_idx is None or read_idx is None:
+        return
+    if not write_idx or not read_idx:
+        return
+    _, dists = _bfs_undirected(num_nodes, src, dst, write_idx)
+    for w in write_idx:
+        for r in read_idx:
+            d = dists[r] if 0 <= r < num_nodes else -1
+            if 0 < d <= 1:
+                raise ValueError(
+                    f"Topology degree-of-separation violation: write_idx node {w} "
+                    f"is within {d} hop(s) of read_idx node {r} "
+                    f"(must be >1). Choose a topology with greater degree of "
+                    f"separation, or pick different write_idx/read_idx."
+                )
+
+
+def prune_stage(
+    stage,
+    edge_threshold: float = 0.01,
+    node_threshold: float = 0.01,
+    transfer_params: bool = True,
+    write_idx: list[int] | None = None,
+    read_idx: list[int] | None = None,
+) -> tuple["DifferentialStage", dict[int, int]]:
+    """Rebuild a DifferentialStage with edges and nodes removed.
+
+    Edge pruning uses a joint Z+gate criterion: an edge is kept if
+    ``(1 - P(Z)) * σ(z_logits) > edge_threshold``. This folds the Z-cell
+    probability (gm_Z ≈ 0 ⇒ no current) and the edge gate (σ(z_logits) ≈ 0)
+    into a single effective-activity score.
+
+    Node pruning uses ``σ(u_logits) > node_threshold`` (no Z-equivalent for
+    nodes).
+
+    When ``write_idx`` and ``read_idx`` are both provided, a connectivity
+    backstop runs after pruning:
+      - BFS from write_idx; verify all read_idx are reachable.
+      - Remove any node not in a component that contains at least one I/O node
+        (dead-island purge).
+      - Re-filter edges for surviving nodes.
+
+    Args:
+        stage: Trained DifferentialStage with z_logits and u_logits.
+        edge_threshold: Joint Z+gate threshold for edges.
+        node_threshold: Gate threshold for nodes.
+        transfer_params: If True, copy surviving logits/raw_mult/raw_leak
+            values into the new stage. If False, the new stage starts with
+            default initialization (used when retraining from scratch).
+        write_idx: Optional compact node ids of write locations. Used for the
+            connectivity backstop. Pass None to skip the check (intermediate
+            stages in multi-stage networks).
+        read_idx: Optional compact node ids of read locations. Used for the
+            connectivity backstop. Pass None to skip the check.
+
+    Returns:
+        A tuple ``(new_stage, node_remap)`` where:
+          - ``new_stage`` is a DifferentialStage with filtered src/dst,
+            logits, raw_mult, z_logits (kept edges only), filtered
+            raw_leak, u_logits (kept nodes only), and compact node IDs
+            (0..N_new-1). When ``transfer_params=True`` all per-edge/
+            per-node parameters are copied from the original stage.
+          - ``node_remap`` is a dict mapping old compact node id -> new
+            compact node id for all surviving nodes. Used by callers to
+            remap I/O indices and transfer per-node I/O mapper weights.
+    """
+    from differential_stage import DifferentialStage
+
+    z = stage.edge_gates().detach().cpu()
+    u = stage.node_gates().detach().cpu()
+    w_logits = stage.logits.detach().cpu()
+    p_z = torch.softmax(w_logits, dim=-1)[:, Z_INDEX]  # [E]
+    eff_score = (1.0 - p_z) * z  # [E]
+
+    keep_edge = eff_score > edge_threshold
+    keep_node = u > node_threshold
+
+    src_old = stage.src.detach().cpu()
+    dst_old = stage.dst.detach().cpu()
+
+    # ----- connectivity backstop -----
+    enforce_io = write_idx is not None and read_idx is not None and len(write_idx) > 0 and len(read_idx) > 0
+    if enforce_io:
+        keep_edge_tmp = keep_edge & keep_node[src_old] & keep_node[dst_old]
+        surv_src = src_old[keep_edge_tmp].tolist()
+        surv_dst = dst_old[keep_edge_tmp].tolist()
+
+        # BFS from write_idx; verify read_idx reachable
+        _, dists = _bfs_undirected(stage.num_nodes, surv_src, surv_dst, list(write_idx))
+        unreachable_reads = [r for r in read_idx if dists[r] < 0]
+        if unreachable_reads:
+            raise ValueError(
+                f"prune_stage: read_idx {unreachable_reads} are unreachable from "
+                f"write_idx {write_idx} after gate-based pruning. "
+                f"Lower edge_threshold={edge_threshold} or node_threshold={node_threshold}."
+            )
+
+        # Identify dead islands: nodes not in any I/O-connected component
+        components = _connected_components(stage.num_nodes, surv_src, surv_dst)
+        io_nodes = set(int(x) for x in write_idx) | set(int(x) for x in read_idx)
+        io_components = [c for c in components if not c.isdisjoint(io_nodes)]
+        if not io_components:
+            raise ValueError(
+                f"prune_stage: no I/O-connected components remain after pruning. "
+                f"Lower edge_threshold={edge_threshold} or node_threshold={node_threshold}."
+            )
+        io_keep = set().union(*io_components)
+        dead_island_nodes = set(range(stage.num_nodes)) - io_keep
+        for n in dead_island_nodes:
+            keep_node[n] = False
+
+    # Build node ID remapping: old_global -> new_compact.
+    new_ids = torch.full((stage.num_nodes,), -1, dtype=torch.long)
+    new_ids[keep_node] = torch.arange(int(keep_node.sum().item()))
+
+    # Re-filter edges: keep only edges where both endpoints survive
+    edge_mask = keep_edge & keep_node[src_old] & keep_node[dst_old]
+    if int(edge_mask.sum().item()) == 0:
+        raise ValueError(
+            f"prune_stage: pruning removed all edges; "
+            f"consider lowering edge_threshold={edge_threshold} or node_threshold={node_threshold}"
+        )
+
+    new_src = new_ids[src_old[edge_mask]].tolist()
+    new_dst = new_ids[dst_old[edge_mask]].tolist()
+
+    num_nodes_new = int(keep_node.sum().item())
+    new_stage = DifferentialStage(
+        num_nodes=num_nodes_new,
+        src=new_src,
+        dst=new_dst,
+        cell_lib=stage.cell_lib,
+        c_eff=stage.c_eff,
+        x_max=stage.x_max,
+        clip_current=stage.clip_current,
+        clip_softness=stage.clip_softness,
+    )
+
+    node_idx_old = torch.nonzero(keep_node, as_tuple=True)[0]
+
+    if transfer_params:
+        with torch.no_grad():
+            edge_idx_old = torch.nonzero(edge_mask, as_tuple=True)[0]
+            new_stage.logits.data.copy_(stage.logits.data[edge_idx_old].cpu())
+            new_stage.raw_mult.data.copy_(stage.raw_mult.data[edge_idx_old].cpu())
+            new_stage.z_logits.data.copy_(stage.z_logits.data[edge_idx_old].cpu())
+        with torch.no_grad():
+            new_stage.raw_leak.data.copy_(stage.raw_leak.data[node_idx_old].cpu())
+            new_stage.u_logits.data.copy_(stage.u_logits.data[node_idx_old].cpu())
+
+    node_remap: dict[int, int] = {
+        int(old_id): int(new_id)
+        for old_id, new_id in zip(
+            node_idx_old.tolist(),
+            new_ids[keep_node].tolist(),
+        )
+    }
+    return new_stage, node_remap
+
+
+def prune_network(
+    net: "KirchhoffNet",
+    edge_threshold: float = 0.01,
+    node_threshold: float = 0.01,
+    transfer_params: bool = True,
+    write_idx: list[int] | None = None,
+    read_idx: list[int] | None = None,
+) -> tuple["KirchhoffNet", list[dict[int, int]]]:
+    """Apply prune_stage to every stage of a KirchhoffNet core.
+
+    Stage widths may change after pruning, so StageTransfer modules are
+    reinitialized to match the new active-node counts. Returns a new
+    KirchhoffNet with the same t_span/num_steps.
+
+    ``write_idx`` and ``read_idx`` (when provided) are routed to the first
+    and last stage respectively for the connectivity backstop. Intermediate
+    stages skip the check.
+
+    Returns:
+        A tuple ``(new_core, stage_remaps)`` where:
+          - ``new_core`` is the pruned KirchhoffNet core.
+          - ``stage_remaps`` is a list of dicts, one per stage, mapping
+            old compact node id -> new compact node id for surviving
+            nodes. ``stage_remaps[0]`` is used to remap write targets,
+            ``stage_remaps[-1]`` is used to remap read targets.
+    """
+    from kirchhoff_net import KirchhoffNet
+
+    n_stages = len(net.stages)
+    new_stages = []
+    stage_remaps: list[dict[int, int]] = []
+    for i, s in enumerate(net.stages):
+        if n_stages == 1:
+            wi, ri = write_idx, read_idx
+        elif i == 0:
+            wi, ri = write_idx, None
+        elif i == n_stages - 1:
+            wi, ri = None, read_idx
+        else:
+            wi, ri = None, None
+        new_s, remap = prune_stage(
+            s,
+            edge_threshold=edge_threshold,
+            node_threshold=node_threshold,
+            transfer_params=transfer_params,
+            write_idx=wi,
+            read_idx=ri,
+        )
+        new_stages.append(new_s)
+        stage_remaps.append(remap)
+    new_widths = [s.num_nodes for s in new_stages]
+    new_transfers = []
+    from stage_transfer import StageTransfer
+    for i in range(len(new_stages) - 1):
+        new_transfers.append(StageTransfer(new_widths[i], new_widths[i + 1]))
+
+    return KirchhoffNet(
+        stages=new_stages,
+        transfers=new_transfers,
+        stage_times=list(net.stage_times),
+        stage_steps=list(net.stage_steps),
+    ), stage_remaps
+
+
+# ---------- integration with DifferentialStage ----------
+
+def validate_topology(topo: SparseTopology, max_hidden_density: float = 0.5) -> None:
+    """Assert that topo satisfies the spec's sanity checks. Raises ValueError on failure."""
+    if len(topo.src) != len(topo.dst):
+        raise ValueError("src/dst length mismatch")
+    if len(topo.edge_type) != len(topo.src):
+        raise ValueError("edge_type length must equal src/dst length")
+    if len(topo.node_kind) != topo.num_nodes:
+        raise ValueError("node_kind length must equal num_nodes")
+    if topo.src or topo.dst:
+        if max(topo.src + topo.dst, default=-1) >= topo.num_nodes:
+            raise ValueError("Edge endpoint >= num_nodes")
+    for s, d in zip(topo.src, topo.dst):
+        if s == d:
+            raise ValueError(f"Self-loop not allowed: edge {s}->{d}")
+    n_h = len(topo.hidden_node_ids)
+    if n_h > 0:
+        max_edges = n_h * (n_h - 1)
+        actual_hidden_edges = sum(1 for t in topo.edge_type if t == EDGE_TYPE_HIDDEN)
+        if n_h > 32 and (actual_hidden_edges / max_edges) > max_hidden_density:
+            raise ValueError(
+                f"Hidden core too dense: {actual_hidden_edges} / {max_edges} > {max_hidden_density}"
+            )
+    for i in topo.input_node_ids:
+        if i not in topo.src:
+            raise ValueError(f"Input node {i} has no outgoing edge")
+    for o in topo.output_node_ids:
+        if o not in topo.dst:
+            raise ValueError(f"Output node {o} has no incoming edge")
+
+
+def topology_to_stage(
+    topo: SparseTopology,
+    cell_lib: IdealizedCellLibrary,
+    c_eff: float | None = None,
+    x_max: float | None = None,
+    clip_current: float | None = None,
+    clip_softness: float | None = None,
+) -> tuple[DifferentialStage, list[int], dict[int, int]]:
+    """Convert a SparseTopology into a DifferentialStage.
+
+    Input and output edges are filtered out (they are write/read taps, not
+    ODE branches). Hidden + projection nodes are remapped to compact 0..N-1.
+
+    Returns:
+        stage: DifferentialStage
+        active_nodes: list of global node ids that are evolved by this stage
+        id_map: dict mapping global node id -> compact id
+    """
+    core_mask = [t in (EDGE_TYPE_HIDDEN, EDGE_TYPE_PROJ) for t in topo.edge_type]
+    core_src = [topo.src[i] for i, m in enumerate(core_mask) if m]
+    core_dst = [topo.dst[i] for i, m in enumerate(core_mask) if m]
+
+    active_nodes = sorted(set(topo.hidden_node_ids + topo.proj_node_ids))
+    id_map = {old: new for new, old in enumerate(active_nodes)}
+
+    remapped_src = [id_map[s] for s in core_src]
+    remapped_dst = [id_map[d] for d in core_dst]
+
+    stage = DifferentialStage(
+        num_nodes=len(active_nodes),
+        src=remapped_src,
+        dst=remapped_dst,
+        cell_lib=cell_lib,
+        c_eff=c_eff,
+        x_max=x_max,
+        clip_current=clip_current,
+        clip_softness=clip_softness,
+    )
+    return stage, active_nodes, id_map
+
+
+# ---------- factory: config -> network ----------
+
+_DEFAULT_WRITE_MODE = "one_to_one"
+_DEFAULT_READ_MODE = "sparse"
+
+
+def build_net_from_preset(
+    preset_name: str,
+    cell_lib: IdealizedCellLibrary,
+    write_mode: str = _DEFAULT_WRITE_MODE,
+    read_mode: str = _DEFAULT_READ_MODE,
+    write_idx: list[int] | None = None,
+    read_idx: list[int] | None = None,
+):
+    """Build a full KirchhoffNetWithIO from a config.PRESETS entry.
+
+    write_mode: "one_to_one" (default) | "dense" | "fan_out"
+    read_mode:  "sparse" (default) | "dense"
+    write_idx / read_idx: optional explicit index lists. When None, the
+        values from the preset config are used (sparse mode) or a
+        default dense mapping (dense mode). For write_mode="fan_out",
+        the preset must supply a 'write_fan_out' dict mapping input
+        index → list of target hidden-node indices.
+
+    If the preset specifies its own 'write_mode' (e.g. 'fan_out'), the
+    caller's write_mode is only honored when it differs from the
+    default — i.e. an explicit override beats the preset's choice.
+    """
+    if preset_name not in PRESETS:
+        raise KeyError(f"Unknown preset: {preset_name!r}. Available: {list(PRESETS)}")
+    cfg = dict(PRESETS[preset_name])
+    preset_write_mode = cfg.get("write_mode", _DEFAULT_WRITE_MODE)
+    if write_mode != _DEFAULT_WRITE_MODE or preset_write_mode == _DEFAULT_WRITE_MODE:
+        cfg["write_mode"] = write_mode
+    cfg["read_mode"] = read_mode
+    if write_idx is not None:
+        cfg["write_idx"] = list(write_idx)
+    if read_idx is not None:
+        cfg["read_idx"] = list(read_idx)
+    return build_net_from_config(cfg, cell_lib=cell_lib)
+
+
+def build_net_from_config(
+    cfg: dict,
+    cell_lib: IdealizedCellLibrary,
+):
+    """Build a KirchhoffNetWithIO from a full config dict."""
+    from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
+    from io_mapper import (
+        InputMapper,
+        RobustInputMapper,
+        OutputMapper,
+        SparseInputMapper,
+        FanOutInputMapper,
+    )
+    from stage_transfer import StageTransfer
+
+    stages_cfg = cfg["stages"]
+    use_robust = cfg.get("use_robust_input", False)
+    out_dim = cfg.get("out_dim", 1)
+    write_mode = cfg.get("write_mode", "one_to_one")
+    read_mode = cfg.get("read_mode", "sparse")
+    if write_mode not in ("one_to_one", "dense", "fan_out"):
+        raise ValueError(
+            f"write_mode must be 'one_to_one', 'dense', or 'fan_out', got {write_mode!r}"
+        )
+    if read_mode not in ("sparse", "dense"):
+        raise ValueError(
+            f"read_mode must be 'sparse' or 'dense', got {read_mode!r}"
+        )
+
+    multi = MultiStageTopology.from_config(stages_cfg)
+    stage_modules = []
+    transfers = []
+    stage_times = []
+    stage_steps = []
+    first_id_map: dict[int, int] = {}
+
+    for stage_idx, topo in enumerate(multi.stages):
+        stage, active_nodes, id_map = topology_to_stage(topo, cell_lib=cell_lib)
+        stage_modules.append(stage)
+        stage_times.append(float(stages_cfg[stage_idx].get("t_span", 0.5)))
+        stage_steps.append(int(stages_cfg[stage_idx].get("num_steps", 20)))
+        if stage_idx == 0:
+            first_id_map = id_map
+
+        if stage_idx < len(multi) - 1:
+            next_topo = multi.stages[stage_idx + 1]
+            next_active = sorted(
+                set(next_topo.hidden_node_ids + next_topo.proj_node_ids)
+            )
+            transfers.append(StageTransfer(len(active_nodes), len(next_active)))
+
+    core = KirchhoffNet(
+        stages=stage_modules,
+        transfers=transfers,
+        stage_times=stage_times,
+        stage_steps=stage_steps,
+    )
+
+    in_dim = stages_cfg[0]["num_inputs"]
+    first_topo = multi.stages[0]
+    first_hid = list(first_topo.hidden_node_ids)
+    first_proj = list(first_topo.proj_node_ids)
+    last_topo = multi.stages[-1]
+    last_hid = list(last_topo.hidden_node_ids)
+    last_proj = list(last_topo.proj_node_ids)
+    n_first_hid = len(first_hid)
+    final_state_dim = len(last_hid) + len(last_proj)
+
+    if write_mode == "one_to_one":
+        preset_write_idx = cfg.get("write_idx")
+        if preset_write_idx is None:
+            preset_write_idx = list(range(min(in_dim, n_first_hid)))
+        if len(preset_write_idx) != in_dim:
+            raise ValueError(
+                f"write_idx length {len(preset_write_idx)} must equal in_dim {in_dim} "
+                f"for one_to_one mode"
+            )
+        input_mapper = SparseInputMapper(
+            in_dim=in_dim, out_dim=n_first_hid, write_idx=preset_write_idx
+        )
+        write_idx_arg = list(preset_write_idx)
+    elif write_mode == "fan_out":
+        fan_out_map = cfg.get("write_fan_out")
+        if fan_out_map is None:
+            raise ValueError(
+                "write_mode='fan_out' requires 'write_fan_out' in config: "
+                "dict mapping input index to list of target hidden-node indices"
+            )
+        input_mapper = FanOutInputMapper(
+            in_dim=in_dim, out_dim=n_first_hid, fan_out_map=fan_out_map
+        )
+        write_idx_arg = sorted(
+            {t for targets in fan_out_map.values() for t in targets}
+        )
+    else:
+        MapperCls = RobustInputMapper if use_robust else InputMapper
+        input_mapper = MapperCls(in_dim=in_dim, out_dim=n_first_hid)
+        write_idx_arg = None
+
+    if read_mode == "sparse":
+        preset_read_idx = cfg.get("read_idx")
+        if preset_read_idx is None:
+            if len(last_hid) > 0:
+                preset_read_idx = [len(last_hid) - 1]
+            else:
+                preset_read_idx = [0]
+        if any(i < 0 or i >= final_state_dim for i in preset_read_idx):
+            raise ValueError(
+                f"read_idx entries must be in [0, {final_state_dim}), "
+                f"got {preset_read_idx}"
+            )
+        read_idx_arg = list(preset_read_idx)
+        output_mapper = OutputMapper(
+            node_dim=final_state_dim, out_dim=out_dim, read_idx=preset_read_idx
+        )
+    else:
+        read_idx_arg = None
+        read_dim = len(last_proj) if len(last_proj) > 0 else len(last_hid)
+        output_mapper = OutputMapper(node_dim=read_dim, out_dim=out_dim)
+
+    net = KirchhoffNetWithIO(
+        input_mapper,
+        core,
+        output_mapper,
+        hid_count=n_first_hid,
+        proj_count=len(first_proj),
+        final_hid_count=len(last_hid),
+        final_proj_count=len(last_proj),
+        write_idx=write_idx_arg,
+        read_idx=read_idx_arg,
+    )
+
+    # Hard topology check: write_idx → read_idx must be >1 hop on the core
+    # graph of the first and last stages. Skip when all read_idx target
+    # projection nodes, since hidden<->proj direct edges are the intended
+    # readout path (R1 spec). When read_idx mixes hidden and proj nodes,
+    # filter to only the non-proj (hidden) entries — proj nodes are 1-hop
+    # from any hidden write target by construction (all_to_all), so they
+    # are exempt from the degree check.
+    #
+    # write_idx_arg and read_idx_arg are in pre-compact (user-facing)
+    # coordinates, but the stage's src/dst are in compact (post-remap)
+    # coordinates. Remap via first_id_map before calling validate.
+    if write_idx_arg is not None and read_idx_arg is not None:
+        all_read_are_proj = all(r >= n_first_hid for r in read_idx_arg)
+        if not all_read_are_proj:
+            hidden_read_idx = [r for r in read_idx_arg if r < n_first_hid]
+            if hidden_read_idx:
+                first_stage = stage_modules[0]
+                compact_write = [
+                    first_id_map[w] for w in write_idx_arg
+                    if w in first_id_map
+                ]
+                compact_read = [
+                    first_id_map[r] for r in hidden_read_idx
+                    if r in first_id_map
+                ]
+                if compact_write and compact_read:
+                    validate_topology_degrees(
+                        src=first_stage.src.tolist(),
+                        dst=first_stage.dst.tolist(),
+                        num_nodes=first_stage.num_nodes,
+                        write_idx=compact_write,
+                        read_idx=compact_read,
+                    )
+
+    return net

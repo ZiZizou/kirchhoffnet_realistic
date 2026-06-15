@@ -134,28 +134,24 @@ def test_topology_primitives():
     from topology import (
         line_graph, ring_graph, grid_graph, cluster_graph, empty_graph
     )
-    lg = line_graph(5, radius=1, bidirectional=True)
-    check("line_graph n=5 rad=1: edges", lg.num_edges() == 8)  # 4 * 2 dirs
+    lg = line_graph(5, radius=1)
+    check("line_graph n=5 rad=1: edges", lg.num_edges() == 4)
     check("line_graph no self-loops", all(s != d for s, d in zip(lg.src, lg.dst)))
 
     rg = ring_graph(8, radius=2)
-    check("ring_graph n=8 rad=2: edges", rg.num_edges() == 32)  # 8*2*2
+    check("ring_graph n=8 rad=2: edges", rg.num_edges() == 16)  # 8*2
 
     gg = grid_graph(2, 3, kernel_size=3)
     check("grid_graph 2x3 kernel=3: 6 nodes", gg.num_nodes == 6)
     check("grid_graph edges > 0", gg.num_edges() > 0)
-    check("grid_graph edges are symmetric (bidirectional)",
-          sorted(zip(gg.src, gg.dst)) == sorted(zip(gg.dst, gg.src)))
     # 2x3 grid, kernel=3: corners (4 nodes) have 3 neighbors, edge (2 nodes)
-    # have 5 neighbors. Total one-sided = 4*3 + 2*5 = 22; unique pairs = 11;
-    # bidirectional edges = 22.
-    check("grid_graph: 2x3 kernel=3 emits 22 bidirectional edges",
-          gg.num_edges() == 22, f"got {gg.num_edges()}")
+    # have 5 neighbors. Total one-sided = 4*3 + 2*5 = 22; unique pairs = 11.
+    # Single-edge-per-pair representation: 11 edges.
+    check("grid_graph: 2x3 kernel=3 emits 11 unique-pair edges",
+          gg.num_edges() == 11, f"got {gg.num_edges()}")
 
     cg = cluster_graph(6, edge_prob=0.5, seed=42)
     check("cluster_graph n=6: 6 nodes", cg.num_nodes == 6)
-    check("cluster_graph edges are symmetric",
-          sorted(zip(cg.src, cg.dst)) == sorted(zip(cg.dst, cg.src)))
 
     eg = empty_graph(4)
     check("empty_graph 0 edges", eg.num_edges() == 0)
@@ -564,8 +560,8 @@ def test_union_topology():
           all(k in topo.node_kind for k in ("input", "hidden", "proj")))
     check("topo has at least one hidden edge", topo.num_edges() > 0)
     hidden_edges = [(s, d) for s, d, t in zip(topo.src, topo.dst, topo.edge_type) if t == "hidden"]
-    check("hidden edges are bidirectional (src/dst symmetric on hidden)",
-          sorted(hidden_edges) == sorted((d, s) for s, d in hidden_edges))
+    check("hidden edges have src < dst (single-edge-per-pair)",
+          all(s < d for s, d in hidden_edges))
 
 
 def test_solver_loss_finite():
@@ -2118,7 +2114,7 @@ def test_smooth2d_preset():
 
 
 def test_smooth2d_grid_preset():
-    print("\nTest NN2: smooth2d_grid preset (5x5 grid + 3 proj, fan-out I/O, 3 stages)")
+    print("\nTest NN2: smooth2d_grid preset (4x4 grid + 3 proj, fan-out I/O, 3 stages)")
     from config import PRESETS
     from topology import build_net_from_preset
     from cell_library import make_default_library
@@ -2134,18 +2130,18 @@ def test_smooth2d_grid_preset():
     check("smooth2d_grid: 3 stages (multistage-smooth2d-grid spec)",
           len(cfg["stages"]) == 3)
     check("smooth2d_grid: num_inputs=2", s["num_inputs"] == 2)
-    check("smooth2d_grid: num_hidden=25", s["num_hidden"] == 25)
+    check("smooth2d_grid: num_hidden=16", s["num_hidden"] == 16)
     check("smooth2d_grid: num_proj=3", s["num_proj"] == 3)
     check("smooth2d_grid: hidden_family=grid", s["hidden_family"] == "grid")
-    check("smooth2d_grid: height=5", s["hidden_kwargs"].get("height") == 5)
-    check("smooth2d_grid: width=5", s["hidden_kwargs"].get("width") == 5)
+    check("smooth2d_grid: height=4", s["hidden_kwargs"].get("height") == 4)
+    check("smooth2d_grid: width=4", s["hidden_kwargs"].get("width") == 4)
     check("smooth2d_grid: kernel_size=3 (8-neighbor)",
           s["hidden_kwargs"].get("kernel_size") == 3)
     check("smooth2d_grid: write_mode=fan_out", cfg.get("write_mode") == "fan_out")
     check("smooth2d_grid: write_fan_out maps both inputs",
-          cfg.get("write_fan_out") == {0: [0, 10, 20], 1: [4, 14, 24]})
-    check("smooth2d_grid: read_idx = center column + 3 proj",
-          cfg["read_idx"] == [2, 7, 12, 17, 22, 25, 26, 27])
+          cfg.get("write_fan_out") == {0: [0, 4, 8], 1: [3, 7, 11]})
+    check("smooth2d_grid: read_idx = 3 proj (proj-only readout)",
+          cfg["read_idx"] == [16, 17, 18])
     check("smooth2d_grid: loss=mse", cfg["loss"] == "mse")
     check("smooth2d_grid: out_dim=1", cfg["out_dim"] == 1)
     check("smooth2d_grid: per-stage t_span=5/3 (~1.667)",
@@ -2165,47 +2161,44 @@ def test_smooth2d_grid_preset():
 
     cell_lib = make_default_library()
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
-    check("smooth2d_grid: builds successfully (degree check relaxed for proj readout)",
+    check("smooth2d_grid: builds successfully (proj-only readout skips degree check)",
           net is not None)
     check("smooth2d_grid: core has 3 stages", len(net.core.stages) == 3)
     check("smooth2d_grid: core has 2 StageTransfer modules (N-1)",
           len(net.core.transfers) == 2)
     check("smooth2d_grid: all transfers are StageTransfer instances",
           all(isinstance(t, StageTransfer) for t in net.core.transfers))
-    check("smooth2d_grid: all transfers are identity (28->28)",
-          all(t.in_nodes == 28 and t.out_nodes == 28 for t in net.core.transfers))
+    check("smooth2d_grid: all transfers are identity (19->19)",
+          all(t.in_nodes == 19 and t.out_nodes == 19 for t in net.core.transfers))
     check("smooth2d_grid: write_idx = sorted union of fan_out targets",
-          net.write_idx == [0, 4, 10, 14, 20, 24])
-    check("smooth2d_grid: read_idx = center column + 3 proj",
-          net.read_idx == [2, 7, 12, 17, 22, 25, 26, 27])
+          net.write_idx == [0, 3, 4, 7, 8, 11])
+    check("smooth2d_grid: read_idx = 3 proj nodes",
+          net.read_idx == [16, 17, 18])
     check("smooth2d_grid: uses FanOutInputMapper",
           isinstance(net.input_mapper, FanOutInputMapper))
-    check("smooth2d_grid: hid_count=25", net.hid_count == 25)
+    check("smooth2d_grid: hid_count=16", net.hid_count == 16)
     check("smooth2d_grid: proj_count=3", net.proj_count == 3)
-    check("smooth2d_grid: final_hid_count=25", net.final_hid_count == 25)
+    check("smooth2d_grid: final_hid_count=16", net.final_hid_count == 16)
     check("smooth2d_grid: final_proj_count=3", net.final_proj_count == 3)
     check("smooth2d_grid: OutputMapper is sparse read (read_idx set)",
           isinstance(net.output_mapper, OutputMapper)
-          and net.output_mapper.read_idx == [2, 7, 12, 17, 22, 25, 26, 27])
+          and net.output_mapper.read_idx == [16, 17, 18])
 
-    n_hidden = 25
+    n_hidden = 16
     n_proj = 3
-    # 8-neighbor grid: interior (9 nodes) have 8 neighbors; edge non-corner
-    # (12 nodes) have 5 neighbors; corner (4 nodes) have 3 neighbors.
-    # Unique undirected pairs: 9*8/2 + 12*5/2 + 4*3/2 = 36 + 30 + 6 = 72.
-    # grid_graph emits 2 entries per unique pair (bidirectional), so
-    # hidden<->hidden edges = 72 * 2 = 144.
-    n_grid_unique_pairs = 9 * 8 // 2 + 12 * 5 // 2 + 4 * 3 // 2
-    n_hidden_edges = n_grid_unique_pairs * 2
-    # Projection edges: n_hidden * n_proj * 2 (bidirectional all-to-all)
-    n_proj_edges = n_hidden * n_proj * 2
+    # 4x4 grid with 8-neighbor (kernel_size=3), single-edge-per-pair:
+    # Computed by exhaustively counting unique (r,c) -> (nr,nc) edges with
+    # j > i over the 16 hidden nodes. Result: 42 hidden edges.
+    n_hidden_edges = 42
+    # Projection edges: n_hidden * n_proj (unidirectional hidden->proj)
+    n_proj_edges = n_hidden * n_proj
     expected_total = n_hidden_edges + n_proj_edges
     for i, stage in enumerate(net.core.stages):
-        check(f"smooth2d_grid: stage {i} edge count = {expected_total} (grid 144 + proj 150)",
+        check(f"smooth2d_grid: stage {i} edge count = {expected_total} (grid 42 + proj 48)",
               int(stage.src.shape[0]) == expected_total,
               f"got {int(stage.src.shape[0])}")
-        check(f"smooth2d_grid: stage {i} num_nodes=28 (25 hid + 3 proj)",
-              int(stage.num_nodes) == 28)
+        check(f"smooth2d_grid: stage {i} num_nodes=19 (16 hid + 3 proj)",
+              int(stage.num_nodes) == 19)
         check(f"smooth2d_grid: stage {i} has positive logits parameter",
               stage.logits.shape == (expected_total, 4))
 
@@ -2215,11 +2208,10 @@ def test_smooth2d_grid_preset():
     check("smooth2d_grid: read_idx entries in [0, final_state_dim)",
           all(0 <= r < net.final_hid_count + net.final_proj_count
               for r in net.read_idx))
-    # Degree-of-separation: every read hidden node is >1 hop from any write
-    # target (center column vs. left/right columns in 8-neighbor grid).
-    check("smooth2d_grid: all read hidden nodes >1 hop from any write target",
-          all(r in {2, 7, 12, 17, 22} for r in net.read_idx
-              if r < net.hid_count))
+    # Degree-of-separation: all read nodes are proj (exempt from >1-hop
+    # check, see topology.py). Verify there are no hidden reads.
+    check("smooth2d_grid: all read nodes are proj (no hidden reads in 4x4 grid)",
+          all(r >= net.hid_count for r in net.read_idx))
 
     # Forward on a random batch.
     u = torch.rand(8, 2)

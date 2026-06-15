@@ -84,8 +84,25 @@ class SparseTopology:
 
 # ---------- primitives ----------
 
-def line_graph(n_nodes: int, radius: int = 1, bidirectional: bool = True) -> SparseTopology:
-    """1D chain; node i connects to i+1..i+radius."""
+def line_graph(n_nodes: int, radius: int = 1, bidirectional: bool = False) -> SparseTopology:
+    """1D chain; node i connects to i+1..i+radius.
+
+    Emits a single directed edge per neighbor pair. L/S cells (odd I-V)
+    provide implicit bidirectional conduction via sign reversal.
+
+    The ``bidirectional`` parameter is deprecated; if ``True`` is passed,
+    a deprecation warning is issued and the function still emits a single
+    edge per pair (matching the new contract).
+    """
+    import warnings
+    if bidirectional:
+        warnings.warn(
+            "line_graph(bidirectional=True) is deprecated; only a single "
+            "edge per pair is emitted. Pass bidirectional=False (or omit) "
+            "to silence this warning.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
     if n_nodes <= 0:
         raise ValueError("n_nodes must be positive")
     if radius < 1:
@@ -96,8 +113,6 @@ def line_graph(n_nodes: int, radius: int = 1, bidirectional: bool = True) -> Spa
             j = i + r
             if j < n_nodes:
                 src.append(i); dst.append(j)
-                if bidirectional:
-                    src.append(j); dst.append(i)
     return SparseTopology(
         num_nodes=n_nodes,
         src=src, dst=dst,
@@ -108,7 +123,12 @@ def line_graph(n_nodes: int, radius: int = 1, bidirectional: bool = True) -> Spa
 
 
 def ring_graph(n_nodes: int, radius: int = 1) -> SparseTopology:
-    """1D ring with wrap-around; useful for periodic signals."""
+    """1D ring with wrap-around; useful for periodic signals.
+
+    Emits a single directed edge per neighbor pair: each node i connects to
+    (i+r) mod n_nodes for r=1..radius. Reverse direction is implicit via
+    sign reversal of L/S cell currents.
+    """
     if n_nodes <= 0:
         raise ValueError("n_nodes must be positive")
     if radius < 1:
@@ -120,7 +140,6 @@ def ring_graph(n_nodes: int, radius: int = 1) -> SparseTopology:
         for r in range(1, radius + 1):
             j = (i + r) % n_nodes
             src.append(i); dst.append(j)
-            src.append(j); dst.append(i)
     return SparseTopology(
         num_nodes=n_nodes,
         src=src, dst=dst,
@@ -133,10 +152,11 @@ def ring_graph(n_nodes: int, radius: int = 1) -> SparseTopology:
 def grid_graph(height: int, width: int, kernel_size: int = 3) -> SparseTopology:
     """2D local grid; node id = row * width + col.
 
-    Edges are bidirectional: each neighbor pair (i, j) yields both (i->j) and (j->i).
-    This matches an undirected electrical network where a branch between two nodes
-    can carry current in either direction. Other primitives (line, ring, cluster)
-    also produce bidirectional edges for the same physical reason.
+    Emits a single directed edge per unique neighbor pair (i, j) with j>i.
+    The single-edge representation matches a 2-terminal electrical branch:
+    L/S cells (odd I-V) carry current either direction via sign reversal,
+    and P cells (asymmetric, softplus threshold) conduct only when
+    V_src - V_dst > theta.
     """
     if height <= 0 or width <= 0:
         raise ValueError("height and width must be positive")
@@ -144,7 +164,7 @@ def grid_graph(height: int, width: int, kernel_size: int = 3) -> SparseTopology:
         raise ValueError("kernel_size must be a positive odd integer")
     n = height * width
     pad = kernel_size // 2
-    raw_src, raw_dst = [], []
+    src, dst = [], []
     for r in range(height):
         for c in range(width):
             i = r * width + c
@@ -156,12 +176,7 @@ def grid_graph(height: int, width: int, kernel_size: int = 3) -> SparseTopology:
                     if 0 <= nr < height and 0 <= nc < width:
                         j = nr * width + nc
                         if j > i:
-                            raw_src.append(i); raw_dst.append(j)
-    src: list[int] = []
-    dst: list[int] = []
-    for s, d in zip(raw_src, raw_dst):
-        src.append(s); dst.append(d)
-        src.append(d); dst.append(s)
+                            src.append(i); dst.append(j)
     return SparseTopology(
         num_nodes=n,
         src=src, dst=dst,
@@ -172,7 +187,12 @@ def grid_graph(height: int, width: int, kernel_size: int = 3) -> SparseTopology:
 
 
 def cluster_graph(n_nodes: int, edge_prob: float = 0.3, seed: int = 0) -> SparseTopology:
-    """Erdős-Rényi-like sparse graph, symmetric, no self-loops."""
+    """Erdős-Rényi-like sparse graph with a single directed edge per undirected pair.
+
+    For each pair (i, j) with i<j, an edge is emitted with probability
+    edge_prob in the direction (i->j). L/S cells (odd I-V) provide implicit
+    bidirectional conduction via sign reversal.
+    """
     if n_nodes <= 0:
         raise ValueError("n_nodes must be positive")
     if not (0.0 <= edge_prob <= 1.0):
@@ -183,7 +203,6 @@ def cluster_graph(n_nodes: int, edge_prob: float = 0.3, seed: int = 0) -> Sparse
         for j in range(i + 1, n_nodes):
             if rng.random() < edge_prob:
                 src.append(i); dst.append(j)
-                src.append(j); dst.append(i)
     return SparseTopology(
         num_nodes=n_nodes,
         src=src, dst=dst,
@@ -240,10 +259,13 @@ def connect_projection(
     proj_ids: Iterable[int],
     pattern: str = "all_to_all",
 ) -> tuple[list[int], list[int]]:
-    """Bidirectional bipartite between hidden and projection nodes."""
-    s1, d1 = connect_bipartite(hidden_ids, proj_ids, pattern)
-    s2, d2 = connect_bipartite(proj_ids, hidden_ids, pattern)
-    return s1 + s2, d1 + d2
+    """Unidirectional bipartite from hidden to projection nodes.
+
+    Each hidden node connects to projection nodes via the given pattern.
+    L/S cells (odd I-V) handle reverse (proj->hidden) flow via sign
+    reversal of current on the same edge.
+    """
+    return connect_bipartite(hidden_ids, proj_ids, pattern)
 
 
 # ---------- composer ----------
@@ -693,7 +715,7 @@ def validate_topology(topo: SparseTopology, max_hidden_density: float = 0.5) -> 
             raise ValueError(f"Self-loop not allowed: edge {s}->{d}")
     n_h = len(topo.hidden_node_ids)
     if n_h > 0:
-        max_edges = n_h * (n_h - 1)
+        max_edges = n_h * (n_h - 1) // 2
         actual_hidden_edges = sum(1 for t in topo.edge_type if t == EDGE_TYPE_HIDDEN)
         if n_h > 32 and (actual_hidden_edges / max_edges) > max_hidden_density:
             raise ValueError(

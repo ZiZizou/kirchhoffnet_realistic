@@ -55,8 +55,8 @@ def build_union_topology(
     for i in range(n):
         for j in range(i + 1, n):
             if active[i, j]:
-                src.extend([i, j])
-                dst.extend([j, i])
+                src.append(i)
+                dst.append(j)
 
     hid_topo = SparseTopology(
         num_nodes=n,

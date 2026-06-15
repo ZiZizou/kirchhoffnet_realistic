@@ -335,52 +335,46 @@ PRESET_SMOOTH2D = {
 }
 
 # Grid-topology variant of the smooth2d preset (smooth2d-grid-preset spec).
-# 5x5 = 25 hidden grid nodes with 8-neighbor local connectivity
+# 4x4 = 16 hidden grid nodes with 8-neighbor local connectivity
 # (grid_graph kernel_size=3). 3 projection nodes are connected
-# bidirectionally to all 25 hidden nodes (proj_pattern="all_to_all",
-# yielding 25*3*2 = 150 projection edges).
+# bidirectionally to all 16 hidden nodes (proj_pattern="all_to_all",
+# yielding 16*3 = 48 projection edges; 42 hidden edges).
 #
 # Multi-stage (multistage-smooth2d-grid spec): 3 independent stages with
-# untied weights. Each stage has the same 5x5 grid + 3 proj topology (28
-# active nodes, 294 edges) but its own learnable parameters. Total t_span=5
+# untied weights. Each stage has the same 4x4 grid + 3 proj topology (19
+# active nodes, 90 edges) but its own learnable parameters. Total t_span=5
 # is split equally (5/3 ≈ 1.667 per stage) and num_steps=50 proportionally
 # (17 per stage), keeping dt ≈ 0.098 constant. StageTransfer between stages
-# is identity (28→28). This triples the edge parameters (~3882 vs ~1294)
-# while making each per-stage backward pass 3x shallower, directly
-# addressing the vanishing gradient issue (single-stage stage0_logits grad
-# was 8e-6). Gradient norms per stage are logged separately in grad_norms.txt.
-#
-# Verified at 50 epochs (cosine LR 3e-4→1e-5, no pruning, MSE loss on
-# 20k Franke train + 4k val):
-#   - Gradient growth on stage{i}_logits: ep0 ~1e-5 → ep40 ~1e-2 (~1000x)
-#   - stage2_logits is the largest at ep40 (4.5e-2) — the last stage
-#     receives the strongest gradient signal, as expected
-#   - Val loss: ep0 0.973 → best 0.921 (ep ~45) → 0.995 (end of cosine)
-#   - Train loss: ep0 0.939 → 0.855 (ep ~35) → 0.995 (end)
-#   - 50 epochs is still short for 4599 params; longer training and/or
-#     warm restarts would help converge to a tighter fit
+# is identity (19→19). This triples the edge parameters (~1767 total) while
+# making each per-stage backward pass 3x shallower, directly addressing
+# the vanishing gradient issue. Gradient norms per stage are logged
+# separately in grad_norms.txt.
 #
 # Fan-out write (smooth2d-sanity-pass spec): each input writes to 3
-# designated hidden nodes (left/right columns of the 5x5 grid) via
-# FanOutInputMapper. This gives 6 total write targets versus the
-# previous 1-to-1 sparse mode (2 targets).
+# designated hidden nodes (left/right columns of the 4x4 grid) via
+# FanOutInputMapper. With 4 rows, write targets are left column rows
+# 0,1,2 = [0, 4, 8] and right column rows 0,1,2 = [3, 7, 11]. This
+# gives 6 total write targets.
 #
-# Wider read: center column of the grid (5 hidden nodes) + 3 proj
-# nodes, all >1 hop from any write target. OutputMapper is a
-# Linear(8, 1) over these 8 read positions. read_idx targets the LAST
+# Read (proj-only): 3 projection nodes only. With 4-wide grid and
+# 8-neighbor connectivity, every hidden node is within 1 hop of the
+# left/right write columns, so the >1-hop topology check would fail
+# for any hidden read. Topology check is skipped when all reads are
+# proj (see topology.py:validate_topology_degrees). OutputMapper is a
+# Linear(3, 1) over these 3 read positions. read_idx targets the LAST
 # stage's state vector.
 #
 # Fit-first: structural regularizers (edge_gate, node_gate, power,
 # capacitance) are zeroed in the preset's 'lambdas' override. The
 # --prune flag can still be passed for retrain experiments, but
 # gates do not receive any gradient pressure during pre-prune fit.
-_STAGE_CFG_25G_3P = {
+_STAGE_CFG_16G_3P = {
     "num_inputs": 2,
-    "num_hidden": 25,
+    "num_hidden": 16,
     "num_proj": 3,
     "num_outputs": 0,
     "hidden_family": "grid",
-    "hidden_kwargs": {"height": 5, "width": 5, "kernel_size": 3},
+    "hidden_kwargs": {"height": 4, "width": 4, "kernel_size": 3},
     "input_pattern": "all_to_all",
     "output_pattern": "all_to_all",
     "proj_pattern": "all_to_all",
@@ -389,16 +383,16 @@ _STAGE_CFG_25G_3P = {
 }
 PRESET_SMOOTH2D_GRID = {
     "stages": [
-        _STAGE_CFG_25G_3P,
-        _STAGE_CFG_25G_3P,
-        _STAGE_CFG_25G_3P,
+        _STAGE_CFG_16G_3P,
+        _STAGE_CFG_16G_3P,
+        _STAGE_CFG_16G_3P,
     ],
     "use_robust_input": False,
     "loss": "mse",
     "out_dim": 1,
     "write_mode": "fan_out",
-    "write_fan_out": {0: [0, 10, 20], 1: [4, 14, 24]},
-    "read_idx": [2, 7, 12, 17, 22, 25, 26, 27],
+    "write_fan_out": {0: [0, 4, 8], 1: [3, 7, 11]},
+    "read_idx": [16, 17, 18],
     "schedule": "three_phase",
     # Legacy per-preset lambda overrides kept for backward compatibility with
     # the --schedule legacy code path. When three_phase is active, the schedule

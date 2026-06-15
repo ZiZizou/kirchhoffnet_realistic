@@ -1622,15 +1622,186 @@ def test_prune_io_forward_pass_preserved_when_zero_edges_removed():
 
 
 def test_prune_io_remap_invalid_index_raises():
-    print("\nTest 62: I/O index remap raises when required node is missing (PIT-4)")
+    print("\nTest 62: I/O index remap skips pruned indices (PIT-4)")
     from train_script import _remap_indices as t_remap
 
     remap = {0: 0, 1: 1}
+    out = t_remap([0, 1, 99], remap)
+    check("PIT-4: missing (pruned) index is silently skipped",
+          out == [0, 1],
+          f"got {out}")
+    check("PIT-4: empty input list returns empty list",
+          t_remap([], remap) == [])
+
+
+def test_prune_stage_protects_write_target():
+    print("\nTest 62a: prune_stage protects write target from being pruned (PIO-1)")
+    import torch
+    from cell_library import IdealizedCellLibrary
+    from differential_stage import DifferentialStage
+    from topology import prune_stage
+
+    cell_lib = IdealizedCellLibrary()
+    # 4-node linear chain: 0->1->2->3
+    stage = DifferentialStage(
+        num_nodes=4,
+        src=[0, 1, 2],
+        dst=[1, 2, 3],
+        cell_lib=cell_lib,
+    )
+    with torch.no_grad():
+        stage.z_logits.fill_(5.0)  # all edges strongly non-Z
+        stage.u_logits.fill_(5.0)  # all nodes strongly alive
+
+    # Force node 0 (write target) to be "dead" by gate, but protect it.
+    with torch.no_grad():
+        stage.u_logits.data[0] = -10.0  # gate -> 0
+    new_stage, remap = prune_stage(
+        stage,
+        edge_threshold=0.01,
+        node_threshold=0.01,
+        protected_nodes={0},
+    )
+    check("PIO-1: protected write target survives pruning",
+          0 in remap,
+          f"remap={remap}")
+    check("PIO-1: new stage still has node for old write target",
+          new_stage.num_nodes >= 1,
+          f"num_nodes={new_stage.num_nodes}")
+
+
+def test_prune_stage_min_read_nodes_guard():
+    print("\nTest 62b: prune_stage raises when all read nodes are pruned (PIO-3)")
+    import torch
+    from cell_library import IdealizedCellLibrary
+    from differential_stage import DifferentialStage
+    from topology import prune_stage
+
+    cell_lib = IdealizedCellLibrary()
+    # Single-stage, no write_idx so the backstop doesn't fire; min_read_nodes
+    # guard catches the "all reads gated dead" case.
+    stage = DifferentialStage(
+        num_nodes=3,
+        src=[0, 1],
+        dst=[1, 2],
+        cell_lib=cell_lib,
+    )
+    with torch.no_grad():
+        stage.z_logits.fill_(5.0)
+        stage.u_logits.data[0] = 5.0
+        stage.u_logits.data[1] = -10.0   # read node 1 gated dead
+        stage.u_logits.data[2] = -10.0   # read node 2 gated dead
+
     try:
-        t_remap([0, 1, 99], remap)
-        check("PIT-4: missing read node raises ValueError", False, "did not raise")
-    except ValueError:
-        check("PIT-4: missing read node raises ValueError", True)
+        prune_stage(stage, edge_threshold=0.01, node_threshold=0.01,
+                    read_idx=[1, 2], min_read_nodes=1)
+        check("PIO-3: prune with all reads dead raises ValueError", False, "did not raise")
+    except ValueError as e:
+        check("PIO-3: prune with all reads dead raises ValueError",
+              "min_read_nodes" in str(e) or "read nodes survived" in str(e),
+              f"got: {e}")
+
+
+def test_prune_stage_min_read_nodes_one_survives():
+    print("\nTest 62c: prune_stage with at least one read node alive succeeds (PIO-3)")
+    import torch
+    from cell_library import IdealizedCellLibrary
+    from differential_stage import DifferentialStage
+    from topology import prune_stage
+
+    cell_lib = IdealizedCellLibrary()
+    # 3-node line 0->1->2 with all nodes alive. write=[0], read=[1, 2].
+    # Pruning with default thresholds keeps everything; both reads survive.
+    stage = DifferentialStage(
+        num_nodes=3,
+        src=[0, 1],
+        dst=[1, 2],
+        cell_lib=cell_lib,
+    )
+    with torch.no_grad():
+        stage.z_logits.fill_(5.0)
+        stage.u_logits.fill_(5.0)
+
+    new_stage, remap = prune_stage(
+        stage,
+        edge_threshold=0.01,
+        node_threshold=0.01,
+        write_idx=[0],
+        read_idx=[1, 2],
+    )
+    check("PIO-3: read node 1 survives", 1 in remap, f"remap={remap}")
+    check("PIO-3: read node 2 survives", 2 in remap, f"remap={remap}")
+    check("PIO-3: write node 0 survives", 0 in remap, f"remap={remap}")
+
+
+
+
+
+def test_prune_output_mapper_elastic_readout():
+    print("\nTest 62d: OutputMapper transfers surviving read columns (PIO-4)")
+    import torch
+    from cell_library import IdealizedCellLibrary
+    from io_mapper import OutputMapper
+    from train_script import _transfer_output_mapper
+
+    # Old OutputMapper reads 4 nodes -> 1 output. proj.weight shape [1, 4].
+    raw = OutputMapper(node_dim=5, out_dim=1, read_idx=[0, 1, 2, 3])
+    # Make weights distinguishable for column-tracking.
+    with torch.no_grad():
+        raw.proj.weight.data.fill_(0.0)
+        for i in range(4):
+            raw.proj.weight.data[0, i] = float(i + 1)  # 1.0, 2.0, 3.0, 4.0
+
+    # Pruned stage: node 1 was removed. last_remap has 0, 2, 3 -> 0, 1, 2.
+    last_remap = {0: 0, 2: 1, 3: 2}
+    new_mapper, new_read_idx = _transfer_output_mapper(
+        raw, [0, 1, 2, 3], last_remap, pruned_last_n=3, out_dim=1,
+    )
+    check("PIO-4: new read_idx has 3 entries (one pruned)",
+          new_read_idx == [0, 1, 2],
+          f"got {new_read_idx}")
+    check("PIO-4: new proj.weight shape is [1, 3]",
+          tuple(new_mapper.proj.weight.shape) == (1, 3),
+          f"got {new_mapper.proj.weight.shape}")
+    # Columns should be [1.0, 3.0, 4.0] (column 1 dropped).
+    expected = torch.tensor([[1.0, 3.0, 4.0]])
+    check("PIO-4: surviving columns preserved in order",
+          torch.allclose(new_mapper.proj.weight.data, expected),
+          f"got {new_mapper.proj.weight.data.tolist()}")
+
+
+def test_prune_network_multi_stage_protects_write():
+    print("\nTest 62e: prune_network protects write_idx in multi-stage (PIO-5)")
+    from cell_library import IdealizedCellLibrary
+    from topology import build_net_from_preset, prune_network
+    from config import PRUNE
+
+    cell_lib = IdealizedCellLibrary()
+    # smooth2d is single-stage; use sinx (also single-stage but with a
+    # configured write_idx). Actually, we need a preset with a known
+    # write_idx. Use smooth2d_grid (3 stages) to exercise the multi-stage
+    # path. We rely on build_net_from_preset wiring up write_idx.
+    net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
+    # Use very high thresholds so almost everything prunes, but the
+    # protected write_idx nodes in stage 0 must still survive.
+    pruned_core, stage_remaps = prune_network(
+        net.core,
+        edge_threshold=float(PRUNE["edge_threshold"]),
+        node_threshold=float(PRUNE["node_threshold"]),
+        transfer_params=True,
+        write_idx=list(net.write_idx) if net.write_idx is not None else None,
+        read_idx=list(net.read_idx) if net.read_idx is not None else None,
+    )
+    # Check that write_idx is contained in stage_remaps[0] (all write
+    # targets survived stage 0).
+    if net.write_idx is not None:
+        stage0_remap = stage_remaps[0]
+        missing = [w for w in net.write_idx if int(w) not in stage0_remap]
+        check("PIO-5: all write_idx entries survive in stage 0",
+              not missing,
+              f"missing={missing} (write_idx={net.write_idx}, remap={stage0_remap})")
+    else:
+        check("PIO-5: preset has no write_idx (skipped)", True)
 
 
 def test_reg_defaults_topology_fix():
@@ -1977,6 +2148,11 @@ def main():
     test_prune_io_mappers_transferred_when_zero_nodes_removed()
     test_prune_io_forward_pass_preserved_when_zero_edges_removed()
     test_prune_io_remap_invalid_index_raises()
+    test_prune_stage_protects_write_target()
+    test_prune_stage_min_read_nodes_guard()
+    test_prune_stage_min_read_nodes_one_survives()
+    test_prune_output_mapper_elastic_readout()
+    test_prune_network_multi_stage_protects_write()
     test_reg_defaults_topology_fix()
 
     test_scheduler_config_entries()

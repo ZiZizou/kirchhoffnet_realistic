@@ -497,6 +497,8 @@ def prune_stage(
     transfer_params: bool = True,
     write_idx: list[int] | None = None,
     read_idx: list[int] | None = None,
+    protected_nodes: set[int] | None = None,
+    min_read_nodes: int = 1,
 ) -> tuple["DifferentialStage", dict[int, int]]:
     """Rebuild a DifferentialStage with edges and nodes removed.
 
@@ -508,12 +510,19 @@ def prune_stage(
     Node pruning uses ``σ(u_logits) > node_threshold`` (no Z-equivalent for
     nodes).
 
+    ``protected_nodes`` are forced to survive pruning regardless of their
+    gate value. This is the input-side guard: write targets (the hidden
+    nodes that receive input writes) are passed in here so they can never
+    be silently pruned. The protection runs before the connectivity
+    backstop so protected nodes also anchor their component.
+
     When ``write_idx`` and ``read_idx`` are both provided, a connectivity
     backstop runs after pruning:
       - BFS from write_idx; verify all read_idx are reachable.
-      - Remove any node not in a component that contains at least one I/O node
-        (dead-island purge).
+      - Remove any node not in a component that contains at least one I/O
+        node (dead-island purge); protected nodes are also part of ``io_nodes``.
       - Re-filter edges for surviving nodes.
+      - If fewer than ``min_read_nodes`` read nodes survive, raise an error.
 
     Args:
         stage: Trained DifferentialStage with z_logits and u_logits.
@@ -527,6 +536,10 @@ def prune_stage(
             stages in multi-stage networks).
         read_idx: Optional compact node ids of read locations. Used for the
             connectivity backstop. Pass None to skip the check.
+        protected_nodes: Optional set of compact node ids that are forced to
+            survive pruning. Use for write targets that must remain alive.
+        min_read_nodes: Minimum number of read_idx nodes that must survive
+            after pruning. If fewer survive, raises ValueError. Default 1.
 
     Returns:
         A tuple ``(new_stage, node_remap)`` where:
@@ -553,6 +566,15 @@ def prune_stage(
     src_old = stage.src.detach().cpu()
     dst_old = stage.dst.detach().cpu()
 
+    # ----- protected nodes: forced to survive -----
+    # Input-side guard: write targets must never be pruned, regardless of
+    # their gate value. Applied before the connectivity backstop so they
+    # also anchor the I/O-connected component.
+    if protected_nodes is not None:
+        for idx in protected_nodes:
+            if 0 <= int(idx) < stage.num_nodes:
+                keep_node[int(idx)] = True
+
     # ----- connectivity backstop -----
     enforce_io = write_idx is not None and read_idx is not None and len(write_idx) > 0 and len(read_idx) > 0
     if enforce_io:
@@ -573,6 +595,8 @@ def prune_stage(
         # Identify dead islands: nodes not in any I/O-connected component
         components = _connected_components(stage.num_nodes, surv_src, surv_dst)
         io_nodes = set(int(x) for x in write_idx) | set(int(x) for x in read_idx)
+        if protected_nodes is not None:
+            io_nodes |= {int(x) for x in protected_nodes}
         io_components = [c for c in components if not c.isdisjoint(io_nodes)]
         if not io_components:
             raise ValueError(
@@ -583,6 +607,18 @@ def prune_stage(
         dead_island_nodes = set(range(stage.num_nodes)) - io_keep
         for n in dead_island_nodes:
             keep_node[n] = False
+
+    # ----- min_read_nodes guard -----
+    # After dead-island purge, count surviving read nodes. If fewer than
+    # min_read_nodes survive, abort the prune (readout would be empty).
+    if read_idx is not None and len(read_idx) > 0:
+        surviving_reads = [r for r in read_idx if bool(keep_node[int(r)])]
+        if len(surviving_reads) < min_read_nodes:
+            raise ValueError(
+                f"prune_stage: only {len(surviving_reads)}/{len(read_idx)} read nodes "
+                f"survived pruning (min_read_nodes={min_read_nodes}). "
+                f"Lower edge_threshold={edge_threshold} or node_threshold={node_threshold}."
+            )
 
     # Build node ID remapping: old_global -> new_compact.
     new_ids = torch.full((stage.num_nodes,), -1, dtype=torch.long)
@@ -640,6 +676,7 @@ def prune_network(
     transfer_params: bool = True,
     write_idx: list[int] | None = None,
     read_idx: list[int] | None = None,
+    min_read_nodes: int = 1,
 ) -> tuple["KirchhoffNet", list[dict[int, int]]]:
     """Apply prune_stage to every stage of a KirchhoffNet core.
 
@@ -650,6 +687,11 @@ def prune_network(
     ``write_idx`` and ``read_idx`` (when provided) are routed to the first
     and last stage respectively for the connectivity backstop. Intermediate
     stages skip the check.
+
+    ``write_idx`` is also passed to stage 0 (and single-stage networks) as
+    ``protected_nodes`` so write targets are guaranteed to survive pruning.
+    Read nodes are NOT protected; elastic readout pruning is allowed, but
+    the prune fails if fewer than ``min_read_nodes`` read nodes survive.
 
     Returns:
         A tuple ``(new_core, stage_remaps)`` where:
@@ -667,12 +709,16 @@ def prune_network(
     for i, s in enumerate(net.stages):
         if n_stages == 1:
             wi, ri = write_idx, read_idx
+            protected = set(write_idx) if write_idx else None
         elif i == 0:
             wi, ri = write_idx, None
+            protected = set(write_idx) if write_idx else None
         elif i == n_stages - 1:
             wi, ri = None, read_idx
+            protected = None
         else:
             wi, ri = None, None
+            protected = None
         new_s, remap = prune_stage(
             s,
             edge_threshold=edge_threshold,
@@ -680,6 +726,8 @@ def prune_network(
             transfer_params=transfer_params,
             write_idx=wi,
             read_idx=ri,
+            protected_nodes=protected,
+            min_read_nodes=min_read_nodes,
         )
         new_stages.append(new_s)
         stage_remaps.append(remap)

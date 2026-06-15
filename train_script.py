@@ -637,16 +637,21 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
 def _remap_indices(idx_list, remap):
     """Remap a list of compact node ids through a node_remap dict.
 
-    Raises ValueError if any index is not in the remap (i.e. was
-    pruned away).
+    Pruned indices (not present in ``remap``) are silently dropped. This
+    is safe because:
+      - write targets are protected from pruning (see ``protected_nodes``
+        in ``prune_stage``), so write_idx entries always survive.
+      - read targets are allowed to be pruned (elastic readout), and the
+        surviving entries are remapped; pruned ones are dropped from the
+        read_idx list, which the caller handles by rebuilding the
+        OutputMapper with fewer input features.
+
+    Returns a list of remapped indices (may be shorter than ``idx_list``).
     """
     out = []
     for i in idx_list:
         if i not in remap:
-            raise ValueError(
-                f"pruning: required I/O node {i} was pruned away; "
-                f"the connectivity backstop should have prevented this"
-            )
+            continue
         out.append(remap[i])
     return out
 
@@ -739,10 +744,12 @@ def _transfer_output_mapper(raw_mapper, raw_read_idx, last_remap,
     transferred from ``raw_mapper``.
 
     For sparse read mode, ``raw_read_idx`` is remapped through
-    ``last_remap``. Position ``i`` in the new proj corresponds
-    to old position ``i`` (the i-th read position still reads
-    the same physical node, just with a new compact id). The
-    proj weight columns can be copied directly.
+    ``last_remap``. If all read nodes survive, position ``i`` in the new
+    proj corresponds to old position ``i`` and the proj weight columns
+    can be copied directly. If some read nodes were pruned (elastic
+    readout), the new mapper has fewer input features; we copy only the
+    columns that correspond to surviving read positions, preserving the
+    learned readout for those nodes.
 
     For dense read mode (no read_idx), if last-stage node count
     unchanged, deepcopy. Otherwise, copy ``proj.weight`` columns
@@ -753,8 +760,15 @@ def _transfer_output_mapper(raw_mapper, raw_read_idx, last_remap,
         new_mapper = OutputMapper(
             node_dim=pruned_last_n, out_dim=out_dim, read_idx=new_read_idx,
         )
+        # Determine which columns of the old weight matrix correspond to
+        # surviving read positions (those entries not pruned away).
+        surviving_old_positions = [
+            i for i, idx in enumerate(raw_read_idx) if idx in last_remap
+        ]
         with torch.no_grad():
-            new_mapper.proj.weight.data.copy_(raw_mapper.proj.weight.data)
+            new_mapper.proj.weight.data.copy_(
+                raw_mapper.proj.weight.data[:, surviving_old_positions]
+            )
             new_mapper.proj.bias.data.copy_(raw_mapper.proj.bias.data)
         return new_mapper, new_read_idx
 

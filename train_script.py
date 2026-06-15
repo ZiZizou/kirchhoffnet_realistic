@@ -253,6 +253,8 @@ def _franke(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
 
 
 def make_data_smooth2d(batch_size: int, val_size: int = 4000):
+    # Fixed seed for reproducible train/val splits and noise across runs.
+    torch.manual_seed(42)
     n_train = 20000
     u_train = torch.rand(n_train, 2)
     y_train = _franke(u_train[:, 0], u_train[:, 1]).unsqueeze(1)

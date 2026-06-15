@@ -499,6 +499,7 @@ def prune_stage(
     read_idx: list[int] | None = None,
     protected_nodes: set[int] | None = None,
     min_read_nodes: int = 1,
+    prune_nodes_by_gate: bool = True,
 ) -> tuple["DifferentialStage", dict[int, int]]:
     """Rebuild a DifferentialStage with edges and nodes removed.
 
@@ -507,8 +508,16 @@ def prune_stage(
     probability (gm_Z ≈ 0 ⇒ no current) and the edge gate (σ(z_logits) ≈ 0)
     into a single effective-activity score.
 
-    Node pruning uses ``σ(u_logits) > node_threshold`` (no Z-equivalent for
-    nodes).
+    Node pruning behavior depends on ``prune_nodes_by_gate``:
+      - ``True`` (default, backward-compat): nodes with
+        ``σ(u_logits) ≤ node_threshold`` are independently removed. This
+        causes collateral edge removal: an edge with high eff_score is
+        still pruned if either endpoint has a low node gate.
+      - ``False``: no independent node pruning. All nodes start alive;
+        they are only removed by the connectivity backstop (dead island
+        purge) if they become fully disconnected from I/O after edge
+        pruning. This preserves the maximum number of edges and nodes
+        consistent with the I/O connectivity constraint.
 
     ``protected_nodes`` are forced to survive pruning regardless of their
     gate value. This is the input-side guard: write targets (the hidden
@@ -527,7 +536,8 @@ def prune_stage(
     Args:
         stage: Trained DifferentialStage with z_logits and u_logits.
         edge_threshold: Joint Z+gate threshold for edges.
-        node_threshold: Gate threshold for nodes.
+        node_threshold: Gate threshold for nodes (only used when
+            ``prune_nodes_by_gate=True``).
         transfer_params: If True, copy surviving logits/raw_mult/raw_leak
             values into the new stage. If False, the new stage starts with
             default initialization (used when retraining from scratch).
@@ -540,10 +550,13 @@ def prune_stage(
             survive pruning. Use for write targets that must remain alive.
         min_read_nodes: Minimum number of read_idx nodes that must survive
             after pruning. If fewer survive, raises ValueError. Default 1.
+        prune_nodes_by_gate: If True, prune nodes by ``σ(u_logits)``
+            independently (legacy behavior). If False, skip node-gate
+            pruning and only remove nodes via the connectivity backstop.
 
     Returns:
         A tuple ``(new_stage, node_remap)`` where:
-          - ``new_stage`` is a DifferentialStage with filtered src/dst,
+          - ``new_stage`` is a new DifferentialStage with filtered src/dst,
             logits, raw_mult, z_logits (kept edges only), filtered
             raw_leak, u_logits (kept nodes only), and compact node IDs
             (0..N_new-1). When ``transfer_params=True`` all per-edge/
@@ -555,13 +568,19 @@ def prune_stage(
     from differential_stage import DifferentialStage
 
     z = stage.edge_gates().detach().cpu()
-    u = stage.node_gates().detach().cpu()
     w_logits = stage.logits.detach().cpu()
     p_z = torch.softmax(w_logits, dim=-1)[:, Z_INDEX]  # [E]
     eff_score = (1.0 - p_z) * z  # [E]
 
     keep_edge = eff_score > edge_threshold
-    keep_node = u > node_threshold
+    if prune_nodes_by_gate:
+        u = stage.node_gates().detach().cpu()
+        keep_node = u > node_threshold
+    else:
+        # Edge-only pruning: all nodes start alive. The connectivity
+        # backstop will only remove nodes that become fully disconnected
+        # (no surviving incident edges).
+        keep_node = torch.ones(stage.num_nodes, dtype=torch.bool)
 
     src_old = stage.src.detach().cpu()
     dst_old = stage.dst.detach().cpu()
@@ -586,10 +605,14 @@ def prune_stage(
         _, dists = _bfs_undirected(stage.num_nodes, surv_src, surv_dst, list(write_idx))
         unreachable_reads = [r for r in read_idx if dists[r] < 0]
         if unreachable_reads:
+            hint = (
+                f"lower edge_threshold={edge_threshold}"
+                + (f" or node_threshold={node_threshold}" if prune_nodes_by_gate
+                   else " (node-gate pruning already disabled)")
+            )
             raise ValueError(
                 f"prune_stage: read_idx {unreachable_reads} are unreachable from "
-                f"write_idx {write_idx} after gate-based pruning. "
-                f"Lower edge_threshold={edge_threshold} or node_threshold={node_threshold}."
+                f"write_idx {write_idx} after gate-based pruning. {hint.capitalize()}."
             )
 
         # Identify dead islands: nodes not in any I/O-connected component
@@ -607,6 +630,26 @@ def prune_stage(
         dead_island_nodes = set(range(stage.num_nodes)) - io_keep
         for n in dead_island_nodes:
             keep_node[n] = False
+
+    # ----- edge-only dead island purge (without I/O indices) -----
+    # When no I/O indices are provided, the connectivity backstop above
+    # doesn't run. In edge-only mode we still need to remove nodes that
+    # have no surviving incident edges (they are dead islands).
+    if not enforce_io and not prune_nodes_by_gate:
+        surv_edges = keep_edge & keep_node[src_old] & keep_node[dst_old]
+        has_incident = torch.zeros(stage.num_nodes, dtype=torch.bool)
+        has_incident.scatter_(0, src_old[surv_edges], True)
+        has_incident.scatter_(0, dst_old[surv_edges], True)
+        if write_idx is not None:
+            for idx in write_idx:
+                has_incident[int(idx)] = True
+        if read_idx is not None:
+            for idx in read_idx:
+                has_incident[int(idx)] = True
+        if protected_nodes is not None:
+            for idx in protected_nodes:
+                has_incident[int(idx)] = True
+        keep_node = keep_node & has_incident
 
     # ----- min_read_nodes guard -----
     # After dead-island purge, count surviving read nodes. If fewer than
@@ -627,9 +670,12 @@ def prune_stage(
     # Re-filter edges: keep only edges where both endpoints survive
     edge_mask = keep_edge & keep_node[src_old] & keep_node[dst_old]
     if int(edge_mask.sum().item()) == 0:
+        hint = (
+            f"lower edge_threshold={edge_threshold}"
+            + (f" or node_threshold={node_threshold}" if prune_nodes_by_gate else "")
+        )
         raise ValueError(
-            f"prune_stage: pruning removed all edges; "
-            f"consider lowering edge_threshold={edge_threshold} or node_threshold={node_threshold}"
+            f"prune_stage: pruning removed all edges; consider {hint}"
         )
 
     new_src = new_ids[src_old[edge_mask]].tolist()
@@ -677,6 +723,7 @@ def prune_network(
     write_idx: list[int] | None = None,
     read_idx: list[int] | None = None,
     min_read_nodes: int = 1,
+    prune_nodes_by_gate: bool = True,
 ) -> tuple["KirchhoffNet", list[dict[int, int]]]:
     """Apply prune_stage to every stage of a KirchhoffNet core.
 
@@ -692,6 +739,9 @@ def prune_network(
     ``protected_nodes`` so write targets are guaranteed to survive pruning.
     Read nodes are NOT protected; elastic readout pruning is allowed, but
     the prune fails if fewer than ``min_read_nodes`` read nodes survive.
+
+    ``prune_nodes_by_gate`` is forwarded to each stage's ``prune_stage``;
+    see that function for the semantics.
 
     Returns:
         A tuple ``(new_core, stage_remaps)`` where:
@@ -728,6 +778,7 @@ def prune_network(
             read_idx=ri,
             protected_nodes=protected,
             min_read_nodes=min_read_nodes,
+            prune_nodes_by_gate=prune_nodes_by_gate,
         )
         new_stages.append(new_s)
         stage_remaps.append(remap)

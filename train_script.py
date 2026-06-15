@@ -252,12 +252,19 @@ def _franke(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _lhs_samples(n: int, d: int, seed: int = 42) -> torch.Tensor:
+    """Latin Hypercube samples in [0, 1]^d with guaranteed stratification."""
+    from scipy.stats.qmc import LatinHypercube
+    sampler = LatinHypercube(d=d, seed=seed)
+    return torch.from_numpy(sampler.random(n=n)).float()
+
+
 def make_data_smooth2d(batch_size: int, val_size: int = 4000):
     # Fixed seed for reproducible train/val splits and noise across runs.
-    torch.manual_seed(42)
     n_train = 20000
-    u_train = torch.rand(n_train, 2)
+    u_train = _lhs_samples(n_train, 2, seed=42)
     y_train = _franke(u_train[:, 0], u_train[:, 1]).unsqueeze(1)
+    torch.manual_seed(42)
     u_val = torch.rand(val_size, 2)
     y_val = _franke(u_val[:, 0], u_val[:, 1]).unsqueeze(1)
 
@@ -582,6 +589,24 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--prune-node-threshold", type=float, default=None,
         help="Override config.PRUNE['node_threshold'] for pruning.",
+    )
+    parser.add_argument(
+        "--prune-nodes-by-gate", dest="prune_nodes_by_gate",
+        action="store_true", default=None,
+        help="Prune nodes independently by σ(u_logits) > node_threshold "
+             "(legacy behavior). Default is set by the config (see "
+             "PRUNE['prune_nodes_by_gate']); when neither this flag nor "
+             "the config specify a value, the legacy behavior is used. "
+             "Disable with --no-prune-nodes-by-gate to skip node-gate "
+             "pruning — nodes then only die via the connectivity "
+             "backstop (dead island purge), preserving edges whose "
+             "endpoints had low u but high eff_score.",
+    )
+    parser.add_argument(
+        "--no-prune-nodes-by-gate", dest="prune_nodes_by_gate",
+        action="store_false",
+        help="Skip node-gate pruning; rely on the connectivity backstop "
+             "to remove disconnected nodes only.",
     )
     parser.add_argument(
         "--retrain-epochs", type=int, default=None,
@@ -1170,9 +1195,12 @@ def main():
         from topology import prune_network
         from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
 
+        # Always import SCHEDULE_THREE_PHASE for the prune_nodes_by_gate
+        # resolution below, regardless of which threshold path we take.
+        from config import SCHEDULE_THREE_PHASE
+
         # For three_phase, use schedule-specific thresholds; CLI overrides take precedence.
         if schedule_mode == "three_phase" and args.prune_edge_threshold is None and args.prune_node_threshold is None:
-            from config import SCHEDULE_THREE_PHASE
             _scfg = SCHEDULE_THREE_PHASE
             edge_thresh = float(_scfg.get("prune_edge_threshold", 0.1))
             node_thresh = float(_scfg.get("prune_node_threshold", 0.05))
@@ -1180,11 +1208,22 @@ def main():
             edge_thresh = args.prune_edge_threshold if args.prune_edge_threshold is not None else float(PRUNE["edge_threshold"])
             node_thresh = args.prune_node_threshold if args.prune_node_threshold is not None else float(PRUNE["node_threshold"])
 
+        # Resolve prune_nodes_by_gate: CLI flag > schedule config > PRUNE config.
+        if args.prune_nodes_by_gate is not None:
+            pnbg = bool(args.prune_nodes_by_gate)
+        else:
+            if schedule_mode == "three_phase":
+                pnbg = bool(SCHEDULE_THREE_PHASE.get("prune_nodes_by_gate",
+                                                     PRUNE.get("prune_nodes_by_gate", True)))
+            else:
+                pnbg = bool(PRUNE.get("prune_nodes_by_gate", True))
+
         pre_edges = sum(s.num_edges() for s in raw_net.core.stages)
         pre_nodes = sum(s.num_nodes for s in raw_net.core.stages)
         print(
             f"[prune] pre-prune: {pre_edges} edges, {pre_nodes} nodes "
-            f"(edge_thresh={edge_thresh}, node_thresh={node_thresh})"
+            f"(edge_thresh={edge_thresh}, node_thresh={node_thresh}, "
+            f"prune_nodes_by_gate={pnbg})"
         )
 
         pruned_core, stage_remaps = prune_network(
@@ -1194,6 +1233,7 @@ def main():
             transfer_params=not args.fresh_init,
             write_idx=list(raw_net.write_idx) if raw_net.write_idx is not None else None,
             read_idx=list(raw_net.read_idx) if raw_net.read_idx is not None else None,
+            prune_nodes_by_gate=pnbg,
         )
 
         post_edges = sum(s.num_edges() for s in pruned_core.stages)

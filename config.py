@@ -141,6 +141,11 @@ LAMBDAS = {
 PRUNE = {
     "edge_threshold": 0.1,
     "node_threshold": 0.05,
+    # When True (legacy), nodes with σ(u_logits) <= node_threshold are pruned
+    # independently, which causes collateral edge removal. When False, no
+    # independent node pruning — nodes are only removed by the connectivity
+    # backstop (dead island purge). See spec/edge-only-prune.md.
+    "prune_nodes_by_gate": True,
 }
 
 # Three-phase training schedule (three-phase-schedule plan).
@@ -182,6 +187,9 @@ SCHEDULE_THREE_PHASE = {
     # Prune thresholds used at the Phase B→C boundary.
     "prune_edge_threshold": 0.1,
     "prune_node_threshold": 0.05,
+    # See PRUNE['prune_nodes_by_gate']. Default (True) is the legacy
+    # behavior; set to False to keep low-u nodes alive (edge-only prune).
+    "prune_nodes_by_gate": True,
 }
 
 # Fixed-step Heun solver

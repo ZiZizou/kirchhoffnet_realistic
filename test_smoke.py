@@ -1804,6 +1804,247 @@ def test_prune_network_multi_stage_protects_write():
         check("PIO-5: preset has no write_idx (skipped)", True)
 
 
+def test_prune_stage_edge_only_keeps_low_u_node_with_incident_edge():
+    print("\nTest 62f: prune_stage with prune_nodes_by_gate=False keeps "
+          "low-u node that has a surviving incident edge (EOP-1)")
+    import torch
+    from cell_library import IdealizedCellLibrary
+    from differential_stage import DifferentialStage
+    from topology import prune_stage
+
+    cell_lib = IdealizedCellLibrary()
+    # Stage: nodes 0, 1, 2, 3. Edges 0->1, 1->2, 2->3.
+    # Nodes 1 and 2 have very low u (legacy would prune them, taking
+    # incident edges with them). Edges 0->1 and 1->2 have high eff_score.
+    # Edge 2->3 is Z-dominant (low eff_score) so it prunes either way.
+    # No read_idx/write_idx passed — skips the connectivity backstop so
+    # edge-only mode completes.
+    stage = DifferentialStage(
+        num_nodes=4,
+        src=[0, 1, 2],
+        dst=[1, 2, 3],
+        cell_lib=cell_lib,
+    )
+    with torch.no_grad():
+        stage.logits.data[0, 0] = 5.0     # P(L) ≈ 1 for edge 0->1
+        stage.logits.data[0, 3] = -5.0
+        stage.logits.data[1, 0] = 5.0     # P(L) ≈ 1 for edge 1->2
+        stage.logits.data[1, 3] = -5.0
+        stage.logits.data[2, 3] = 5.0     # P(Z) ≈ 1 for edge 2->3 (prune by Z)
+        stage.logits.data[2, 0] = -5.0
+        stage.z_logits.fill_(5.0)
+        stage.u_logits.data[0] = 5.0
+        stage.u_logits.data[1] = -10.0    # low u
+        stage.u_logits.data[2] = -10.0    # low u
+        stage.u_logits.data[3] = 5.0
+
+    # Legacy mode (gate) may raise "all edges removed" because node-gate
+    # pruning cascades through edges. Catch that — it's the symptom of
+    # collateral damage that the new edge-only mode is meant to fix.
+    gate_raised = False
+    try:
+        pruned_gate, _ = prune_stage(
+            stage, edge_threshold=0.1, node_threshold=0.05,
+            prune_nodes_by_gate=True,
+        )
+        gate_edges = pruned_gate.num_edges()
+    except ValueError:
+        gate_raised = True
+        gate_edges = 0
+
+    pruned_edge, _ = prune_stage(
+        stage, edge_threshold=0.1, node_threshold=0.05,
+        prune_nodes_by_gate=False,
+    )
+    # Nodes 0,1,2 survive via edges 0->1, 1->2. Node 3 is a dead island
+    # (edge 2->3 pruned via Z-dominance, no other incident edge).
+    check("EOP-1: edge-only mode keeps 3 nodes (0,1,2; node 3 dead island)",
+          pruned_edge.num_nodes == 3,
+          f"got {pruned_edge.num_nodes} nodes, expected 3")
+    check("EOP-1: edge-only mode keeps 2 active edges (0->1 and 1->2)",
+          pruned_edge.num_edges() == 2,
+          f"got {pruned_edge.num_edges()} edges, expected 2")
+    check("EOP-1: edge-only mode preserves more capacity than legacy gate mode",
+          pruned_edge.num_edges() > gate_edges,
+          f"gate_edges={gate_edges} (raised={gate_raised}), "
+          f"edge_only_edges={pruned_edge.num_edges()}")
+
+
+def test_prune_stage_edge_only_disconnected_node_removed():
+    print("\nTest 62g: prune_stage with prune_nodes_by_gate=False still removes "
+          "a node that becomes fully disconnected after edge pruning (EOP-2)")
+    import torch
+    from cell_library import IdealizedCellLibrary
+    from differential_stage import DifferentialStage
+    from topology import prune_stage
+
+    cell_lib = IdealizedCellLibrary()
+    # Stage: nodes 0, 1, 2, 3. Edges 0->1 (Z-dominant) and 2->3 (active).
+    # After edge pruning: 0->1 dies, 2->3 survives. Nodes 0, 1 become
+    # dead islands (0 has no surviving incident edge; 1 only had 0->1).
+    # Nodes 2, 3 stay alive via the surviving 2->3 edge.
+    stage = DifferentialStage(
+        num_nodes=4,
+        src=[0, 2],
+        dst=[1, 3],
+        cell_lib=cell_lib,
+    )
+    with torch.no_grad():
+        stage.logits.data[0, 3] = 5.0     # P(Z) ≈ 1 for edge 0->1
+        stage.logits.data[0, 0] = -5.0
+        stage.logits.data[1, 0] = 5.0     # P(L) ≈ 1 for edge 2->3
+        stage.logits.data[1, 3] = -5.0
+        stage.z_logits.fill_(5.0)
+        stage.u_logits.fill_(5.0)
+
+    pruned, _remap = prune_stage(
+        stage, edge_threshold=0.1, node_threshold=0.05,
+        prune_nodes_by_gate=False,
+    )
+    # Nodes 0 and 1 are fully disconnected (edge 0->1 was Z-pruned).
+    # Nodes 2 and 3 stay alive via the surviving edge 2->3.
+    check("EOP-2: edge-only mode prunes disconnected nodes (0, 1)",
+          pruned.num_nodes == 2,
+          f"got {pruned.num_nodes} nodes, expected 2")
+    check("EOP-2: edge-only mode keeps the surviving active edge 2->3",
+          pruned.num_edges() == 1,
+          f"got {pruned.num_edges()} edges, expected 1")
+
+
+def test_prune_stage_edge_only_matches_legacy_when_no_node_collateral():
+    print("\nTest 62h: prune_stage edge-only matches legacy when all low-u "
+          "nodes also have no surviving incident edges (EOP-3)")
+    import torch
+    from cell_library import IdealizedCellLibrary
+    from differential_stage import DifferentialStage
+    from topology import prune_stage
+
+    cell_lib = IdealizedCellLibrary()
+    # Stage: nodes 0, 1, 2, 3. Edges 0->1, 0->2, 2->3.
+    # Make edges 0->1 and 0->2 Z-dominant (eff_score -> 0) so they prune.
+    # Edge 2->3 stays active. Node 2 has low u (would be legacy-pruned),
+    # but its incident edge 2->3 has high eff_score and survives.
+    # No read_idx/write_idx passed — skips the connectivity backstop.
+    stage = DifferentialStage(
+        num_nodes=4,
+        src=[0, 0, 2],
+        dst=[1, 2, 3],
+        cell_lib=cell_lib,
+    )
+    with torch.no_grad():
+        stage.logits.data[0, 3] = 5.0
+        stage.logits.data[0, 0] = -5.0
+        stage.logits.data[1, 3] = 5.0
+        stage.logits.data[1, 0] = -5.0
+        stage.logits.data[2, 0] = 5.0
+        stage.logits.data[2, 3] = -5.0
+        stage.z_logits.fill_(5.0)
+        stage.u_logits.fill_(-10.0)  # all low-u (legacy would prune all)
+
+    # Legacy mode: with all u low, every node gets pruned; the single
+    # active edge 2->3 is then collateral-damaged too. This raises.
+    gate_raised = False
+    try:
+        pruned_gate, _ = prune_stage(
+            stage, edge_threshold=0.1, node_threshold=0.05,
+            prune_nodes_by_gate=True,
+        )
+        gate_result = "completed"
+    except ValueError:
+        gate_raised = True
+        gate_result = "raised"
+
+    pruned_edge, _ = prune_stage(
+        stage, edge_threshold=0.1, node_threshold=0.05,
+        prune_nodes_by_gate=False,
+    )
+    # Edge-only: nodes 2, 3 stay alive (2->3 edge has high eff_score).
+    # Nodes 0, 1 are dead islands (all incident edges Z-pruned).
+    check("EOP-3: legacy gate-mode either raises or prunes all (demonstrates collateral)",
+          gate_raised or (pruned_gate.num_edges() == 0),
+          f"legacy result: {gate_result}, "
+          f"gate edges={pruned_gate.num_edges() if not gate_raised else 'N/A'}")
+    check("EOP-3: edge-only mode retains nodes 2, 3 (edge 2->3 active, node 0 also dead island)",
+          pruned_edge.num_nodes == 2,
+          f"got {pruned_edge.num_nodes} nodes, expected 2")
+    check("EOP-3: edge-only mode retains the single active edge",
+          pruned_edge.num_edges() == 1,
+          f"got {pruned_edge.num_edges()} edges, expected 1")
+
+
+def test_prune_network_edge_only_preserves_more_capacity():
+    print("\nTest 62i: prune_stage edge-only vs gate mode (EOP-4)")
+    import torch
+    from cell_library import IdealizedCellLibrary
+    from differential_stage import DifferentialStage
+    from topology import prune_stage
+
+    cell_lib = IdealizedCellLibrary()
+    # Single stage: 4 nodes, edges 0->1 (hi-z), 0->2 (lo-z), 1->3 (hi-z).
+    # Node 1 has low u_logits (gate mode kills it, severing the 0->1->3 path
+    # and disconnecting read_idx=[3] from write_idx=[0]).
+    # Edge-only mode keeps node 1 alive (high-z incident edge 0->1), so
+    # the I/O path remains intact and read_idx=[3] stays reachable.
+    stage = DifferentialStage(
+        num_nodes=4,
+        src=[0, 0, 1],
+        dst=[1, 2, 3],
+        cell_lib=cell_lib,
+    )
+    with torch.no_grad():
+        stage.z_logits.data[0] = 5.0    # hi gate for edge 0->1
+        stage.z_logits.data[1] = -10.0  # lo gate for edge 0->2
+        stage.z_logits.data[2] = 5.0    # hi gate for edge 1->3
+        stage.u_logits.data[0] = 5.0    # hi u (write target)
+        stage.u_logits.data[1] = -10.0  # low u (gate mode kills this)
+        stage.u_logits.data[2] = 5.0    # hi u
+        stage.u_logits.data[3] = 5.0    # hi u (read target)
+        stage.logits.data[:, 0] = 5.0   # P(L) ≈ 1 for all edges
+        stage.logits.data[:, 3] = -5.0  # P(Z) ≈ 0
+
+    gate_raised = False
+    try:
+        pruned_gate, _ = prune_stage(
+            stage, edge_threshold=0.1, node_threshold=0.05,
+            write_idx=[0], read_idx=[3],
+            prune_nodes_by_gate=True,
+        )
+        gate_edges = pruned_gate.num_edges()
+        gate_nodes = pruned_gate.num_nodes
+    except ValueError:
+        gate_raised = True
+        gate_edges, gate_nodes = 0, 0
+
+    pruned_edge, _ = prune_stage(
+        stage, edge_threshold=0.1, node_threshold=0.05,
+        write_idx=[0], read_idx=[3],
+        prune_nodes_by_gate=False,
+    )
+    edge_edges = pruned_edge.num_edges()
+    edge_nodes = pruned_edge.num_nodes
+    check("EOP-4: edge-only mode completes (keeps I/O path intact)",
+          not gate_raised or edge_edges > 0,
+          f"gate_raised={gate_raised}, edge_edges={edge_edges}")
+    check("EOP-4: edge-only mode keeps more edges than gate mode",
+          edge_edges > gate_edges,
+          f"gate={gate_edges}, edge_only={edge_edges}")
+    check("EOP-4: edge-only mode keeps at least as many nodes as gate mode",
+          edge_nodes >= gate_nodes,
+          f"gate={gate_nodes}, edge_only={edge_nodes}")
+
+
+def test_prune_nodes_by_gate_config_default():
+    print("\nTest 62j: PRUNE['prune_nodes_by_gate'] is True by default (EOP-5)")
+    from config import PRUNE
+    check("EOP-5: PRUNE['prune_nodes_by_gate'] is True (backward compat)",
+          PRUNE.get("prune_nodes_by_gate", True) is True,
+          f"got {PRUNE.get('prune_nodes_by_gate', True)}")
+    from config import SCHEDULE_THREE_PHASE
+    check("EOP-5: SCHEDULE_THREE_PHASE['prune_nodes_by_gate'] is True (backward compat)",
+          SCHEDULE_THREE_PHASE.get("prune_nodes_by_gate", True) is True,
+          f"got {SCHEDULE_THREE_PHASE.get('prune_nodes_by_gate', True)}")
+
+
 def test_reg_defaults_topology_fix():
     print("\nTest 59: config.py regularizer values updated (PT-4)")
     from config import OPTIM, LAMBDAS
@@ -2153,6 +2394,11 @@ def main():
     test_prune_stage_min_read_nodes_one_survives()
     test_prune_output_mapper_elastic_readout()
     test_prune_network_multi_stage_protects_write()
+    test_prune_stage_edge_only_keeps_low_u_node_with_incident_edge()
+    test_prune_stage_edge_only_disconnected_node_removed()
+    test_prune_stage_edge_only_matches_legacy_when_no_node_collateral()
+    test_prune_network_edge_only_preserves_more_capacity()
+    test_prune_nodes_by_gate_config_default()
     test_reg_defaults_topology_fix()
 
     test_scheduler_config_entries()

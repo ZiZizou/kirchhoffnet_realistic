@@ -81,15 +81,16 @@ PHYS = {
 # Training hyperparameters
 _BASE_BATCH_SIZE = 1024
 _BASE_LR = 3e-4
+_FINAL_BATCH_SIZE = 2048
 OPTIM = {
     # LR auto-scales linearly with batch size (Goyal et al., 2017):
     # lr_new = base_lr * (batch_size / base_batch_size)
     # Compensates for fewer optimizer steps per epoch at larger batch sizes.
-    "lr": _BASE_LR * (4096 / _BASE_BATCH_SIZE),
     "weight_decay": 1e-4,
     "grad_clip_norm": 5.0,
     "epochs": 800,
-    "batch_size": 4096,
+    "batch_size": _FINAL_BATCH_SIZE,
+    "lr": _BASE_LR * (_FINAL_BATCH_SIZE / _BASE_BATCH_SIZE),
     "reg_warmup_epochs": 100,
     "reg_anneal_epochs": 50,
     "scheduler_T_0": 50,

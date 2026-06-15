@@ -166,11 +166,11 @@ SCHEDULE_THREE_PHASE = {
     "tau_c_init": 0.6,         # Tau at start of retrain
     "tau_c_final": 0.1,        # Tau at end of retrain
     # Lambda warmup within Phase B: ramp from 0 to full over this fraction.
-    "warmup_frac_b": 1.0 / 6.0,
+    "warmup_frac_b": 1.0 / 2.0,
     # Phase B target lambdas (Strategy 2: gate pruning first, tiny Z pressure).
     "lambdas_b": {
-        "sparsity": 1e-4,
-        "edge_gate": 5e-5,
+        "sparsity": 5e-5,
+        "edge_gate": 1e-5,
         "node_gate": 1e-5,
         "power": 1e-5,
         "capacitance": 1e-6,
@@ -412,8 +412,8 @@ PRESET_SMOOTH2D_GRID = {
     # the --schedule legacy code path. When three_phase is active, the schedule
     # functions in train.py replace these with the phase-aware values.
     "lambdas": {
-        "sparsity": 1e-4,
-        "edge_gate": 5e-5,
+        "sparsity": 1e-5,
+        "edge_gate": 5e-6,
         "node_gate": 1e-5,
         "power": 1e-5,
         "capacitance": 1e-6,

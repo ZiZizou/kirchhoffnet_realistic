@@ -54,7 +54,7 @@ def test_config_loads():
     check("NUM_CELLS == 4", config.NUM_CELLS == 4)
     check("PHYS has x_max=3.0 (three-phase-schedule: increased from 0.3 for headroom)",
           config.PHYS["x_max"] == 3.0)
-    check("OPTIM has lr=3e-4", abs(config.OPTIM["lr"] - 3e-4) < 1e-12)
+    check("OPTIM has lr=6e-4 (auto-scaled from 3e-4 at batch_size=2048)", abs(config.OPTIM["lr"] - 6e-4) < 1e-12)
     check("LAMBDAS has sparsity=1e-3", abs(config.LAMBDAS["sparsity"] - 1e-3) < 1e-12)
     check("LAMBDAS has rail=1.0 (three-phase-schedule: down from 10.0 for x_max=3.0 regime)",
           abs(config.LAMBDAS["rail"] - 1.0) < 1e-12)
@@ -927,27 +927,34 @@ def test_reg_schedule_curve():
 
 
 def test_smooth2d_grid_sparsity_zero_override():
-    print("\nTest 43a: smooth2d_grid preset lambdas match three_phase Strategy 2 values")
+    print("\nTest 43a: smooth2d_grid preset lambdas (legacy path) and schedule config")
     import config
     from config import SCHEDULE_THREE_PHASE
     from train_script import _resolve_lambdas
     sg_lambdas = _resolve_lambdas("smooth2d_grid")
-    b_target = SCHEDULE_THREE_PHASE["lambdas_b"]
-    check("smooth2d-grid: preset sparsity matches Phase B target",
-          abs(sg_lambdas["sparsity"] - float(b_target["sparsity"])) < 1e-12,
-          f"got {sg_lambdas['sparsity']}, expected {b_target['sparsity']}")
-    check("smooth2d-grid: preset edge_gate matches Phase B target",
-          abs(sg_lambdas["edge_gate"] - float(b_target["edge_gate"])) < 1e-12,
+    # Per-preset lambdas are for the legacy schedule path, distinct from
+    # Phase B schedule lambdas (which apply under --schedule three_phase).
+    check("smooth2d-grid: preset legacy lambdas sparsity=1e-5",
+          abs(sg_lambdas["sparsity"] - 1e-5) < 1e-12,
+          f"got {sg_lambdas['sparsity']}")
+    check("smooth2d-grid: preset legacy lambdas edge_gate=5e-6",
+          abs(sg_lambdas["edge_gate"] - 5e-6) < 1e-12,
           f"got {sg_lambdas['edge_gate']}")
-    check("smooth2d-grid: preset node_gate matches Phase B target",
-          abs(sg_lambdas["node_gate"] - float(b_target["node_gate"])) < 1e-12,
+    check("smooth2d-grid: preset legacy lambdas node_gate=1e-5",
+          abs(sg_lambdas["node_gate"] - 1e-5) < 1e-12,
           f"got {sg_lambdas['node_gate']}")
-    check("smooth2d-grid: preset power matches Phase B target",
-          abs(sg_lambdas["power"] - float(b_target["power"])) < 1e-12,
+    check("smooth2d-grid: preset legacy lambdas power=1e-5",
+          abs(sg_lambdas["power"] - 1e-5) < 1e-12,
           f"got {sg_lambdas['power']}")
-    check("smooth2d-grid: preset capacitance matches Phase B target",
-          abs(sg_lambdas["capacitance"] - float(b_target["capacitance"])) < 1e-12,
+    check("smooth2d-grid: preset legacy lambdas capacitance=1e-6",
+          abs(sg_lambdas["capacitance"] - 1e-6) < 1e-12,
           f"got {sg_lambdas['capacitance']}")
+    check("smooth2d-grid: Phase B schedule sparsity=5e-5",
+          abs(float(SCHEDULE_THREE_PHASE["lambdas_b"]["sparsity"]) - 5e-5) < 1e-12,
+          f"got {SCHEDULE_THREE_PHASE['lambdas_b']['sparsity']}")
+    check("smooth2d-grid: Phase B schedule edge_gate=1e-5",
+          abs(float(SCHEDULE_THREE_PHASE["lambdas_b"]["edge_gate"]) - 1e-5) < 1e-12,
+          f"got {SCHEDULE_THREE_PHASE['lambdas_b']['edge_gate']}")
     check("smooth2d-grid: preset schedule=three_phase",
           config.PRESETS["smooth2d_grid"].get("schedule") == "three_phase")
     check("smooth2d-grid: preset tau_anneal is True",
@@ -2040,8 +2047,12 @@ def test_prune_nodes_by_gate_config_default():
           PRUNE.get("prune_nodes_by_gate", True) is True,
           f"got {PRUNE.get('prune_nodes_by_gate', True)}")
     from config import SCHEDULE_THREE_PHASE
-    check("EOP-5: SCHEDULE_THREE_PHASE['prune_nodes_by_gate'] is True (backward compat)",
-          SCHEDULE_THREE_PHASE.get("prune_nodes_by_gate", True) is True,
+    # four-phase-redesign/Phase 1a: SCHEDULE_THREE_PHASE default flipped
+    # to False to disable node-gate pruning (nodes only die via the
+    # connectivity backstop). The legacy PRUNE['prune_nodes_by_gate']
+    # still defaults to True for backward compat with non-schedule users.
+    check("EOP-5: SCHEDULE_THREE_PHASE['prune_nodes_by_gate'] is False (four-phase-redesign 1a)",
+          SCHEDULE_THREE_PHASE.get("prune_nodes_by_gate", True) is False,
           f"got {SCHEDULE_THREE_PHASE.get('prune_nodes_by_gate', True)}")
 
 
@@ -2575,11 +2586,14 @@ def test_smooth2d_grid_preset():
               for st in cfg["stages"]))
     check("smooth2d_grid: proj_pattern=all_to_all",
           s.get("proj_pattern") == "all_to_all")
-    check("smooth2d_grid: lambdas match Phase B Strategy 2 values",
-          cfg.get("lambdas", {}).get("edge_gate") == 5e-5
-          and cfg.get("lambdas", {}).get("node_gate") == 1e-5
-          and cfg.get("lambdas", {}).get("power") == 1e-5
-          and cfg.get("lambdas", {}).get("capacitance") == 1e-6)
+    check("smooth2d_grid: legacy preset lambdas edge_gate=5e-6",
+          cfg.get("lambdas", {}).get("edge_gate") == 5e-6)
+    check("smooth2d_grid: legacy preset lambdas node_gate=1e-5",
+          cfg.get("lambdas", {}).get("node_gate") == 1e-5)
+    check("smooth2d_grid: legacy preset lambdas power=1e-5",
+          cfg.get("lambdas", {}).get("power") == 1e-5)
+    check("smooth2d_grid: legacy preset lambdas capacitance=1e-6",
+          cfg.get("lambdas", {}).get("capacitance") == 1e-6)
 
     cell_lib = make_default_library()
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
@@ -2749,7 +2763,7 @@ def test_fan_out_input_mapper_out_of_range_raises():
 def test_optim_lr_lowered():
     print("\nTest FO-7: OPTIM['lr'] lowered to 3e-4 (sanity-pass consultant rec)")
     from config import OPTIM
-    check("OPTIM.lr == 3e-4", abs(OPTIM["lr"] - 3e-4) < 1e-12,
+    check("OPTIM.lr == 6e-4 (auto-scaled to batch_size=2048)", abs(OPTIM["lr"] - 6e-4) < 1e-12,
           f"got {OPTIM['lr']}")
 
 

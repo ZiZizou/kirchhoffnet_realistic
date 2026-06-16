@@ -158,7 +158,7 @@ Preset defaults (SR4.2):
 - `housing`: `write_mode=one_to_one`, `write_idx=[0..7]`, `read_mode=sparse`, `read_idx=[15]` (out of 16 hidden + 4 proj = 20)
 - `smooth2d_grid`: `write_mode=fan_out`, `write_fan_out={0:[0,4,8], 1:[3,7,11]}`, `read_mode=sparse`, `read_idx=[16,17,18]`
 
-CLI flags (SR5): `--write-mode {one_to_one,dense,fan_out}`, `--read-mode {sparse,dense}`, `--write-idx "0,2,4"`, `--read-idx "7"`. The index overrides take precedence over preset values.
+CLI flags (SR5): `--write-mode {one_to_one,dense}`, `--read-mode {sparse,dense}`, `--write-idx "0,2,4"`, `--read-idx "7"`. The index overrides take precedence over preset values. Fan-out write is only available through the `write_fan_out` preset config, not as a CLI flag.
 
 ### 2.6 Staged regularizer warm-up (RR-A)
 
@@ -299,9 +299,9 @@ freely. Rail is always active as a safety net.
 **Phase B (compress, epochs 30–70%).** Tau anneals from 1.0→0.6
 (gentle specialization — capping at 0.6 instead of 0.1 prevents Z-death
 from prematurely locking edges to the zero cell). Structural
-regularizers (edge_gate=5e-5, node_gate=1e-5, power=1e-5,
-capacitance=1e-6, sparsity=1e-4) are ramped from 0 to full over the
-first ~17% of Phase B (≈7 epochs at 800 total). Gate logits are pushed
+regularizers (edge_gate=1e-5, node_gate=1e-5, power=1e-5,
+capacitance=1e-6, sparsity=5e-5) are ramped from 0 to full over the
+first ~50% of Phase B (≈20 epochs at 800 total). Gate logits are pushed
 toward 0 (closed) or stay at 1 (open).
 
 **Phase C (retrain, epochs 70–100%).** At the B→C boundary, automatic
@@ -334,7 +334,7 @@ regularizer weight without redefining the entire dictionary.
 
 Active overrides:
 - **sinx**: `{"rail": 1.0}`.
-- **smooth2d_grid**: `{"sparsity": 1e-4, "edge_gate": 5e-5, "node_gate": 1e-5, "power": 1e-5, "capacitance": 1e-6, "rail": 0.1}`.
+- **smooth2d_grid**: `{"sparsity": 1e-5, "edge_gate": 5e-6, "node_gate": 1e-5, "power": 1e-5, "capacitance": 1e-6, "rail": 0.1}`. Note: these legacy per-preset lambdas are for the `--schedule legacy` code path; under `--schedule three_phase` the schedule's phase-aware values (Phase B lambdas_b) replace them entirely.
 - **housing**: no override.
 
 ### 2.11 Deprecated `temp_c` sampling (RR-C)
@@ -459,7 +459,7 @@ this gives `lr=6e-4`.
 
 - `CELL_LIBRARY` — L/S/P/Z cell parameters (gm, isat, rho, gleak, bias, theta, beta)
 - `PHYS` — physical constants (x_max=3.0, C_eff=1.0, beta_softness=0.02, clip_current=0.05, clip_softness=0.02)
-- `OPTIM` — training hyperparameters (lr=6e-4, wd=1e-4, epochs=800, batch_size=2048, reg_warmup_epochs=100, reg_anneal_epochs=50, CosineAnnealingLR with T_max based on phase boundaries)
+- `OPTIM` — training hyperparameters (lr auto-computed as `3e-4 * batch_size/1024` = 6e-4 at 2048, wd=1e-4, epochs=800, batch_size=2048, reg_warmup_epochs=100, reg_anneal_epochs=50, scheduler_T_0=50, CosineAnnealingLR with T_max based on phase boundaries)
 - `TAU` — temperature annealing schedule (init=1.0, final=0.1, min=0.15, hardening_epoch_frac=0.1, final_pretrain=0.8 for two-phase pre-prune)
 - `LAMBDAS` — regularizer weights (sparsity=1e-3, rail=1.0, edge_gate=5e-4, node_gate=1e-4, power=1e-4, capacitance=1e-5, entropy=0.0)
 - `PRUNE` — pruning thresholds (edge_threshold=0.1, node_threshold=0.05, prune_nodes_by_gate=True)
@@ -776,19 +776,103 @@ to avoid over-aggressive updates during warm-start fine-tuning.**
 | Special | LHS-based sampling for training data. No lambda overrides. |
 
 ### `smooth2d_grid` — Franke 2D regression (3-stage grid topology)
+
 | | |
 |---|---|
 | Input | 2D (x, y) in [0, 1]² |
 | Output | 1D (Franke function value, normalized) |
 | Architecture | **3 stages**: each 16 hidden (4×4 grid, 8-neighbor kernel_size=3) + 3 proj (all_to_all). StageTransfer identity (19→19). |
-| Edges/Params | ~90 edges/stage (42 hidden + 48 proj), ~588 params/stage = ~1764 total |
+| Edges/Params | 90 edges/stage (42 hidden + 48 proj), 578 params/stage = 1734 core + 16 I/O = ~1750 total |
 | Integration | t_span=5/3 ≈ 1.667 per stage, 17 steps per stage, dt ≈ 0.098 constant |
 | Loss | MSE |
 | Train size | 20K (4K val, 4K test, sigma=0.01 noise) |
 | Write/Read | `write_mode=fan_out`, `write_fan_out={0:[0,4,8], 1:[3,7,11]}` (6 write targets), `read_mode=sparse`, `read_idx=[16,17,18]` (3 proj readout) |
 | Schedule | `schedule=three_phase` (auto-prune at B→C boundary) |
-| Lambda override | `{"sparsity": 1e-4, "edge_gate": 5e-5, "node_gate": 1e-5, "power": 1e-5, "capacitance": 1e-6, "rail": 0.1}` |
+| Lambda override | `{"sparsity": 1e-5, "edge_gate": 5e-6, "node_gate": 1e-5, "power": 1e-5, "capacitance": 1e-6, "rail": 0.1}` (legacy path; three_phase uses schedule phase values) |
 | Special | Fan-out write spreads each input to 3 grid positions (left/right columns). Proj-only read. Structural regularizers zeroed in fit-first phase. Multi-stage helps vanishing gradient. |
+
+#### Stage topology: 4×4 grid
+
+The 16 hidden nodes are arranged as a 2D grid in row-major order:
+
+```
+    col 0   col 1   col 2   col 3
+row 0  [0] --- [1] --- [2] --- [3]
+        |  \  /  |  \  /  |  \  /  |
+row 1  [4] --- [5] --- [6] --- [7]
+        |  \  /  |  \  /  |  \  /  |
+row 2  [8] --- [9] --- [10] -- [11]
+        |  \  /  |  \  /  |  \  /  |
+row 3 [12] --- [13] --- [14] -- [15]
+```
+
+- **Connectivity:** `kernel_size=3` means each node connects to its 8 immediate neighbors (Chebyshev distance ≤ 1): up, down, left, right, and 4 diagonals. This is shown by the `---` (cardinal) and `\ /` (diagonal) lines in the diagram.
+- **Single directed edge per pair:** Each undirected neighbor pair emits exactly one directed edge (i→j with j>i). L/S/P cells provide effective bidirectionality via sign-reversal or threshold gating.
+- **42 hidden edges:** Counting unique pairs per node type:
+  - 4 interior nodes (5,6,9,10) × 8 neighbors / 2 = 16
+  - 8 edge nodes (1,2,4,7,8,11,13,14) × 5 neighbors / 2 = 20
+  - 4 corner nodes (0,3,12,15) × 3 neighbors / 2 = 6
+  - Total = 16 + 20 + 6 = **42**
+
+#### Projection nodes
+
+3 projection nodes are appended after the 16 hidden nodes, indices 16, 17, 18. Each proj node connects to ALL 16 hidden nodes bidirectionally (`proj_pattern=all_to_all`), yielding 16 × 3 = **48 projection edges**. The total state vector per stage is 16 (hidden) + 3 (proj) = **19 nodes** with **90 edges**.
+
+#### Multi-stage design (vanishing gradient mitigation)
+
+Three independent stages, each with the same 19-node / 90-edge topology but **untied weights** (separate learnable parameters per stage). The total t_span=5 and num_steps=50 are split equally:
+
+- Per-stage t_span = 5/3 ≈ 1.667
+- Per-stage num_steps = round(50/3) = 17
+- dt = 1.667 / 17 ≈ 0.098 (constant across stages)
+
+The StageTransfer between stages is **identity (19→19)** — no width change. The three non-identity transfers would only activate if pruning changed a stage's node count.
+
+Why 3 stages instead of 1? The backward pass through a single ODE stage with 50 steps produces gradients that vanish exponentially with depth. Splitting into 3 stages of 17 steps each makes each per-stage backward pass **3× shallower**, preserving gradient flow to early-stage parameters. Gradient norms per stage are logged separately in `grad_norms.txt` (`stage0_logits`, `stage1_logits`, etc.) to monitor this.
+
+#### Fan-out write mapping
+
+Each 2D input (x, y) writes to 3 hidden nodes along the left and right columns of the 4×4 grid:
+
+```
+Input 0 (x) → left column, rows 0,1,2 → hidden nodes [0, 4, 8]
+Input 1 (y) → right column, rows 0,1,2 → hidden nodes [3, 7, 11]
+```
+
+This gives 6 target positions, each with its own learnable (gain, bias) pair via `FanOutInputMapper` (12 I/O mapper parameters total). The bottom row (row 3, nodes 12,13,14,15) receives no direct write — it must be activated by grid propagation.
+
+#### Proj-only readout (degree-of-separation)
+
+The output is read from the 3 projection nodes (indices 16, 17, 18 in the full 19-node state vector). Readout is a single Linear(3→1) = 4 parameters.
+
+Why projection nodes instead of hidden? The KirchhoffNet topology validation (`validate_topology_degrees`) enforces that every (write, read) node pair must be **≥2 hops apart** on the core graph — otherwise the input can bypass capacitor dynamics and directly drive the output. With a 4×4 grid and 8-neighbor connectivity, every hidden node is within 1 hop of both write columns (left column at [0,4,8] and right column at [3,7,11]), making hidden-node readout impossible. Projection nodes are explicitly exempt from this check (they are the intended global readout tap).
+
+#### Parameter count breakdown
+
+Per stage (19 nodes, 90 edges, 4 cell types L/S/P/Z):
+
+| Parameter group | Shape | Count |
+|----------------|-------|-------|
+| `logits` | [90, 4] | 360 |
+| `raw_mult` | [90] | 90 |
+| `raw_leak` | [19] | 19 |
+| `z_logits` | [90] | 90 |
+| `u_logits` | [19] | 19 |
+| **Per-stage total** | | **578** |
+
+Full network (3 stages + I/O):
+
+| Component | Count |
+|-----------|-------|
+| 3 × stage parameters | 1,734 |
+| FanOutInputMapper (6 × gain + 6 × bias) | 12 |
+| OutputMapper Linear(3→1) | 4 |
+| 2 × StageTransfer (no params) | 0 |
+| **Grand total** | **1,750** |
+
+#### Lambda overrides and Phase B interaction
+
+The per-preset lambda override provides default values for the `--schedule legacy` code path. Under `--schedule three_phase` (the default for this preset), these values are **replaced** by the schedule's phase-aware lambdas (see §2.9). The Phase B lambdas are more aggressive: `sparsity=5e-5` vs the preset's `1e-5`, `edge_gate=1e-5` vs `5e-6`. This separation exists because the legacy path needs gentle regularization during a single training phase, while the three-phase schedule can apply stronger regularization in Phase B (compress) without hurting Phase A (fit).
 
 ### Removed presets (R4.2, R4.3)
 - `xor` — removed from active PRESETS (weak analog motivation).
@@ -818,10 +902,11 @@ PHYS = {"x_max": 3.0, "C_eff": 1.0,
 
 # Training (RR-A: reg_warmup_epochs=100 for longer free phase;
 #              lr auto-scaled: BASE_LR=3e-4 * batch_size/1024 = 6e-4 at 2048)
+#              scheduler_T_0 was 80 before multistage-smooth2d-grid, now 50)
 OPTIM = {"lr": 6e-4, "weight_decay": 1e-4, "grad_clip_norm": 5.0,
          "epochs": 800, "batch_size": 2048,
          "reg_warmup_epochs": 100, "reg_anneal_epochs": 50,
-         "scheduler_T_0": 80, "scheduler_T_mult": 1, "scheduler_eta_min": 1e-5}
+         "scheduler_T_0": 50, "scheduler_T_mult": 1, "scheduler_eta_min": 1e-5}
 
 # Temperature annealing (init=1.0, final=0.1, min=0.15,
 #                        final_pretrain=0.8 for two-phase pre-prune)
@@ -840,11 +925,13 @@ PRUNE = {"edge_threshold": 0.1, "node_threshold": 0.05,
          "prune_nodes_by_gate": True}
 
 # Three-phase schedule (fit 30% / compress 40% / retrain 30%)
+# warmup_frac_b was 1.0/6.0 before three-phase-schedule fine-tuning; now 1.0/2.0
+# lambdas_b sparsity/edge_gate were 1e-4/5e-5 before schedule tuning; now 5e-5/1e-5
 SCHEDULE_THREE_PHASE = {"frac_a": 0.30, "frac_b": 0.40, "frac_c": 0.30,
                         "tau_a": 1.0, "tau_b_init": 1.0, "tau_b_final": 0.6,
                         "tau_c_init": 0.6, "tau_c_final": 0.1,
-                        "warmup_frac_b": 1.0/6.0,
-                        "lambdas_b": {"sparsity": 1e-4, "edge_gate": 5e-5,
+                        "warmup_frac_b": 1.0/2.0,
+                        "lambdas_b": {"sparsity": 5e-5, "edge_gate": 1e-5,
                                       "node_gate": 1e-5, "power": 1e-5,
                                       "capacitance": 1e-6},
                         "lambdas_c": {"sparsity": 1e-5, "edge_gate": 0.0,
@@ -898,7 +985,7 @@ Convergence diagnostic: captures ODE state snapshots during integration and plot
 
 ### Smoke test (`test_smoke.py`)
 
-**567 total test checks** (116 test functions; 565 pass + 2 pre-existing failures) covering the full pipeline:
+**572 total test checks** (116 test functions; 572 pass + 0 failures) covering the full pipeline:
 R1-R7, RR-A through RR-D reviewer-residual cleanup, CP-1 through CP-5
 complexity pruning, smooth2d and smooth2d_grid presets (including
 three-phase schedule, fan-out write), MLP benchmark comparison,
@@ -985,13 +1072,11 @@ Coverage:
 | 124-126 | Gradient logging | --grad-log CLI, collect_gradient_norms, file output |
 | 127 | Three-phase (TP-1–9) | phase_boundaries, phase_for_epoch, three_phase_tau, three_phase_lambdas, solidification metrics, argmax validation, schedule file markers |
 
-**Pre-existing failures (2):**
-Both failures are the same issue — test expectations check `OPTIM["lr"] == 3e-4`
-but the auto-scaling formula gives `6e-4` at batch_size=2048:
-- `test_config_loads`: `OPTIM has lr=3e-4` (actual: 6e-4)
-- `test_smooth2d_grid_preset`: `OPTIM.lr == 3e-4: got 0.0006`
-
-These are cosmetic — the test expectations predate batch-size-aware LR scaling.
+**Pre-existing failures (0):**
+All checks pass after test expectations were updated to match batch-size-aware
+LR auto-scaling (3e-4 → 6e-4), per-preset lambda values (sparsity=1e-5,
+edge_gate=5e-6 for smooth2d_grid legacy path), and schedule config values
+(sparsity=5e-5, edge_gate=1e-5, warmup_frac_b=1/2 for three_phase).
 
 ---
 
@@ -1011,7 +1096,7 @@ kirchhoff_redesign/ideal/
 ├── train.py                       # Loss, regularizers (4 decomposed CP terms), tau annealing, three-phase schedule,
 │                                  #   solidification metrics, argmax validation, stage-LR scaling, training loop
 ├── train_script.py                # CLI training entry point (4 problems; prune/retrain; three-phase; AMP/compile/DP)
-├── test_smoke.py                  # ~565-test smoke suite (116 test functions; P cell, gates, pruning, three-phase,
+├── test_smoke.py                  # ~572-test smoke suite (116 test functions; P cell, gates, pruning, three-phase,
 │                                  #   smooth2d/smooth2d_grid, fan-out write, MLP benchmark, gradient logging)
 ├── mlp_benchmark.py               # MLPRegressor baseline for smooth2d Franke task
 ├── visualize.py                   # Matplotlib/networkx visualization utilities

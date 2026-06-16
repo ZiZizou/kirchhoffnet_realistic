@@ -148,12 +148,18 @@ PRUNE = {
     "prune_nodes_by_gate": True,
 }
 
-# Three-phase training schedule (three-phase-schedule plan).
+# Three-phase training schedule (three-phase-schedule plan, refined by four-phase-redesign).
 # Generic schedule that any preset can opt into via ``preset["schedule"] = "three_phase"``.
 # Splits the total epoch budget into three phases with independently configured
 # tau annealing and structural regularizer magnitudes. Calibrated for the
 # post-x_max=3.0 operating regime where task loss is ~0.03 (not ~1.0) — see
 # spec/three-phase-schedule.md for the full scale discipline rationale.
+#
+# four-phase-redesign/Phase 1a updates:
+#   - prune_edge_threshold 0.1 -> 0.05 (less violent pruning at B->C)
+#   - prune_nodes_by_gate True -> False (nodes only die via connectivity backstop)
+#   - node_gate in lambdas_b 1e-5 -> 0.0 (node_gate is too destructive when
+#     used in concert with edge_gate; remove the regularizer from B entirely)
 SCHEDULE_THREE_PHASE = {
     # Fraction of total epochs allocated to each phase.
     "frac_a": 0.30,            # Phase A: fit (no structure pressure)
@@ -168,10 +174,12 @@ SCHEDULE_THREE_PHASE = {
     # Lambda warmup within Phase B: ramp from 0 to full over this fraction.
     "warmup_frac_b": 1.0 / 2.0,
     # Phase B target lambdas (Strategy 2: gate pruning first, tiny Z pressure).
+    # four-phase-redesign/1a: node_gate=0 (removed; node gate is too destructive
+    # when combined with edge_gate and active pruning in the same window).
     "lambdas_b": {
         "sparsity": 5e-5,
         "edge_gate": 1e-5,
-        "node_gate": 1e-5,
+        "node_gate": 0.0,
         "power": 1e-5,
         "capacitance": 1e-6,
     },
@@ -184,12 +192,14 @@ SCHEDULE_THREE_PHASE = {
         "power": 0.0,
         "capacitance": 0.0,
     },
-    # Prune thresholds used at the Phase B→C boundary.
-    "prune_edge_threshold": 0.1,
+    # Prune thresholds used at the Phase B->C boundary.
+    # four-phase-redesign/1a: edge 0.1 -> 0.05 (gentler cut, retains more
+    # edges so the retrain has material to work with).
+    "prune_edge_threshold": 0.05,
     "prune_node_threshold": 0.05,
-    # See PRUNE['prune_nodes_by_gate']. Default (True) is the legacy
-    # behavior; set to False to keep low-u nodes alive (edge-only prune).
-    "prune_nodes_by_gate": True,
+    # four-phase-redesign/1a: True -> False (nodes only die via connectivity
+    # backstop; prevents the legacy "zap all low-u nodes" pathology).
+    "prune_nodes_by_gate": False,
 }
 
 # Fixed-step Heun solver

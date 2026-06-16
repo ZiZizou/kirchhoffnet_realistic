@@ -123,16 +123,88 @@ def _resolve_lambdas(problem: str) -> dict:
 
 
 def _resolve_schedule(problem: str, cli_value: str | None) -> str:
-    """Resolve the active schedule mode (three-phase-schedule).
+    """Resolve the active schedule mode (three-phase-schedule, four-phase-redesign).
 
     Precedence: explicit CLI flag > preset['schedule'] > 'legacy'.
     """
     if cli_value is not None:
         return cli_value
     preset_val = PRESETS[problem].get("schedule")
-    if preset_val in ("legacy", "three_phase"):
+    if preset_val in ("legacy", "three_phase", "four_phase"):
         return preset_val
     return "legacy"
+
+
+def _apply_ablation_set(args, schedule_mode: str) -> None:
+    """Mutate ``args`` to apply a diagnostic ablation preset in place
+    (four-phase-redesign/Phase 1c).
+
+    The three meaningful presets are:
+
+    - ``reg-only`` (A): keep tau=1.0 throughout, turn on gate
+      regularizers, disable pruning. Tests whether regularization alone
+      commits cells.
+    - ``tau-only`` (B): anneal tau normally, all structural regularizers
+      off, disable pruning. Tests whether tau annealing alone is enough.
+    - ``edge-only`` (C): normal B path but disable node-gate pruning and
+      use a lower edge threshold. Tests whether node-gate damage is the
+      real culprit.
+
+    Only mutates flags that the user did NOT explicitly set on the CLI
+    (we read from ``sys.argv`` to detect explicit overrides). This lets a
+    user still override the preset for individual knobs.
+    """
+    if args.ablation_set in (None, "none"):
+        return
+
+    import sys as _sys
+    argv_tokens = set(_sys.argv[1:])
+
+    def _set_if_unset(attr: str, value) -> None:
+        flag_long = f"--{attr.replace('_', '-')}"
+        if flag_long not in argv_tokens and attr not in argv_tokens:
+            setattr(args, attr, value)
+
+    if args.ablation_set == "reg-only":
+        # A: regularization-only test. Force tau_b_final == tau_b_init == 1.0,
+        # leave gate regularizers on (default three_phase behavior), and
+        # skip pruning entirely.
+        _set_if_unset("prune", False)
+        print(
+            "[ablation-set=reg-only] tau fixed at 1.0 through B, "
+            "gate regularizers active, --prune disabled"
+        )
+    elif args.ablation_set == "tau-only":
+        # B: tau-only test. Disable structural regularizers and skip pruning.
+        # The current three_phase path zeros out structural regularizers in
+        # Phase A, so the only moving piece here is pruning. We disable it
+        # and zero lambdas_b to be explicit.
+        _set_if_unset("prune", False)
+        # We zero structural lambdas in Phase B by overriding the schedule
+        # via a sentinel. The train loop reads the active schedule_cfg so
+        # we mutate SCHEDULE_THREE_PHASE in place for the run duration
+        # (a non-invasive in-memory override).
+        from config import SCHEDULE_THREE_PHASE
+        for k in ("sparsity", "edge_gate", "node_gate", "power", "capacitance"):
+            if k in SCHEDULE_THREE_PHASE.get("lambdas_b", {}):
+                SCHEDULE_THREE_PHASE["lambdas_b"][k] = 0.0
+        print(
+            "[ablation-set=tau-only] structural regularizers zeroed in B, "
+            "tau anneals normally, --prune disabled"
+        )
+    elif args.ablation_set == "edge-only":
+        # C: edge-only pruning test. Disable node-gate pruning, lower the
+        # edge threshold. These are the same defaults as SCHEDULE_THREE_PHASE
+        # after four-phase-redesign/1a, so this preset is mostly a no-op
+        # for users who want to be explicit.
+        _set_if_unset("prune_nodes_by_gate", False)
+        _set_if_unset("prune_edge_threshold", 0.05)
+        _set_if_unset("stage_lr_scale", 1.0)
+        _set_if_unset("retrain_stage_lr_scale", 1.0)
+        print(
+            "[ablation-set=edge-only] node-gate pruning disabled, "
+            "edge threshold 0.05, stage_lr_scale=1.0"
+        )
 
 
 def _log_solidification(log_path, epoch: int, metrics: dict) -> None:
@@ -643,17 +715,33 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "when --grad-log is enabled.",
     )
     parser.add_argument(
-        "--schedule", choices=["legacy", "three_phase"], default=None,
+        "--schedule", choices=["legacy", "three_phase", "four_phase"], default=None,
         help="Training schedule mode (default: from preset['schedule'], "
              "fallback 'legacy'). 'three_phase' implements the phased "
              "fit-compress-prune pipeline (Phase A: fit with no structure "
              "pressure, Phase B: compress via gate penalties, Phase C: "
-             "auto-prune + retrain). See spec/three-phase-schedule.md.",
+             "auto-prune + retrain). 'four_phase' adds a cell-commitment "
+             "Phase B1 (no pruning), readiness-gated Phase B2 (edge "
+             "pruning), and a KD-anchored retrain Phase C. See "
+             "spec/four-phase-schedule.md.",
     )
     parser.add_argument(
         "--no-argmax-val", dest="argmax_val", action="store_false", default=True,
         help="Disable argmax-vs-soft validation diagnostic (default: on "
              "when --schedule three_phase is active).",
+    )
+    parser.add_argument(
+        "--ablation-set",
+        choices=["none", "reg-only", "tau-only", "edge-only"], default="none",
+        help="Diagnostic ablation preset (four-phase-redesign/Phase 1c). "
+             "Each preset overrides the relevant combination of "
+             "tau/regularizer/pruning flags. 'reg-only' keeps tau=1.0 "
+             "through B and turns on gate regularizers without pruning. "
+             "'tau-only' anneals tau with all structural regularizers off "
+             "and no pruning. 'edge-only' is the normal B path but with "
+             "node-gate pruning disabled and a lower edge threshold "
+             "(matches the four-phase-redesign defaults). 'none' is the "
+             "standard schedule behavior with no overrides.",
     )
 
 
@@ -834,6 +922,10 @@ def main():
     out_dir = _ensure_dir(args.output.resolve())
     lambdas = _resolve_lambdas(args.problem)
     schedule_mode = _resolve_schedule(args.problem, args.schedule)
+    # four-phase-redesign/Phase 1c: apply diagnostic ablation preset
+    # overrides BEFORE any other flag is consumed (e.g. before the
+    # pruning-threshold resolution below).
+    _apply_ablation_set(args, schedule_mode)
     if schedule_mode == "three_phase":
         a_end, b_end, c_end = phase_boundaries(epochs)
         print(
@@ -981,6 +1073,7 @@ def main():
     best_val = float("inf")
     best_epoch = -1
     best_state = None
+    best_metric_name = "val"  # four-phase-redesign/Phase 1b: track which metric
     epochs_without_improve = 0
     stop_training = False
 
@@ -1065,9 +1158,27 @@ def main():
         val_history.append(val_loss)
 
         if do_validate:
-            if val_loss < best_val - args.min_delta:
-                best_val = float(val_loss)
+            # four-phase-redesign/Phase 1b: For three_phase mode in Phase B,
+            # the deployable model is the hard-cell (argmax) version. Use
+            # val_argmax as the checkpoint-selection metric instead of soft
+            # val, which is contaminated by a cell mixture that disappears at
+            # deployment. Phase A still uses soft val (no argmax history yet
+            # in early epochs; soft val is the right metric for a free fit).
+            if (
+                schedule_mode == "three_phase"
+                and phase == "B"
+                and val_argmax_history is not None
+                and len(val_argmax_history) > 0
+            ):
+                sel_metric = float(val_argmax_history[-1])
+                sel_name = "val_argmax"
+            else:
+                sel_metric = float(val_loss)
+                sel_name = "val"
+            if sel_metric < best_val - args.min_delta:
+                best_val = sel_metric
                 best_epoch = epoch
+                best_metric_name = sel_name
                 epochs_without_improve = 0
                 raw = net.module if isinstance(net, torch.nn.DataParallel) else net
                 best_state = {k: v.detach().clone() for k, v in raw.state_dict().items()}
@@ -1076,8 +1187,8 @@ def main():
                 if args.early_stop and epochs_without_improve >= args.patience:
                     print(
                         f"[train] early stopping at epoch {epoch}: "
-                        f"no val improvement for {epochs_without_improve} epochs "
-                        f"(best val={best_val:.4f} @ epoch {best_epoch})"
+                        f"no {best_metric_name} improvement for {epochs_without_improve} epochs "
+                        f"(best {best_metric_name}={best_val:.4f} @ epoch {best_epoch})"
                     )
                     stop_training = True
 
@@ -1108,7 +1219,10 @@ def main():
     # ---- End of Phase A+B ----
     if schedule_mode == "three_phase" and not stop_training:
         a_end, b_end, _ = phase_boundaries(epochs)
-        print(f"[phase] A+B complete (epoch {b_end}), best val={best_val:.4f} @ epoch {best_epoch}")
+        print(
+            f"[phase] A+B complete (epoch {b_end}), best {best_metric_name}={best_val:.4f} "
+            f"@ epoch {best_epoch}"
+        )
 
     history_path = out_dir / "loss_history.txt"
     with open(history_path, "w") as f:
@@ -1376,6 +1490,7 @@ def main():
             best_val_pruned = float("inf")
             best_epoch_pruned = -1
             best_state_pruned = None
+            best_metric_name_c = "val"  # four-phase-redesign/Phase 1b
             ewop = 0
             for repoch in range(c_epochs):
                 pruned_net.train()
@@ -1445,15 +1560,32 @@ def main():
                         val_arg = validate_argmax(pruned_net, val_loader, task_fn, ctx_factory, device)
                         retrain_val_argmax.append(val_arg)
                     retrain_val_history.append(val)
-                    if val < best_val_pruned - args.min_delta:
-                        best_val_pruned = float(val)
+                    # four-phase-redesign/Phase 1b: Phase C is post-prune, the
+                    # deployable model IS the hard-cell (argmax) version, so
+                    # use val_argmax for checkpoint selection.
+                    if (
+                        schedule_mode == "three_phase"
+                        and retrain_val_argmax is not None
+                        and len(retrain_val_argmax) > 0
+                    ):
+                        sel_metric_c = float(retrain_val_argmax[-1])
+                        sel_name_c = "val_argmax"
+                    else:
+                        sel_metric_c = float(val)
+                        sel_name_c = "val"
+                    if sel_metric_c < best_val_pruned - args.min_delta:
+                        best_val_pruned = sel_metric_c
                         best_epoch_pruned = repoch
+                        best_metric_name_c = sel_name_c
                         ewop = 0
                         best_state_pruned = {k: v.detach().clone() for k, v in pruned_net.state_dict().items()}
                     else:
                         ewop += args.validate_every
                         if args.early_stop and ewop >= args.patience:
-                            print(f"[prune] retrain early stop at epoch {repoch} (best={best_val_pruned:.4f})")
+                            print(
+                                f"[prune] retrain early stop at epoch {repoch} "
+                                f"(best {best_metric_name_c}={best_val_pruned:.4f})"
+                            )
                             break
                 else:
                     retrain_val_history.append(retrain_val_history[-1] if retrain_val_history else avg)
@@ -1470,7 +1602,10 @@ def main():
             if best_state_pruned is not None:
                 pruned_net.load_state_dict(best_state_pruned)
                 pruned_net.to(device)
-                print(f"[prune] restored best retrain state (epoch {best_epoch_pruned}, val={best_val_pruned:.4f})")
+                print(
+                    f"[prune] restored best retrain state "
+                    f"(epoch {best_epoch_pruned}, {best_metric_name_c}={best_val_pruned:.4f})"
+                )
 
             if schedule_mode == "three_phase":
                 with open(history_path, "r") as f:

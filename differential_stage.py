@@ -98,7 +98,7 @@ class DifferentialStage(nn.Module):
     def num_edges(self) -> int:
         return int(self.src.numel())
 
-    def rhs(self, x: torch.Tensor, ctx, tau: float = 1.0) -> torch.Tensor:
+    def rhs(self, x: torch.Tensor, ctx, tau: float = 1.0, cell_mode: str = "soft") -> torch.Tensor:
         """Compute dx/dt at state x. x: [batch, num_nodes].
 
         Gate application (CP-2):
@@ -108,6 +108,11 @@ class DifferentialStage(nn.Module):
         - Edge gate: i_edge *= sigmoid(z_logits) — multiplies the edge current
           after cell-library evaluation. When z_e -> 0 the edge contributes
           zero current regardless of cell type.
+
+        ``cell_mode`` (four-phase-redesign/Phase 2a): forwarded to
+        ``cell_lib.forward`` to control the cell-selection mode. ``'soft'``
+        uses a softmax mixture (default). ``'ste'`` uses one cell per edge
+        in the forward pass with straight-through soft gradients.
         """
         # Node gate: scale node voltages before computing edge inputs.
         node_mask = torch.sigmoid(self.u_logits)  # [N]
@@ -124,6 +129,7 @@ class DifferentialStage(nn.Module):
             x_max=self.x_max,
             ctx=ctx,
             tau=tau,
+            cell_mode=cell_mode,
         )
 
         # Edge gate: multiply each edge's current by its gate.
@@ -168,10 +174,16 @@ class DifferentialStage(nn.Module):
         num_steps: int | None = None,
         tau: float | None = None,
         store_trajectory: bool = True,
+        cell_mode: str = "soft",
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Integrate stage with fixed-step Heun. Returns (x_final, traj).
 
         traj: [batch, num_nodes, num_steps+1] if store_trajectory else None.
+
+        ``cell_mode`` (four-phase-redesign/Phase 2a): forwarded to
+        ``rhs`` to control cell selection. ``'soft'`` is the standard
+        mixture; ``'ste'`` uses one cell per edge in the forward pass
+        with straight-through soft gradients.
         """
         t_span = float(t_span if t_span is not None else SOLVER["t_span"])
         num_steps = int(num_steps if num_steps is not None else SOLVER["num_steps"])
@@ -182,9 +194,9 @@ class DifferentialStage(nn.Module):
         traj_chunks = [x] if store_trajectory else None
 
         for _ in range(num_steps):
-            k1 = self.rhs(x, ctx=ctx, tau=tau)
+            k1 = self.rhs(x, ctx=ctx, tau=tau, cell_mode=cell_mode)
             x_pred = x + dt * k1
-            k2 = self.rhs(x_pred, ctx=ctx, tau=tau)
+            k2 = self.rhs(x_pred, ctx=ctx, tau=tau, cell_mode=cell_mode)
             x = x + 0.5 * dt * (k1 + k2)
             if store_trajectory:
                 traj_chunks.append(x)

@@ -77,6 +77,7 @@ class KirchhoffNet(nn.Module):
         ctx,
         tau: float | None = None,
         store_trajectory: bool = False,
+        cell_mode: str = "soft",
     ):
         from sim_context import SimContext
 
@@ -100,6 +101,7 @@ class KirchhoffNet(nn.Module):
                 num_steps=self.stage_steps[i],
                 tau=tau_i,
                 store_trajectory=store_trajectory,
+                cell_mode=cell_mode,
             )
             if store_trajectory and traj is not None:
                 all_trajs.append(traj)
@@ -229,6 +231,7 @@ class KirchhoffNetWithIO(nn.Module):
         ctx,
         tau: float | None = None,
         store_trajectory: bool = False,
+        cell_mode: str = "soft",
     ):
         x0 = self.input_mapper(u)
         if x0.size(1) != self.hid_count:
@@ -244,7 +247,8 @@ class KirchhoffNetWithIO(nn.Module):
             x_final, trajs = x0_full, None
         else:
             x_final, trajs = self.core(
-                x0_full, ctx=ctx, tau=tau, store_trajectory=store_trajectory
+                x0_full, ctx=ctx, tau=tau, store_trajectory=store_trajectory,
+                cell_mode=cell_mode,
             )
         if self.read_idx is not None:
             x_read = x_final

@@ -26,6 +26,7 @@ import torch.nn.functional as F
 from config import (
     LAMBDAS,
     OPTIM,
+    SCHEDULE_FOUR_PHASE,
     SCHEDULE_THREE_PHASE,
     SOLVER,
     TAU,
@@ -48,6 +49,12 @@ __all__ = [
     "phase_boundaries",
     "three_phase_tau",
     "three_phase_lambdas",
+    "four_phase_boundaries",
+    "phase_for_epoch_four",
+    "four_phase_tau",
+    "four_phase_lambdas",
+    "four_phase_kd_active",
+    "prune_readiness_check",
     "compute_solidification_metrics",
     "validate_argmax",
     "make_optimizer",
@@ -358,6 +365,334 @@ def three_phase_lambdas(
     return out
 
 
+# ---------- four-phase schedule (four-phase-redesign plan) ----------
+
+def four_phase_boundaries(
+    total_epochs: int, schedule_cfg: dict | None = None
+) -> tuple[int, int, int, int]:
+    """Compute (a_end, b1_end, b2_end, c_end) epoch boundaries for the
+    four-phase schedule (four-phase-redesign/Phase 3b).
+
+    Phase fractions must sum to 1.0 (frac_a + frac_b1 + frac_b2 + frac_c = 1).
+    Each end is computed by rounding total_epochs * cumulative_frac, with
+    the constraint that adjacent phases differ by at least 1 epoch.
+
+    Returns (a_end, b1_end, b2_end, c_end) with
+    ``0 < a_end < b1_end < b2_end < c_end == total_epochs``.
+    """
+    if schedule_cfg is None:
+        schedule_cfg = SCHEDULE_FOUR_PHASE
+    frac_a = float(schedule_cfg.get("frac_a", 0.25))
+    frac_b1 = float(schedule_cfg.get("frac_b1", 0.20))
+    frac_b2 = float(schedule_cfg.get("frac_b2", 0.25))
+    frac_c = float(schedule_cfg.get("frac_c", 0.30))
+    total_frac = frac_a + frac_b1 + frac_b2 + frac_c
+    if abs(total_frac - 1.0) > 1e-6:
+        raise ValueError(
+            f"four_phase schedule fractions must sum to 1.0, got {total_frac} "
+            f"(frac_a={frac_a}, frac_b1={frac_b1}, frac_b2={frac_b2}, frac_c={frac_c})"
+        )
+    a_end = int(round(total_epochs * frac_a))
+    b1_end = int(round(total_epochs * (frac_a + frac_b1)))
+    b2_end = int(round(total_epochs * (frac_a + frac_b1 + frac_b2)))
+    c_end = total_epochs
+    if a_end < 1:
+        a_end = 1
+    if b1_end < a_end + 1:
+        b1_end = a_end + 1
+    if b2_end < b1_end + 1:
+        b2_end = b1_end + 1
+    return (a_end, b1_end, b2_end, c_end)
+
+
+def phase_for_epoch_four(
+    epoch: int, total_epochs: int, schedule_cfg: dict | None = None
+) -> str:
+    """Return the active phase name for the four-phase schedule.
+
+    Returns one of: 'A', 'B1', 'B2', 'C'.
+    Boundary semantics:
+      - Phase A:  ``0 <= epoch < a_end``
+      - Phase B1: ``a_end <= epoch < b1_end``
+      - Phase B2: ``b1_end <= epoch < b2_end``
+      - Phase C:  ``b2_end <= epoch < c_end`` (c_end == total_epochs)
+    """
+    a_end, b1_end, b2_end, _ = four_phase_boundaries(total_epochs, schedule_cfg)
+    if epoch < a_end:
+        return "A"
+    if epoch < b1_end:
+        return "B1"
+    if epoch < b2_end:
+        return "B2"
+    return "C"
+
+
+def four_phase_tau(
+    epoch: int, total_epochs: int, schedule_cfg: dict | None = None
+) -> float:
+    """Tau value for the current epoch under the four-phase schedule.
+
+    Phase A:  fixed at ``tau_a`` (default 1.0).
+    Phase B1: anneals ``tau_b1_init`` -> ``tau_b1_final`` (1.0 -> 0.6).
+    Phase B2: anneals ``tau_b2_init`` -> ``tau_b2_final`` (0.6 -> 0.4).
+    Phase C:  anneals ``tau_c_init`` -> ``tau_c_final`` (0.4 -> 0.1).
+
+    Tau is continuous at all phase boundaries (end of B1 == start of B2
+    at 0.6; end of B2 == start of C at 0.4 by construction).
+    """
+    if schedule_cfg is None:
+        schedule_cfg = SCHEDULE_FOUR_PHASE
+    a_end, b1_end, b2_end, _ = four_phase_boundaries(total_epochs, schedule_cfg)
+
+    if epoch < a_end:
+        return float(schedule_cfg.get("tau_a", 1.0))
+
+    if epoch < b1_end:
+        tau_init = float(schedule_cfg.get("tau_b1_init", 1.0))
+        tau_final = float(schedule_cfg.get("tau_b1_final", 0.6))
+        local_epoch = epoch - a_end
+        local_total = max(1, b1_end - a_end)
+        return tau_for_epoch(local_epoch, total_epochs=local_total,
+                             tau_init=tau_init, tau_final=tau_final)
+
+    if epoch < b2_end:
+        tau_init = float(schedule_cfg.get("tau_b2_init", 0.6))
+        tau_final = float(schedule_cfg.get("tau_b2_final", 0.4))
+        local_epoch = epoch - b1_end
+        local_total = max(1, b2_end - b1_end)
+        return tau_for_epoch(local_epoch, total_epochs=local_total,
+                             tau_init=tau_init, tau_final=tau_final)
+
+    tau_init = float(schedule_cfg.get("tau_c_init", 0.4))
+    tau_final = float(schedule_cfg.get("tau_c_final", 0.1))
+    local_epoch = epoch - b2_end
+    local_total = max(1, total_epochs - b2_end)
+    return tau_for_epoch(local_epoch, total_epochs=local_total,
+                         tau_init=tau_init, tau_final=tau_final)
+
+
+def four_phase_lambdas(
+    epoch: int,
+    total_epochs: int,
+    base_lambdas: dict,
+    schedule_cfg: dict | None = None,
+) -> dict:
+    """Effective lambda dict for the current epoch under the four-phase
+    schedule (four-phase-redesign/Phase 3b).
+
+    Phase A:  all structural lambdas = 0. ``rail`` preserved.
+    Phase B1: lambdas_b1 ramped from 0 to full over warmup_frac_b1.
+    Phase B2: lambdas_b2 ramped from 0 to full over warmup_frac_b2.
+    Phase C:  lambdas_c at full strength (no warmup).
+
+    The output dict always includes ``rail`` from ``base_lambdas``.
+    Returns a fresh dict; ``base_lambdas`` is not mutated.
+    """
+    if schedule_cfg is None:
+        schedule_cfg = SCHEDULE_FOUR_PHASE
+    a_end, b1_end, b2_end, _ = four_phase_boundaries(total_epochs, schedule_cfg)
+    rail_val = float(base_lambdas.get("rail", 0.0))
+    out = {"rail": rail_val}
+
+    if epoch < a_end:
+        for k in _REG_KEYS:
+            out[k] = 0.0
+        return out
+
+    if epoch < b1_end:
+        lambdas_b1 = schedule_cfg.get("lambdas_b1", {})
+        warmup_frac = float(schedule_cfg.get("warmup_frac_b1", 0.25))
+        local_epoch = epoch - a_end
+        local_total = max(1, b1_end - a_end)
+        warmup_epochs = max(1, int(round(warmup_frac * local_total)))
+        if local_epoch < warmup_epochs:
+            scale = float(local_epoch + 1) / float(warmup_epochs)
+        else:
+            scale = 1.0
+        for k in _REG_KEYS:
+            out[k] = float(lambdas_b1.get(k, 0.0)) * scale
+        return out
+
+    if epoch < b2_end:
+        lambdas_b2 = schedule_cfg.get("lambdas_b2", {})
+        warmup_frac = float(schedule_cfg.get("warmup_frac_b2", 0.25))
+        local_epoch = epoch - b1_end
+        local_total = max(1, b2_end - b1_end)
+        warmup_epochs = max(1, int(round(warmup_frac * local_total)))
+        if local_epoch < warmup_epochs:
+            scale = float(local_epoch + 1) / float(warmup_epochs)
+        else:
+            scale = 1.0
+        for k in _REG_KEYS:
+            out[k] = float(lambdas_b2.get(k, 0.0)) * scale
+        return out
+
+    lambdas_c = schedule_cfg.get("lambdas_c", {})
+    for k in _REG_KEYS:
+        out[k] = float(lambdas_c.get(k, 0.0))
+    return out
+
+
+def four_phase_kd_active(
+    epoch: int,
+    total_epochs: int,
+    schedule_cfg: dict | None = None,
+) -> bool:
+    """Whether teacher distillation should be active for the current epoch
+    (four-phase-redesign/Phase 3c).
+
+    KD is active in Phase B1 and B2 only (not A, not C). During Phase A
+    we are fitting the soft teacher; during Phase C we are retraining the
+    pruned compact model and want to fit the task directly.
+    """
+    phase = phase_for_epoch_four(epoch, total_epochs, schedule_cfg)
+    return phase in ("B1", "B2")
+
+
+# ---------- readiness-based prune trigger (four-phase-redesign) ----------
+
+def prune_readiness_check(
+    val_soft_history: list[float],
+    val_argmax_history: list[float],
+    solidification_metrics: list[dict],
+    schedule_cfg: dict | None = None,
+    min_readings: int = 10,
+) -> tuple[bool, dict]:
+    """Evaluate whether the network is ready for pruning
+    (four-phase-redesign/Phase 3d).
+
+    ALL four conditions must be satisfied (AND-logic):
+
+    1. **Ratio**: ``val_argmax / val_soft < readiness_ratio_max``
+       (hard model close to soft model).
+    2. **Probability**: ``mean_max_cell_prob > readiness_prob_min``
+       (cells are mostly committed to a single type).
+    3. **Stability**: std(frac_sigma_z_below_0.1) over the most recent
+       ``readiness_window`` readings < readiness_stability_max
+       (gate fractions have stopped moving).
+    4. **Improvement**: val_argmax improvement rate over the last
+       ``readiness_window`` readings < readiness_improvement_min
+       (no longer improving rapidly).
+
+    If there are fewer than ``min_readings`` in the histories, returns
+    (False, {...}) with an explanation.
+
+    Args:
+        val_soft_history: Recent soft-validation losses (most recent last).
+        val_argmax_history: Recent argmax-validation losses (most recent
+            last). May be shorter than val_soft_history if argmax validation
+            was not computed every epoch.
+        solidification_metrics: Recent dicts from
+            ``compute_solidification_metrics`` (most recent last). Must
+            contain keys ``mean_max_cell_prob`` and
+            ``frac_sigma_z_below_0.1``.
+        schedule_cfg: A ``SCHEDULE_FOUR_PHASE`` dict. Default reads the
+            module-level ``SCHEDULE_FOUR_PHASE``.
+        min_readings: Minimum number of readings required before computing
+            readiness. Default 10.
+
+    Returns:
+        ``(ready, details)`` where ``ready`` is True iff all conditions
+        are met, and ``details`` is a dict with keys ``ratio``,
+        ``max_cell_prob``, ``stability``, ``improvement_rate``,
+        ``all_ready``, and the individual boolean checks.
+    """
+    if schedule_cfg is None:
+        schedule_cfg = SCHEDULE_FOUR_PHASE
+
+    ratio_max = float(schedule_cfg.get("readiness_ratio_max", 1.2))
+    prob_min = float(schedule_cfg.get("readiness_prob_min", 0.85))
+    stability_max = float(schedule_cfg.get("readiness_stability_max", 0.02))
+    improvement_min = float(schedule_cfg.get("readiness_improvement_min", 1e-4))
+    window = int(schedule_cfg.get("readiness_window", 10))
+
+    details: dict = {
+        "ratio": None,
+        "max_cell_prob": None,
+        "stability": None,
+        "improvement_rate": None,
+        "ready_ratio": False,
+        "ready_prob": False,
+        "ready_stability": False,
+        "ready_improvement": False,
+        "all_ready": False,
+        "note": "",
+    }
+
+    # Need enough readings for any condition.
+    n_val = len(val_argmax_history)
+    n_soft = len(val_soft_history)
+    n_solid = len(solidification_metrics)
+    if n_val < min_readings or n_soft < min_readings or n_solid < min_readings:
+        details["note"] = (
+            f"too few readings: val={n_val}, soft={n_soft}, solid={n_solid} "
+            f"(need ≥{min_readings})"
+        )
+        return False, details
+
+    # Condition 1: ratio check
+    recent_val = val_argmax_history[-window:]
+    recent_soft = val_soft_history[-window:]
+    ratios = [v / max(s, 1e-10) for v, s in zip(recent_val, recent_soft)]
+    mean_ratio = sum(ratios) / len(ratios)
+    details["ratio"] = mean_ratio
+    details["ready_ratio"] = mean_ratio < ratio_max
+
+    # Condition 2: max cell probability
+    recent_probs = [
+        m.get("mean_max_cell_prob", 0.0) for m in solidification_metrics[-window:]
+    ]
+    mean_prob = sum(recent_probs) / len(recent_probs)
+    details["max_cell_prob"] = mean_prob
+    details["ready_prob"] = mean_prob > prob_min
+
+    # Condition 3: gate stability
+    recent_gate_fracs = [
+        m.get("frac_sigma_z_below_0.1", 0.0) for m in solidification_metrics[-window:]
+    ]
+    if len(recent_gate_fracs) >= 2:
+        import statistics
+        gate_stability = statistics.stdev(recent_gate_fracs)
+    else:
+        gate_stability = 1.0  # not stable with < 2 readings
+    details["stability"] = gate_stability
+    details["ready_stability"] = gate_stability < stability_max
+
+    # Condition 4: improvement rate (val_argmax)
+    recent_val_for_rate = val_argmax_history[-window:]
+    if len(recent_val_for_rate) >= 2:
+        n_points = len(recent_val_for_rate)
+        x_vals = list(range(n_points))
+        # Simple linear fit slope: cov(x,y) / var(x)
+        x_mean = sum(x_vals) / n_points
+        y_mean = sum(recent_val_for_rate) / n_points
+        cov = sum(
+            (x_vals[i] - x_mean) * (recent_val_for_rate[i] - y_mean)
+            for i in range(n_points)
+        )
+        var_x = sum((x - x_mean) ** 2 for x in x_vals)
+        if var_x > 0:
+            improvement_rate = cov / var_x
+        else:
+            improvement_rate = 0.0
+    else:
+        improvement_rate = float("inf")
+    details["improvement_rate"] = improvement_rate
+    # Negative slope = loss is decreasing (improving). We check that the
+    # abs improvement rate is below the threshold (i.e. no longer improving
+    # rapidly). A positive slope means loss is increasing.
+    details["ready_improvement"] = abs(improvement_rate) < improvement_min
+
+    details["all_ready"] = (
+        details["ready_ratio"]
+        and details["ready_prob"]
+        and details["ready_stability"]
+        and details["ready_improvement"]
+    )
+
+    return details["all_ready"], details
+
+
 # ---------- solidification monitoring (three-phase-schedule plan) ----------
 
 def compute_solidification_metrics(
@@ -493,6 +828,11 @@ def compute_loss(
     amp: bool = False,
     amp_dtype: torch.dtype = torch.float16,
     reg_scale: float = 1.0,
+    cell_mode: str = "soft",
+    teacher: KirchhoffNetWithIO | KirchhoffNet | None = None,
+    lambda_kd: float = 0.0,
+    teacher_tau: float = 1.0,
+    teacher_cell_mode: str = "soft",
 ):
     """Compute total loss = task + regularizers + entropy bonus.
 
@@ -502,6 +842,20 @@ def compute_loss(
     ``reg_scale`` (RR-A) is a multiplicative factor on sparsity/complexity/
     rail: pass ``reg_schedule(epoch)`` from the training loop to implement
     staged warm-up. Defaults to 1.0 (no warm-up).
+
+    ``cell_mode`` (four-phase-redesign/Phase 2a): forwarded to the
+    network forward pass. ``'soft'`` is the standard mixture; ``'ste'``
+    uses one cell per edge in the forward pass with straight-through
+    soft gradients.
+
+    ``teacher`` / ``lambda_kd`` (four-phase-redesign/Phase 3c): when a
+    teacher network is provided, an additional KD loss
+    ``lambda_kd * MSE(y_student, y_teacher)`` is added to the data-side
+    loss. Teacher is run with ``torch.no_grad()`` and uses
+    ``teacher_cell_mode`` / ``teacher_tau`` (defaults: soft / 1.0). The
+    KD loss is a data-side term so it lives in ``total_task`` (gets
+    DataParallel averaging like the task loss) rather than in
+    ``structural`` (which is not averaged).
 
     If `amp` is True, wraps forward+loss in torch.cuda.amp.autocast for
     mixed-precision training. Caller is responsible for GradScaler.
@@ -514,11 +868,29 @@ def compute_loss(
     )
     with autocast_ctx:
         if isinstance(net, KirchhoffNetWithIO):
-            out, trajs = net(x0, ctx=ctx, tau=tau, store_trajectory=True)
+            out, trajs = net(x0, ctx=ctx, tau=tau, store_trajectory=True,
+                             cell_mode=cell_mode)
         else:
-            out, trajs = net(x0, ctx=ctx, tau=tau, store_trajectory=True)
+            out, trajs = net(x0, ctx=ctx, tau=tau, store_trajectory=True,
+                             cell_mode=cell_mode)
 
         loss_task = task_fn(out, target)
+
+        # four-phase-redesign/Phase 3c: teacher distillation. Compute
+        # y_teacher in no_grad mode with its own tau/cell_mode and add
+        # MSE to the data-side loss.
+        loss_kd = loss_task.new_zeros(())
+        if teacher is not None and lambda_kd > 0.0:
+            with torch.no_grad():
+                if isinstance(teacher, KirchhoffNetWithIO):
+                    y_teacher, _ = teacher(x0, ctx=ctx, tau=teacher_tau,
+                                           store_trajectory=False,
+                                           cell_mode=teacher_cell_mode)
+                else:
+                    y_teacher, _ = teacher(x0, ctx=ctx, tau=teacher_tau,
+                                           store_trajectory=False,
+                                           cell_mode=teacher_cell_mode)
+            loss_kd = F.mse_loss(out, y_teacher.detach())
 
         if trajs is None:
             zero = loss_task.new_zeros((), requires_grad=True)
@@ -538,7 +910,7 @@ def compute_loss(
         ) = _compute_regularizers(net, trajs, tau, lambdas)
 
         # Split the loss into two pieces so that DataParallel averages
-        # ONLY the data-dependent pieces (task + rail) and does NOT
+        # ONLY the data-dependent pieces (task + rail + KD) and does NOT
         # halve the structural regularizers (sparsity/edge_gate/
         # node_gate/power/capacitance/entropy) which depend only on
         # `net.module`'s parameters and have no business being
@@ -549,6 +921,7 @@ def compute_loss(
         total_task = (
             loss_task
             + float(lambdas.get("rail", 0.0)) * loss_rail
+            + float(lambda_kd) * loss_kd
         )
         structural = (
             + reg_scale * float(lambdas.get("sparsity", 0.0)) * loss_sparsity
@@ -572,6 +945,8 @@ def compute_loss(
             "reg_scale": float(reg_scale),
             "total": float((total_task + structural).item()),
         }
+        if teacher is not None and lambda_kd > 0.0:
+            parts["kd"] = float(loss_kd.item())
         return total_task, structural, parts
     return total_task, structural
 
@@ -875,6 +1250,7 @@ def train_epoch(
     log_every: int = 0,
     scaler: torch.amp.GradScaler | None = None,
     amp: bool = False,
+    cell_mode: str = "soft",
 ):
     """Run one training epoch. ctx_factory(batch_size, num_edges_total, device) -> SimContext.
 
@@ -885,6 +1261,11 @@ def train_epoch(
     :func:`reg_schedule` so the network learns freely in the first
     ``reg_warmup_epochs`` and the penalties anneal in linearly over the
     next ``reg_anneal_epochs`` (RR-A).
+
+    ``cell_mode`` (four-phase-redesign/Phase 2a): forwarded to
+    ``compute_loss``. ``'soft'`` uses softmax-weighted cell mixtures;
+    ``'ste'`` uses one cell per edge in the forward pass with
+    straight-through soft gradients.
 
     If `scaler` is provided, uses AMP with `scaler.scale(loss).backward()`,
     `scaler.step(optimizer)`, `scaler.update()`. Otherwise standard
@@ -904,6 +1285,7 @@ def train_epoch(
         loss_task, loss_structural, parts = compute_loss(
             net, u, target, ctx, task_fn, lambdas=lambdas, tau=tau,
             return_parts=True, amp=amp, reg_scale=reg_scale,
+            cell_mode=cell_mode,
         )
         if scaler is not None:
             scaler.scale(loss_task).backward(retain_graph=True)

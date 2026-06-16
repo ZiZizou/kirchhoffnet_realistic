@@ -47,6 +47,7 @@ from config import (
     OPTIM,
     PRESETS,
     LAMBDAS,
+    SCHEDULE_FOUR_PHASE,
     TAU,
     VARIATION,
 )
@@ -63,6 +64,12 @@ from train import (
     phase_for_epoch,
     three_phase_tau,
     three_phase_lambdas,
+    four_phase_boundaries,
+    phase_for_epoch_four,
+    four_phase_tau,
+    four_phase_lambdas,
+    four_phase_kd_active,
+    prune_readiness_check,
     compute_solidification_metrics,
     validate_argmax,
 )
@@ -135,6 +142,24 @@ def _resolve_schedule(problem: str, cli_value: str | None) -> str:
     return "legacy"
 
 
+def _resolve_cell_mode(cli_value: str, phase: str, schedule_mode: str) -> str:
+    """Resolve the cell selection mode for the current epoch
+    (four-phase-redesign/Phase 2b).
+
+    Behavior:
+    - ``cli_value == 'soft'`` or ``'ste'``: honor the explicit override.
+    - ``cli_value == 'auto'`` (default): use ``'soft'`` for Phase A and
+      ``'ste'`` for Phase B/C. Outside of a phased schedule, always
+      ``'soft'``.
+    """
+    if cli_value in ("soft", "ste"):
+        return cli_value
+    # 'auto'
+    if schedule_mode in ("three_phase", "four_phase") and phase in ("B", "C", "B1", "B2"):
+        return "ste"
+    return "soft"
+
+
 def _apply_ablation_set(args, schedule_mode: str) -> None:
     """Mutate ``args`` to apply a diagnostic ablation preset in place
     (four-phase-redesign/Phase 1c).
@@ -182,14 +207,20 @@ def _apply_ablation_set(args, schedule_mode: str) -> None:
         _set_if_unset("prune", False)
         # We zero structural lambdas in Phase B by overriding the schedule
         # via a sentinel. The train loop reads the active schedule_cfg so
-        # we mutate SCHEDULE_THREE_PHASE in place for the run duration
+        # we mutate the schedule dict in place for the run duration
         # (a non-invasive in-memory override).
         from config import SCHEDULE_THREE_PHASE
         for k in ("sparsity", "edge_gate", "node_gate", "power", "capacitance"):
             if k in SCHEDULE_THREE_PHASE.get("lambdas_b", {}):
                 SCHEDULE_THREE_PHASE["lambdas_b"][k] = 0.0
+        from config import SCHEDULE_FOUR_PHASE
+        for phase_key in ("lambdas_b1", "lambdas_b2"):
+            if phase_key in SCHEDULE_FOUR_PHASE:
+                for k in ("sparsity", "edge_gate", "power", "capacitance"):
+                    if k in SCHEDULE_FOUR_PHASE[phase_key]:
+                        SCHEDULE_FOUR_PHASE[phase_key][k] = 0.0
         print(
-            "[ablation-set=tau-only] structural regularizers zeroed in B, "
+            "[ablation-set=tau-only] structural regularizers zeroed in B/B1/B2, "
             "tau anneals normally, --prune disabled"
         )
     elif args.ablation_set == "edge-only":
@@ -369,7 +400,7 @@ def make_data(problem: str, batch_size: int):
     raise ValueError(f"Unknown problem: {problem}")
 
 
-def validate(net, val_loader, task_fn, ctx_factory, device) -> float:
+def validate(net, val_loader, task_fn, ctx_factory, device, cell_mode: str = "soft") -> float:
     net.eval()
     total = 0.0
     n = 0
@@ -378,7 +409,7 @@ def validate(net, val_loader, task_fn, ctx_factory, device) -> float:
             u = u.to(device)
             target = target.to(device)
             ctx = ctx_factory(u.size(0), device=device)
-            out, _ = net(u, ctx=ctx, store_trajectory=False)
+            out, _ = net(u, ctx=ctx, store_trajectory=False, cell_mode=cell_mode)
             loss = task_fn(out, target)
             total += float(loss.item()) * u.size(0)
             n += u.size(0)
@@ -743,6 +774,15 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "(matches the four-phase-redesign defaults). 'none' is the "
              "standard schedule behavior with no overrides.",
     )
+    parser.add_argument(
+        "--cell-mode", choices=["soft", "ste", "auto"], default="auto",
+        help="Cell selection mode (four-phase-redesign/Phase 2b). 'soft' "
+             "uses a softmax-weighted mixture of cells per edge. 'ste' "
+             "uses one cell per edge in the forward pass (argmax) with "
+             "straight-through soft gradients in the backward pass. "
+             "'auto' uses 'soft' for Phase A and 'ste' for B/C (only "
+             "meaningful with --schedule three_phase / four_phase).",
+    )
 
 
 # ----------------------------------------------------------------
@@ -932,6 +972,14 @@ def main():
             f"[train] three_phase schedule: A=[0,{a_end}) B=[{a_end},{b_end}) "
             f"C=[{b_end},{c_end}) (total={epochs})"
         )
+    elif schedule_mode == "four_phase":
+        fp_a_end, fp_b1_end, fp_b2_end, fp_c_end = four_phase_boundaries(epochs)
+        print(
+            f"[train] four_phase schedule: A=[0,{fp_a_end}) "
+            f"B1=[{fp_a_end},{fp_b1_end}) "
+            f"B2=[{fp_b1_end},{fp_b2_end}) "
+            f"C=[{fp_b2_end},{fp_c_end}) (total={epochs})"
+        )
     _save_config_snapshot(out_dir, args.problem, args, lambdas)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -1055,16 +1103,25 @@ def main():
         tqdm = None
 
     grad_log_path = out_dir / "grad_norms.txt" if args.grad_log else None
-    solid_log_path = out_dir / "solidification_metrics.txt" if schedule_mode == "three_phase" else None
+    solid_log_path = out_dir / "solidification_metrics.txt" if schedule_mode in ("three_phase", "four_phase") else None
 
     # ---------- Determine effective training scope ----------
     # Three-phase: Phase A+B use the overcomplete network (epochs 0..b_end).
+    # Four-phase: Phase A+B1+B2 use the overcomplete network (epochs 0..b2_end).
     # Legacy: single phase over all epochs.
     if schedule_mode == "three_phase":
         a_end, b_end, _ = phase_boundaries(epochs)
         ab_total = b_end  # Phase A+B epoch count
         c_total = max(1, epochs - b_end)
         needs_prune = True  # three_phase always prunes at the B→C boundary
+    elif schedule_mode == "four_phase":
+        fp_a_end, fp_b1_end, fp_b2_end, _ = four_phase_boundaries(epochs)
+        a_end = fp_a_end
+        b1_end = fp_b1_end
+        b2_end = fp_b2_end
+        ab_total = b2_end  # Phase A+B1+B2 epoch count
+        c_total = max(1, epochs - b2_end)
+        needs_prune = False  # four_phase handles pruning inline during B2
     else:
         ab_total = epochs
         c_total = 0
@@ -1077,26 +1134,79 @@ def main():
     epochs_without_improve = 0
     stop_training = False
 
+    # four-phase-redesign: teacher distillation state
+    teacher_net = None
+    teacher_frozen = False
+    # Readiness tracking for four_phase B2
+    readiness_histories: dict = {}
+    readiness_prune_fired = False
+    readiness_prune_epoch = -1
+
     # ---- Phase A + B: overcomplete training ----
     tau_anneal_enabled = PRESETS[args.problem].get("tau_anneal", True)
     if schedule_mode == "legacy" and tau_anneal_enabled:
         tau_kwargs = {}
         if args.prune:
             tau_kwargs["tau_final"] = float(TAU.get("final_pretrain", TAU["final"]))
-    ab_desc = f"train {args.problem} [A+B]" if schedule_mode == "three_phase" else f"train {args.problem} [ablation={args.ablation}]"
+    if schedule_mode == "three_phase":
+        ab_desc = f"train {args.problem} [A+B]"
+    elif schedule_mode == "four_phase":
+        ab_desc = f"train {args.problem} [A+B1+B2]"
+    else:
+        ab_desc = f"train {args.problem} [ablation={args.ablation}]"
     ab_iter = (
         tqdm(range(ab_total), desc=ab_desc, unit="epoch")
         if tqdm is not None else range(ab_total)
     )
     # Track argmax validation alongside soft (when enabled).
-    val_argmax_history = [] if (schedule_mode == "three_phase" and args.argmax_val) else None
+    argmax_val_enabled = (
+        (schedule_mode in ("three_phase", "four_phase")) and args.argmax_val
+    )
+    val_argmax_history = [] if argmax_val_enabled else None
+    # four-phase-redesign: solidification metrics stored for readiness check
+    solid_metrics_history: list[dict] = []
+    # Validate-only histories (matching cadence of solid_metrics_history)
+    # Avoids duplicate entries on non-validate epochs for the readiness check.
+    val_v_history: list[float] = []
+    val_argmax_v_history: list[float] = [] if argmax_val_enabled else None
 
     for epoch in ab_iter:
         if stop_training:
             break
         net.train()
 
-        if schedule_mode == "three_phase":
+        if schedule_mode == "four_phase":
+            tau = four_phase_tau(epoch, epochs)
+            phase = phase_for_epoch_four(epoch, epochs)
+            effective_lambdas = four_phase_lambdas(epoch, epochs, lambdas)
+            reg_scale = 1.0  # four_phase_lambdas already includes warmup
+
+            # Teacher cloning at phase transition A -> B1.
+            if phase in ("B1", "B2") and not teacher_frozen and best_state is not None:
+                # Deep-copy the architecture and load the best Phase A
+                # checkpoint into the frozen teacher.
+                import copy as _copy
+                raw = net.module if isinstance(net, torch.nn.DataParallel) else net
+                teacher_net = _copy.deepcopy(raw)
+                teacher_net.load_state_dict(best_state)
+                teacher_net.requires_grad_(False)
+                teacher_net.eval()
+                teacher_net.to(device)
+                teacher_frozen = True
+                print(
+                    f"[teacher] cloned best Phase A state (epoch {best_epoch}, "
+                    f"{best_metric_name}={best_val:.4f}) as frozen teacher"
+                )
+
+            # If readiness triggered on a previous validate step, stop here.
+            if phase == "B2" and readiness_prune_fired:
+                print(
+                    f"[four_phase] readiness pruning triggered at epoch {epoch} "
+                    f"(B2 cut short, was scheduled for {b2_end})"
+                )
+                break
+
+        elif schedule_mode == "three_phase":
             tau = three_phase_tau(epoch, epochs)
             phase = phase_for_epoch(epoch, epochs)
             effective_lambdas = three_phase_lambdas(epoch, epochs, lambdas)
@@ -1110,6 +1220,10 @@ def main():
             reg_scale = reg_schedule(epoch)
             effective_lambdas = lambdas
 
+        # four-phase-redesign/Phase 2b: per-epoch cell selection mode.
+        # 'auto' uses 'ste' for Phase B/C of phased schedules.
+        cell_mode = _resolve_cell_mode(args.cell_mode, phase, schedule_mode)
+
         total_loss = 0.0
         n_batches = 0
         for batch in train_loader:
@@ -1118,10 +1232,19 @@ def main():
             u, target = batch
             u = u.to(device)
             target = target.to(device)
+            # four-phase-redesign/Phase 3c: pass teacher for KD when active.
+            kd_teacher = None
+            kd_lambda = 0.0
+            if schedule_mode == "four_phase" and teacher_frozen and four_phase_kd_active(epoch, epochs):
+                kd_teacher = teacher_net
+                kd_lambda = float(SCHEDULE_FOUR_PHASE.get("lambda_kd", 1.0))
             loss_task, loss_structural, _ = compute_loss(
                 net, u, target, ctx, task_fn,
                 lambdas=effective_lambdas, tau=tau, return_parts=True,
                 amp=amp_enabled, amp_dtype=amp_dtype, reg_scale=reg_scale,
+                cell_mode=cell_mode,
+                teacher=kd_teacher, lambda_kd=kd_lambda, teacher_tau=1.0,
+                teacher_cell_mode="soft",
             )
             if scaler is not None and scaler._enabled:
                 scaler.scale(loss_task).backward(retain_graph=True)
@@ -1141,14 +1264,53 @@ def main():
         avg_train = total_loss / max(1, n_batches)
         do_validate = (epoch % args.validate_every == 0) or (epoch == ab_total - 1)
         if do_validate:
-            val_loss = validate(net, val_loader, task_fn, ctx_factory, device)
-            # Argmax validation (three_phase only)
+            val_loss = validate(net, val_loader, task_fn, ctx_factory, device, cell_mode=cell_mode)
+            val_v_history.append(val_loss)
+            # Argmax validation for phased schedules
             if val_argmax_history is not None:
                 val_arg = validate_argmax(net, val_loader, task_fn, ctx_factory, device)
                 val_argmax_history.append(val_arg)
-            if solid_log_path is not None and phase in ("A", "B"):
+                val_argmax_v_history.append(val_arg)
+            if solid_log_path is not None and phase in ("A", "B", "B1", "B2"):
                 metrics = compute_solidification_metrics(net, tau=tau)
                 _log_solidification(solid_log_path, epoch, metrics)
+                # Store for four_phase readiness check.
+                if schedule_mode == "four_phase":
+                    solid_metrics_history.append(metrics)
+            # four-phase-redesign/Phase 3d: readiness check during B2.
+            # Uses validate-only histories (val_v_history, val_argmax_v_history)
+            # to avoid duplicate entries on non-validate epochs.
+            if (
+                schedule_mode == "four_phase"
+                and phase == "B2"
+                and val_argmax_v_history is not None
+                and len(val_argmax_v_history) >= 10
+                and len(val_v_history) >= 10
+                and len(solid_metrics_history) >= 10
+            ):
+                is_ready, ready_details = prune_readiness_check(
+                    val_v_history, val_argmax_v_history, solid_metrics_history,
+                )
+                # Also log readiness diagnostics.
+                if solid_log_path is not None:
+                    _log_solidification(
+                        solid_log_path, epoch,
+                        {"ready_ratio": ready_details.get("ratio", -1.0),
+                         "ready_prob": ready_details.get("max_cell_prob", -1.0),
+                         "ready_stability": ready_details.get("stability", -1.0),
+                         "ready_improvement": ready_details.get("improvement_rate", -1.0),
+                         "all_ready": 1.0 if ready_details.get("all_ready", False) else 0.0},
+                    )
+                if is_ready and not readiness_prune_fired:
+                    readiness_prune_fired = True
+                    readiness_prune_epoch = epoch
+                    print(
+                        f"[four_phase] READINESS TRIGGERED at epoch {epoch}: "
+                        f"ratio={ready_details['ratio']:.3f}, "
+                        f"prob={ready_details['max_cell_prob']:.3f}, "
+                        f"stability={ready_details['stability']:.4f}, "
+                        f"improvement={ready_details['improvement_rate']:.6f}"
+                    )
         else:
             val_loss = val_history[-1] if val_history else avg_train
             if val_argmax_history is not None:
@@ -1159,17 +1321,15 @@ def main():
 
         if do_validate:
             # four-phase-redesign/Phase 1b: For three_phase mode in Phase B,
-            # the deployable model is the hard-cell (argmax) version. Use
-            # val_argmax as the checkpoint-selection metric instead of soft
-            # val, which is contaminated by a cell mixture that disappears at
-            # deployment. Phase A still uses soft val (no argmax history yet
-            # in early epochs; soft val is the right metric for a free fit).
-            if (
-                schedule_mode == "three_phase"
-                and phase == "B"
-                and val_argmax_history is not None
-                and len(val_argmax_history) > 0
-            ):
+            # and for four_phase mode in B1/B2, the deployable model is the
+            # hard-cell (argmax) version. Use val_argmax as checkpoint metric
+            # instead of soft val, which includes cell mixture that vanishes
+            # at deployment. Phase A still uses soft val.
+            use_argmax_ckpt = (
+                (schedule_mode == "three_phase" and phase == "B")
+                or (schedule_mode == "four_phase" and phase in ("B1", "B2"))
+            ) and val_argmax_history is not None and len(val_argmax_history) > 0
+            if use_argmax_ckpt:
                 sel_metric = float(val_argmax_history[-1])
                 sel_name = "val_argmax"
             else:
@@ -1216,25 +1376,63 @@ def main():
                 f"tau={tau:.3f}  lr={lr_str}"
             )
 
-    # ---- End of Phase A+B ----
+    # ---- End of Phase A+B (or A+B1+B2) ----
     if schedule_mode == "three_phase" and not stop_training:
         a_end, b_end, _ = phase_boundaries(epochs)
         print(
             f"[phase] A+B complete (epoch {b_end}), best {best_metric_name}={best_val:.4f} "
             f"@ epoch {best_epoch}"
         )
+    elif schedule_mode == "four_phase":
+        if stop_training and not teacher_frozen:
+            # Early stopped in Phase A — no pruning, just save.
+            print(
+                f"[four_phase] early stop in Phase A at epoch {epoch}, "
+                f"skipping prune+retrain"
+            )
+        else:
+            if readiness_prune_fired:
+                print(
+                    f"[four_phase] A+B1+B2 complete, prune triggered at epoch "
+                    f"{readiness_prune_epoch}, best {best_metric_name}={best_val:.4f} "
+                    f"@ epoch {best_epoch}"
+                )
+            elif stop_training and teacher_frozen:
+                # Early stop during B1/B2 — still prune since compression
+                # has already begun.
+                print(
+                    f"[four_phase] early stop at epoch {epoch} during "
+                    f"B1/B2, pruning anyway"
+                )
+            else:
+                print(
+                    f"[four_phase] A+B1+B2 complete (fallback prune at epoch {b2_end}), "
+                    f"best {best_metric_name}={best_val:.4f} @ epoch {best_epoch}"
+                )
+                readiness_prune_fired = True
+            needs_prune = True
 
     history_path = out_dir / "loss_history.txt"
     with open(history_path, "w") as f:
         if val_argmax_history is not None and len(val_argmax_history) == len(val_history):
             f.write("epoch\ttrain\tval\tval_argmax\tphase\n")
             for i, (t, v, va) in enumerate(zip(history, val_history, val_argmax_history)):
-                p = phase_for_epoch(i, epochs) if schedule_mode == "three_phase" else "A"
+                if schedule_mode == "three_phase":
+                    p = phase_for_epoch(i, epochs)
+                elif schedule_mode == "four_phase":
+                    p = phase_for_epoch_four(i, epochs)
+                else:
+                    p = "A"
                 f.write(f"{i}\t{t}\t{v}\t{va}\t{p}\n")
         else:
             f.write("epoch\ttrain\tval\tphase\n")
             for i, (t, v) in enumerate(zip(history, val_history)):
-                p = phase_for_epoch(i, epochs) if schedule_mode == "three_phase" else "A"
+                if schedule_mode == "three_phase":
+                    p = phase_for_epoch(i, epochs)
+                elif schedule_mode == "four_phase":
+                    p = phase_for_epoch_four(i, epochs)
+                else:
+                    p = "A"
                 f.write(f"{i}\t{t}\t{v}\t{p}\n")
 
     plt = _import_matplotlib()
@@ -1313,11 +1511,20 @@ def main():
         # resolution below, regardless of which threshold path we take.
         from config import SCHEDULE_THREE_PHASE
 
-        # For three_phase, use schedule-specific thresholds; CLI overrides take precedence.
-        if schedule_mode == "three_phase" and args.prune_edge_threshold is None and args.prune_node_threshold is None:
-            _scfg = SCHEDULE_THREE_PHASE
-            edge_thresh = float(_scfg.get("prune_edge_threshold", 0.1))
-            node_thresh = float(_scfg.get("prune_node_threshold", 0.05))
+        # For phased schedules, use schedule-specific thresholds;
+        # CLI overrides take precedence.
+        if args.prune_edge_threshold is None and args.prune_node_threshold is None:
+            if schedule_mode == "four_phase":
+                _scfg = SCHEDULE_FOUR_PHASE
+                edge_thresh = float(_scfg.get("prune_edge_threshold", 0.05))
+                node_thresh = float(_scfg.get("prune_node_threshold", 0.05))
+            elif schedule_mode == "three_phase":
+                _scfg = SCHEDULE_THREE_PHASE
+                edge_thresh = float(_scfg.get("prune_edge_threshold", 0.1))
+                node_thresh = float(_scfg.get("prune_node_threshold", 0.05))
+            else:
+                edge_thresh = float(PRUNE["edge_threshold"])
+                node_thresh = float(PRUNE["node_threshold"])
         else:
             edge_thresh = args.prune_edge_threshold if args.prune_edge_threshold is not None else float(PRUNE["edge_threshold"])
             node_thresh = args.prune_node_threshold if args.prune_node_threshold is not None else float(PRUNE["node_threshold"])
@@ -1326,7 +1533,10 @@ def main():
         if args.prune_nodes_by_gate is not None:
             pnbg = bool(args.prune_nodes_by_gate)
         else:
-            if schedule_mode == "three_phase":
+            if schedule_mode == "four_phase":
+                pnbg = bool(SCHEDULE_FOUR_PHASE.get("prune_nodes_by_gate",
+                                                     PRUNE.get("prune_nodes_by_gate", True)))
+            elif schedule_mode == "three_phase":
                 pnbg = bool(SCHEDULE_THREE_PHASE.get("prune_nodes_by_gate",
                                                      PRUNE.get("prune_nodes_by_gate", True)))
             else:
@@ -1444,7 +1654,7 @@ def main():
         # of the epoch budget. For legacy, respect the --retrain flag.
         retrain_enabled = args.retrain if schedule_mode == "legacy" else True
         if retrain_enabled:
-            if schedule_mode == "three_phase":
+            if schedule_mode in ("three_phase", "four_phase"):
                 c_epochs = c_total
                 c_lr = args.retrain_lr if args.retrain_lr is not None else lr
             else:
@@ -1503,6 +1713,14 @@ def main():
                     if solid_log_path is not None and repoch % args.validate_every == 0:
                         c_metrics = compute_solidification_metrics(pruned_net, tau=tau_r)
                         _log_solidification(solid_log_path, global_epoch, c_metrics)
+                elif schedule_mode == "four_phase":
+                    global_epoch = b2_end + repoch
+                    tau_r = four_phase_tau(global_epoch, epochs)
+                    effective_c_lambdas = four_phase_lambdas(global_epoch, epochs, lambdas)
+                    reg_r = 1.0
+                    if solid_log_path is not None and repoch % args.validate_every == 0:
+                        c_metrics = compute_solidification_metrics(pruned_net, tau=tau_r)
+                        _log_solidification(solid_log_path, global_epoch, c_metrics)
                 else:
                     retrain_warmup = (0 if (not args.fresh_init) else max(1, c_epochs // 2))
                     retrain_tau_init = float(TAU.get("final_pretrain", TAU["init"]))
@@ -1518,6 +1736,9 @@ def main():
                         anneal=max(25, c_epochs // 4),
                     )
                     effective_c_lambdas = lambdas
+                # four-phase-redesign/Phase 2b: cell_mode in Phase C.
+                # Phase C is post-prune and STE is the deployable form.
+                cell_mode_c = _resolve_cell_mode(args.cell_mode, "C", schedule_mode)
                 tot = 0.0
                 nb = 0
                 for batch in train_loader:
@@ -1530,6 +1751,7 @@ def main():
                         pruned_net, u_b, tgt_b, ctx, task_fn,
                         lambdas=effective_c_lambdas, tau=tau_r, return_parts=True,
                         amp=amp_enabled, amp_dtype=amp_dtype, reg_scale=reg_r,
+                        cell_mode=cell_mode_c,
                     )
                     if retrain_scaler is not None and retrain_scaler._enabled:
                         retrain_scaler.scale(loss_task).backward(retain_graph=True)
@@ -1555,7 +1777,7 @@ def main():
                 avg = tot / max(1, nb)
                 retrain_history.append(avg)
                 if repoch % args.validate_every == 0 or repoch == c_epochs - 1:
-                    val = validate(pruned_net, val_loader, task_fn, ctx_factory, device)
+                    val = validate(pruned_net, val_loader, task_fn, ctx_factory, device, cell_mode=cell_mode_c)
                     if retrain_val_argmax is not None:
                         val_arg = validate_argmax(pruned_net, val_loader, task_fn, ctx_factory, device)
                         retrain_val_argmax.append(val_arg)
@@ -1564,7 +1786,7 @@ def main():
                     # deployable model IS the hard-cell (argmax) version, so
                     # use val_argmax for checkpoint selection.
                     if (
-                        schedule_mode == "three_phase"
+                        schedule_mode in ("three_phase", "four_phase")
                         and retrain_val_argmax is not None
                         and len(retrain_val_argmax) > 0
                     ):
@@ -1591,7 +1813,7 @@ def main():
                     retrain_val_history.append(retrain_val_history[-1] if retrain_val_history else avg)
                     if retrain_val_argmax is not None:
                         retrain_val_argmax.append(retrain_val_argmax[-1] if retrain_val_argmax else avg)
-                phase_tag = " [C]" if schedule_mode == "three_phase" else ""
+                phase_tag = " [C]" if schedule_mode in ("three_phase", "four_phase") else ""
                 print(
                     f"  {'retrain' if schedule_mode == 'legacy' else 'phase-C'} epoch {repoch:4d}{phase_tag}  "
                     f"train={avg:.4f}  "
@@ -1607,7 +1829,8 @@ def main():
                     f"(epoch {best_epoch_pruned}, {best_metric_name_c}={best_val_pruned:.4f})"
                 )
 
-            if schedule_mode == "three_phase":
+            if schedule_mode in ("three_phase", "four_phase"):
+                phase_c_start = b_end if schedule_mode == "three_phase" else b2_end
                 with open(history_path, "r") as f:
                     header = f.readline().strip()
                 has_argmax = "val_argmax" in header
@@ -1615,11 +1838,11 @@ def main():
                     f.write(f"\n# Phase C (prune + retrain): {post_edges}/{pre_edges} edges, {post_nodes}/{pre_nodes} nodes survived\n")
                     if has_argmax and retrain_val_argmax is not None:
                         for i, (t, v, va) in enumerate(zip(retrain_history, retrain_val_history, retrain_val_argmax)):
-                            global_ep = b_end + i
+                            global_ep = phase_c_start + i
                             f.write(f"{global_ep}\t{t}\t{v}\t{va}\tC\n")
                     else:
                         for i, (t, v) in enumerate(zip(retrain_history, retrain_val_history)):
-                            global_ep = b_end + i
+                            global_ep = phase_c_start + i
                             f.write(f"{global_ep}\t{t}\t{v}\tC\n")
             else:
                 with open(history_path, "a") as f:

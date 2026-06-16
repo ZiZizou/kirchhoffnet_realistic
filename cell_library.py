@@ -95,6 +95,7 @@ class IdealizedCellLibrary(nn.Module):
         x_max: float,
         ctx,  # SimContext
         tau: float = 1.0,
+        cell_mode: str = "soft",
     ) -> torch.Tensor:
         """Compute edge currents for one stage call.
 
@@ -106,14 +107,37 @@ class IdealizedCellLibrary(nn.Module):
             x_max: Differential rail limit (V).
             ctx: SimContext with optional mismatch.
             tau: Soft library selection temperature.
+            cell_mode: Cell selection mode. ``'soft'`` (default) uses
+                standard softmax weighting — a mixture of cells per edge.
+                ``'ste'`` (straight-through estimator, four-phase-redesign)
+                uses one cell per edge in the forward pass
+                (``one_hot(argmax(softmax(logits/tau)))``) and routes the
+                backward pass through the soft weights via
+                ``w_hard + w_soft - w_soft.detach()``. This produces a
+                discrete deployable model while preserving the smooth
+                gradient signal needed for training.
 
         Returns:
             i_edge: [batch, num_edges] edge currents in uA.
         """
+        if cell_mode not in ("soft", "ste"):
+            raise ValueError(
+                f"cell_mode must be 'soft' or 'ste', got {cell_mode!r}"
+            )
+
         batch, num_edges = x_src.shape
         Q = self.num_cells
 
-        weights = F.softmax(logits / tau, dim=-1)  # [E, Q]
+        w_soft = F.softmax(logits / tau, dim=-1)  # [E, Q]
+
+        # four-phase-redesign/Phase 2a: straight-through hard selection.
+        # Forward uses a one-hot hard selection; backward sees soft grads.
+        if cell_mode == "ste":
+            idx = w_soft.argmax(dim=-1)  # [E]
+            w_hard = F.one_hot(idx, num_classes=Q).to(w_soft.dtype)  # [E, Q]
+            weights = w_hard + w_soft - w_soft.detach()  # STE: hard fwd, soft bwd
+        else:
+            weights = w_soft
 
         mult = F.softplus(raw_mult)  # [E] (R3.3: m → 0 as raw_mult → -∞)
         mult = mult.unsqueeze(0).unsqueeze(-1)  # [1, E, 1]

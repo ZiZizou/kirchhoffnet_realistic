@@ -202,6 +202,56 @@ SCHEDULE_THREE_PHASE = {
     "prune_nodes_by_gate": False,
 }
 
+# Four-phase training schedule (four-phase-redesign/Phase 3a).
+# Splits Phase B from the three-phase schedule into B1 (cell commitment,
+# no pruning) and B2 (edge pruning, readiness-gated). Adds teacher
+# distillation (lambda_kd) and STE cell mode. See spec/four-phase-schedule.md.
+SCHEDULE_FOUR_PHASE = {
+    # Fraction of total epochs allocated to each phase. Must sum to 1.0.
+    "frac_a": 0.25,            # Phase A: free fit (soft teacher)
+    "frac_b1": 0.20,           # Phase B1: cell commitment (no pruning)
+    "frac_b2": 0.25,           # Phase B2: edge pruning (readiness-gated)
+    "frac_c": 0.30,            # Phase C: retrain compact model
+    # Tau targets per phase.
+    "tau_a": 1.0,              # Fixed tau during free fit
+    "tau_b1_init": 1.0,        # Tau at start of B1
+    "tau_b1_final": 0.6,       # Tau at end of B1
+    "tau_b2_init": 0.6,        # Tau at start of B2
+    "tau_b2_final": 0.4,       # Tau at end of B2 (readiness check here)
+    "tau_c_init": 0.4,         # Tau at start of retrain
+    "tau_c_final": 0.1,        # Tau at end of retrain
+    # Phase B1 lambdas: cell commitment only, NO edge/node gate.
+    "lambdas_b1": {
+        "sparsity": 5e-5,
+    },
+    # Phase B2 lambdas: sparsity + edge_gate. NO node_gate.
+    "lambdas_b2": {
+        "sparsity": 5e-5,
+        "edge_gate": 1e-5,
+    },
+    # Phase C retrain lambdas: tiny sparsity for crisp cell family.
+    "lambdas_c": {
+        "sparsity": 1e-5,
+    },
+    # Warmup within each compress phase: ramp from 0 to full over this fraction.
+    "warmup_frac_b1": 0.25,
+    "warmup_frac_b2": 0.25,
+    # Teacher distillation weight (active in B1 and B2 only).
+    "lambda_kd": 1.0,
+    # Readiness-based prune trigger (Phase B2 -> Phase C boundary).
+    # ALL conditions must be true to fire (AND-logic).
+    "readiness_ratio_max": 1.2,        # val_argmax / val_soft must be below this
+    "readiness_prob_min": 0.85,        # mean_max_cell_prob must be above this
+    "readiness_stability_max": 0.02,   # std(frac_sigma_z_below_0.1) over window
+    "readiness_improvement_min": 1e-4, # val_argmax improvement rate per epoch
+    "readiness_window": 10,            # number of recent readings for stability checks
+    # Prune thresholds (used at the B2->C boundary, whether readiness-gated
+    # or fallback).
+    "prune_edge_threshold": 0.05,
+    "prune_node_threshold": 0.05,
+    "prune_nodes_by_gate": False,  # edge-only: nodes only die via connectivity
+}
+
 # Fixed-step Heun solver
 SOLVER = {
     "method": "heun",

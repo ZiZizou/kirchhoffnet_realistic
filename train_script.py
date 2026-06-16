@@ -50,6 +50,7 @@ from config import (
     SCHEDULE_FOUR_PHASE,
     TAU,
     VARIATION,
+    make_smooth2d_grid_preset,
 )
 from cell_library import IdealizedCellLibrary
 from topology import build_net_from_preset
@@ -560,6 +561,11 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
         help="Task to train (default: sinx)",
     )
     parser.add_argument(
+        "--grid-size", type=int, default=5, dest="grid_size",
+        help="Hidden grid height/width for smooth2d_grid (default: 5, N×N grid). "
+             "Only applies when --problem smooth2d_grid.",
+    )
+    parser.add_argument(
         "--output", type=Path, default=Path("./output"),
         help="Output directory for artifacts (default: ./output)",
     )
@@ -989,6 +995,11 @@ def main():
     read_idx_arg = _parse_int_list(args.read_idx)
 
     cell_lib = IdealizedCellLibrary()
+    # Override the grid preset when grid_size != default or for smooth2d_grid.
+    if args.problem == "smooth2d_grid":
+        PRESETS["smooth2d_grid"] = make_smooth2d_grid_preset(
+            grid_size=args.grid_size,
+        )
     net = build_net_from_preset(
         args.problem,
         cell_lib=cell_lib,
@@ -998,8 +1009,9 @@ def main():
         read_idx=read_idx_arg,
     )
     net.to(device)
+    grid_label = f" {args.grid_size}×{args.grid_size} grid," if args.problem == "smooth2d_grid" else ""
     print(
-        f"[train] problem={args.problem} epochs={epochs} lr={lr} device={device} "
+        f"[train] problem={args.problem}{grid_label} epochs={epochs} lr={lr} device={device} "
         f"output={out_dir} amp={amp_enabled} compile={compile_enabled} "
         f"parallel={parallel_enabled} ({n_gpus} GPUs) "
         f"validate_every={args.validate_every} early_stop={args.early_stop} "

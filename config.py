@@ -409,78 +409,94 @@ PRESET_SMOOTH2D = {
 }
 
 # Grid-topology variant of the smooth2d preset (smooth2d-grid-preset spec).
-# 4x4 = 16 hidden grid nodes with 8-neighbor local connectivity
-# (grid_graph kernel_size=3). 3 projection nodes are connected
-# bidirectionally to all 16 hidden nodes (proj_pattern="all_to_all",
-# yielding 16*3 = 48 projection edges; 42 hidden edges).
-#
-# Multi-stage (multistage-smooth2d-grid spec): 3 independent stages with
-# untied weights. Each stage has the same 4x4 grid + 3 proj topology (19
-# active nodes, 90 edges) but its own learnable parameters. Total t_span=5
-# is split equally (5/3 ≈ 1.667 per stage) and num_steps=50 proportionally
-# (17 per stage), keeping dt ≈ 0.098 constant. StageTransfer between stages
-# is identity (19→19). This triples the edge parameters (~1767 total) while
-# making each per-stage backward pass 3x shallower, directly addressing
-# the vanishing gradient issue. Gradient norms per stage are logged
-# separately in grad_norms.txt.
-#
-# Fan-out write (smooth2d-sanity-pass spec): each input writes to 3
-# designated hidden nodes (left/right columns of the 4x4 grid) via
-# FanOutInputMapper. With 4 rows, write targets are left column rows
-# 0,1,2 = [0, 4, 8] and right column rows 0,1,2 = [3, 7, 11]. This
-# gives 6 total write targets.
-#
-# Read (proj-only): 3 projection nodes only. With 4-wide grid and
-# 8-neighbor connectivity, every hidden node is within 1 hop of the
-# left/right write columns, so the >1-hop topology check would fail
-# for any hidden read. Topology check is skipped when all reads are
-# proj (see topology.py:validate_topology_degrees). OutputMapper is a
-# Linear(3, 1) over these 3 read positions. read_idx targets the LAST
-# stage's state vector.
+# Grid size is configurable via ``make_smooth2d_grid_preset(grid_size)``,
+# which also accepts `--grid-size N` from train_script.py.
+# Caller formula for exact topology layout is documented in
+# spec/grid-size-cli.md.
 #
 # Fit-first: structural regularizers (edge_gate, node_gate, power,
 # capacitance) are zeroed in the preset's 'lambdas' override. The
 # --prune flag can still be passed for retrain experiments, but
 # gates do not receive any gradient pressure during pre-prune fit.
-_STAGE_CFG_16G_3P = {
-    "num_inputs": 2,
-    "num_hidden": 16,
-    "num_proj": 3,
-    "num_outputs": 0,
-    "hidden_family": "grid",
-    "hidden_kwargs": {"height": 4, "width": 4, "kernel_size": 3},
-    "input_pattern": "all_to_all",
-    "output_pattern": "all_to_all",
-    "proj_pattern": "all_to_all",
-    "t_span": SOLVER["t_span"] / 3,
-    "num_steps": round(SOLVER["num_steps"] / 3),
-}
-PRESET_SMOOTH2D_GRID = {
-    "stages": [
-        _STAGE_CFG_16G_3P,
-        _STAGE_CFG_16G_3P,
-        _STAGE_CFG_16G_3P,
-    ],
-    "use_robust_input": False,
-    "loss": "mse",
-    "out_dim": 1,
-    "write_mode": "fan_out",
-    "write_fan_out": {0: [0, 4, 8], 1: [3, 7, 11]},
-    "read_idx": [16, 17, 18],
-    "schedule": "three_phase",
-    # Legacy per-preset lambda overrides kept for backward compatibility with
-    # the --schedule legacy code path. When three_phase is active, the schedule
-    # functions in train.py replace these with the phase-aware values.
-    "lambdas": {
-        "sparsity": 1e-5,
-        "edge_gate": 5e-6,
-        "node_gate": 1e-5,
-        "power": 1e-5,
-        "capacitance": 1e-6,
-        "rail": 0.1,
-    },
-    "tau_anneal": True,
-}
+
+
+def make_smooth2d_grid_preset(
+    grid_size: int,
+    num_stages: int = 3,
+    num_proj: int = 3,
+) -> dict:
+    """Dynamically build the smooth2d_grid preset dict for any square grid size.
+
+    ``grid_size`` is the height/width of the hidden grid (N×N). Each stage
+    has ``grid_size ** 2`` hidden nodes, ``num_proj`` projection nodes,
+    and ``num_inputs=2`` input nodes.
+
+    The write fan-out and read indices are computed to match the patterns
+    validated in the original git history (5×5 and 4×4 variants). See
+    spec/grid-size-cli.md for the exact formulas.
+    """
+    num_hidden = grid_size * grid_size
+    n_stages = max(1, num_stages)
+    _stage_cfg = {
+        "num_inputs": 2,
+        "num_hidden": num_hidden,
+        "num_proj": num_proj,
+        "num_outputs": 0,
+        "hidden_family": "grid",
+        "hidden_kwargs": {"height": grid_size, "width": grid_size, "kernel_size": 3},
+        "input_pattern": "all_to_all",
+        "output_pattern": "all_to_all",
+        "proj_pattern": "all_to_all",
+        "t_span": SOLVER["t_span"] / n_stages,
+        "num_steps": round(SOLVER["num_steps"] / n_stages),
+    }
+
+    # Fan-out write: left column for input 0, right column for input 1.
+    # For grid_size >= 5 use every other row (matches original 5×5 pattern);
+    # for smaller grids use consecutive rows 0..height-2 (matches 4×4).
+    if grid_size >= 5:
+        rows = list(range(0, grid_size, 2))
+    else:
+        rows = list(range(grid_size - 1))
+    fan_out = {
+        0: [r * grid_size for r in rows],
+        1: [r * grid_size + (grid_size - 1) for r in rows],
+    }
+
+    # Read indices: for grid_size >= 5 the center column is >1 hop from
+    # the write columns, so include center-column hidden nodes + proj.
+    # For smaller grids, only proj nodes are valid (every hidden node is
+    # within 1 hop of a write target).
+    if grid_size >= 5:
+        center_col = grid_size // 2
+        center_nodes = [r * grid_size + center_col for r in range(grid_size)]
+        read_idx = center_nodes + list(range(num_hidden, num_hidden + num_proj))
+    else:
+        read_idx = list(range(num_hidden, num_hidden + num_proj))
+
+    return {
+        "stages": [_stage_cfg] * n_stages,
+        "use_robust_input": False,
+        "loss": "mse",
+        "out_dim": 1,
+        "write_mode": "fan_out",
+        "write_fan_out": fan_out,
+        "read_idx": read_idx,
+        "schedule": "three_phase",
+        "lambdas": {
+            "sparsity": 1e-5,
+            "edge_gate": 5e-6,
+            "node_gate": 1e-5,
+            "power": 1e-5,
+            "capacitance": 1e-6,
+            "rail": 0.1,
+        },
+        "tau_anneal": True,
+    }
+
+
+# Static default: 5×5 grid, 3 stages, 3 proj nodes.
+PRESET_SMOOTH2D_GRID = make_smooth2d_grid_preset(grid_size=5)
 
 PRESETS = {
     "sinx": PRESET_SINX,

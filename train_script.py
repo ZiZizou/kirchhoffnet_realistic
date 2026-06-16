@@ -234,9 +234,12 @@ def _apply_ablation_set(args, schedule_mode: str) -> None:
         _set_if_unset("prune_edge_threshold", 0.05)
         _set_if_unset("stage_lr_scale", 1.0)
         _set_if_unset("retrain_stage_lr_scale", 1.0)
+        _set_if_unset("mapper_lr_scale", 1.0)
+        _set_if_unset("retrain_mapper_lr_scale", 1.0)
+        _set_if_unset("freeze_mappers", False)
         print(
             "[ablation-set=edge-only] node-gate pruning disabled, "
-            "edge threshold 0.05, stage_lr_scale=1.0"
+            "edge threshold 0.05, stage_lr_scale=1.0, mapper_lr_scale=1.0"
         )
 
 
@@ -260,7 +263,8 @@ def _log_solidification(log_path, epoch: int, metrics: dict) -> None:
         f.write("\t".join(row) + "\n")
 
 
-def _save_config_snapshot(out_dir: Path, problem: str, args, lambdas: dict) -> None:
+def _save_config_snapshot(out_dir: Path, problem: str, args, lambdas: dict,
+                          net=None) -> None:
     snap_path = out_dir / "config_snapshot.txt"
     with open(snap_path, "w") as f:
         f.write(f"problem: {problem}\n")
@@ -278,10 +282,35 @@ def _save_config_snapshot(out_dir: Path, problem: str, args, lambdas: dict) -> N
         for k, v in VARIATION.items():
             f.write(f"  {k}: {v}\n")
         f.write("\nI/O MAPPING:\n")
-        f.write(f"  write_mode: {args.write_mode}\n")
-        f.write(f"  read_mode: {args.read_mode}\n")
-        f.write(f"  write_idx: {args.write_idx}\n")
-        f.write(f"  read_idx: {args.read_idx}\n")
+        if net is not None:
+            from io_mapper import FanOutInputMapper, SparseInputMapper, InputMapper
+            if isinstance(net.input_mapper, FanOutInputMapper):
+                effective_write = "fan_out"
+            elif isinstance(net.input_mapper, SparseInputMapper):
+                effective_write = "one_to_one"
+            elif isinstance(net.input_mapper, InputMapper):
+                effective_write = "dense"
+            else:
+                effective_write = type(net.input_mapper).__name__
+            f.write(f"  write_mode: {effective_write}\n")
+            f.write(f"  input_mapper: {type(net.input_mapper).__name__}\n")
+            if effective_write == "fan_out":
+                f.write(f"  fan_out_map: {net.input_mapper.fan_out_map}\n")
+            f.write(f"  write_idx: {list(net.write_idx) if net.write_idx is not None else None}\n")
+            f.write(f"  output_mapper: {type(net.output_mapper).__name__}\n")
+            f.write(f"  read_idx: {list(net.read_idx) if net.read_idx is not None else None}\n")
+            f.write(f"  hid_count: {net.hid_count}\n")
+            f.write(f"  proj_count: {net.proj_count}\n")
+            f.write(f"  stage_lr_scale: {args.stage_lr_scale}\n")
+            f.write(f"  mapper_lr_scale: {args.mapper_lr_scale}\n")
+            f.write(f"  retrain_stage_lr_scale: {args.retrain_stage_lr_scale}\n")
+            f.write(f"  retrain_mapper_lr_scale: {args.retrain_mapper_lr_scale}\n")
+            f.write(f"  freeze_mappers: {args.freeze_mappers}\n")
+        else:
+            f.write(f"  write_mode: {args.write_mode}\n")
+            f.write(f"  read_mode: {args.read_mode}\n")
+            f.write(f"  write_idx: {args.write_idx}\n")
+            f.write(f"  read_idx: {args.read_idx}\n")
 
 
 def make_data_sinx(batch_size: int, val_size: int = 1024):
@@ -691,6 +720,27 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "if you want geometric scaling during retrain.",
     )
     parser.add_argument(
+        "--mapper-lr-scale", type=float, default=1.0,
+        help="LR multiplier for I/O mapper params (input_mapper + output_mapper). "
+             "Default 1.0 (no change). Use <1.0 (e.g. 0.1) to slow mapper learning "
+             "when mapper gradient norms dominate core by ~300x. Composes with "
+             "--stage-lr-scale.",
+    )
+    parser.add_argument(
+        "--retrain-mapper-lr-scale", type=float, default=1.0,
+        help="Mapper LR scale for the pruned-network retrain optimizer "
+             "(default: 1.0). Mirrors --mapper-lr-scale if you want to slow "
+             "mapper learning during retrain.",
+    )
+    parser.add_argument(
+        "--freeze-mappers", dest="freeze_mappers", action="store_true", default=False,
+        help="Freeze mapper requires_grad during the first half of the combined "
+             "B1+B2 duration (four_phase schedule only). Mappers train normally "
+             "in Phase A, freeze at B1 start, unfreeze at the midpoint. After "
+             "unfreeze mappers resume at the --mapper-lr-scale rate. "
+             "Ignored for three_phase and legacy schedules.",
+    )
+    parser.add_argument(
         "--device", default=None,
         help="Device 'cpu' or 'cuda' (default: auto-detect)",
     )
@@ -751,14 +801,16 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
         help="Enable PVT/mismatch injection during training (default: off, R6.3).",
     )
     parser.add_argument(
-        "--write-mode", choices=["one_to_one", "dense"], default="one_to_one",
-        help="Input write mapping (default: one_to_one, SR1). Use 'dense' for "
-             "the original nn.Linear(d, hid_count) baseline.",
+        "--write-mode", choices=["one_to_one", "dense", "fan_out"], default=None,
+        help="Input write mapping (default: from preset). 'one_to_one' uses "
+             "SparseInputMapper, 'dense' uses InputMapper (nn.Linear), "
+             "'fan_out' uses FanOutInputMapper with preset-defined targets.",
     )
     parser.add_argument(
-        "--read-mode", choices=["sparse", "dense"], default="sparse",
-        help="Output read mapping (default: sparse, SR2). Use 'dense' for the "
-             "original full-projection readout baseline.",
+        "--read-mode", choices=["sparse", "dense"], default=None,
+        help="Output read mapping (default: from preset, typically 'sparse'). "
+             "'sparse' uses OutputMapper with preset-defined read_idx; "
+             "'dense' uses full-projection readout.",
     )
     parser.add_argument(
         "--write-idx", type=str, default=None,
@@ -1083,8 +1135,21 @@ def main():
             f"B2=[{fp_b1_end},{fp_b2_end}) "
             f"C=[{fp_b2_end},{fp_c_end}) (total={epochs})"
         )
-    _save_config_snapshot(out_dir, args.problem, args, lambdas)
-
+        if args.freeze_mappers:
+            mapper_unfreeze_epoch = fp_a_end + (fp_b2_end - fp_a_end) // 2
+            print(
+                f"[train] four_phase freeze_mappers: freeze at epoch {fp_a_end}, "
+                f"unfreeze at epoch {mapper_unfreeze_epoch}"
+            )
+        else:
+            mapper_unfreeze_epoch = -1
+    else:
+        mapper_unfreeze_epoch = -1
+    if args.freeze_mappers and schedule_mode != "four_phase":
+        print(
+            f"[train] WARNING: --freeze-mappers ignored for schedule_mode={schedule_mode} "
+            f"(only supported for four_phase)"
+        )
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if args.device is not None:
         device = args.device
@@ -1121,16 +1186,28 @@ def main():
         if args.problem in ("smooth2d_grid", "housing_grid")
         else ""
     )
+    in_mapper_name = type(net.input_mapper).__name__
+    out_mapper_name = type(net.output_mapper).__name__
     print(
         f"[train] problem={args.problem}{grid_label} epochs={epochs} lr={lr} device={device} "
         f"output={out_dir} amp={amp_enabled} compile={compile_enabled} "
         f"parallel={parallel_enabled} ({n_gpus} GPUs) "
         f"validate_every={args.validate_every} early_stop={args.early_stop} "
         f"ablation={args.ablation} variation={args.variation} "
-        f"write_mode={args.write_mode} read_mode={args.read_mode} "
+        f"input_mapper={in_mapper_name} output_mapper={out_mapper_name} "
+        f"hid_count={net.hid_count} proj_count={net.proj_count} "
         f"write_idx={list(net.write_idx) if net.write_idx is not None else None} "
         f"read_idx={list(net.read_idx) if net.read_idx is not None else None}"
     )
+    _save_config_snapshot(out_dir, args.problem, args, lambdas, net=net)
+
+    effective_write_mode = (
+        "fan_out" if isinstance(net.input_mapper, FanOutInputMapper)
+        else "one_to_one" if isinstance(net.input_mapper, SparseInputMapper)
+        else "dense"
+    )
+    effective_read_mode = "sparse" if net.read_idx is not None else "dense"
+
     data_out = make_data(args.problem, batch_size)
     if len(data_out) == 4:
         train_loader, val_loader, task_fn, inverse_stats = data_out
@@ -1181,11 +1258,16 @@ def main():
     else:
         ctx_factory = make_static_ctx_factory()
 
-    optimizer = make_optimizer(net, lr=lr, stage_lr_scale=args.stage_lr_scale)
-    if args.stage_lr_scale != 1.0:
+    optimizer = make_optimizer(
+        net, lr=lr,
+        stage_lr_scale=args.stage_lr_scale,
+        mapper_lr_scale=args.mapper_lr_scale,
+    )
+    if args.stage_lr_scale != 1.0 or args.mapper_lr_scale != 1.0:
         lr_strs = [f"{g['lr']:.1e}" for g in optimizer.param_groups]
         print(
-            f"[train] stage_lr_scale={args.stage_lr_scale}: per-group LRs = {lr_strs}"
+            f"[train] stage_lr_scale={args.stage_lr_scale}, "
+            f"mapper_lr_scale={args.mapper_lr_scale}: per-group LRs = {lr_strs}"
         )
     if args.use_scheduler:
         if schedule_mode == "three_phase":
@@ -1300,6 +1382,8 @@ def main():
     # housing_grid: per-epoch dicts of {val, mae_orig, rmse_orig} for
     # logging in original housing-price units (USD x 100k).
     val_orig_history: list[dict] = [] if inverse_stats is not None else None
+    # mapper-lr-control: freeze state for --freeze-mappers (four_phase only)
+    mappers_frozen = False
 
     for epoch in ab_iter:
         if stop_training:
@@ -1328,6 +1412,28 @@ def main():
                     f"[teacher] cloned best Phase A state (epoch {best_epoch}, "
                     f"{best_metric_name}={best_val:.4f}) as frozen teacher"
                 )
+
+            # mapper-lr-control: freeze mappers at A->B1 boundary, unfreeze
+            # at the midpoint of the combined B1+B2 duration. Only when
+            # --freeze-mappers is set and schedule_mode is four_phase.
+            if args.freeze_mappers:
+                raw = net.module if isinstance(net, torch.nn.DataParallel) else net
+                if epoch == fp_a_end and not mappers_frozen:
+                    raw.input_mapper.requires_grad_(False)
+                    raw.output_mapper.requires_grad_(False)
+                    mappers_frozen = True
+                    print(
+                        f"[mapper] frozen mappers at epoch {epoch} "
+                        f"(unfreeze at {mapper_unfreeze_epoch})"
+                    )
+                elif epoch == mapper_unfreeze_epoch and mappers_frozen:
+                    raw.input_mapper.requires_grad_(True)
+                    raw.output_mapper.requires_grad_(True)
+                    mappers_frozen = False
+                    print(
+                        f"[mapper] unfrozen mappers at epoch {epoch} "
+                        f"(lr_scale={args.mapper_lr_scale})"
+                    )
 
             # If readiness triggered on a previous validate step, stop here.
             if phase == "B2" and readiness_prune_fired:
@@ -1746,7 +1852,7 @@ def main():
 
         raw_write_idx = list(raw_net.write_idx) if raw_net.write_idx is not None else None
         raw_read_idx = list(raw_net.read_idx) if raw_net.read_idx is not None else None
-        if args.read_mode == "sparse" and raw_read_idx is None:
+        if effective_read_mode == "sparse" and raw_read_idx is None:
             raw_read_idx = list(read_idx_arg) if read_idx_arg is not None else [0]
 
         if not args.fresh_init:
@@ -1759,7 +1865,7 @@ def main():
                 pruned_last_n, out_dim,
             )
         else:
-            if args.write_mode == "one_to_one":
+            if effective_write_mode == "one_to_one":
                 if raw_write_idx is None:
                     pruned_write_idx = list(range(min(in_dim, pruned_first_n)))
                 else:
@@ -1767,7 +1873,7 @@ def main():
                 input_mapper_pruned = SparseInputMapper(
                     in_dim=in_dim, out_dim=pruned_first_n, write_idx=pruned_write_idx,
                 )
-            elif args.write_mode == "fan_out":
+            elif effective_write_mode == "fan_out":
                 fan_out_map = preset_cfg.get("write_fan_out")
                 if fan_out_map is None:
                     raise ValueError(
@@ -1788,7 +1894,7 @@ def main():
                 input_mapper_pruned = MapperCls(in_dim=in_dim, out_dim=pruned_first_n)
                 pruned_write_idx = None
 
-            if args.read_mode == "sparse":
+            if effective_read_mode == "sparse":
                 if raw_read_idx is None:
                     pruned_read_idx = [0]
                 else:
@@ -1808,8 +1914,8 @@ def main():
             proj_count=0,
             final_hid_count=pruned_last_n,
             final_proj_count=0,
-            write_idx=pruned_write_idx if args.write_mode == "one_to_one" else None,
-            read_idx=pruned_read_idx if args.read_mode == "sparse" else None,
+            write_idx=pruned_write_idx if effective_write_mode == "one_to_one" else None,
+            read_idx=pruned_read_idx if effective_read_mode == "sparse" else None,
         )
         pruned_net.to(device)
 
@@ -1831,11 +1937,13 @@ def main():
             retrain_optimizer = make_optimizer(
                 pruned_net, lr=c_lr,
                 stage_lr_scale=args.retrain_stage_lr_scale,
+                mapper_lr_scale=args.retrain_mapper_lr_scale,
             )
-            if args.retrain_stage_lr_scale != 1.0:
+            if args.retrain_stage_lr_scale != 1.0 or args.retrain_mapper_lr_scale != 1.0:
                 lr_strs = [f"{g['lr']:.1e}" for g in retrain_optimizer.param_groups]
                 print(
-                    f"[prune] retrain stage_lr_scale={args.retrain_stage_lr_scale}: "
+                    f"[prune] retrain stage_lr_scale={args.retrain_stage_lr_scale}, "
+                    f"retrain_mapper_lr_scale={args.retrain_mapper_lr_scale}: "
                     f"per-group LRs = {lr_strs}"
                 )
             if args.use_scheduler:

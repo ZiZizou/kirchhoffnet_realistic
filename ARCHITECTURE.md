@@ -1,8 +1,8 @@
 # Reduced Differential KirchhoffNet — Architecture & Reference
 
-> **Version:** Idealized (v3)  
+> **Version:** Idealized (v4)  
 > **Design target:** Tapeout-plausible analog compute fabric  
-> **Key decisions:** Differential signaling, sparse topology only, cell-library-based edge parameterization (L/S/P/Z), direct BPTT through Heun integration, three-phase fit-compress-prune schedule
+> **Key decisions:** Differential signaling, sparse topology only, cell-library-based edge parameterization (L/S/P/Z), direct BPTT through Heun integration, three-phase fit-compress-prune schedule (with four-phase readiness-gated variant), STE cell mode, teacher distillation
 
 ---
 
@@ -149,16 +149,17 @@ The network operates in three phases:
 
 **Sparse I/O mapping (sparse-io-mapping spec).** Each preset specifies `write_idx` and `read_idx` lists, and the default write/read modes are:
 - `--write-mode one_to_one` (default): each input feature `u_i` writes to exactly one hidden node `h_{write_idx[i]}` via `SparseInputMapper`. Hidden nodes not in `write_idx` are zero-initialized at t=0. Parameter count: `2 * in_dim` (vs `in_dim * hid_count + hid_count` for dense `InputMapper`).
-- `--write-mode fan_out`: each input feature writes to K>1 hidden nodes via `FanOutInputMapper` with per-target (gain, bias) pairs. Used by `smooth2d_grid` preset.
+- **Fan-out write** (not a CLI `--write-mode` choice; set per-preset via `write_fan_out`): each input feature writes to K>1 hidden nodes via `FanOutInputMapper` with per-target (gain, bias) pairs. Used by `smooth2d_grid` preset.
 - `--read-mode sparse` (default): `OutputMapper` gathers only from `read_idx` full-state indices (a learnable linear of size `len(read_idx) -> out_dim`).
 - `--write-mode dense` / `--read-mode dense`: original `InputMapper` / `OutputMapper` behavior for baseline comparison.
 
 Preset defaults (SR4.2):
 - `sinx`: `write_mode=one_to_one`, `write_idx=[0]`, `read_mode=sparse`, `read_idx=[7]` (out of 8 hidden + 2 proj = 10)
 - `housing`: `write_mode=one_to_one`, `write_idx=[0..7]`, `read_mode=sparse`, `read_idx=[15]` (out of 16 hidden + 4 proj = 20)
-- `smooth2d_grid`: `write_mode=fan_out`, `write_fan_out={0:[0,4,8], 1:[3,7,11]}`, `read_mode=sparse`, `read_idx=[16,17,18]`
+- `smooth2d_grid`: `write_mode=fan_out`, `write_fan_out` = auto-computed left/right column indices (depends on grid_size), `read_mode=sparse`, `read_idx` = center column + proj nodes (see `make_smooth2d_grid_preset()` for exact formula)
+- `housing_grid`: `write_mode=dense` (all-to-all, 8 housing features have no spatial structure), `read_idx` = center column + proj nodes
 
-CLI flags (SR5): `--write-mode {one_to_one,dense}`, `--read-mode {sparse,dense}`, `--write-idx "0,2,4"`, `--read-idx "7"`. The index overrides take precedence over preset values. Fan-out write is only available through the `write_fan_out` preset config, not as a CLI flag.
+CLI flags (SR5): `--write-mode {one_to_one,dense}`, `--read-mode {sparse,dense}`, `--write-idx "0,2,4"`, `--read-idx "7"`. The index overrides take precedence over preset values. Fan-out write is only available through the `write_fan_out` preset config (not as a CLI `--write-mode` choice).
 
 ### 2.6 Staged regularizer warm-up (RR-A)
 
@@ -200,17 +201,21 @@ term penalizes node count as a proxy for routing area.
 
 In addition, **learnable gate parameters** are added to every
 `DifferentialStage`:
-- `z_logits [E]` — edge open-logit (init 2.0 → `σ(2) ≈ 0.88`).
+- `z_logits [E]` — edge open-logit (init 0.0 → `σ(0) ≈ 0.50`).
   Each `i_edge` is multiplied by `σ(z_logits[e])` in `rhs()`,
   so a closed edge contributes zero current.
-- `u_logits [N]` — node open-logit (init 2.0 → `σ(2) ≈ 0.88`).
+- `u_logits [N]` — node open-logit (init 0.0 → `σ(0) ≈ 0.50`).
   The state `x` is multiplied elementwise by `σ(u_logits)` before
   voltage differences are computed, so a closed node is pinned to ~0.
 
-Note: the gate init was reduced from 5.0 to 2.0 (fix-z-death) to improve
-gradient flow. At 5.0, `σ(5) ≈ 0.993` but `dσ/dz ≈ 0.007` — the gate
-gradient was 14× weaker. At 2.0, `dσ/dz ≈ 0.10`, a 2× reduction from
-the ideal `z=0` but a 14× improvement over `z=5`.
+The gate init was lowered to 0.0 (four-phase-redesign) to place gates
+at the **maximum-gradient** point of the sigmoid (`dσ/dz = 0.25` at
+`z=0`). At 2.0 (previous value), `σ(2) ≈ 0.88` but `dσ/dz ≈ 0.10`,
+making the gradient 2.5× weaker. In practice, gates initialized at 2.0
+never closed — `frac_sigma_z_below_0.1` stayed at 0 for entire
+training runs because the regularizer gradient `λ·σ·(1-σ) ≈ 1e-6` was
+negligible. With `z=0` the same regularizer gives `λ·σ·(1-σ) ≈ 2.5e-6`
+and gates can actually respond to structural pressure.
 
 Helper methods on `DifferentialStage`:
 - `edge_gates()` — returns `σ(z_logits)`
@@ -289,8 +294,8 @@ structural regularizer magnitudes:
 | Phase | Epochs | Tau | Regularizers | Action |
 |-------|--------|-----|-------------|--------|
 | **A** (fit) | 0–30% | Fixed 1.0 | All zero — free fit | Network learns task without structure pressure |
-| **B** (compress) | 30–70% | 1.0→0.6 anneal | Gate penalties ramped in (Strategy 2) | Gate logits are pushed toward 0 or 1 |
-| **C** (retrain) | 70–100% | 0.6→0.1 anneal | Only sparsity (1e-5) + rail (unchanged) | Auto-prune at B→C boundary, retrain compact network |
+| **B** (compress) | 30–70% | 1.0→0.6 anneal | Gate penalties ramped in | Gate logits pushed toward 0 (closed) or stay open; node_gate disabled |
+| **C** (retrain) | 70–100% | 0.6→0.1 anneal | Only sparsity (1e-5) + rail | Auto-prune at B→C boundary, retrain compact network |
 
 **Phase A (fit, epochs 0–30%).** All structural regularizers are zeroed.
 Tau stays at 1.0 (no hardening pressure). The network learns the task
@@ -299,17 +304,19 @@ freely. Rail is always active as a safety net.
 **Phase B (compress, epochs 30–70%).** Tau anneals from 1.0→0.6
 (gentle specialization — capping at 0.6 instead of 0.1 prevents Z-death
 from prematurely locking edges to the zero cell). Structural
-regularizers (edge_gate=1e-5, node_gate=1e-5, power=1e-5,
-capacitance=1e-6, sparsity=5e-5) are ramped from 0 to full over the
-first ~50% of Phase B (≈20 epochs at 800 total). Gate logits are pushed
-toward 0 (closed) or stay at 1 (open).
+regularizers are ramped from 0 to full over the first 50% of Phase B:
+sparsity=5e-5, edge_gate=1e-5, power=1e-5, capacitance=1e-6.
+**node_gate is 0.0** during Phase B — the node gate regularizer was
+found to be too destructive when combined with edge_gate, causing
+collateral node death that disconnected the I/O path. Nodes only die
+via the connectivity backstop (dead island purge) at prune time.
 
 **Phase C (retrain, epochs 70–100%).** At the B→C boundary, automatic
 pruning removes edges/nodes below the schedule's thresholds
-(edge_threshold=0.1, node_threshold=0.05). The compact network is
-retrained from warm-start with aggressive tau annealing (0.6→0.1) and
-only sparsity (1e-5) + rail (unchanged). Gate penalties are off
-(irrelevant post-prune).
+(edge_threshold=0.05, node_threshold=0.05, prune_nodes_by_gate=False —
+edge-only pruning). The compact network is retrained from warm-start
+with aggressive tau annealing (0.6→0.1) and only sparsity (1e-5) +
+rail (unchanged). Gate penalties are off (irrelevant post-prune).
 
 **Solidification diagnostics.** During Phases A and B, per-epoch
 metrics are logged to `solidification.tsv`:
@@ -323,7 +330,7 @@ evaluated with τ→0.001 (effectively argmax cell selection) and the
 task loss is compared against the soft-τ baseline. A small gap means
 cell selection is solidified.
 
-The `--schedule {legacy,three_phase}` CLI flag selects the mode.
+The `--schedule {legacy,three_phase,four_phase}` CLI flag selects the mode.
 `smooth2d_grid` defaults to `three_phase` via its preset config.
 
 ### 2.10 Per-preset lambda overrides (RR-D)
@@ -335,6 +342,7 @@ regularizer weight without redefining the entire dictionary.
 Active overrides:
 - **sinx**: `{"rail": 1.0}`.
 - **smooth2d_grid**: `{"sparsity": 1e-5, "edge_gate": 5e-6, "node_gate": 1e-5, "power": 1e-5, "capacitance": 1e-6, "rail": 0.1}`. Note: these legacy per-preset lambdas are for the `--schedule legacy` code path; under `--schedule three_phase` the schedule's phase-aware values (Phase B lambdas_b) replace them entirely.
+- **housing_grid**: same as smooth2d_grid (identical lambda override).
 - **housing**: no override.
 
 ### 2.11 Deprecated `temp_c` sampling (RR-C)
@@ -393,6 +401,181 @@ L2 gradient norms written to `grad_norms.txt`. Each row shows per-stage
 `lr = BASE_LR × (batch_size / BASE_BATCH_SIZE)` (Goyal et al., 2017)
 where `BASE_LR=3e-4` and `BASE_BATCH_SIZE=1024`. At `batch_size=2048`,
 this gives `lr=6e-4`.
+
+### 2.14 Four-phase training schedule (four-phase-redesign plan)
+
+A four-phase extension of the three-phase schedule that splits Phase B
+into B1 (cell commitment, no pruning) and B2 (edge pruning,
+readiness-gated). Adds teacher distillation and straight-through
+estimator (STE) cell mode for cleaner hardening.
+
+**Availability and activation.** Any preset can opt into the four-phase
+schedule via `--schedule four_phase` on the CLI. No preset defaults to
+four_phase — it is always an explicit override. This is orthogonal to
+the topology: it works with `sinx`, `housing`, `smooth2d`,
+`smooth2d_grid`, and `housing_grid` alike. The grid size (`--grid-size`)
+and number of ODE stages are independent of the schedule choice.
+
+**Config entry (``SCHEDULE_FOUR_PHASE`` in ``config.py``).** Phase
+fractions default to frac_a=0.25, frac_b1=0.20, frac_b2=0.25,
+frac_c=0.30 (must sum to 1.0). Tau targets: tau_a=1.0 (fixed),
+tau_b1_init=1.0→tau_b1_final=0.6, tau_b2_init=0.6→tau_b2_final=0.4,
+tau_c_init=0.4→tau_c_final=0.1. Tau is continuous at all phase
+boundaries by construction (end-of-B1 ≈ 0.6 = start-of-B2;
+end-of-B2 ≈ 0.4 = start-of-C). Teacher KD weight: lambda_kd=1.0.
+Warmup within B1/B2: 25% of each phase's epoch window.
+
+| Phase | Epochs | Tau | Regularizers | Cell Mode | Action |
+|-------|--------|-----|-------------|-----------|--------|
+| **A** (fit) | 0–25% | Fixed 1.0 | All zero | Soft | Learn task freely |
+| **B1** (cell commit) | 25–45% | 1.0→0.6 | sparsity=5e-5 only | STE | Commit cells, no pruning |
+| **B2** (edge prune) | 45–70% | 0.6→0.4 | sparsity=5e-5, edge_gate=1e-5 | STE | Prune edges readiness-gated |
+| **C** (retrain) | 70–100% | 0.4→0.1 | sparsity=1e-5 only | STE | Retrain compact model |
+
+---
+
+**Phase A (fit, epochs 0–25%).** Identical to three-phase Phase A: all
+structural regularizers zeroed, tau=1.0, standard soft cell mixture.
+The network learns the task freely with no structure pressure. Rail is
+always active as a safety net.
+
+**Teacher cloning at A→B1 boundary.** At the first epoch of Phase B1,
+a deep copy of the best Phase A checkpoint (lowest soft validation loss)
+is frozen as the teacher network. The teacher is kept in eval mode with
+`requires_grad_(False)` and stays on the device for the remainder of
+B1+B2. The teacher uses soft cell mode with tau=1.0 — providing a
+smooth, well-behaved regression target — while the student transitions
+to STE mode. If training is early-stopped during Phase A (before
+teacher cloning fires), the four-phase schedule skips pruning and
+retrain entirely, falling back to a standard save of the best Phase A
+model.
+
+---
+
+**Phase B1 (cell commitment, epochs 25–45%).** Tau anneals from 1.0→0.6
+using the same exponential-decay + smooth-linear-hardening as
+three-phase. Only the sparsity regularizer (5e-5, ramped from 0 to full
+over the first 25% of B1 ≈ 20 epochs at 800 total) is active — no
+edge_gate/node_gate/power/capacitance. Cell mode switches to **STE**
+(straight-through estimator): each edge selects exactly one cell in the
+forward pass (`argmax` over logits) but the backward pass flows through
+the softmax distribution (identity gradient). This gives hard cell
+commitment during inference while preserving differentiable training.
+Teacher distillation (`lambda_kd * MSE(y_student, y_teacher)`) is active
+throughout B1, anchoring the student's predictions to the smooth Phase A
+behavior.
+
+This phase commits each edge to a single cell family without pruning
+any edges. The absence of gate regularizers means edge and node gates
+receive no gradient pressure — they remain at their initialized values
+(σ≈0.50, max-gradient). Gate-pressure is intentionally deferred to B2.
+
+---
+
+**Phase B2 (edge pruning, epochs 45–70%).** Tau continues from 0.6→0.4.
+The edge_gate regularizer (1e-5, ramped over the first 25% of B2) is
+added to sparsity. This is the first time gates receive gradient
+pressure — the regularizer λ·σ(z)·(1-σ(z)) pushes z_logits toward
+negative values (gate closed) when the edge's contribution to task loss
+is small. STE cell mode and teacher distillation continue from B1.
+
+**Readiness-gated prune.** Pruning is NOT automatic at the B2→C
+boundary. Instead, on every validation epoch during B2, a readiness
+check evaluates four AND-logic conditions over a trailing window
+(default 10 epochs):
+
+1. **Ratio**: `mean(val_argmax / val_soft) < 1.2` over the window.
+   The hard-cell model (τ≈0.001, effectively argmax) must produce a
+   validation loss close to the soft mixture model. A large gap means
+   the network still relies on blurry cell mixtures.
+2. **Cell probability**: `mean_max_cell_prob > 0.85`. Over all edges,
+   the mean of max(softmax(logits/τ)) must exceed 0.85, indicating most
+   edges have committed to a specific cell type.
+3. **Gate stability**: `std(frac_sigma_z_below_0.1) < 0.02` over the
+   window. The fraction of edge gates below the prune threshold must
+   have stabilised — if gates are still moving, the pruning boundary
+   would be premature.
+4. **Improvement**: `|val_argmax improvement rate| < 1e-4` (absolute
+   slope of linear fit over the window). The model must have converged
+   — no longer improving rapidly.
+
+All four conditions must be met for the readiness check to return True.
+On readiness trigger, B2 ends immediately and Phase C begins at the
+current epoch with the freshly pruned network. If readiness never fires,
+pruning happens at the fallback B2→C boundary (70% of total epochs,
+the hardcoded frac_c boundary).
+
+**Checkpoint selection during B1/B2.** In B1 and B2, the best model is
+tracked by `val_argmax` (hard-cell validation loss) rather than soft
+validation loss. The argmax model is the deployable form — soft
+validation includes cell mixture artifacts that vanish at deployment.
+Phase A still uses soft val for checkpoint selection.
+
+---
+
+**Phase C (retrain, epochs 70–100%).** At the B2→C boundary (whether
+readiness-triggered or fallback), auto-pruning removes edges below
+`prune_edge_threshold=0.05`. Pruning is edge-only
+(`prune_nodes_by_gate=False`) — nodes only die via the connectivity
+backstop (dead island purge). The compact network is retrained from
+warm-start with tau annealing 0.4→0.1, only sparsity (1e-5) + rail,
+STE cell mode continues. Teacher distillation is OFF in Phase C —
+the compact model should fit the task directly. Phase C also uses
+val_argmax for checkpoint selection (the compact network IS the
+deployable form).
+
+---
+
+**Teacher distillation details.** The KD loss is computed as
+`lambda_kd * MSE(y_student, y_teacher)` where `lambda_kd = 1.0`
+(configurable via `SCHEDULE_FOUR_PHASE["lambda_kd"]`). The teacher
+forward pass runs under `torch.no_grad()` with `soft` cell mode and
+`tau=1.0`. The KD loss is a data-side term: it is added to `total_task`
+(the DataParallel-averaged component) alongside task loss and rail,
+not to the structural regularizer term. This ensures correct gradient
+averaging across GPUs. KD is active only during B1 and B2 (checked via
+`four_phase_kd_active()`).
+
+---
+
+**Cell mode auto-resolution.** The `--cell-mode` flag accepts
+`{soft, ste, auto}`. With `--cell-mode auto` (the default), the
+schedule resolves per-epoch:
+- Phase A: `soft` (standard softmax mixture)
+- Phases B1/B2/C: `ste` (straight-through estimator)
+
+When `--cell-mode soft` or `--cell-mode ste` is explicitly passed, that
+mode is used for all epochs regardless of phase.
+
+---
+
+**Diagnostic ablation sets.** The `--ablation-set` flag works with
+four_phase:
+- `reg-only`: tau=1.0 throughout B1 and B2, gate regularizers left at
+  default, pruning disabled. Tests whether tau annealing alone drives
+  cell commitment.
+- `tau-only`: structural regularizers zeroed in B1 and B2, tau anneals
+  normally, pruning disabled. Tests whether regularizers alone drive
+  commitment.
+- `edge-only`: applies the same edge-only defaults as the standard
+  four-phase schedule (no node-gate pruning, edge_threshold=0.05).
+  Mostly a no-op for four_phase since this is already the default.
+
+---
+
+**Key differences from three-phase:**
+| Dimension | Three-phase | Four-phase |
+|-----------|-------------|------------|
+| Phases | A (fit) → B (compress) → C (retrain) | A (fit) → B1 (commit) → B2 (prune) → C (retrain) |
+| Tau | 1.0 → 0.6 → 0.1 | 1.0 → 0.6 → 0.4 → 0.1 |
+| Prune trigger | Automatic at B→C boundary | Readiness-gated (4 AND-condition checks) |
+| Cell mode | Soft throughout | STE in B1/B2/C |
+| Teacher distillation | None | `lambda_kd=1.0` in B1/B2 |
+| Node gate in B | `node_gate=1e-5` (can kill nodes) | `node_gate=0.0` (removed entirely) |
+| Edge threshold | 0.05 | 0.05 |
+| Prune nodes by gate | False | False |
+| B1 regularizers | (merged with B) | sparsity=5e-5 only |
+| B2 regularizers | (merged with B) | sparsity=5e-5 + edge_gate=1e-5 |
 
 ---
 
@@ -462,12 +645,13 @@ this gives `lr=6e-4`.
 - `OPTIM` — training hyperparameters (lr auto-computed as `3e-4 * batch_size/1024` = 6e-4 at 2048, wd=1e-4, epochs=800, batch_size=2048, reg_warmup_epochs=100, reg_anneal_epochs=50, scheduler_T_0=50, CosineAnnealingLR with T_max based on phase boundaries)
 - `TAU` — temperature annealing schedule (init=1.0, final=0.1, min=0.15, hardening_epoch_frac=0.1, final_pretrain=0.8 for two-phase pre-prune)
 - `LAMBDAS` — regularizer weights (sparsity=1e-3, rail=1.0, edge_gate=5e-4, node_gate=1e-4, power=1e-4, capacitance=1e-5, entropy=0.0)
-- `PRUNE` — pruning thresholds (edge_threshold=0.1, node_threshold=0.05, prune_nodes_by_gate=True)
-- `SCHEDULE_THREE_PHASE` — three-phase schedule config (frac_a=0.30, frac_b=0.40, frac_c=0.30; tau targets per phase; Phase B/C lambdas; warmup_frac_b)
+- `PRUNE` — pruning thresholds (edge_threshold=0.1, node_threshold=0.05, prune_nodes_by_gate=True; overridden by SCHEDULE_THREE_PHASE in phased mode)
+- `SCHEDULE_THREE_PHASE` — three-phase schedule config (frac_a=0.30, frac_b=0.40, frac_c=0.30; tau targets per phase; Phase B/C lambdas; warmup_frac_b; edge-only pruning)
+- `SCHEDULE_FOUR_PHASE` — four-phase schedule config (frac_a=0.25, frac_b1=0.20, frac_b2=0.25, frac_c=0.30; readiness-gated prune, teacher distillation, STE cell mode)
 - `SOLVER` — integration defaults (method=heun, t_span=5, num_steps=50)
-- `INIT` — parameter initialization biases (logits_z_bias=0.0 for equal cell probability P(L)=P(S)=P(P)=P(Z)=0.25; z_logit_init=2.0, u_logit_init=2.0 → σ≈0.88, dσ/dz≈0.10; raw_mult_init=0.0, raw_leak_init=-3.0, gain_scale=1.0)
+- `INIT` — parameter initialization biases (logits_z_bias=0.0 for equal cell probability P(L)=P(S)=P(P)=P(Z)=0.25; z_logit_init=0.0, u_logit_init=0.0 → σ=0.50, dσ/dz=0.25 (max-gradient); raw_mult_init=0.0, raw_leak_init=-3.0, gain_scale=1.0)
 - `VARIATION` — PVT/mismatch defaults (temp_c=27.0, gain_shift_std=0.05, edge_mismatch_std=0.05; temp_c sampling deprecated)
-- `PRESETS` — task-specific topology configs (sinx, housing, smooth2d, smooth2d_grid; supports per-preset lambdas, write_mode, schedule flag, write_fan_out)
+- `PRESETS` — task-specific topology configs (sinx, housing, smooth2d, smooth2d_grid, housing_grid; supports per-preset lambdas, write_mode, schedule flag, write_fan_out)
 
 ### `cell_library.py`
 **IdealizedCellLibrary** — Tanh-surrogate edge cell library with smooth rectifier support.
@@ -553,12 +737,14 @@ C_eff · dxⱼ/dt = Σ_{e: dst(e)=j} I_e − Σ_{e: src(e)=j} I_e − leakⱼ ·
 ### `train.py`
 **Loss functions, regularizers, tau annealing, training loop, three-phase schedule.**
 
-- `compute_loss(net, u, target, ctx, task_fn, ...)` — total = task + reg_scale·(sparsity + edge_gate + node_gate + power + capacitance) + rail − entropy_bonus. Splits into task+rail (data-dependent) and structural (parameter-only) components for DataParallel safety.
+- `compute_loss(net, u, target, ctx, task_fn, ..., cell_mode='soft', teacher=None, lambda_kd=0.0)` — total = task + reg_scale·(sparsity + edge_gate + node_gate + power + capacitance) + rail − entropy_bonus. Supports `cell_mode='ste'` (straight-through estimator for one-hot cell selection) and optional teacher distillation (`lambda_kd * MSE(y_student, y_teacher)`). Splits into task+rail+KD (data-dependent) and structural (parameter-only) components for DataParallel safety.
 - `compute_solver_loss(net, b, x_star, A, ctx, ...)` — solver-specific: residual + 0.1·solution + regularizers (preserved on disk; not active in paper v1)
 - `tau_for_epoch(epoch, total_epochs, tau_init, tau_final)` — monotonic exponential decay with smooth linear hardening in the last fraction of training
 - `reg_schedule(epoch)` — piecewise linear warm-up: [0, W) off, [W, W+A) linear anneal, [W+A, ∞) full
 - `apply_reg_schedule(lambdas, epoch)` — returns copy of lambdas with structural terms scaled by reg_schedule
 - `phase_boundaries(total_epochs)` / `phase_for_epoch(epoch, ...)` / `three_phase_tau(...)` / `three_phase_lambdas(...)` — three-phase schedule infrastructure
+- `four_phase_boundaries(total_epochs)` / `phase_for_epoch_four(...)` / `four_phase_tau(...)` / `four_phase_lambdas(...)` / `four_phase_kd_active(...)` — four-phase schedule infrastructure (B1 cell-commit, B2 readiness-gated prune, teacher distillation)
+- `prune_readiness_check(...)` — readiness-gated prune trigger (AND-logic: ratio, cell prob, gate stability, improvement)
 - `compute_solidification_metrics(net, tau)` — returns dict of mean cell prob, P(Z), gate openness fractions
 - `validate_argmax(net, val_loader, ...)` — validation with τ→0.001 (argmax cell selection) for solidification diagnostics
 - `make_optimizer(net, lr, weight_decay, stage_lr_scale)` — AdamW with optional per-stage geometric LR scaling
@@ -578,7 +764,7 @@ C_eff · dxⱼ/dt = Σ_{e: dst(e)=j} I_e − Σ_{e: src(e)=j} I_e − leakⱼ ·
 | Entropy bonus | `−Σ w·log(w)` of logits/tau (off by default) | 0.0·tau |
 
 ### `train_script.py`
-**Main training entry point** — CLI script supporting `--problem {sinx,housing,smooth2d,smooth2d_grid}`.
+**Main training entry point** — CLI script supporting `--problem {sinx,housing,smooth2d,smooth2d_grid,housing_grid}`.
 
 CLI flags:
 - `--problem`, `--output`, `--epochs`, `--lr`, `--device`
@@ -586,16 +772,20 @@ CLI flags:
 - `--amp` / `--no-amp`, `--compile` / `--no-compile`, `--parallel` / `--no-parallel`
 - `--validate-every`, `--early-stop` / `--no-early-stop`, `--patience`, `--min-delta`
 - `--ablation {none,mapper-only,empty-graph}`, `--variation`
-- `--write-mode {one_to_one,dense,fan_out}`, `--read-mode {sparse,dense}`
+- `--write-mode {one_to_one,dense}`, `--read-mode {sparse,dense}`
+  (fan_out is not a CLI choice — it is set per-preset via `write_fan_out`)
 - `--write-idx`, `--read-idx` (comma-separated)
 - `--prune`, `--retrain` / `--no-retrain`, `--prune-edge-threshold`, `--prune-node-threshold`
 - `--prune-nodes-by-gate` / `--no-prune-nodes-by-gate`
 - `--retrain-epochs`, `--retrain-lr`, `--fresh-init`
 - `--scheduler-type {cosine,warm_restarts}`, `--no-scheduler`
 - `--grad-log`, `--grad-log-every`
-- `--schedule {legacy,three_phase}`, `--no-argmax-val`
+- `--schedule {legacy,three_phase,four_phase}`, `--no-argmax-val`
+- `--grid-size N` (overrides per-problem grid default: smooth2d_grid=7, housing_grid=5)
+- `--cell-mode {soft,ste,auto}` (controls per-epoch cell selection; `auto` uses soft for Phase A, STE for B/C)
+- `--ablation-set {none,reg-only,tau-only,edge-only}` (diagnostic ablation preset for four-phase-redesign)
 
-Outputs per run: `loss_history.txt` (with phase markers for three_phase), `loss_curve.png`, `model.pt`, `config_snapshot.txt`, per-stage graph/selection/trajectory plots, output fit, pipeline diagram, `solidification_metrics.txt` (three_phase), `grad_norms.txt` (when --grad-log enabled), `prune_summary.txt` (when pruning), `model_pruned.pt`.
+Outputs per run: `loss_history.txt` (with phase markers for three_phase/four_phase), `loss_curve.png`, `model.pt`, `config_snapshot.txt`, per-stage graph/selection/trajectory plots, output fit, pipeline diagram, `solidification_metrics.txt` (phased schedules), `grad_norms.txt` (when --grad-log enabled), `prune_summary.txt` (when pruning), `model_pruned.pt`.
 
 ### `visualize.py`
 **Visualization utilities** (lazy-imports matplotlib/networkx).
@@ -609,7 +799,7 @@ Outputs per run: `loss_history.txt` (with phase markers for three_phase), `loss_
 - `plot_network(net)` — full pipeline visualization
 
 ### `gen_network_images.py`
-**Standalone image generator** — Runs all 4 non-solver presets and saves visualizations to `network_visualization/`.
+**Standalone image generator** — Runs all non-solver presets and saves visualizations to `network_visualization/`.
 
 ### `mlp_benchmark.py`
 **MLP baselines** — MLPRegressor(2→H→1) for smooth2d Franke task, benchmark comparison.
@@ -658,6 +848,22 @@ Outputs per run: `loss_history.txt` (with phase markers for three_phase), `loss_
 6. Phase C: retrain compact network with post-prune lambdas.
 ```
 
+### Training step — four-phase schedule
+
+```
+1. Determine phase for epoch (A/B1/B2/C via phase_for_epoch_four).
+2. Clone frozen teacher from best Phase A checkpoint (at A→B1 boundary).
+3. Compute tau via four_phase_tau (phase-dependent annealing).
+4. Compute effective_lambdas via four_phase_lambdas.
+5. Resolve cell_mode: Phase A=soft, B1/B2/C=STE (straight-through estimator).
+6. Forward pass with teacher distillation in B1/B2:
+     L = L_task + lambda_kd * MSE(y_student, y_teacher) + rail + structural
+7. In Phase B2: evaluate readiness check every validate epoch.
+8. On readiness trigger (or B2→C boundary fallback):
+     auto-prune (edge-only, edge_threshold=0.05, no node-gate pruning).
+9. Phase C: retrain compact network with STE cell mode.
+```
+
 ### Input/Output edge filtering
 
 `SparseTopology` includes input/output edges for topology visualization and validation. `topology_to_stage()` **removes** them — only hidden and projection edges enter the ODE core. This means:
@@ -693,9 +899,14 @@ Z index. With 4 cells (L/S/P/Z), this gives equal P=0.25 for each cell
 at init (fix-z-death: was +1.0 bias giving P(Z)≈0.42, which combined with
 tau annealing 1.0→0.1 amplified to ~99.99% Z by end of training).
 
-Gate logits are initialized at +2.0 so `σ(2) ≈ 0.88` with `dσ/dz ≈ 0.10`.
-This gives 88% open gates (strong signal flow) while keeping gate gradients
-14× healthier than `z=5.0` (dσ/dz=0.007).
+Gate logits are initialized at 0.0 so `σ(0) ≈ 0.50` with `dσ/dz ≈ 0.25`.
+This places gates at the **maximum-gradient** point of the sigmoid,
+giving the regularizer maximum sensitivity to push gates open or closed.
+The trade-off (50% open gates vs 88% open at z=2.0) is accepted because
+the prior 88% open was effectively permanent — gates at z=2.0 never
+closed during training (`frac_sigma_z_below_0.1` stayed at 0) because
+the regularizer gradient `λ·σ·(1-σ) ≈ 1e-6` was negligible. With z=0,
+the same regularizer gives `≈ 2.5e-6` and gates can actually respond.
 
 - `raw_mult`: zeros → multiplicity = softplus(0) = ln(2) ≈ 0.69
 - `raw_leak`: −3.0 → leak = softplus(−3) ≈ 0.05
@@ -751,6 +962,7 @@ to avoid over-aggressive updates during warm-start fine-tuning.**
 | Loss | MSE |
 | Train size | 8192 |
 | Write/Read | `write_mode=one_to_one`, `write_idx=[0]`, `read_mode=sparse`, `read_idx=[7]` |
+| Schedule | `schedule=three_phase` (default; override via `--schedule four_phase`) |
 | Special | Lambda override: `{"rail": 1.0}` |
 
 ### `housing` — California housing price regression (appendix-only)
@@ -762,6 +974,7 @@ to avoid over-aggressive updates during warm-start fine-tuning.**
 | Loss | MAE |
 | Train size | ~16.5K |
 | Write/Read | `write_mode=one_to_one`, `write_idx=[0..7]`, `read_mode=sparse`, `read_idx=[15]` |
+| Schedule | `schedule=three_phase` (default; override via `--schedule four_phase`) |
 | Special | Uses `RobustInputMapper` (per-feature log-scale preconditioner) |
 
 ### `smooth2d` — Franke function 2D regression (line topology)
@@ -773,6 +986,7 @@ to avoid over-aggressive updates during warm-start fine-tuning.**
 | Loss | MSE |
 | Train size | 20K (4K val, 4K test, sigma=0.01 noise) |
 | Write/Read | `write_mode=one_to_one`, `write_idx=[0,1]`, `read_mode=sparse`, `read_idx=[9]` (hidden readout) |
+| Schedule | `schedule=three_phase` (default; override via `--schedule four_phase`) |
 | Special | LHS-based sampling for training data. No lambda overrides. |
 
 ### `smooth2d_grid` — Franke 2D regression (3-stage grid topology)
@@ -781,19 +995,21 @@ to avoid over-aggressive updates during warm-start fine-tuning.**
 |---|---|
 | Input | 2D (x, y) in [0, 1]² |
 | Output | 1D (Franke function value, normalized) |
-| Architecture | **3 stages**: each 16 hidden (4×4 grid, 8-neighbor kernel_size=3) + 3 proj (all_to_all). StageTransfer identity (19→19). |
-| Edges/Params | 90 edges/stage (42 hidden + 48 proj), 578 params/stage = 1734 core + 16 I/O = ~1750 total |
+| Architecture | **3 stages**: each 49 hidden (7×7 grid, 8-neighbor kernel_size=3) + 3 proj (all_to_all). StageTransfer identity (52→52). Configurable via `--grid-size N`. |
+| Edges/Params | Per stage: 294 hidden edges + 147 proj edges = 441 edges, 2261 params. 3 stages = 6783 core + I/O = ~6800 total (at 7×7 default). Use `--grid-size 4` for 4×4 topology (90 edges/stage, ~1750 total). |
 | Integration | t_span=5/3 ≈ 1.667 per stage, 17 steps per stage, dt ≈ 0.098 constant |
 | Loss | MSE |
 | Train size | 20K (4K val, 4K test, sigma=0.01 noise) |
-| Write/Read | `write_mode=fan_out`, `write_fan_out={0:[0,4,8], 1:[3,7,11]}` (6 write targets), `read_mode=sparse`, `read_idx=[16,17,18]` (3 proj readout) |
-| Schedule | `schedule=three_phase` (auto-prune at B→C boundary) |
+| Write/Read | `write_mode=fan_out`, `write_fan_out` = left/right column formula (see `make_smooth2d_grid_preset`), `read_mode=sparse`, `read_idx` = center column + proj nodes |
+| Schedule | `schedule=three_phase` (default; override via `--schedule four_phase`) |
 | Lambda override | `{"sparsity": 1e-5, "edge_gate": 5e-6, "node_gate": 1e-5, "power": 1e-5, "capacitance": 1e-6, "rail": 0.1}` (legacy path; three_phase uses schedule phase values) |
-| Special | Fan-out write spreads each input to 3 grid positions (left/right columns). Proj-only read. Structural regularizers zeroed in fit-first phase. Multi-stage helps vanishing gradient. |
+| Special | Fan-out write spreads each input to grid left/right columns. Proj-only read for grids <5; center column + proj for grids ≥5. Configurable grid size via `make_smooth2d_grid_preset(grid_size)` or `--grid-size N` CLI. With `--schedule four_phase`, checkpoints during B1/B2 track `val_argmax` (hard-cell loss) instead of soft validation loss. |
 
-#### Stage topology: 4×4 grid
+#### Stage topology: configurable N×N grid
 
-The 16 hidden nodes are arranged as a 2D grid in row-major order:
+The hidden nodes are arranged as a square grid of size `N × N` in
+row-major order (default N=7, configurable via `--grid-size N`).
+The 4×4 case (N=4) is shown for illustration:
 
 ```
     col 0   col 1   col 2   col 3
@@ -806,73 +1022,111 @@ row 2  [8] --- [9] --- [10] -- [11]
 row 3 [12] --- [13] --- [14] -- [15]
 ```
 
-- **Connectivity:** `kernel_size=3` means each node connects to its 8 immediate neighbors (Chebyshev distance ≤ 1): up, down, left, right, and 4 diagonals. This is shown by the `---` (cardinal) and `\ /` (diagonal) lines in the diagram.
+- **Connectivity:** `kernel_size=3` means each node connects to its 8 immediate neighbors (Chebyshev distance ≤ 1): up, down, left, right, and 4 diagonals.
 - **Single directed edge per pair:** Each undirected neighbor pair emits exactly one directed edge (i→j with j>i). L/S/P cells provide effective bidirectionality via sign-reversal or threshold gating.
-- **42 hidden edges:** Counting unique pairs per node type:
-  - 4 interior nodes (5,6,9,10) × 8 neighbors / 2 = 16
-  - 8 edge nodes (1,2,4,7,8,11,13,14) × 5 neighbors / 2 = 20
-  - 4 corner nodes (0,3,12,15) × 3 neighbors / 2 = 6
-  - Total = 16 + 20 + 6 = **42**
+- **Edge count formula:** For grid size N: interior nodes = (N-2)², edge nodes = 4(N-2), corner nodes = 4. Each interior node has 8/2=4 unique edges, each edge node has 5/2=2.5 (interior-facing edges round down bidirectionally), each corner has 3/2=1.5. Exact count: `2N(N-1)` unique hidden-to-hidden pairs → `2N(N-1)` directed edges. For N=7: 84 hidden edges. For N=4: 42 hidden edges.
 
 #### Projection nodes
 
-3 projection nodes are appended after the 16 hidden nodes, indices 16, 17, 18. Each proj node connects to ALL 16 hidden nodes bidirectionally (`proj_pattern=all_to_all`), yielding 16 × 3 = **48 projection edges**. The total state vector per stage is 16 (hidden) + 3 (proj) = **19 nodes** with **90 edges**.
+3 projection nodes are appended after the N² hidden nodes. Each proj
+node connects to ALL N² hidden nodes bidirectionally
+(`proj_pattern=all_to_all`), yielding `N² × 3` projection edges.
+The total state vector per stage is `N² + 3` nodes.
+- For N=7 (default): 49 hidden + 3 proj = 52 nodes, 84 + 147 = 441 edges.
+- For N=4: 16 hidden + 3 proj = 19 nodes, 42 + 48 = 90 edges.
 
 #### Multi-stage design (vanishing gradient mitigation)
 
-Three independent stages, each with the same 19-node / 90-edge topology but **untied weights** (separate learnable parameters per stage). The total t_span=5 and num_steps=50 are split equally:
+N_stages independent stages (default 3), each with the same N²+3-node /
+2N(N-1)+3N²-edge topology but **untied weights** (separate learnable
+parameters per stage). The total t_span=5 and num_steps=50 are split
+equally:
 
-- Per-stage t_span = 5/3 ≈ 1.667
-- Per-stage num_steps = round(50/3) = 17
-- dt = 1.667 / 17 ≈ 0.098 (constant across stages)
+- Per-stage t_span = 5 / N_stages
+- Per-stage num_steps = round(50 / N_stages)
+- dt = (t_span / num_steps) per stage (constant across stages)
 
-The StageTransfer between stages is **identity (19→19)** — no width change. The three non-identity transfers would only activate if pruning changed a stage's node count.
+The StageTransfer between stages is **identity** — no width change
+unless pruning modified a stage's node count.
 
-Why 3 stages instead of 1? The backward pass through a single ODE stage with 50 steps produces gradients that vanish exponentially with depth. Splitting into 3 stages of 17 steps each makes each per-stage backward pass **3× shallower**, preserving gradient flow to early-stage parameters. Gradient norms per stage are logged separately in `grad_norms.txt` (`stage0_logits`, `stage1_logits`, etc.) to monitor this.
+Why multiple stages instead of 1? The backward pass through a single ODE
+stage with 50 steps produces gradients that vanish exponentially with
+depth. Splitting into N stages makes each per-stage backward pass
+N× shallower, preserving gradient flow to early-stage parameters.
+
+Gradient norms per stage are logged separately in `grad_norms.txt`
+(`stage0_logits`, `stage1_logits`, etc.) to monitor this.
 
 #### Fan-out write mapping
 
-Each 2D input (x, y) writes to 3 hidden nodes along the left and right columns of the 4×4 grid:
+Each 2D input (x, y) writes to hidden nodes along the left and right
+columns of the grid, using the `FanOutInputMapper`. The fan-out pattern
+is computed dynamically by `make_smooth2d_grid_preset()`:
 
-```
-Input 0 (x) → left column, rows 0,1,2 → hidden nodes [0, 4, 8]
-Input 1 (y) → right column, rows 0,1,2 → hidden nodes [3, 7, 11]
-```
+- For grid_size ≥ 5: every other row (rows 0,2,4,...).
+- For grid_size < 5: consecutive rows (0..height-2).
 
-This gives 6 target positions, each with its own learnable (gain, bias) pair via `FanOutInputMapper` (12 I/O mapper parameters total). The bottom row (row 3, nodes 12,13,14,15) receives no direct write — it must be activated by grid propagation.
+Example (grid_size=4): Input 0 (x) → left column rows 0,1,2 → [0,4,8];
+Input 1 (y) → right column rows 0,1,2 → [3,7,11]. 6 write targets,
+each with learnable (gain, bias) pair = 12 I/O params.
+
+Example (grid_size=7, default): Input 0 (x) → left column rows 0,2,4 → [0,14,28];
+Input 1 (y) → right column rows 0,2,4 → [6,20,34]. 6 write targets = 12 I/O params.
 
 #### Proj-only readout (degree-of-separation)
 
-The output is read from the 3 projection nodes (indices 16, 17, 18 in the full 19-node state vector). Readout is a single Linear(3→1) = 4 parameters.
+The output is read from the 3 projection nodes. For grid_size ≥ 5,
+the center-column hidden nodes are ALSO included in read_idx (they are
+>1 hop from write columns and pass the degree-of-separation check).
 
-Why projection nodes instead of hidden? The KirchhoffNet topology validation (`validate_topology_degrees`) enforces that every (write, read) node pair must be **≥2 hops apart** on the core graph — otherwise the input can bypass capacitor dynamics and directly drive the output. With a 4×4 grid and 8-neighbor connectivity, every hidden node is within 1 hop of both write columns (left column at [0,4,8] and right column at [3,7,11]), making hidden-node readout impossible. Projection nodes are explicitly exempt from this check (they are the intended global readout tap).
+Readout is a single Linear(len(read_idx)→1).
+
+Why projection nodes instead of hidden? The KirchhoffNet topology
+validation (`validate_topology_degrees`) enforces that every (write,
+read) node pair must be **≥2 hops apart** on the core graph — otherwise
+the input can bypass capacitor dynamics and directly drive the output.
+Projection nodes are explicitly exempt from this check (they are the
+intended global readout tap).
 
 #### Parameter count breakdown
 
-Per stage (19 nodes, 90 edges, 4 cell types L/S/P/Z):
+Per stage (N=7 default: 52 nodes, 441 edges, 4 cell types L/S/P/Z):
 
-| Parameter group | Shape | Count |
-|----------------|-------|-------|
-| `logits` | [90, 4] | 360 |
-| `raw_mult` | [90] | 90 |
-| `raw_leak` | [19] | 19 |
-| `z_logits` | [90] | 90 |
-| `u_logits` | [19] | 19 |
-| **Per-stage total** | | **578** |
+| Parameter group | Shape (N=7) | Count (N=7) | Shape (N=4) | Count (N=4) |
+|----------------|---------|-----------|---------|-----------|
+| `logits` | [441, 4] | 1764 | [90, 4] | 360 |
+| `raw_mult` | [441] | 441 | [90] | 90 |
+| `raw_leak` | [52] | 52 | [19] | 19 |
+| `z_logits` | [441] | 441 | [90] | 90 |
+| `u_logits` | [52] | 52 | [19] | 19 |
+| **Per-stage total** | | **2,750** | | **578** |
 
-Full network (3 stages + I/O):
+Full network at N=7 (3 stages + I/O):
 
-| Component | Count |
-|-----------|-------|
-| 3 × stage parameters | 1,734 |
-| FanOutInputMapper (6 × gain + 6 × bias) | 12 |
-| OutputMapper Linear(3→1) | 4 |
-| 2 × StageTransfer (no params) | 0 |
-| **Grand total** | **1,750** |
+| Component | Count (N=7) | Count (N=4) |
+|-----------|-----------|-----------|
+| 3 × stage parameters | 8,250 | 1,734 |
+| FanOutInputMapper | 12 | 12 |
+| OutputMapper (3 or 10 read-in) | 4–11 | 4 |
+| 2 × StageTransfer (no params) | 0 | 0 |
+| **Grand total** | **8,266** | **1,750** |
 
 #### Lambda overrides and Phase B interaction
 
 The per-preset lambda override provides default values for the `--schedule legacy` code path. Under `--schedule three_phase` (the default for this preset), these values are **replaced** by the schedule's phase-aware lambdas (see §2.9). The Phase B lambdas are more aggressive: `sparsity=5e-5` vs the preset's `1e-5`, `edge_gate=1e-5` vs `5e-6`. This separation exists because the legacy path needs gentle regularization during a single training phase, while the three-phase schedule can apply stronger regularization in Phase B (compress) without hurting Phase A (fit).
+
+### `housing_grid` — California housing (3-stage grid topology)
+
+| | |
+|---|---|
+| Input | 8D (min-max scaled to [0, 1] per feature) |
+| Output | 1D (price, standardized) |
+| Architecture | **3 stages**: each 25 hidden (5×5 grid, kernel_size=3) + 3 proj. StageTransfer identity (28→28). Configurable via `--grid-size N`. |
+| Loss | Huber (delta=1.0) |
+| Train size | ~13.2K (80/20 split) |
+| Write/Read | `write_mode=dense`, `read_idx` = center column + proj nodes |
+| Schedule | `schedule=three_phase` (default; override via `--schedule four_phase`) |
+| Special | Dense write (all-to-all) since housing features have no spatial structure. Read from center-column hidden nodes + proj (3–8 read positions depending on grid size). Validation logs MAE/RMSE in original units (USD × 100k). With `--schedule four_phase`, checkpoints during B1/B2 track `val_argmax` (hard-cell loss) instead of soft validation loss. |
 
 ### Removed presets (R4.2, R4.3)
 - `xor` — removed from active PRESETS (weak analog motivation).
@@ -902,7 +1156,7 @@ PHYS = {"x_max": 3.0, "C_eff": 1.0,
 
 # Training (RR-A: reg_warmup_epochs=100 for longer free phase;
 #              lr auto-scaled: BASE_LR=3e-4 * batch_size/1024 = 6e-4 at 2048)
-#              scheduler_T_0 was 80 before multistage-smooth2d-grid, now 50)
+#              scheduler_T_0 is 50)
 OPTIM = {"lr": 6e-4, "weight_decay": 1e-4, "grad_clip_norm": 5.0,
          "epochs": 800, "batch_size": 2048,
          "reg_warmup_epochs": 100, "reg_anneal_epochs": 50,
@@ -921,32 +1175,55 @@ LAMBDAS = {"sparsity": 1e-3, "rail": 1.0,
            "entropy": 0.0}
 
 # Pruning thresholds (post-x_max=3.0 regime: 0.1/0.05, was 0.01/0.01)
+# Note: SCHEDULE_THREE_PHASE overrides these for --schedule three_phase.
 PRUNE = {"edge_threshold": 0.1, "node_threshold": 0.05,
          "prune_nodes_by_gate": True}
 
 # Three-phase schedule (fit 30% / compress 40% / retrain 30%)
-# warmup_frac_b was 1.0/6.0 before three-phase-schedule fine-tuning; now 1.0/2.0
-# lambdas_b sparsity/edge_gate were 1e-4/5e-5 before schedule tuning; now 5e-5/1e-5
+# four-phase-redesign/1a: node_gate in lambdas_b -> 0.0 (removed);
+#   prune_edge_threshold 0.1 -> 0.05 (gentler cut);
+#   prune_nodes_by_gate True -> False (edge-only pruning).
 SCHEDULE_THREE_PHASE = {"frac_a": 0.30, "frac_b": 0.40, "frac_c": 0.30,
                         "tau_a": 1.0, "tau_b_init": 1.0, "tau_b_final": 0.6,
                         "tau_c_init": 0.6, "tau_c_final": 0.1,
                         "warmup_frac_b": 1.0/2.0,
                         "lambdas_b": {"sparsity": 5e-5, "edge_gate": 1e-5,
-                                      "node_gate": 1e-5, "power": 1e-5,
+                                      "node_gate": 0.0, "power": 1e-5,
                                       "capacitance": 1e-6},
-                        "lambdas_c": {"sparsity": 1e-5, "edge_gate": 0.0,
-                                      "node_gate": 0.0, "power": 0.0,
-                                      "capacitance": 0.0},
-                        "prune_edge_threshold": 0.1,
+                        "lambdas_c": {"sparsity": 1e-5},
+                        "prune_edge_threshold": 0.05,
                         "prune_node_threshold": 0.05,
-                        "prune_nodes_by_gate": True}
+                        "prune_nodes_by_gate": False}
+
+# Four-phase schedule (four-phase-redesign plan).
+# Splits three-phase Phase B into B1 (cell commitment, no pruning) and
+# B2 (edge pruning, readiness-gated). Adds teacher distillation and
+# STE cell mode.
+SCHEDULE_FOUR_PHASE = {"frac_a": 0.25, "frac_b1": 0.20, "frac_b2": 0.25, "frac_c": 0.30,
+                       "tau_a": 1.0, "tau_b1_init": 1.0, "tau_b1_final": 0.6,
+                       "tau_b2_init": 0.6, "tau_b2_final": 0.4,
+                       "tau_c_init": 0.4, "tau_c_final": 0.1,
+                       "warmup_frac_b1": 0.25, "warmup_frac_b2": 0.25,
+                       "lambdas_b1": {"sparsity": 5e-5},
+                       "lambdas_b2": {"sparsity": 5e-5, "edge_gate": 1e-5},
+                       "lambdas_c": {"sparsity": 1e-5},
+                       "lambda_kd": 1.0,
+                       "readiness_ratio_max": 1.2,
+                       "readiness_prob_min": 0.85,
+                       "readiness_stability_max": 0.02,
+                       "readiness_improvement_min": 1e-4,
+                       "readiness_window": 10,
+                       "prune_edge_threshold": 0.05,
+                       "prune_node_threshold": 0.05,
+                       "prune_nodes_by_gate": False}
 
 # Integration defaults
 SOLVER = {"method": "heun", "t_span": 5, "num_steps": 50}
 
-# Parameter initialization (fix-z-death: equal cell probability, healthy gate gradients)
+# Parameter initialization (four-phase-redesign: equal cell probability,
+# max-gradient gate init)
 INIT = {"logits_z_bias": 0.0, "raw_mult_init": 0.0, "raw_leak_init": -3.0,
-        "gain_scale": 1.0, "z_logit_init": 2.0, "u_logit_init": 2.0}
+        "gain_scale": 1.0, "z_logit_init": 0.0, "u_logit_init": 0.0}
 
 # Variation injection (R6.3: off by default at training time; temp_c deprecated)
 VARIATION = {"temp_c_default": 27.0, "temp_c_choices": [0.0, 27.0, 75.0],
@@ -985,7 +1262,7 @@ Convergence diagnostic: captures ODE state snapshots during integration and plot
 
 ### Smoke test (`test_smoke.py`)
 
-**572 total test checks** (116 test functions; 572 pass + 0 failures) covering the full pipeline:
+**634 total test checks** (118 test functions; 0 failures) covering the full pipeline:
 R1-R7, RR-A through RR-D reviewer-residual cleanup, CP-1 through CP-5
 complexity pruning, smooth2d and smooth2d_grid presets (including
 three-phase schedule, fan-out write), MLP benchmark comparison,
@@ -1044,7 +1321,7 @@ Coverage:
 | 50 | Tau backward compat | tau_for_epoch with no overrides uses config defaults |
 | 51 | Preset lambda overrides | RR-D: per-preset lambdas merge correctly over global LAMBDAS |
 | 52 | Z-bias eliminated | fix-z-death: INIT['logits_z_bias'] == 0.0, P(Z)=0.25, equal cell prob |
-| 53 | Gate initialization | z_logit_init=2.0, u_logit_init=2.0 → σ≈0.88, dσ/dz≈0.10 |
+| 53 | Gate initialization | z_logit_init=0.0, u_logit_init=0.0 → σ=0.50, dσ/dz=0.25 (max-gradient) |
 | 54 | Gates applied in rhs | Closed vs open gates produce different RHS output |
 | 55 | Per-component regularizers | edge_gate, node_gate, power, capacitance all finite, go to 0 when gates closed |
 | 56 | prune_stage | Removes low-gate edges/nodes, returns DifferentialStage without gating |
@@ -1071,6 +1348,11 @@ Coverage:
 | 121-123 | Loss history | Phase markers, retrain appended, format correct |
 | 124-126 | Gradient logging | --grad-log CLI, collect_gradient_norms, file output |
 | 127 | Three-phase (TP-1–9) | phase_boundaries, phase_for_epoch, three_phase_tau, three_phase_lambdas, solidification metrics, argmax validation, schedule file markers |
+| 128 | housing_grid preset | Topology, forward shape, sparse I/O defaults, Huber loss |
+| 129 | housing_grid data | Huber loss delta, inverse stats, original-unit validation |
+| 130 | Stage LR scaling | backward compat, multi-group, scheduler compat |
+| 131 | Rail loss ReLU² | Zero inside bounds, positive outside bounds |
+| 132 | Retrain LR scale | Defaults to 1.0 |
 
 **Pre-existing failures (0):**
 All checks pass after test expectations were updated to match batch-size-aware
@@ -1085,7 +1367,7 @@ edge_gate=5e-6 for smooth2d_grid legacy path), and schedule config values
 ```
 kirchhoff_redesign/ideal/
 ├── __init__.py                    # Package docstring
-├── config.py                      # All tunable constants + presets (L/S/P/Z, three-phase schedule)
+├── config.py                      # All tunable constants + presets (L/S/P/Z, three-phase and four-phase schedules)
 ├── cell_library.py                # IdealizedCellLibrary (L/S/P/Z tanh + rectifier surrogates)
 ├── topology.py                    # Graph primitives, builder, stage conversion, pruning (joint Z+gate)
 ├── differential_stage.py          # DifferentialStage (COO graph + Heun ODE + gates + compile)
@@ -1093,11 +1375,14 @@ kirchhoff_redesign/ideal/
 ├── stage_transfer.py              # StageTransfer (truncation/zero-padding)
 ├── io_mapper.py                   # InputMapper, RobustInputMapper, SparseInputMapper, FanOutInputMapper, OutputMapper
 ├── kirchhoff_net.py               # KirchhoffNet, KirchhoffNetWithIO
-├── train.py                       # Loss, regularizers (4 decomposed CP terms), tau annealing, three-phase schedule,
-│                                  #   solidification metrics, argmax validation, stage-LR scaling, training loop
-├── train_script.py                # CLI training entry point (4 problems; prune/retrain; three-phase; AMP/compile/DP)
-├── test_smoke.py                  # ~572-test smoke suite (116 test functions; P cell, gates, pruning, three-phase,
-│                                  #   smooth2d/smooth2d_grid, fan-out write, MLP benchmark, gradient logging)
+├── train.py                       # Loss, regularizers (4 decomposed CP terms), tau annealing, three-phase + four-phase
+│                                  #   schedules, solidification metrics, argmax validation, readiness-based prune
+│                                  #   trigger, teacher distillation, stage-LR scaling, training loop
+├── train_script.py                # CLI training entry point (5 problems; prune/retrain; three-phase + four-phase;
+│                                  #   grid-size CLI; ablation-set; cell-mode; AMP/compile/DP)
+├── test_smoke.py                  # 634-test smoke suite (118 test functions; P cell, gates, pruning, three-phase,
+│                                  #   four-phase, smooth2d/smooth2d_grid, housing_grid, fan-out write, MLP benchmark,
+│                                  #   gradient logging, stage-LR scaling, rail-loss, ablation-set CLI)
 ├── mlp_benchmark.py               # MLPRegressor baseline for smooth2d Franke task
 ├── visualize.py                   # Matplotlib/networkx visualization utilities
 ├── gen_network_images.py          # Generate network viz images for all presets

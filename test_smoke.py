@@ -2456,6 +2456,16 @@ def main():
     test_log_solidification_format()
     test_smooth2d_grid_uses_three_phase()
 
+    # Mapper LR control tests (mapper-lr-control plan, spec order)
+    test_mapper_lr_scale_separate_group()        # MLR-1: mapper-only group
+    test_mapper_lr_scale_combined_with_stage_lr_scale()  # MLR-2: stage+ mapper together
+    test_mapper_lr_scale_backward_compat()        # MLR-3: backward compat
+    test_freeze_mappers_cli_flag_parsed()         # MLR-4: freeze flag
+    test_mapper_lr_scale_cli_flag_parsed()        # MLR-5: mapper-lr-scale flag
+    test_mapper_lr_scale_rejects_zero_or_negative()  # MLR-6: validation
+    test_mapper_unfreeze_epoch_midpoint()         # MLR-7: midpoint
+    test_freeze_mappers_requires_grad_toggle()    # MLR-8: requires_grad toggle
+
     print()
     print("=" * 60)
     print(f"Smoke test results: {passed} passed, {failed} failed")
@@ -2679,6 +2689,23 @@ def test_smooth2d_grid_preset():
     check("smooth2d_grid: 1-batch loss is finite", math.isfinite(avg_loss),
           f"loss={avg_loss:.6f}")
     print(f"  [INFO] smooth2d_grid 1-batch loss: {avg_loss:.6f}")
+
+    # Override test: explicit write_mode="dense" should produce InputMapper.
+    from io_mapper import InputMapper, FanOutInputMapper
+    net_dense = build_net_from_preset(
+        "smooth2d_grid", cell_lib=make_default_library(), write_mode="dense",
+    )
+    check("smooth2d_grid: write_mode='dense' override produces InputMapper",
+          isinstance(net_dense.input_mapper, InputMapper)
+          and type(net_dense.input_mapper) is InputMapper,
+          f"got {type(net_dense.input_mapper).__name__}")
+    # Default (no override) produces FanOutInputMapper.
+    net_fanout = build_net_from_preset(
+        "smooth2d_grid", cell_lib=make_default_library(),
+    )
+    check("smooth2d_grid: default (no write_mode) produces FanOutInputMapper",
+          isinstance(net_fanout.input_mapper, FanOutInputMapper),
+          f"got {type(net_fanout.input_mapper).__name__}")
 
 
 def test_housing_grid_preset():
@@ -3454,7 +3481,7 @@ def test_stage_lr_scale_multi_group():
     check("SLS-2: at least 1 param group",
           len(group_lrs) >= 1, f"got {len(group_lrs)} groups")
 
-    # For KirchhoffNetWithIO we expect N_stages + 1 groups (stage + other).
+    # For KirchhoffNetWithIO we expect N_stages + 1 groups (stages + mapper).
     # Build the full expected LR list: stage groups + base LR for other.
     expected_stage_lrs = [
         base_lr * (scale ** (n_stages - 1 - i))
@@ -3770,6 +3797,236 @@ def test_smooth2d_grid_uses_three_phase():
           f"got {cfg.get('schedule')!r}")
     check("TP-9: tau_anneal is True",
           cfg.get("tau_anneal") is True)  # three_phase uses its own tau; tau_anneal acts as gate
+
+
+# ---- Mapper LR control tests (mapper-lr-control plan) ----
+
+def test_mapper_lr_scale_backward_compat():
+    """MLR-3: mapper_lr_scale=1.0 preserves single-group optimizer (backward compat)."""
+    print("\nTest MLR-3: mapper_lr_scale=1.0 backward compatibility")
+    from train import make_optimizer
+    from topology import build_net_from_preset
+    from cell_library import make_default_library
+
+    cell_lib = make_default_library()
+    net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
+    optim = make_optimizer(net, lr=1e-3, stage_lr_scale=1.0, mapper_lr_scale=1.0)
+    check("MLR-3: single param group when both scales=1.0",
+          len(optim.param_groups) == 1,
+          f"got {len(optim.param_groups)} groups")
+
+
+def test_mapper_lr_scale_separate_group():
+    """MLR-1: mapper_lr_scale<1.0 creates a separate param group for mappers at scaled LR."""
+    print("\nTest MLR-1: mapper_lr_scale=0.1 creates separate mapper group")
+    from train import make_optimizer
+    from topology import build_net_from_preset
+    from cell_library import make_default_library
+
+    cell_lib = make_default_library()
+    net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
+    base_lr = 1e-3
+    mapper_scale = 0.1
+    optim = make_optimizer(net, lr=base_lr, stage_lr_scale=1.0, mapper_lr_scale=mapper_scale)
+
+    check("MLR-1: 2 param groups (core + mapper)",
+          len(optim.param_groups) == 2,
+          f"got {len(optim.param_groups)} groups")
+
+    group_lrs = sorted([g["lr"] for g in optim.param_groups])
+    expected_lrs = sorted([base_lr, base_lr * mapper_scale])
+    check("MLR-1: correct LRs in groups",
+          all(abs(g - e) < 1e-12 for g, e in zip(group_lrs, expected_lrs)),
+          f"expected {expected_lrs}, got {group_lrs}")
+
+    # Verify mapper group actually contains mapper params.
+    mapper_group = next(
+        g for g in optim.param_groups
+        if abs(g["lr"] - base_lr * mapper_scale) < 1e-12
+    )
+    mapper_param_names = []
+    for p in mapper_group["params"]:
+        for n, pp in net.named_parameters():
+            if pp is p:
+                mapper_param_names.append(n)
+                break
+    check("MLR-1: mapper group contains only input_mapper/output_mapper params",
+          all("input_mapper" in n or "output_mapper" in n for n in mapper_param_names)
+          and len(mapper_param_names) > 0,
+          f"got {mapper_param_names}")
+
+
+def test_mapper_lr_scale_combined_with_stage_lr_scale():
+    """MLR-2: mapper_lr_scale + stage_lr_scale both active creates per-stage + mapper groups."""
+    print("\nTest MLR-2: both stage_lr_scale and mapper_lr_scale active")
+    from train import make_optimizer
+    from topology import build_net_from_preset
+    from cell_library import make_default_library
+
+    cell_lib = make_default_library()
+    net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
+    base_lr = 1e-3
+    stage_scale = 10.0
+    mapper_scale = 0.1
+    optim = make_optimizer(
+        net, lr=base_lr,
+        stage_lr_scale=stage_scale,
+        mapper_lr_scale=mapper_scale,
+    )
+
+    n_stages = len(net.core.stages)
+    group_lrs = sorted([g["lr"] for g in optim.param_groups])
+    expected_stage_lrs = [
+        base_lr * (stage_scale ** (n_stages - 1 - i))
+        for i in range(n_stages)
+    ]
+    # For smooth2d_grid (KirchhoffNetWithIO), all non-stage non-mapper params
+    # are absent or empty, so we get N_stages + 1 groups (stages + mapper).
+    expected_lrs = sorted(expected_stage_lrs + [base_lr * mapper_scale])
+    check("MLR-2: N_stages + 1 groups (stages + mapper)",
+          len(group_lrs) == n_stages + 1,
+          f"got {len(group_lrs)} groups: {group_lrs}, expected {n_stages + 1}")
+    check("MLR-2: correct LRs across all groups",
+          all(abs(g - e) < 1e-12 for g, e in zip(group_lrs, expected_lrs)),
+          f"expected {expected_lrs}, got {group_lrs}")
+
+
+def test_mapper_lr_scale_rejects_zero_or_negative():
+    """MLR-6: mapper_lr_scale <= 0 raises ValueError."""
+    print("\nTest MLR-6: mapper_lr_scale validation")
+    from train import make_optimizer
+    from topology import build_net_from_preset
+    from cell_library import make_default_library
+
+    cell_lib = make_default_library()
+    net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
+    try:
+        make_optimizer(net, lr=1e-3, mapper_lr_scale=0.0)
+        raised = False
+    except ValueError:
+        raised = True
+    check("MLR-6: mapper_lr_scale=0.0 raises ValueError", raised)
+
+    try:
+        make_optimizer(net, lr=1e-3, mapper_lr_scale=-0.1)
+        raised = False
+    except ValueError:
+        raised = True
+    check("MLR-6: mapper_lr_scale=-0.1 raises ValueError", raised)
+
+
+def test_freeze_mappers_cli_flag_parsed():
+    """MLR-4: --freeze-mappers CLI flag is parsed correctly."""
+    print("\nTest MLR-4: --freeze-mappers CLI flag")
+    import subprocess
+    import sys
+    script = (
+        "import sys; sys.path.insert(0, '.'); "
+        "from train_script import _add_argparse_args; "
+        "import argparse; "
+        "p = argparse.ArgumentParser(); "
+        "_add_argparse_args(p); "
+        "args = p.parse_args(['--problem', 'sinx']); "
+        "print('freeze_mappers_default:', args.freeze_mappers); "
+        "args2 = p.parse_args(['--problem', 'sinx', '--freeze-mappers']); "
+        "print('freeze_mappers_set:', args2.freeze_mappers)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd="kirchhoff_redesign/ideal",
+        capture_output=True, text=True, timeout=60,
+    )
+    check("MLR-4: subprocess returns 0", result.returncode == 0,
+          f"stderr: {result.stderr}")
+    check("MLR-4: default freeze_mappers is False",
+          "freeze_mappers_default: False" in result.stdout,
+          f"stdout: {result.stdout}")
+    check("MLR-4: --freeze-mappers sets flag to True",
+          "freeze_mappers_set: True" in result.stdout,
+          f"stdout: {result.stdout}")
+
+
+def test_mapper_lr_scale_cli_flag_parsed():
+    """MLR-5: --mapper-lr-scale CLI flag is parsed correctly."""
+    print("\nTest MLR-5: --mapper-lr-scale CLI flag")
+    import subprocess
+    import sys
+    script = (
+        "import sys; sys.path.insert(0, '.'); "
+        "from train_script import _add_argparse_args; "
+        "import argparse; "
+        "p = argparse.ArgumentParser(); "
+        "_add_argparse_args(p); "
+        "args = p.parse_args(['--problem', 'sinx']); "
+        "print('default:', args.mapper_lr_scale); "
+        "args2 = p.parse_args(['--problem', 'sinx', '--mapper-lr-scale', '0.1']); "
+        "print('set:', args2.mapper_lr_scale)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd="kirchhoff_redesign/ideal",
+        capture_output=True, text=True, timeout=60,
+    )
+    check("MLR-5: subprocess returns 0", result.returncode == 0,
+          f"stderr: {result.stderr}")
+    check("MLR-5: default mapper_lr_scale is 1.0",
+          "default: 1.0" in result.stdout,
+          f"stdout: {result.stdout}")
+    check("MLR-5: --mapper-lr-scale 0.1 parsed",
+          "set: 0.1" in result.stdout,
+          f"stdout: {result.stdout}")
+
+
+def test_mapper_unfreeze_epoch_midpoint():
+    """MLR-7: mapper_unfreeze_epoch = fp_a_end + (fp_b2_end - fp_a_end) // 2."""
+    print("\nTest MLR-7: mapper unfreeze epoch = midpoint of B1+B2")
+    from train import four_phase_boundaries
+
+    for total in [120, 240, 400]:
+        a_end, b1_end, b2_end, _ = four_phase_boundaries(total)
+        midpoint = a_end + (b2_end - a_end) // 2
+        # Verify it's strictly between a_end and b2_end, closer to a_end
+        # (since integer division truncates).
+        check(f"MLR-7: midpoint in (a_end, b2_end) for {total} epochs",
+              a_end < midpoint < b2_end,
+              f"a_end={a_end}, b2_end={b2_end}, midpoint={midpoint}")
+        # Verify it's the floor of the arithmetic mean.
+        arithmetic_mean = (a_end + b2_end) / 2
+        check(f"MLR-7: midpoint == floor(mean) for {total} epochs",
+              midpoint == int(arithmetic_mean),
+              f"midpoint={midpoint}, floor(mean)={int(arithmetic_mean)}")
+
+
+def test_freeze_mappers_requires_grad_toggle():
+    """MLR-8: requires_grad_(False) on input/output_mapper, then (True), works as expected."""
+    print("\nTest MLR-8: requires_grad toggle on mappers")
+    from topology import build_net_from_preset
+    from cell_library import make_default_library
+
+    cell_lib = make_default_library()
+    net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
+    raw = net.module if hasattr(net, "module") else net
+
+    in_p = list(raw.input_mapper.parameters())
+    out_p = list(raw.output_mapper.parameters())
+    check("MLR-8: input_mapper has params", len(in_p) > 0)
+    check("MLR-8: output_mapper has params", len(out_p) > 0)
+
+    raw.input_mapper.requires_grad_(False)
+    raw.output_mapper.requires_grad_(False)
+    in_all_false = all(not p.requires_grad for p in in_p)
+    out_all_false = all(not p.requires_grad for p in out_p)
+    check("MLR-8: all mapper params have requires_grad=False after freeze",
+          in_all_false and out_all_false,
+          f"in_all_false={in_all_false}, out_all_false={out_all_false}")
+
+    raw.input_mapper.requires_grad_(True)
+    raw.output_mapper.requires_grad_(True)
+    in_all_true = all(p.requires_grad for p in in_p)
+    out_all_true = all(p.requires_grad for p in out_p)
+    check("MLR-8: all mapper params have requires_grad=True after unfreeze",
+          in_all_true and out_all_true,
+          f"in_all_true={in_all_true}, out_all_true={out_all_true}")
 
 
 if __name__ == "__main__":

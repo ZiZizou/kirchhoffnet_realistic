@@ -871,39 +871,32 @@ def topology_to_stage(
 
 # ---------- factory: config -> network ----------
 
-_DEFAULT_WRITE_MODE = "one_to_one"
-_DEFAULT_READ_MODE = "sparse"
-
-
 def build_net_from_preset(
     preset_name: str,
     cell_lib: IdealizedCellLibrary,
-    write_mode: str = _DEFAULT_WRITE_MODE,
-    read_mode: str = _DEFAULT_READ_MODE,
+    write_mode: str | None = None,
+    read_mode: str | None = None,
     write_idx: list[int] | None = None,
     read_idx: list[int] | None = None,
 ):
     """Build a full KirchhoffNetWithIO from a config.PRESETS entry.
 
-    write_mode: "one_to_one" (default) | "dense" | "fan_out"
-    read_mode:  "sparse" (default) | "dense"
-    write_idx / read_idx: optional explicit index lists. When None, the
-        values from the preset config are used (sparse mode) or a
-        default dense mapping (dense mode). For write_mode="fan_out",
-        the preset must supply a 'write_fan_out' dict mapping input
-        index → list of target hidden-node indices.
+    Resolution precedence: explicit value > preset value > hardcoded default.
 
-    If the preset specifies its own 'write_mode' (e.g. 'fan_out'), the
-    caller's write_mode is only honored when it differs from the
-    default — i.e. an explicit override beats the preset's choice.
+    * write_mode:  "one_to_one" | "dense" | "fan_out".  When ``None``
+                   (default), use the preset's ``write_mode`` if present,
+                   else ``"one_to_one"``.
+    * read_mode:   "sparse" | "dense".  When ``None`` (default), use the
+                   preset's ``read_mode`` if present, else ``"sparse"``.
+    * write_idx / read_idx: explicit index lists override preset values.
     """
     if preset_name not in PRESETS:
         raise KeyError(f"Unknown preset: {preset_name!r}. Available: {list(PRESETS)}")
     cfg = dict(PRESETS[preset_name])
-    preset_write_mode = cfg.get("write_mode", _DEFAULT_WRITE_MODE)
-    if write_mode != _DEFAULT_WRITE_MODE or preset_write_mode == _DEFAULT_WRITE_MODE:
+    if write_mode is not None:
         cfg["write_mode"] = write_mode
-    cfg["read_mode"] = read_mode
+    if read_mode is not None:
+        cfg["read_mode"] = read_mode
     if write_idx is not None:
         cfg["write_idx"] = list(write_idx)
     if read_idx is not None:

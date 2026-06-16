@@ -1139,6 +1139,7 @@ def make_optimizer(
     lr: float | None = None,
     weight_decay: float | None = None,
     stage_lr_scale: float = 1.0,
+    mapper_lr_scale: float = 1.0,
 ):
     """Build the AdamW optimizer.
 
@@ -1158,6 +1159,12 @@ def make_optimizer(
 
             Example with ``stage_lr_scale=10`` and 3 stages:
               stage 0 → lr × 100, stage 1 → lr × 10, stage 2 → lr × 1
+        mapper_lr_scale: Multiplier on base LR for the I/O mapper parameter
+            group (input_mapper + output_mapper). When ``1.0`` (default) and
+            ``stage_lr_scale == 1.0``, falls back to a single param group.
+            When ``<1.0``, mappers learn more slowly — useful when mapper
+            gradient norms dominate core by ~300×. Composes with
+            ``stage_lr_scale`` so both controls can be active simultaneously.
     """
     if lr is None:
         lr = OPTIM["lr"]
@@ -1167,12 +1174,17 @@ def make_optimizer(
         raise ValueError(
             f"stage_lr_scale must be positive, got {stage_lr_scale}"
         )
+    if mapper_lr_scale <= 0.0:
+        raise ValueError(
+            f"mapper_lr_scale must be positive, got {mapper_lr_scale}"
+        )
 
-    if stage_lr_scale == 1.0:
+    if stage_lr_scale == 1.0 and mapper_lr_scale == 1.0:
         return torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=weight_decay)
 
     raw = net.module if isinstance(net, torch.nn.DataParallel) else net
     stage_params: dict[int, list[torch.nn.Parameter]] = {}
+    mapper_params: list[torch.nn.Parameter] = []
     other_params: list[torch.nn.Parameter] = []
 
     core = getattr(raw, "core", raw)
@@ -1193,15 +1205,26 @@ def make_optimizer(
                 other_params.append(p)
                 continue
             stage_params.setdefault(idx, []).append(p)
+        elif "input_mapper" in name or "output_mapper" in name:
+            mapper_params.append(p)
         else:
             other_params.append(p)
 
     groups: list[dict] = []
-    for i in sorted(stage_params.keys()):
-        stage_lr = lr * (stage_lr_scale ** (num_stages - 1 - i))
-        groups.append({"params": stage_params[i], "lr": stage_lr})
-    if other_params:
-        groups.append({"params": other_params, "lr": lr})
+    if stage_lr_scale == 1.0:
+        core_params = other_params
+        for stage_list in stage_params.values():
+            core_params.extend(stage_list)
+        if core_params:
+            groups.append({"params": core_params, "lr": lr})
+    else:
+        for i in sorted(stage_params.keys()):
+            stage_lr = lr * (stage_lr_scale ** (num_stages - 1 - i))
+            groups.append({"params": stage_params[i], "lr": stage_lr})
+        if other_params:
+            groups.append({"params": other_params, "lr": lr})
+    if mapper_params:
+        groups.append({"params": mapper_params, "lr": lr * mapper_lr_scale})
 
     return torch.optim.AdamW(groups, lr=lr, weight_decay=weight_decay)
 

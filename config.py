@@ -265,17 +265,26 @@ SOLVER = {
 # with tau annealing 1.0→0.1, was amplified to ~99.99% by the end of
 # training — stage0_logits gradient (~6e-6) was 5M× too small to overcome
 # the +1.0 logit bias within 100 epochs.
-# Gates: z_logit_init=2.0, u_logit_init=2.0 → σ≈0.88, dσ/dz≈0.10. This
-# gives 88% open gates (strong signal flow through deep ODE stacks) while
-# keeping gate gradients 14× healthier than z=5.0 (dσ/dz=0.007) and only
-# 2× worse than z=0.0. Balanced between expressivity and learnability.)
+# Gates: z_logit_init=0.0, u_logit_init=0.0 → σ=0.5, dσ/dz=0.25. This
+# sits at the maximum-gradient point of the sigmoid, giving gates 2.4×
+# more sensitivity to regularization than z=2.0 (σ≈0.88, dσ/dz≈0.10).
+# Prior value of 2.0 caused 0 edges to ever prune (frac_sigma_z_below_0.1
+# stuck at 0 for entire training) because the regularizer gradient λ*σ*(1-σ)
+# ≈ 1e-6 was negligible. With z=0 the same regularizer gives 2.5e-6 and
+# gates can actually respond to structural pressure.
+# Node gates (u_logit) are changed for symmetry, though node gate pruning
+# is not currently active — nodes only die via edge disconnection.
+# Trade-off: 50% open gates reduce raw signal flow vs 88% open. This is
+# accepted because the prior 88% open was effectively permanent — gates
+# never closed anyway. A 50% start that CAN close is more useful than
+# 88% that cannot.)
 INIT = {
     "logits_z_bias": 0.0,
     "raw_mult_init": 0.0,
     "raw_leak_init": -3.0,
     "gain_scale": 1.0,
-    "z_logit_init": 2.0,
-    "u_logit_init": 2.0,
+    "z_logit_init": 0.0,
+    "u_logit_init": 0.0,
 }
 
 # Variation context defaults
@@ -495,8 +504,12 @@ def make_smooth2d_grid_preset(
     }
 
 
-# Static default: 5×5 grid, 3 stages, 3 proj nodes.
-PRESET_SMOOTH2D_GRID = make_smooth2d_grid_preset(grid_size=5)
+# Static default: 7×7 grid (49 hidden nodes), 3 stages, 3 proj nodes.
+# Increased from 5×5 to give the network more capacity to specialize —
+# at 5×5 the network showed zero train/val gap (underfitting) and used
+# all edges uniformly (0 pruned), indicating the capacity was fully
+# consumed by the blended-behavior solution.
+PRESET_SMOOTH2D_GRID = make_smooth2d_grid_preset(grid_size=7)
 
 
 def make_housing_grid_preset(

@@ -1,0 +1,8 @@
+param_count: 2001
+best_val_huber: 0.134990
+best_epoch: 799
+final_val_huber: 0.134990
+final_mae_orig: 0.434464
+final_rmse_orig: 0.643272
+epochs_run: 800
+elapsed_seconds: 347.54

@@ -1,0 +1,15 @@
+model: MLPRegressor(8 -> 200 -> 1, activation=relu)
+param_count: 2001
+activation: relu
+epochs: 800
+lr: 0.0006
+weight_decay: 0.0001
+batch_size: 2048
+grad_clip_norm: 5.0
+patience: 50
+min_delta: 0.0001
+validate_every: 5
+seed: 0
+device: cpu
+dataset: California Housing (20640 samples, 80/20 split, min-max features, standardized targets, Huber loss delta=1.0)
+scheduler: CosineAnnealingWarmRestarts(T_0=50, T_mult=1, eta_min=1e-05)

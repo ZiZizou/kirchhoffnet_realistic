@@ -74,10 +74,10 @@ def test_config_loads():
           abs(config.PRUNE["node_threshold"] - 0.05) < 1e-12)
     check("INIT logits_z_bias=0.0 (fix-z-death: equal cell probability)",
           config.INIT["logits_z_bias"] == 0.0)
-    check("INIT z_logit_init=2.0 (fix-z-death: 88% open gates)",
-          abs(config.INIT["z_logit_init"] - 2.0) < 1e-12)
-    check("INIT u_logit_init=2.0 (fix-z-death: 88% open gates)",
-          abs(config.INIT["u_logit_init"] - 2.0) < 1e-12)
+    check("INIT z_logit_init=0.0 (grid7-gate0: 50% open gates, max gradient sensitivity)",
+          abs(config.INIT["z_logit_init"] - 0.0) < 1e-12)
+    check("INIT u_logit_init=0.0 (grid7-gate0: 50% open gates, max gradient sensitivity)",
+          abs(config.INIT["u_logit_init"] - 0.0) < 1e-12)
     check("OPTIM has reg_warmup_epochs (RR-A)",
           "reg_warmup_epochs" in config.OPTIM)
     check("OPTIM has reg_anneal_epochs (RR-A)",
@@ -1076,7 +1076,7 @@ def test_z_bias_eliminated():
 
 
 def test_gate_initialization():
-    print("\nTest 46: gate parameter initialization (fix-z-death: z=2.0, u=2.0)")
+    print("\nTest 46: gate parameter initialization (grid7-gate0: z=0.0, u=0.0)")
     from cell_library import IdealizedCellLibrary
     from topology import ring_graph, StageTopologyBuilder, topology_to_stage
     from differential_stage import DifferentialStage
@@ -1099,14 +1099,14 @@ def test_gate_initialization():
           z.shape == (stage.num_edges(),))
     check("CP-1: node_gates() returns σ(u_logits)",
           u.shape == (stage.num_nodes,))
-    check("fix-z-death: σ(z_logit_init=2) ≈ 0.8808 (88% open gates)",
-          abs(float(z[0].item()) - 0.8808) < 1e-3,
+    check("grid7-gate0: σ(z_logit_init=0) = 0.5 (50% open gates, max gradient)",
+          abs(float(z[0].item()) - 0.5) < 1e-3,
           f"got {float(z[0].item()):.4f}")
-    check("fix-z-death: σ(u_logit_init=2) ≈ 0.8808 (88% open gates)",
-          abs(float(u[0].item()) - 0.8808) < 1e-3,
+    check("grid7-gate0: σ(u_logit_init=0) = 0.5 (50% open gates, max gradient)",
+          abs(float(u[0].item()) - 0.5) < 1e-3,
           f"got {float(u[0].item()):.4f}")
-    expected_grad = 0.8808 * (1 - 0.8808)
-    check("fix-z-death: σ'(z_logit=2) ≈ 0.1050 (gate gradient is 14x healthier than z=5.0)",
+    expected_grad = 0.5 * (1 - 0.5)
+    check("grid7-gate0: σ'(z_logit=0) = 0.25 (max gradient sensitivity, 2.4x z=2.0)",
           abs(float((z * (1 - z))[0].item()) - expected_grad) < 1e-3,
           f"got {float((z * (1 - z))[0].item()):.4f}")
 
@@ -1168,15 +1168,15 @@ def test_complexity_regularizers():
     u = _stage_node_gates(stage)
     mult = _stage_multiplicities(stage)
 
-    # Edge gate: σ(z_logit_init=2) ≈ 0.8808 for each edge (fix-z-death).
-    expected_z = stage.num_edges() * 0.8808
-    check("CP-4: edge_gate = Σz_e at init ≈ num_edges * 0.8808 (z_logit_init=2)",
+    # Edge gate: σ(z_logit_init=0) = 0.5 for each edge (grid7-gate0).
+    expected_z = stage.num_edges() * 0.5
+    check("CP-4: edge_gate = Σz_e at init ≈ num_edges * 0.5 (z_logit_init=0)",
           abs(float(z.sum().item()) - expected_z) < 1e-2,
           f"got {float(z.sum().item()):.4f}, expected {expected_z:.4f}")
 
-    # Node gate: σ(u_logit_init=2) ≈ 0.8808 for each node (fix-z-death).
-    expected_u = stage.num_nodes * 0.8808
-    check("CP-4: node_gate = Σu_j at init ≈ num_nodes * 0.8808 (u_logit_init=2)",
+    # Node gate: σ(u_logit_init=0) = 0.5 for each node (grid7-gate0).
+    expected_u = stage.num_nodes * 0.5
+    check("CP-4: node_gate = Σu_j at init ≈ num_nodes * 0.5 (u_logit_init=0)",
           abs(float(u.sum().item()) - expected_u) < 1e-2,
           f"got {float(u.sum().item()):.4f}, expected {expected_u:.4f}")
 
@@ -1225,8 +1225,8 @@ def test_prune_stage():
           f"pre={pre_edges}, post={pruned.num_edges()}")
     check("CP-5: pruned stage has fewer nodes", pruned.num_nodes < pre_nodes,
           f"pre={pre_nodes}, post={pruned.num_nodes}")
-    check("CP-5: pruned stage gates preserve init z_logit value (z=2 → σ≈0.8808, fix-z-death)",
-          pruned.z_logits is not None and abs(float(pruned.edge_gates().mean()) - 0.8808) < 0.05,
+    check("CP-5: pruned stage gates preserve init z_logit value (z=0 → σ=0.5, grid7-gate0)",
+          pruned.z_logits is not None and abs(float(pruned.edge_gates().mean()) - 0.5) < 0.05,
           f"mean edge gate: {float(pruned.edge_gates().mean()):.4f}")
     check("CP-5: pruned stage is a DifferentialStage",
           hasattr(pruned, "rhs") and hasattr(pruned, "forward"))
@@ -2549,7 +2549,7 @@ def test_smooth2d_preset():
 
 
 def test_smooth2d_grid_preset():
-    print("\nTest NN2: smooth2d_grid preset (4x4 grid + 3 proj, fan-out I/O, 3 stages)")
+    print("\nTest NN2: smooth2d_grid preset (7x7 grid + 3 proj, fan-out I/O, 3 stages)")
     from config import PRESETS
     from topology import build_net_from_preset
     from cell_library import make_default_library
@@ -2565,18 +2565,20 @@ def test_smooth2d_grid_preset():
     check("smooth2d_grid: 3 stages (multistage-smooth2d-grid spec)",
           len(cfg["stages"]) == 3)
     check("smooth2d_grid: num_inputs=2", s["num_inputs"] == 2)
-    check("smooth2d_grid: num_hidden=16", s["num_hidden"] == 16)
+    check("smooth2d_grid: num_hidden=49", s["num_hidden"] == 49)
     check("smooth2d_grid: num_proj=3", s["num_proj"] == 3)
     check("smooth2d_grid: hidden_family=grid", s["hidden_family"] == "grid")
-    check("smooth2d_grid: height=4", s["hidden_kwargs"].get("height") == 4)
-    check("smooth2d_grid: width=4", s["hidden_kwargs"].get("width") == 4)
+    check("smooth2d_grid: height=7", s["hidden_kwargs"].get("height") == 7)
+    check("smooth2d_grid: width=7", s["hidden_kwargs"].get("width") == 7)
     check("smooth2d_grid: kernel_size=3 (8-neighbor)",
           s["hidden_kwargs"].get("kernel_size") == 3)
     check("smooth2d_grid: write_mode=fan_out", cfg.get("write_mode") == "fan_out")
+    # 7x7: rows=[0,2,4,6], left col=0, right col=6
     check("smooth2d_grid: write_fan_out maps both inputs",
-          cfg.get("write_fan_out") == {0: [0, 4, 8], 1: [3, 7, 11]})
-    check("smooth2d_grid: read_idx = 3 proj (proj-only readout)",
-          cfg["read_idx"] == [16, 17, 18])
+          cfg.get("write_fan_out") == {0: [0, 14, 28, 42], 1: [6, 20, 34, 48]})
+    # 7x7: center_col=3, so center column hidden nodes + 3 proj
+    check("smooth2d_grid: read_idx = 7 center column + 3 proj",
+          cfg["read_idx"] == [3, 10, 17, 24, 31, 38, 45, 49, 50, 51])
     check("smooth2d_grid: loss=mse", cfg["loss"] == "mse")
     check("smooth2d_grid: out_dim=1", cfg["out_dim"] == 1)
     check("smooth2d_grid: per-stage t_span=5/3 (~1.667)",
@@ -2599,57 +2601,56 @@ def test_smooth2d_grid_preset():
 
     cell_lib = make_default_library()
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
-    check("smooth2d_grid: builds successfully (proj-only readout skips degree check)",
+    check("smooth2d_grid: builds successfully (center column reads >= 3 hops from writes)",
           net is not None)
     check("smooth2d_grid: core has 3 stages", len(net.core.stages) == 3)
     check("smooth2d_grid: core has 2 StageTransfer modules (N-1)",
           len(net.core.transfers) == 2)
     check("smooth2d_grid: all transfers are StageTransfer instances",
           all(isinstance(t, StageTransfer) for t in net.core.transfers))
-    check("smooth2d_grid: all transfers are identity (19->19)",
-          all(t.in_nodes == 19 and t.out_nodes == 19 for t in net.core.transfers))
+    check("smooth2d_grid: all transfers are identity (52->52)",
+          all(t.in_nodes == 52 and t.out_nodes == 52 for t in net.core.transfers))
+    # write_fan_out: {0: [0, 14, 28, 42], 1: [6, 20, 34, 48]} → sorted union
     check("smooth2d_grid: write_idx = sorted union of fan_out targets",
-          net.write_idx == [0, 3, 4, 7, 8, 11])
-    check("smooth2d_grid: read_idx = 3 proj nodes",
-          net.read_idx == [16, 17, 18])
+          net.write_idx == [0, 6, 14, 20, 28, 34, 42, 48])
+    check("smooth2d_grid: read_idx = 7 center column + 3 proj",
+          net.read_idx == [3, 10, 17, 24, 31, 38, 45, 49, 50, 51])
     check("smooth2d_grid: uses FanOutInputMapper",
           isinstance(net.input_mapper, FanOutInputMapper))
-    check("smooth2d_grid: hid_count=16", net.hid_count == 16)
+    check("smooth2d_grid: hid_count=49", net.hid_count == 49)
     check("smooth2d_grid: proj_count=3", net.proj_count == 3)
-    check("smooth2d_grid: final_hid_count=16", net.final_hid_count == 16)
+    check("smooth2d_grid: final_hid_count=49", net.final_hid_count == 49)
     check("smooth2d_grid: final_proj_count=3", net.final_proj_count == 3)
     check("smooth2d_grid: OutputMapper is sparse read (read_idx set)",
           isinstance(net.output_mapper, OutputMapper)
-          and net.output_mapper.read_idx == [16, 17, 18])
+          and net.output_mapper.read_idx == [3, 10, 17, 24, 31, 38, 45, 49, 50, 51])
 
-    n_hidden = 16
+    n_hidden = 49
     n_proj = 3
-    # 4x4 grid with 8-neighbor (kernel_size=3), single-edge-per-pair:
-    # Computed by exhaustively counting unique (r,c) -> (nr,nc) edges with
-    # j > i over the 16 hidden nodes. Result: 42 hidden edges.
-    n_hidden_edges = 42
+    # 7x7 grid with 8-neighbor (kernel_size=3), single-edge-per-pair:
+    # Degree: 4 corners*3 + 20 edge*5 + 25 interior*8 = 12+100+200 = 312
+    # Single-branch (1 directed per pair) = 312/2 = 156.
+    n_hidden_edges = 156
     # Projection edges: n_hidden * n_proj (unidirectional hidden->proj)
     n_proj_edges = n_hidden * n_proj
     expected_total = n_hidden_edges + n_proj_edges
     for i, stage in enumerate(net.core.stages):
-        check(f"smooth2d_grid: stage {i} edge count = {expected_total} (grid 42 + proj 48)",
+        check(f"smooth2d_grid: stage {i} edge count = {expected_total} (grid 156 + proj 147)",
               int(stage.src.shape[0]) == expected_total,
               f"got {int(stage.src.shape[0])}")
-        check(f"smooth2d_grid: stage {i} num_nodes=19 (16 hid + 3 proj)",
-              int(stage.num_nodes) == 19)
+        check(f"smooth2d_grid: stage {i} num_nodes=52 (49 hid + 3 proj)",
+              int(stage.num_nodes) == 52)
         check(f"smooth2d_grid: stage {i} has positive logits parameter",
               stage.logits.shape == (expected_total, 4))
 
     # Explicit bounds checks on the I/O index lists.
     check("smooth2d_grid: write_idx entries in [0, hid_count)",
           all(0 <= w < net.hid_count for w in net.write_idx))
+    # For grid_size >= 5, read_idx includes center-column hidden nodes (which
+    # are >1 hop from the write columns) + proj nodes. All must be valid.
     check("smooth2d_grid: read_idx entries in [0, final_state_dim)",
           all(0 <= r < net.final_hid_count + net.final_proj_count
               for r in net.read_idx))
-    # Degree-of-separation: all read nodes are proj (exempt from >1-hop
-    # check, see topology.py). Verify there are no hidden reads.
-    check("smooth2d_grid: all read nodes are proj (no hidden reads in 4x4 grid)",
-          all(r >= net.hid_count for r in net.read_idx))
 
     # Forward on a random batch.
     u = torch.rand(8, 2)
@@ -3405,13 +3406,13 @@ def test_rectifier_cell():
           bool(cell_lib._is_rect[P_INDEX].item()),
           f"got {cell_lib._is_rect[P_INDEX].item()}")
 
-    # Check gate init values (fix-z-death: updated from 0.0/1.0 to 2.0/2.0)
+    # Check gate init values (grid7-gate0: updated from 2.0/2.0 to 0.0/0.0)
     from config import INIT
-    check("P-7: z_logit_init == 2.0 (fix-z-death: 88% open gates, was 0.0)",
-          INIT["z_logit_init"] == 2.0,
+    check("P-7: z_logit_init == 0.0 (grid7-gate0: 50% open gates, was 2.0)",
+          INIT["z_logit_init"] == 0.0,
           f"got {INIT['z_logit_init']}")
-    check("P-8: u_logit_init == 2.0 (fix-z-death: 88% open gates, was 1.0)",
-          INIT["u_logit_init"] == 2.0,
+    check("P-8: u_logit_init == 0.0 (grid7-gate0: 50% open gates, was 2.0)",
+          INIT["u_logit_init"] == 0.0,
           f"got {INIT['u_logit_init']}")
 
 

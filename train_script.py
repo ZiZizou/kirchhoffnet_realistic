@@ -656,8 +656,10 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
         help="Task to train (default: sinx)",
     )
     parser.add_argument(
-        "--grid-size", type=int, default=5, dest="grid_size",
-        help="Hidden grid height/width for smooth2d_grid and housing_grid (default: 5, N×N grid). "
+        "--grid-size", type=int, default=None, dest="grid_size",
+        help="Hidden grid height/width for smooth2d_grid and housing_grid. "
+             "Per-problem default: smooth2d_grid=7, housing_grid=5. "
+             "Explicit --grid-size N overrides either. "
              "Only applies when --problem smooth2d_grid or --problem housing_grid.",
     )
     parser.add_argument(
@@ -1090,15 +1092,21 @@ def main():
     read_idx_arg = _parse_int_list(args.read_idx)
 
     cell_lib = IdealizedCellLibrary()
-    # Override the grid preset when grid_size != default or for smooth2d_grid/housing_grid.
+    # Per-problem grid-size default (grid7-gate0: smooth2d_grid=7, housing_grid=5).
+    # Explicit --grid-size N overrides either.
     if args.problem == "smooth2d_grid":
+        resolved_grid_size = args.grid_size if args.grid_size is not None else 7
         PRESETS["smooth2d_grid"] = make_smooth2d_grid_preset(
-            grid_size=args.grid_size,
+            grid_size=resolved_grid_size,
         )
     elif args.problem == "housing_grid":
+        resolved_grid_size = args.grid_size if args.grid_size is not None else 5
         PRESETS["housing_grid"] = make_housing_grid_preset(
-            grid_size=args.grid_size,
+            grid_size=resolved_grid_size,
         )
+    else:
+        resolved_grid_size = args.grid_size
+    args.grid_size = resolved_grid_size
     net = build_net_from_preset(
         args.problem,
         cell_lib=cell_lib,

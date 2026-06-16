@@ -82,8 +82,8 @@ def test_config_loads():
           "reg_warmup_epochs" in config.OPTIM)
     check("OPTIM has reg_anneal_epochs (RR-A)",
           "reg_anneal_epochs" in config.OPTIM)
-    check("PRESETS has sinx, housing, smooth2d, smooth2d_grid",
-          set(config.PRESETS.keys()) == {"sinx", "housing", "smooth2d", "smooth2d_grid"})
+    check("PRESETS has sinx, housing, smooth2d, smooth2d_grid, housing_grid",
+          set(config.PRESETS.keys()) == {"sinx", "housing", "smooth2d", "smooth2d_grid", "housing_grid"})
 
     t = config.cells_to_tensor_dict()
     check("cells_to_tensor_dict: gm shape (4,)", t["gm"].shape == (4,))
@@ -2069,7 +2069,7 @@ def test_active_presets_stage_count():
     from config import PRESETS
     # R4/R5: sinx/housing/smooth2d use 1 stage; smooth2d_grid uses 3 stages
     # (multistage-smooth2d-grid spec) with identical per-stage topology.
-    expected_stages = {"sinx": 1, "housing": 1, "smooth2d": 1, "smooth2d_grid": 3}
+    expected_stages = {"sinx": 1, "housing": 1, "smooth2d": 1, "smooth2d_grid": 3, "housing_grid": 3}
     for name, cfg in PRESETS.items():
         n_stages = len(cfg["stages"])
         check(f"R4/R5: preset '{name}' has expected stage count",
@@ -2425,6 +2425,8 @@ def main():
 
     test_smooth2d_preset()
     test_smooth2d_grid_preset()
+    test_housing_grid_preset()
+    test_housing_grid_data_huber_loss()
     test_fan_out_input_mapper_basic()
     test_fan_out_input_mapper_param_count()
     test_fan_out_input_mapper_gradients()
@@ -2676,6 +2678,170 @@ def test_smooth2d_grid_preset():
     check("smooth2d_grid: 1-batch loss is finite", math.isfinite(avg_loss),
           f"loss={avg_loss:.6f}")
     print(f"  [INFO] smooth2d_grid 1-batch loss: {avg_loss:.6f}")
+
+
+def test_housing_grid_preset():
+    print("\nTest NN3: housing_grid preset (5x5 grid + 3 proj, dense I/O, 3 stages, Huber loss)")
+    from config import PRESETS, make_housing_grid_preset
+    from topology import build_net_from_preset
+    from cell_library import make_default_library
+    from io_mapper import InputMapper, OutputMapper
+    from stage_transfer import StageTransfer
+
+    cfg = PRESETS.get("housing_grid")
+    check("housing_grid present in PRESETS", cfg is not None)
+    if cfg is None:
+        return
+
+    s = cfg["stages"][0]
+    check("housing_grid: 3 stages (mirrors smooth2d_grid)",
+          len(cfg["stages"]) == 3)
+    check("housing_grid: num_inputs=8 (CA housing features)", s["num_inputs"] == 8)
+    check("housing_grid: num_hidden=25 (5x5 grid)", s["num_hidden"] == 25)
+    check("housing_grid: num_proj=3", s["num_proj"] == 3)
+    check("housing_grid: hidden_family=grid", s["hidden_family"] == "grid")
+    check("housing_grid: height=5", s["hidden_kwargs"].get("height") == 5)
+    check("housing_grid: width=5", s["hidden_kwargs"].get("width") == 5)
+    check("housing_grid: kernel_size=3 (8-neighbor)",
+          s["hidden_kwargs"].get("kernel_size") == 3)
+    check("housing_grid: write_mode=dense", cfg.get("write_mode") == "dense")
+    check("housing_grid: write_mode=dense (no explicit write_idx needed)",
+          cfg.get("write_mode") == "dense" and cfg.get("write_idx") is None)
+    check("housing_grid: loss=huber", cfg["loss"] == "huber")
+    check("housing_grid: out_dim=1", cfg["out_dim"] == 1)
+    check("housing_grid: schedule=three_phase",
+          cfg.get("schedule") == "three_phase")
+    check("housing_grid: tau_anneal=True",
+          cfg.get("tau_anneal", True) is True)
+    check("housing_grid: per-stage t_span=5/3 (~1.667)",
+          abs(s["t_span"] - 5.0 / 3) < 1e-6)
+    check("housing_grid: per-stage num_steps=17 (round(50/3))",
+          s["num_steps"] == 17)
+    check("housing_grid: all 3 stages share t_span/num_steps",
+          all(st["t_span"] == s["t_span"] and st["num_steps"] == s["num_steps"]
+              for st in cfg["stages"]))
+    check("housing_grid: read_idx = center column (5 nodes) + 3 proj = 8 reads",
+          len(cfg["read_idx"]) == 8
+          and cfg["read_idx"][:5] == [2, 7, 12, 17, 22]
+          and cfg["read_idx"][5:] == [25, 26, 27])
+    check("housing_grid: preset lambdas edge_gate=5e-6",
+          cfg.get("lambdas", {}).get("edge_gate") == 5e-6)
+    check("housing_grid: preset lambdas node_gate=1e-5",
+          cfg.get("lambdas", {}).get("node_gate") == 1e-5)
+    check("housing_grid: preset lambdas power=1e-5",
+          cfg.get("lambdas", {}).get("power") == 1e-5)
+    check("housing_grid: preset lambdas capacitance=1e-6",
+          cfg.get("lambdas", {}).get("capacitance") == 1e-6)
+    check("housing_grid: preset lambdas rail=0.1",
+          cfg.get("lambdas", {}).get("rail") == 0.1)
+
+    cell_lib = make_default_library()
+    net = build_net_from_preset("housing_grid", cell_lib=cell_lib)
+    check("housing_grid: builds successfully", net is not None)
+    check("housing_grid: core has 3 stages", len(net.core.stages) == 3)
+    check("housing_grid: core has 2 StageTransfer modules (N-1)",
+          len(net.core.transfers) == 2)
+    check("housing_grid: all transfers are StageTransfer instances",
+          all(isinstance(t, StageTransfer) for t in net.core.transfers))
+    check("housing_grid: all transfers are identity (28->28)",
+          all(t.in_nodes == 28 and t.out_nodes == 28 for t in net.core.transfers))
+    check("housing_grid: write_idx is None (dense mode = all hidden)",
+          net.write_idx is None)
+    check("housing_grid: read_idx = 8 nodes (5 hidden center col + 3 proj)",
+          net.read_idx == [2, 7, 12, 17, 22, 25, 26, 27])
+    check("housing_grid: uses plain InputMapper (dense write)",
+          isinstance(net.input_mapper, InputMapper)
+          and type(net.input_mapper) is InputMapper)
+    check("housing_grid: input_mapper gain is (8, 25) dense (8 inputs -> 25 hidden)",
+          net.input_mapper.gain.weight.shape == (25, 8))
+    check("housing_grid: hid_count=25", net.hid_count == 25)
+    check("housing_grid: proj_count=3", net.proj_count == 3)
+    check("housing_grid: final_hid_count=25", net.final_hid_count == 25)
+    check("housing_grid: final_proj_count=3", net.final_proj_count == 3)
+    check("housing_grid: OutputMapper is sparse read (read_idx set)",
+          isinstance(net.output_mapper, OutputMapper)
+          and net.output_mapper.read_idx == [2, 7, 12, 17, 22, 25, 26, 27])
+
+    n_hidden = 25
+    n_proj = 3
+    n_hidden_edges = 72
+    n_proj_edges = n_hidden * n_proj
+    expected_total = n_hidden_edges + n_proj_edges
+    for i, stage in enumerate(net.core.stages):
+        check(f"housing_grid: stage {i} edge count = {expected_total} (grid 72 + proj {n_proj_edges})",
+              int(stage.src.shape[0]) == expected_total,
+              f"got {int(stage.src.shape[0])}")
+        check(f"housing_grid: stage {i} num_nodes=28 (25 hid + 3 proj)",
+              int(stage.num_nodes) == 28)
+        check(f"housing_grid: stage {i} has positive logits parameter",
+              stage.logits.shape == (expected_total, 4))
+
+    check("housing_grid: read_idx entries in [0, final_state_dim)",
+          all(0 <= r < net.final_hid_count + net.final_proj_count
+              for r in net.read_idx))
+    check("housing_grid: 5 read nodes are hidden (center column)",
+          sum(1 for r in net.read_idx if r < net.hid_count) == 5)
+    check("housing_grid: 3 read nodes are proj",
+          sum(1 for r in net.read_idx if r >= net.hid_count) == 3)
+
+    u = torch.rand(8, 8)
+    ctx = None
+    out, _ = net(u, ctx=ctx)
+    check("housing_grid: forward shape (8,1)", out.shape == (8, 1))
+    check("housing_grid: forward output is finite",
+          torch.isfinite(out).all().item())
+
+    cfg4 = make_housing_grid_preset(grid_size=4)
+    check("make_housing_grid_preset(4): 4x4 grid, 16 hidden",
+          cfg4["stages"][0]["num_hidden"] == 16)
+    check("make_housing_grid_preset(4): 3 stages",
+          len(cfg4["stages"]) == 3)
+    check("make_housing_grid_preset(4): write_mode still dense",
+          cfg4["write_mode"] == "dense")
+
+
+def test_housing_grid_data_huber_loss():
+    print("\nTest NN4: housing_grid data loader (Huber loss + inverse stats)")
+    try:
+        from train_script import make_data_housing_grid, denormalize_targets
+    except ImportError as e:
+        check("import make_data_housing_grid", False, f"failed: {e}")
+        return
+    try:
+        from sklearn.datasets import fetch_california_housing
+    except ImportError:
+        check("sklearn available", True, "sklearn not installed, skipping data test")
+        return
+
+    train_loader, val_loader, task_fn, inverse_stats = make_data_housing_grid(batch_size=128)
+    check("make_data_housing_grid: returns 4-tuple with inverse_stats",
+          inverse_stats is not None and "y_mean" in inverse_stats and "y_std" in inverse_stats)
+
+    import torch.nn.functional as F
+    a = torch.tensor([0.0, 0.5, 1.0, 2.0])
+    b = torch.tensor([0.5, 0.5, 0.5, 0.5])
+    huber = task_fn(a, b)
+    expected = F.huber_loss(a, b, delta=1.0)
+    check("housing_grid: task_fn is Huber loss (delta=1.0)",
+          abs(float(huber) - float(expected)) < 1e-6,
+          f"got {float(huber):.6f}, expected {float(expected):.6f}")
+
+    for u_b, y_b in train_loader:
+        check("housing_grid: input batch shape (B, 8)", u_b.shape[1] == 8)
+        check("housing_grid: target batch shape (B, 1)", y_b.shape[1] == 1)
+        check("housing_grid: input values in [0, 1] (normalized by per-col max)",
+              u_b.min() >= -1e-6 and u_b.max() <= 1.0 + 1e-6)
+        break
+    print(f"  [INFO] housing_grid inverse_stats: y_mean={inverse_stats['y_mean']:.4f}, "
+          f"y_std={inverse_stats['y_std']:.4f}")
+
+    y_norm = torch.tensor([0.0, 1.0, -1.0])
+    y_orig = denormalize_targets(y_norm, inverse_stats)
+    expected = y_norm * inverse_stats["y_std"] + inverse_stats["y_mean"]
+    check("denormalize_targets: y = y_norm * y_std + y_mean",
+          torch.allclose(y_orig, expected),
+          f"got {y_orig.tolist()}, expected {expected.tolist()}")
+
 
 
 # ---- FanOutInputMapper tests (smooth2d-sanity-pass spec) ----

@@ -498,9 +498,83 @@ def make_smooth2d_grid_preset(
 # Static default: 5×5 grid, 3 stages, 3 proj nodes.
 PRESET_SMOOTH2D_GRID = make_smooth2d_grid_preset(grid_size=5)
 
+
+def make_housing_grid_preset(
+    grid_size: int,
+    num_stages: int = 3,
+    num_proj: int = 3,
+) -> dict:
+    """Build the housing_grid preset dict for any square grid size.
+
+    Reuses the 5x5 grid + 3-stage topology from ``smooth2d_grid`` but
+    swaps in the 8 California-housing features and uses dense write
+    (all-to-all) since the features have no spatial structure.
+
+    ``grid_size`` is the height/width of the hidden grid (N×N). Each
+    stage has ``grid_size ** 2`` hidden nodes, ``num_proj`` projection
+    nodes, and ``num_inputs=8`` (the eight California-housing features).
+
+    Loss is declared as ``huber`` for preset metadata consistency; the
+    actual training loss is ``F.huber_loss(delta=1.0)`` in
+    ``train_script.make_data_housing_grid``. Validation logs are also
+    reported in original housing-price units (USD × 100k) via inverse
+    normalization of the standardized targets.
+    """
+    num_hidden = grid_size * grid_size
+    n_stages = max(1, num_stages)
+    _stage_cfg = {
+        "num_inputs": 8,
+        "num_hidden": num_hidden,
+        "num_proj": num_proj,
+        "num_outputs": 0,
+        "hidden_family": "grid",
+        "hidden_kwargs": {"height": grid_size, "width": grid_size, "kernel_size": 3},
+        "input_pattern": "all_to_all",
+        "output_pattern": "all_to_all",
+        "proj_pattern": "all_to_all",
+        "t_span": SOLVER["t_span"] / n_stages,
+        "num_steps": round(SOLVER["num_steps"] / n_stages),
+    }
+
+    # Read indices: same convention as smooth2d_grid (center column + proj)
+    # so the model can read hidden activations that are 2+ hops from any
+    # input source. This is a heuristic; for housing_grid there is no
+    # spatial meaning to the grid, so it primarily acts as a structural
+    # regularizer (limits the OutputMapper to a small subset).
+    if grid_size >= 3:
+        center_col = grid_size // 2
+        center_nodes = [r * grid_size + center_col for r in range(grid_size)]
+        read_idx = center_nodes + list(range(num_hidden, num_hidden + num_proj))
+    else:
+        read_idx = list(range(num_hidden, num_hidden + num_proj))
+
+    return {
+        "stages": [_stage_cfg] * n_stages,
+        "use_robust_input": False,
+        "loss": "huber",
+        "out_dim": 1,
+        "write_mode": "dense",
+        "read_idx": read_idx,
+        "schedule": "three_phase",
+        "lambdas": {
+            "sparsity": 1e-5,
+            "edge_gate": 5e-6,
+            "node_gate": 1e-5,
+            "power": 1e-5,
+            "capacitance": 1e-6,
+            "rail": 0.1,
+        },
+        "tau_anneal": True,
+    }
+
+
+# Static default: 5x5 grid, 3 stages, 3 proj nodes (mirrors smooth2d_grid).
+PRESET_HOUSING_GRID = make_housing_grid_preset(grid_size=5)
+
 PRESETS = {
     "sinx": PRESET_SINX,
     "housing": PRESET_HOUSING,
     "smooth2d": PRESET_SMOOTH2D,
     "smooth2d_grid": PRESET_SMOOTH2D_GRID,
+    "housing_grid": PRESET_HOUSING_GRID,
 }

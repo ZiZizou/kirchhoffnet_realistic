@@ -51,6 +51,7 @@ from config import (
     TAU,
     VARIATION,
     make_smooth2d_grid_preset,
+    make_housing_grid_preset,
 )
 from cell_library import IdealizedCellLibrary
 from topology import build_net_from_preset
@@ -299,7 +300,13 @@ def make_data_sinx(batch_size: int, val_size: int = 1024):
     return train_loader, val_loader, F.mse_loss
 
 
-def make_data_housing(batch_size: int, val_size: int = 0):
+def _load_california_housing_data() -> tuple[torch.Tensor, torch.Tensor, float, float]:
+    """Load raw California housing: (X, y_normalized, y_mean, y_std).
+
+    Targets are standardized (subtract mean, divide by std). Features
+    are returned *unnormalized* so that each caller can apply its own
+    normalization scheme.
+    """
     try:
         from sklearn.datasets import fetch_california_housing
     except ImportError as e:
@@ -311,36 +318,74 @@ def make_data_housing(batch_size: int, val_size: int = 0):
     data = fetch_california_housing()
     X = torch.tensor(data.data, dtype=torch.float32)
     y = torch.tensor(data.target, dtype=torch.float32).unsqueeze(1)
+    y_mean = float(y.mean().item())
+    y_std = float(y.std().clamp(min=1e-6).item())
+    y_norm = (y - y_mean) / y_std
+    return X, y_norm, y_mean, y_std
+
+
+def _make_data_split(
+    X: torch.Tensor, y: torch.Tensor, batch_size: int, seed: int = 42
+) -> tuple[DataLoader, DataLoader]:
+    """Deterministic 80/20 train/val split + DataLoaders."""
+    n = X.shape[0]
+    rng = torch.Generator().manual_seed(seed)
+    perm = torch.randperm(n, generator=rng)
+    n_train = int(0.8 * n)
+    train_ds = TensorDataset(X[perm[:n_train]], y[perm[:n_train]])
+    val_ds = TensorDataset(X[perm[n_train:]], y[perm[n_train:]])
+    return (
+        DataLoader(train_ds, batch_size=batch_size, shuffle=True),
+        DataLoader(val_ds, batch_size=batch_size, shuffle=False),
+    )
+
+
+def make_data_housing(batch_size: int, val_size: int = 0):
+    X, y_norm, y_mean, y_std = _load_california_housing_data()
 
     x_max = X.max(dim=0, keepdim=True).values.clamp(min=1e-6)
     X = X / x_max
-    y_mean = y.mean()
-    y_std = y.std().clamp(min=1e-6)
-    y_norm = (y - y_mean) / y_std
 
-    n = X.shape[0]
-    rng = torch.Generator().manual_seed(42)
-    perm = torch.randperm(n, generator=rng)
-    n_train = int(0.8 * n)
-    train_idx = perm[:n_train]
-    val_idx = perm[n_train:]
-
-    train_u = X[train_idx]
-    train_y = y_norm[train_idx]
-    val_u = X[val_idx]
-    val_y = y_norm[val_idx]
-
-    train_loader = DataLoader(
-        TensorDataset(train_u, train_y), batch_size=batch_size, shuffle=True
-    )
-    val_loader = DataLoader(
-        TensorDataset(val_u, val_y), batch_size=batch_size, shuffle=False
-    )
+    train_loader, val_loader = _make_data_split(X, y_norm, batch_size)
 
     def task_fn(y_pred, y_target):
         return F.l1_loss(y_pred, y_target)
 
     return train_loader, val_loader, task_fn
+
+
+def make_data_housing_grid(batch_size: int, huber_delta: float = 1.0):
+    """California-housing regression on the 5x5 grid topology.
+
+    Features are min-max scaled to [0, 1] per column (handles both
+    non-negative features like ``Population`` and signed features like
+    ``Longitude``). Targets are standardized. Training loss is Huber
+    (delta=1.0), blending MSE's smooth gradients for small errors with
+    L1's robustness to heavy tails in housing prices.
+
+    Returns ``(train_loader, val_loader, task_fn, inverse_stats)`` where
+    ``inverse_stats`` is ``{"y_mean": ..., "y_std": ...}`` for
+    denormalizing validation predictions back to original units.
+    """
+    X, y_norm, y_mean, y_std = _load_california_housing_data()
+
+    x_min = X.min(dim=0, keepdim=True).values
+    x_max = X.max(dim=0, keepdim=True).values
+    x_range = (x_max - x_min).clamp(min=1e-6)
+    X = (X - x_min) / x_range
+
+    train_loader, val_loader = _make_data_split(X, y_norm, batch_size)
+
+    def task_fn(y_pred, y_target):
+        return F.huber_loss(y_pred, y_target, delta=huber_delta)
+
+    inverse_stats = {"y_mean": y_mean, "y_std": y_std}
+    return train_loader, val_loader, task_fn, inverse_stats
+
+
+def denormalize_targets(y_norm: torch.Tensor, inverse_stats: dict) -> torch.Tensor:
+    """Map standardized targets back to original California-housing units."""
+    return y_norm * inverse_stats["y_std"] + inverse_stats["y_mean"]
 
 
 def _franke(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
@@ -398,6 +443,8 @@ def make_data(problem: str, batch_size: int):
         return make_data_smooth2d(batch_size)
     if problem == "smooth2d_grid":
         return make_data_smooth2d(batch_size)
+    if problem == "housing_grid":
+        return make_data_housing_grid(batch_size)
     raise ValueError(f"Unknown problem: {problem}")
 
 
@@ -416,6 +463,54 @@ def validate(net, val_loader, task_fn, ctx_factory, device, cell_mode: str = "so
             n += u.size(0)
     net.train()
     return total / max(1, n)
+
+
+def validate_with_inverse(
+    net,
+    val_loader,
+    task_fn,
+    ctx_factory,
+    device,
+    inverse_stats: dict | None,
+    cell_mode: str = "soft",
+) -> dict:
+    """Validation that also reports metrics in the original (denormalized) target units.
+
+    Returns a dict with:
+      - ``val``: training-space loss (mean of ``task_fn(out, target)``)
+      - ``mae_orig``: MAE in original target units (USD x 100k for California housing)
+      - ``rmse_orig``: RMSE in original target units
+    If ``inverse_stats`` is None, ``mae_orig`` and ``rmse_orig`` are
+    reported as NaN (no denormalization available).
+    """
+    net.eval()
+    total = 0.0
+    n = 0
+    se_sum = 0.0
+    ae_sum = 0.0
+    with torch.no_grad():
+        for u, target in val_loader:
+            u = u.to(device)
+            target = target.to(device)
+            ctx = ctx_factory(u.size(0), device=device)
+            out, _ = net(u, ctx=ctx, store_trajectory=False, cell_mode=cell_mode)
+            loss = task_fn(out, target)
+            total += float(loss.item()) * u.size(0)
+            if inverse_stats is not None:
+                pred_orig = denormalize_targets(out, inverse_stats)
+                targ_orig = denormalize_targets(target, inverse_stats)
+                ae_sum += float((pred_orig - targ_orig).abs().sum().item())
+                se_sum += float(((pred_orig - targ_orig) ** 2).sum().item())
+            n += u.size(0)
+    net.train()
+    out_dict = {"val": total / max(1, n)}
+    if inverse_stats is not None and n > 0:
+        out_dict["mae_orig"] = ae_sum / n
+        out_dict["rmse_orig"] = (se_sum / n) ** 0.5
+    else:
+        out_dict["mae_orig"] = float("nan")
+        out_dict["rmse_orig"] = float("nan")
+    return out_dict
 
 
 def collect_predictions(net, inputs, ctx_factory, device) -> torch.Tensor:
@@ -557,13 +652,13 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
     """Populate ``parser`` with the train_script CLI flags.  Split out of
     ``main()`` so smoke tests can introspect the flag surface (PP-5)."""
     parser.add_argument(
-        "--problem", choices=["sinx", "housing", "smooth2d", "smooth2d_grid"], default="sinx",
+        "--problem", choices=["sinx", "housing", "smooth2d", "smooth2d_grid", "housing_grid"], default="sinx",
         help="Task to train (default: sinx)",
     )
     parser.add_argument(
         "--grid-size", type=int, default=5, dest="grid_size",
-        help="Hidden grid height/width for smooth2d_grid (default: 5, N×N grid). "
-             "Only applies when --problem smooth2d_grid.",
+        help="Hidden grid height/width for smooth2d_grid and housing_grid (default: 5, N×N grid). "
+             "Only applies when --problem smooth2d_grid or --problem housing_grid.",
     )
     parser.add_argument(
         "--output", type=Path, default=Path("./output"),
@@ -995,9 +1090,13 @@ def main():
     read_idx_arg = _parse_int_list(args.read_idx)
 
     cell_lib = IdealizedCellLibrary()
-    # Override the grid preset when grid_size != default or for smooth2d_grid.
+    # Override the grid preset when grid_size != default or for smooth2d_grid/housing_grid.
     if args.problem == "smooth2d_grid":
         PRESETS["smooth2d_grid"] = make_smooth2d_grid_preset(
+            grid_size=args.grid_size,
+        )
+    elif args.problem == "housing_grid":
+        PRESETS["housing_grid"] = make_housing_grid_preset(
             grid_size=args.grid_size,
         )
     net = build_net_from_preset(
@@ -1009,7 +1108,11 @@ def main():
         read_idx=read_idx_arg,
     )
     net.to(device)
-    grid_label = f" {args.grid_size}×{args.grid_size} grid," if args.problem == "smooth2d_grid" else ""
+    grid_label = (
+        f" {args.grid_size}×{args.grid_size} grid,"
+        if args.problem in ("smooth2d_grid", "housing_grid")
+        else ""
+    )
     print(
         f"[train] problem={args.problem}{grid_label} epochs={epochs} lr={lr} device={device} "
         f"output={out_dir} amp={amp_enabled} compile={compile_enabled} "
@@ -1020,7 +1123,12 @@ def main():
         f"write_idx={list(net.write_idx) if net.write_idx is not None else None} "
         f"read_idx={list(net.read_idx) if net.read_idx is not None else None}"
     )
-    train_loader, val_loader, task_fn = make_data(args.problem, batch_size)
+    data_out = make_data(args.problem, batch_size)
+    if len(data_out) == 4:
+        train_loader, val_loader, task_fn, inverse_stats = data_out
+    else:
+        train_loader, val_loader, task_fn = data_out
+        inverse_stats = None
 
     if args.ablation != "none":
         apply_ablation(net, args.ablation)
@@ -1181,6 +1289,9 @@ def main():
     # Avoids duplicate entries on non-validate epochs for the readiness check.
     val_v_history: list[float] = []
     val_argmax_v_history: list[float] = [] if argmax_val_enabled else None
+    # housing_grid: per-epoch dicts of {val, mae_orig, rmse_orig} for
+    # logging in original housing-price units (USD x 100k).
+    val_orig_history: list[dict] = [] if inverse_stats is not None else None
 
     for epoch in ab_iter:
         if stop_training:
@@ -1276,8 +1387,18 @@ def main():
         avg_train = total_loss / max(1, n_batches)
         do_validate = (epoch % args.validate_every == 0) or (epoch == ab_total - 1)
         if do_validate:
-            val_loss = validate(net, val_loader, task_fn, ctx_factory, device, cell_mode=cell_mode)
+            if inverse_stats is not None:
+                val_metrics = validate_with_inverse(
+                    net, val_loader, task_fn, ctx_factory, device,
+                    inverse_stats=inverse_stats, cell_mode=cell_mode,
+                )
+                val_loss = val_metrics["val"]
+            else:
+                val_loss = validate(net, val_loader, task_fn, ctx_factory, device, cell_mode=cell_mode)
+                val_metrics = None
             val_v_history.append(val_loss)
+            if inverse_stats is not None and val_metrics is not None:
+                val_orig_history.append(val_metrics)
             # Argmax validation for phased schedules
             if val_argmax_history is not None:
                 val_arg = validate_argmax(net, val_loader, task_fn, ctx_factory, device)
@@ -1426,7 +1547,19 @@ def main():
 
     history_path = out_dir / "loss_history.txt"
     with open(history_path, "w") as f:
-        if val_argmax_history is not None and len(val_argmax_history) == len(val_history):
+        has_argmax = val_argmax_history is not None and len(val_argmax_history) == len(val_history)
+        has_orig = val_orig_history is not None and len(val_orig_history) == len(val_history)
+        if has_argmax and has_orig:
+            f.write("epoch\ttrain\tval\tval_argmax\tmae_orig\trmse_orig\tphase\n")
+            for i, (t, v, va, m) in enumerate(zip(history, val_history, val_argmax_history, val_orig_history)):
+                if schedule_mode == "three_phase":
+                    p = phase_for_epoch(i, epochs)
+                elif schedule_mode == "four_phase":
+                    p = phase_for_epoch_four(i, epochs)
+                else:
+                    p = "A"
+                f.write(f"{i}\t{t}\t{v}\t{va}\t{m['mae_orig']:.6f}\t{m['rmse_orig']:.6f}\t{p}\n")
+        elif has_argmax:
             f.write("epoch\ttrain\tval\tval_argmax\tphase\n")
             for i, (t, v, va) in enumerate(zip(history, val_history, val_argmax_history)):
                 if schedule_mode == "three_phase":
@@ -1436,6 +1569,16 @@ def main():
                 else:
                     p = "A"
                 f.write(f"{i}\t{t}\t{v}\t{va}\t{p}\n")
+        elif has_orig:
+            f.write("epoch\ttrain\tval\tmae_orig\trmse_orig\tphase\n")
+            for i, (t, v, m) in enumerate(zip(history, val_history, val_orig_history)):
+                if schedule_mode == "three_phase":
+                    p = phase_for_epoch(i, epochs)
+                elif schedule_mode == "four_phase":
+                    p = phase_for_epoch_four(i, epochs)
+                else:
+                    p = "A"
+                f.write(f"{i}\t{t}\t{v}\t{m['mae_orig']:.6f}\t{m['rmse_orig']:.6f}\t{p}\n")
         else:
             f.write("epoch\ttrain\tval\tphase\n")
             for i, (t, v) in enumerate(zip(history, val_history)):
@@ -1709,6 +1852,7 @@ def main():
             retrain_history = []
             retrain_val_history = []
             retrain_val_argmax = [] if val_argmax_history is not None else None
+            retrain_orig_history = [] if inverse_stats is not None else None
             best_val_pruned = float("inf")
             best_epoch_pruned = -1
             best_state_pruned = None
@@ -1789,11 +1933,21 @@ def main():
                 avg = tot / max(1, nb)
                 retrain_history.append(avg)
                 if repoch % args.validate_every == 0 or repoch == c_epochs - 1:
-                    val = validate(pruned_net, val_loader, task_fn, ctx_factory, device, cell_mode=cell_mode_c)
+                    if inverse_stats is not None:
+                        val_metrics_c = validate_with_inverse(
+                            pruned_net, val_loader, task_fn, ctx_factory, device,
+                            inverse_stats=inverse_stats, cell_mode=cell_mode_c,
+                        )
+                        val = val_metrics_c["val"]
+                    else:
+                        val_metrics_c = None
+                        val = validate(pruned_net, val_loader, task_fn, ctx_factory, device, cell_mode=cell_mode_c)
                     if retrain_val_argmax is not None:
                         val_arg = validate_argmax(pruned_net, val_loader, task_fn, ctx_factory, device)
                         retrain_val_argmax.append(val_arg)
                     retrain_val_history.append(val)
+                    if retrain_orig_history is not None and val_metrics_c is not None:
+                        retrain_orig_history.append(val_metrics_c)
                     # four-phase-redesign/Phase 1b: Phase C is post-prune, the
                     # deployable model IS the hard-cell (argmax) version, so
                     # use val_argmax for checkpoint selection.
@@ -1825,6 +1979,11 @@ def main():
                     retrain_val_history.append(retrain_val_history[-1] if retrain_val_history else avg)
                     if retrain_val_argmax is not None:
                         retrain_val_argmax.append(retrain_val_argmax[-1] if retrain_val_argmax else avg)
+                    if retrain_orig_history is not None:
+                        retrain_orig_history.append(
+                            retrain_orig_history[-1] if retrain_orig_history
+                            else {"val": avg, "mae_orig": float("nan"), "rmse_orig": float("nan")}
+                        )
                 phase_tag = " [C]" if schedule_mode in ("three_phase", "four_phase") else ""
                 print(
                     f"  {'retrain' if schedule_mode == 'legacy' else 'phase-C'} epoch {repoch:4d}{phase_tag}  "
@@ -1846,12 +2005,23 @@ def main():
                 with open(history_path, "r") as f:
                     header = f.readline().strip()
                 has_argmax = "val_argmax" in header
+                has_orig = "mae_orig" in header
                 with open(history_path, "a") as f:
                     f.write(f"\n# Phase C (prune + retrain): {post_edges}/{pre_edges} edges, {post_nodes}/{pre_nodes} nodes survived\n")
-                    if has_argmax and retrain_val_argmax is not None:
+                    if has_argmax and has_orig and retrain_orig_history is not None:
+                        for i, (t, v, va, m) in enumerate(
+                            zip(retrain_history, retrain_val_history, retrain_val_argmax, retrain_orig_history)
+                        ):
+                            global_ep = phase_c_start + i
+                            f.write(f"{global_ep}\t{t}\t{v}\t{va}\t{m['mae_orig']:.6f}\t{m['rmse_orig']:.6f}\tC\n")
+                    elif has_argmax:
                         for i, (t, v, va) in enumerate(zip(retrain_history, retrain_val_history, retrain_val_argmax)):
                             global_ep = phase_c_start + i
                             f.write(f"{global_ep}\t{t}\t{v}\t{va}\tC\n")
+                    elif has_orig and retrain_orig_history is not None:
+                        for i, (t, v, m) in enumerate(zip(retrain_history, retrain_val_history, retrain_orig_history)):
+                            global_ep = phase_c_start + i
+                            f.write(f"{global_ep}\t{t}\t{v}\t{m['mae_orig']:.6f}\t{m['rmse_orig']:.6f}\tC\n")
                     else:
                         for i, (t, v) in enumerate(zip(retrain_history, retrain_val_history)):
                             global_ep = phase_c_start + i

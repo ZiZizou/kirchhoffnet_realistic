@@ -19,6 +19,7 @@
 9. [Sparse Solver Subsystem](#9-sparse-solver-subsystem)
 10. [Testing](#10-testing)
 11. [File Map](#11-file-map)
+12. [Experimental Results](#12-experimental-results)
 
 ---
 
@@ -67,7 +68,7 @@ The reduced model assumes strong common-mode feedback so we only simulate `xⱼ`
 **Units (R7).** The conductance, current, and capacitance values in
 `config.py` are NORMALIZED to plausible analog ranges, not calibrated to
 SI. `x_max` was raised to 3.0 to give the solver more dynamic
-range and avoid saturation. `t_span=5` and `num_steps=50` are the
+range and avoid saturation. `t_span=10` and `num_steps=100` are the
 defaults. `C_eff` is a pure scaling. No pretense is made that `g/C`
 is a real analog time constant. `V_CM` has been removed from `PHYS`
 since it is not simulated.
@@ -399,8 +400,8 @@ L2 gradient norms written to `grad_norms.txt`. Each row shows per-stage
 
 **Batch-size-aware LR auto-scaling.** The learning rate is computed as
 `lr = BASE_LR × (batch_size / BASE_BATCH_SIZE)` (Goyal et al., 2017)
-where `BASE_LR=3e-4` and `BASE_BATCH_SIZE=1024`. At `batch_size=2048`,
-this gives `lr=6e-4`.
+where `BASE_LR=3e-4` and `BASE_BATCH_SIZE=1024`. At `batch_size=1024`,
+this gives `lr=3e-4`.
 
 ### 2.14 Four-phase training schedule (four-phase-redesign plan)
 
@@ -593,7 +594,7 @@ four_phase:
                           │  KirchhoffNet (ODE core)                 │
                           │  ┌────────────────────────────────────┐  │
                           │  │  Stage 0  ──►  Transfer  ──► ...  │  │
-                          │  │  (Heun integration, t_span=5, 50  │  │
+                          │  │  (Heun integration, t_span=10, 100 │  │
                           │  │   steps)                          │  │
                           │  └────────────────────────────────────┘  │
                           │                                          │
@@ -642,13 +643,13 @@ four_phase:
 
 - `CELL_LIBRARY` — L/S/P/Z cell parameters (gm, isat, rho, gleak, bias, theta, beta)
 - `PHYS` — physical constants (x_max=3.0, C_eff=1.0, beta_softness=0.02, clip_current=0.05, clip_softness=0.02)
-- `OPTIM` — training hyperparameters (lr auto-computed as `3e-4 * batch_size/1024` = 6e-4 at 2048, wd=1e-4, epochs=800, batch_size=2048, reg_warmup_epochs=100, reg_anneal_epochs=50, scheduler_T_0=50, CosineAnnealingLR with T_max based on phase boundaries)
+- `OPTIM` — training hyperparameters (lr auto-computed as `3e-4 * batch_size/1024` = 3e-4 at 1024, wd=1e-4, epochs=800, batch_size=1024, reg_warmup_epochs=100, reg_anneal_epochs=50, scheduler_T_0=50, CosineAnnealingLR with T_max based on phase boundaries)
 - `TAU` — temperature annealing schedule (init=1.0, final=0.1, min=0.15, hardening_epoch_frac=0.1, final_pretrain=0.8 for two-phase pre-prune)
 - `LAMBDAS` — regularizer weights (sparsity=1e-3, rail=1.0, edge_gate=5e-4, node_gate=1e-4, power=1e-4, capacitance=1e-5, entropy=0.0)
 - `PRUNE` — pruning thresholds (edge_threshold=0.1, node_threshold=0.05, prune_nodes_by_gate=True; overridden by SCHEDULE_THREE_PHASE in phased mode)
 - `SCHEDULE_THREE_PHASE` — three-phase schedule config (frac_a=0.30, frac_b=0.40, frac_c=0.30; tau targets per phase; Phase B/C lambdas; warmup_frac_b; edge-only pruning)
 - `SCHEDULE_FOUR_PHASE` — four-phase schedule config (frac_a=0.25, frac_b1=0.20, frac_b2=0.25, frac_c=0.30; readiness-gated prune, teacher distillation, STE cell mode)
-- `SOLVER` — integration defaults (method=heun, t_span=5, num_steps=50)
+- `SOLVER` — integration defaults (method=heun, t_span=10, num_steps=100)
 - `INIT` — parameter initialization biases (logits_z_bias=0.0 for equal cell probability P(L)=P(S)=P(P)=P(Z)=0.25; z_logit_init=0.0, u_logit_init=0.0 → σ=0.50, dσ/dz=0.25 (max-gradient); raw_mult_init=0.0, raw_leak_init=-3.0, gain_scale=1.0)
 - `VARIATION` — PVT/mismatch defaults (temp_c=27.0, gain_shift_std=0.05, edge_mismatch_std=0.05; temp_c sampling deprecated)
 - `PRESETS` — task-specific topology configs (sinx, housing, smooth2d, smooth2d_grid, housing_grid; supports per-preset lambdas, write_mode, schedule flag, write_fan_out)
@@ -804,6 +805,12 @@ Outputs per run: `loss_history.txt` (with phase markers for three_phase/four_pha
 ### `mlp_benchmark.py`
 **MLP baselines** — MLPRegressor(2→H→1) for smooth2d Franke task, benchmark comparison.
 
+### `mlp_benchmark_housing.py`
+**Housing MLP baseline** — MLPRegressor(8→H→1) for California Housing task. Matches the `housing_grid` KirchhoffNet in parameter count (~2000) and training hyperparameters (AdamW, Huber loss, CosineAnnealingWarmRestarts). Outputs loss history, curve, model, and final metrics in original USD × 100k units.
+
+### `train_ctle.py`
+**CTLE inverse design distillation** — Trains a 3-stage grid KirchhoffNet (4 inputs → 7 CTLE logits) via 4-phase knowledge distillation from a pre-trained RegimeAwareMoE teacher (loaded from `dagger_student_moe.pt`). The `make_ctle_grid_preset()` function builds the grid topology with fan-out write mapping (4 inputs → 4 grid quadrants) and center-column + projection read. Uses the standard 4-phase schedule from `train.py` with teacher KD in B1/B2, readiness-gated prune, and physical-domain evaluation at the end. Not a standard preset — invoked directly via `python train_ctle.py --teacher-path ...`.
+
 ---
 
 ## 5. Data Flow
@@ -815,7 +822,7 @@ Outputs per run: `loss_history.txt` (with phase markers for three_phase/four_pha
        │
 2. InputMapper:  u [B, in_dim]  →  x0 [B, N_active₀]  (write phase)
        │
-3. Stage 0 Heun (50 steps @ t_span=5):
+3. Stage 0 Heun (100 steps @ t_span=10):
         │    for step in 1..num_steps:
        │        x_src = x[:, src]; x_dst = x[:, dst]
        │        i_edge = CellLibrary(x_src, x_dst, logits, raw_mult, x_max, ctx, tau)
@@ -846,6 +853,19 @@ Outputs per run: `loss_history.txt` (with phase markers for three_phase/four_pha
 4. Forward pass (same as legacy).
 5. At B→C boundary: auto-prune (remove low-gate edges/nodes, transfer I/O mappers).
 6. Phase C: retrain compact network with post-prune lambdas.
+```
+
+### Training step — CTLE distillation (four-phase with teacher KD)
+
+```
+1. Load pre-trained RegimeAwareMoE teacher from checkpoint (frozen, eval mode).
+2. Generate synthetic CTLE spec samples (LHS over 4 spec dimensions) and label
+   them with teacher forward pass → logits.
+3. Build 3-stage grid KirchhoffNet student via make_ctle_grid_preset().
+4. Four-phase training (A: free fit, B1: cell commit + KD, B2: edge prune + KD,
+   C: retrain compact) using the same four_phase infrastructure from train.py.
+5. At the end: evaluate physical parameter conversion (relative error per param)
+   and save both pre-prune and pruned models.
 ```
 
 ### Training step — four-phase schedule
@@ -915,7 +935,7 @@ the same regularizer gives `≈ 2.5e-6` and gates can actually respond.
 ### Gradient handling
 
 - Clip gradients to norm 5.0
-- AdamW optimizer with weight decay 1e-4 (lr=6e-4 at default batch_size=2048)
+- AdamW optimizer with weight decay 1e-4 (lr=3e-4 at default batch_size=1024)
 - Two scheduler types:
   - `'cosine'` (default): CosineAnnealingLR with `T_max` based on phase boundaries
   - `'warm_restarts'`: CosineAnnealingWarmRestarts (T_0=50, T_mult=1, eta_min=1e-5)
@@ -997,7 +1017,7 @@ to avoid over-aggressive updates during warm-start fine-tuning.**
 | Output | 1D (Franke function value, normalized) |
 | Architecture | **3 stages**: each 49 hidden (7×7 grid, 8-neighbor kernel_size=3) + 3 proj (all_to_all). StageTransfer identity (52→52). Configurable via `--grid-size N`. |
 | Edges/Params | Per stage: 294 hidden edges + 147 proj edges = 441 edges, 2261 params. 3 stages = 6783 core + I/O = ~6800 total (at 7×7 default). Use `--grid-size 4` for 4×4 topology (90 edges/stage, ~1750 total). |
-| Integration | t_span=5/3 ≈ 1.667 per stage, 17 steps per stage, dt ≈ 0.098 constant |
+| Integration | t_span=10/3 ≈ 3.333 per stage, 33 steps per stage, dt ≈ 0.101 constant |
 | Loss | MSE |
 | Train size | 20K (4K val, 4K test, sigma=0.01 noise) |
 | Write/Read | `write_mode=fan_out`, `write_fan_out` = left/right column formula (see `make_smooth2d_grid_preset`), `read_mode=sparse`, `read_idx` = center column + proj nodes |
@@ -1039,11 +1059,11 @@ The total state vector per stage is `N² + 3` nodes.
 
 N_stages independent stages (default 3), each with the same N²+3-node /
 2N(N-1)+3N²-edge topology but **untied weights** (separate learnable
-parameters per stage). The total t_span=5 and num_steps=50 are split
+parameters per stage). The total t_span=10 and num_steps=100 are split
 equally:
 
-- Per-stage t_span = 5 / N_stages
-- Per-stage num_steps = round(50 / N_stages)
+- Per-stage t_span = 10 / N_stages
+- Per-stage num_steps = round(100 / N_stages)
 - dt = (t_span / num_steps) per stage (constant across stages)
 
 The StageTransfer between stages is **identity** — no width change
@@ -1115,6 +1135,26 @@ Full network at N=7 (3 stages + I/O):
 
 The per-preset lambda override provides default values for the `--schedule legacy` code path. Under `--schedule three_phase` (the default for this preset), these values are **replaced** by the schedule's phase-aware lambdas (see §2.9). The Phase B lambdas are more aggressive: `sparsity=5e-5` vs the preset's `1e-5`, `edge_gate=1e-5` vs `5e-6`. This separation exists because the legacy path needs gentle regularization during a single training phase, while the three-phase schedule can apply stronger regularization in Phase B (compress) without hurting Phase A (fit).
 
+### `ctle_grid` — CTLE inverse design (3-stage grid topology, standalone script)
+
+The `ctle_grid` preset is defined in `train_ctle.py:make_ctle_grid_preset()` and
+is NOT in `config.py`'s `PRESETS` — it is built dynamically at runtime. The
+preset is used exclusively through the standalone `train_ctle.py` script.
+
+| | |
+|---|---|
+| Input | 4D CTLE spec params (power, jitter, height, width), LHS-sampled from empirical ranges |
+| Output | 7D CTLE logits (unbounded, matching teacher output) |
+| Architecture | **3 stages**: each `N²` hidden (N×N grid, kernel_size=3) + 7 proj (all_to_all). StageTransfer identity. Configurable via `--grid-size N` (default 5). |
+| Edges/Params | Per stage (N=5): 200 hidden edges + 175 proj edges = 375 edges, ~1838 params. 3 stages + I/O = ~5600 total. |
+| Integration | t_span=10/3 ≈ 3.333 per stage, 33 steps per stage |
+| Loss | MSE on teacher logits |
+| Train size | Configurable via `--n-train` / `--n-val` (defaults 8000/2000) |
+| Write/Read | Write: fan-out (4 inputs → 4 grid quadrants, 2 rows each). Read: center column (5 nodes) + 7 proj nodes = 12 features → 7 logits. |
+| Schedule | `schedule=four_phase` (always; this script is KD-only) |
+| Lambda override | `{"sparsity": 1e-5, "edge_gate": 5e-6, "node_gate": 0.0, "power": 1e-5, "capacitance": 1e-6, "rail": 0.1}` |
+| Special | Teacher distillation from RegimeAwareMoE (`lambda_kd=1.0` in B1/B2). Physical-domain evaluation at end (relative error per converted CTLE parameter). Standalone script: `python train_ctle.py --teacher-path /path/to/dagger_student_moe.pt [--grid-size 4]`. |
+
 ### `housing_grid` — California housing (3-stage grid topology)
 
 | | |
@@ -1155,10 +1195,10 @@ PHYS = {"x_max": 3.0, "C_eff": 1.0,
         "beta_softness": 0.02, "clip_current": 0.05, "clip_softness": 0.02}
 
 # Training (RR-A: reg_warmup_epochs=100 for longer free phase;
-#              lr auto-scaled: BASE_LR=3e-4 * batch_size/1024 = 6e-4 at 2048)
+#              lr auto-scaled: BASE_LR=3e-4 * batch_size/1024 = 3e-4 at 1024)
 #              scheduler_T_0 is 50)
-OPTIM = {"lr": 6e-4, "weight_decay": 1e-4, "grad_clip_norm": 5.0,
-         "epochs": 800, "batch_size": 2048,
+OPTIM = {"lr": 3e-4, "weight_decay": 1e-4, "grad_clip_norm": 5.0,
+         "epochs": 800, "batch_size": 1024,
          "reg_warmup_epochs": 100, "reg_anneal_epochs": 50,
          "scheduler_T_0": 50, "scheduler_T_mult": 1, "scheduler_eta_min": 1e-5}
 
@@ -1218,7 +1258,7 @@ SCHEDULE_FOUR_PHASE = {"frac_a": 0.25, "frac_b1": 0.20, "frac_b2": 0.25, "frac_c
                        "prune_nodes_by_gate": False}
 
 # Integration defaults
-SOLVER = {"method": "heun", "t_span": 5, "num_steps": 50}
+SOLVER = {"method": "heun", "t_span": 10, "num_steps": 100}
 
 # Parameter initialization (four-phase-redesign: equal cell probability,
 # max-gradient gate init)
@@ -1262,7 +1302,7 @@ Convergence diagnostic: captures ODE state snapshots during integration and plot
 
 ### Smoke test (`test_smoke.py`)
 
-**634 total test checks** (118 test functions; 0 failures) covering the full pipeline:
+**616 total test checks** (126 test functions; 0 failures) covering the full pipeline:
 R1-R7, RR-A through RR-D reviewer-residual cleanup, CP-1 through CP-5
 complexity pruning, smooth2d and smooth2d_grid presets (including
 three-phase schedule, fan-out write), MLP benchmark comparison,
@@ -1355,10 +1395,10 @@ Coverage:
 | 132 | Retrain LR scale | Defaults to 1.0 |
 
 **Pre-existing failures (0):**
-All checks pass after test expectations were updated to match batch-size-aware
-LR auto-scaling (3e-4 → 6e-4), per-preset lambda values (sparsity=1e-5,
-edge_gate=5e-6 for smooth2d_grid legacy path), and schedule config values
-(sparsity=5e-5, edge_gate=1e-5, warmup_frac_b=1/2 for three_phase).
+All checks pass with current config values (batch_size=1024, lr=3e-4,
+SOLVER t_span=10, num_steps=100; per-preset lambda values sparsity=1e-5,
+edge_gate=5e-6 for smooth2d_grid legacy path; schedule config values
+sparsity=5e-5, edge_gate=1e-5, warmup_frac_b=1/2 for three_phase).
 
 ---
 
@@ -1380,10 +1420,12 @@ kirchhoff_redesign/ideal/
 │                                  #   trigger, teacher distillation, stage-LR scaling, training loop
 ├── train_script.py                # CLI training entry point (5 problems; prune/retrain; three-phase + four-phase;
 │                                  #   grid-size CLI; ablation-set; cell-mode; AMP/compile/DP)
-├── test_smoke.py                  # 634-test smoke suite (118 test functions; P cell, gates, pruning, three-phase,
+├── test_smoke.py                  # 616-check smoke suite (126 test functions; P cell, gates, pruning, three-phase,
 │                                  #   four-phase, smooth2d/smooth2d_grid, housing_grid, fan-out write, MLP benchmark,
 │                                  #   gradient logging, stage-LR scaling, rail-loss, ablation-set CLI)
 ├── mlp_benchmark.py               # MLPRegressor baseline for smooth2d Franke task
+├── mlp_benchmark_housing.py       # MLPRegressor baseline for California Housing task
+├── train_ctle.py                  # CTLE inverse design: 4-phase KD from RegimeAwareMoE teacher
 ├── visualize.py                   # Matplotlib/networkx visualization utilities
 ├── gen_network_images.py          # Generate network viz images for all presets
 ├── sparse_solver_data.py          # Random sparse SPD matrix + dataset generator (preserved, not active)
@@ -1394,3 +1436,99 @@ kirchhoff_redesign/ideal/
 ├── results/                       # Training run output directories (generated)
 └── network_visualization/         # Generated PNGs from gen_network_images.py (if present)
 ```
+
+---
+
+## 12. Experimental Results
+
+### 12.1 smooth2d_grid four-phase (5x5, 3-stage) — SUCCESS
+
+**Command:**
+```
+./venv/bin/python kirchhoff_redesign/ideal/train_script.py \
+  --problem smooth2d_grid --grid-size 5 --output result_grid_4_phase_5x5 \
+  --schedule four_phase --epochs 800 --lr 3e-4 --batch-size 1024 \
+  --stage-lr-scale 1.3 --validate-every 20 --grad-log
+```
+
+**Config summary:**
+| Field | Value |
+|-------|-------|
+| Grid size | 5×5 (25 hidden + 3 proj) |
+| Stages | 3 |
+| Params | ~2000 |
+| Teacher | none (direct regression) |
+| C_eff | 1.0 |
+| Write mode | fan_out |
+| Batch size | 1024 |
+| LR | 3e-4 |
+| Stage LR scale | 1.3 |
+| Schedule | four_phase |
+| Epochs | 800 |
+| Platform | RTX 4090 (kaggle) |
+
+**Outcome:** SUCCESS — val_argmax converged below task loss threshold and readiness-gated prune fired successfully.
+
+**Key metrics:**
+| Phase | Epochs | Task loss (train/val) | val_argmax |
+|-------|--------|---------------------|------------|
+| A | 0–199 | ~0.02 / ~0.03 | ~0.04 |
+| B1 | 200–359 | ~0.01 / ~0.02 | ~0.03 |
+| B2 | 360–559 | ~0.01 / ~0.02 | ~0.02 |
+| C (pruned) | 560–799 | ~0.01 / ~0.02 | ~0.02 |
+
+**Diagnosis:** C_eff=1.0 provided normal solver dynamics. Stage LR scaling (1.3) kept early-stage gradients alive. Fan-out write and center-column + proj readout created clean gradient paths. Readiness gate fired at ~epoch 540 (within B2 window), confirming that cell commitment, gate stability, and convergence all aligned. No Z-hoarding observed — mean_pZ stayed below 0.35 throughout.
+
+### 12.2 CTLE distillation four-phase (4x4, 3-stage, dense write) — FAILED
+
+**Command:**
+```
+python train_ctle.py --teacher-path /path/to/dagger_student_moe.pt \
+  --grid-size 4 --epochs 1000 --lr 12e-4 --batch-size 4096 \
+  --write-mode dense --mapper-lr-scale 0.1 --validate-every 20 \
+  --stage-lr-scale 1.3
+```
+
+Also note that for this experiment t_span was set to 5.0 and num_steps was set to 50.
+
+**Config summary:**
+| Field | Value |
+|-------|-------|
+| Grid size | 4×4 (16 hidden + 7 proj) |
+| Stages | 3 |
+| Params | 5984 |
+| Teacher | MoE 56403 params (~9.4× compression) |
+| C_eff | 0.5 |
+| Write mode | dense |
+| Batch size | 4096 |
+| LR | 12e-4 |
+| Stage LR scale | 1.3 |
+| Mapper LR scale | 0.1 |
+| Schedule | four_phase |
+| Epochs | 1000 |
+| Platform | Kaggle T4x2 |
+
+**Outcome:** FAILED — val plateaued at ~0.70 (never below threshold), readiness-gated prune never fired.
+
+**Key metrics:**
+| Phase | Epochs | Best val | Best val_argmax | Notes |
+|-------|--------|---------|----------------|-------|
+| A | 0–249 | ~0.70 | 3.7 (spike) | Z-hoarding: mean_pZ 0.25 → 0.57 |
+| B1 | 250–449 | ~0.70 | ~0.71 | val_argmax recovered slightly with KD |
+| B2 | 450–699 | ~0.70 | ~0.71 | Readiness never triggered |
+| C (fallback) | 700–999 | ~0.70 | ~0.71 | Retrain from fallback prune, no improvement |
+
+**Diagnosis:**
+- C_eff=0.5 accelerated dynamics, amplifying gradient imbalance between early/late stages (confirmed: 800× imbalance epoch 0, 2–6× steady state)
+- Batch_size=4096 with lr=12e-4 (Goyal scaling: base 3e-4 × 4096/1024 = 12e-4) was too aggressive — caused val_argmax spike in Phase A
+- Dense write path (all-to-all) created 16×16=256 input→hidden connections, drowning out the ODE gradients with mapper gradients
+- Z-hoarding: mean_pZ reached 0.69 by B1 end, starving L/S/P edges of probability mass
+- Platform: Kaggle T4x2 ~4h wall time insufficient for thorough tuning
+
+**Artifacts:** `result_4_phase_4x4_dense_write_moe_distillation_failed/` contains loss_history, config_snapshot, gradient_norms.txt, solidification_metrics.txt, output_log.txt.
+
+### 12.3 Kaggle run notes
+- Always verify `--lr` vs Goyal scaling: `lr = base_lr × (batch_size / 1024)`. At batch_size=4096, `lr = 3e-4 × 4 = 12e-4`. Lower to 6e-4 (batch_size=2048) for next attempt.
+- C_eff below 1.0 should be avoided unless there is strong evidence the standard dynamics are too slow — the smooth2d SUCCESS used C_eff=1.0.
+- Stage LR scaling at 1.3 is effective but may need increase to 1.5 if gradient logs show >10× imbalance in steady state.
+- For CTLE distillation, try `--write-mode one_to_one` or fan-out (the ctle_grid default) instead of dense to reduce mapper gradient dominance.

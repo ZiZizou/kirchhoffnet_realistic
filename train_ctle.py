@@ -1073,15 +1073,13 @@ def main() -> None:
                 teacher_cell_mode="soft",
             )
             if scaler is not None and scaler._enabled:
-                scaler.scale(loss_task).backward(retain_graph=True)
-                scaler.scale(loss_structural).backward()
+                scaler.scale(loss_task + loss_structural).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=grad_clip)
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                loss_task.backward(retain_graph=True)
-                loss_structural.backward()
+                (loss_task + loss_structural).backward()
                 torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=grad_clip)
                 optimizer.step()
             total_loss += float((loss_task + loss_structural).item())
@@ -1333,15 +1331,13 @@ def main() -> None:
                     cell_mode=cell_mode_c,
                 )
                 if retrain_scaler is not None and retrain_scaler._enabled:
-                    retrain_scaler.scale(loss_task).backward(retain_graph=True)
-                    retrain_scaler.scale(loss_structural).backward()
+                    retrain_scaler.scale(loss_task + loss_structural).backward()
                     retrain_scaler.unscale_(retrain_optimizer)
                     torch.nn.utils.clip_grad_norm_(pruned_net.parameters(), max_norm=grad_clip)
                     retrain_scaler.step(retrain_optimizer)
                     retrain_scaler.update()
                 else:
-                    loss_task.backward(retain_graph=True)
-                    loss_structural.backward()
+                    (loss_task + loss_structural).backward()
                     torch.nn.utils.clip_grad_norm_(pruned_net.parameters(), max_norm=grad_clip)
                     retrain_optimizer.step()
                 tot += float((loss_task + loss_structural).item())

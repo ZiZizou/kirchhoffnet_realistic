@@ -755,6 +755,18 @@ def main() -> None:
         help="Disable torch.compile.",
     )
     parser.add_argument(
+        "--amp", dest="amp", action="store_true", default=None,
+        help="Enable mixed precision (AMP) (default: on when CUDA).",
+    )
+    parser.add_argument(
+        "--no-amp", dest="amp", action="store_false",
+        help="Disable mixed precision.",
+    )
+    parser.add_argument(
+        "--amp-dtype", choices=["float16", "bfloat16"], default="float16",
+        help="AMP autocast dtype (default: float16; bfloat16 needs Ampere+).",
+    )
+    parser.add_argument(
         "--parallel", dest="parallel", action="store_true", default=None,
         help="Enable DataParallel across multiple GPUs (default: on when >=2 GPUs).",
     )
@@ -800,12 +812,15 @@ def main() -> None:
     device = torch.device(device)
 
     n_gpus = torch.cuda.device_count() if str(device).startswith("cuda") else 0
+    amp_enabled = args.amp if args.amp is not None else torch.cuda.is_available()
+    amp_dtype = torch.float16 if args.amp_dtype == "float16" else torch.bfloat16
     compile_enabled = args.compile if args.compile is not None else (n_gpus >= 1)
     parallel_enabled = args.parallel if args.parallel is not None else (n_gpus >= 2)
 
     print(f"[train_ctle] device={device} epochs={epochs} lr={lr} batch_size={batch_size} "
           f"grid_size={args.grid_size} num_stages={args.num_stages} "
-          f"compile={compile_enabled} parallel={parallel_enabled} ({n_gpus} GPUs) "
+          f"compile={compile_enabled} parallel={parallel_enabled} "
+          f"amp={amp_enabled} amp_dtype={args.amp_dtype} ({n_gpus} GPUs) "
           f"output={out_dir}")
 
     # ---- load teacher MoE ----
@@ -934,6 +949,8 @@ def main() -> None:
         f.write(f"write_mode: {_effective_write_mode}\n")
         f.write(f"compile: {compile_enabled}\n")
         f.write(f"parallel: {parallel_enabled}\n")
+        f.write(f"amp: {amp_enabled}\n")
+        f.write(f"amp_dtype: {args.amp_dtype}\n")
         f.write(f"grad_log: {args.grad_log}\n")
         f.write(f"grad_log_every: {args.grad_log_every}\n")
         f.write(f"prune: {args.prune}\n")
@@ -1012,6 +1029,11 @@ def main() -> None:
     readiness_prune_fired = False
     readiness_prune_epoch = -1
 
+    # ---- AMP scaler ----
+    scaler = (
+        torch.amp.GradScaler("cuda", enabled=amp_enabled and amp_dtype == torch.float16)
+    )
+
     # ---- Phase A + B1 + B2 training loop ----
     print("[train_ctle] starting 4-phase training loop")
     for epoch in range(ab_total):
@@ -1045,14 +1067,23 @@ def main() -> None:
             loss_task, loss_structural, _ = compute_loss(
                 net, u_b, tgt_b, ctx=None, task_fn=task_fn,
                 lambdas=eff_lambdas, tau=tau, return_parts=True,
-                amp=False, reg_scale=1.0, cell_mode=cell_mode,
+                amp=amp_enabled, amp_dtype=amp_dtype, reg_scale=1.0,
+                cell_mode=cell_mode,
                 teacher=kd_teacher, lambda_kd=kd_lambda, teacher_tau=1.0,
                 teacher_cell_mode="soft",
             )
-            loss_task.backward(retain_graph=True)
-            loss_structural.backward()
-            torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=grad_clip)
-            optimizer.step()
+            if scaler is not None and scaler._enabled:
+                scaler.scale(loss_task).backward(retain_graph=True)
+                scaler.scale(loss_structural).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss_task.backward(retain_graph=True)
+                loss_structural.backward()
+                torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=grad_clip)
+                optimizer.step()
             total_loss += float((loss_task + loss_structural).item())
             n_batches += 1
         avg_train = total_loss / max(1, n_batches)
@@ -1278,6 +1309,9 @@ def main() -> None:
         best_val_pruned = float("inf")
         best_epoch_pruned = -1
         best_state_pruned: dict | None = None
+        retrain_scaler = (
+            torch.amp.GradScaler("cuda", enabled=amp_enabled and amp_dtype == torch.float16)
+        )
         ewop_p = 0
         for repoch in range(c_total):
             pruned_net.train()
@@ -1295,12 +1329,21 @@ def main() -> None:
                 loss_task, loss_structural, _ = compute_loss(
                     pruned_net, u_b, tgt_b, ctx=None, task_fn=task_fn,
                     lambdas=eff_c_lambdas, tau=tau_r, return_parts=True,
-                    amp=False, reg_scale=1.0, cell_mode=cell_mode_c,
+                    amp=amp_enabled, amp_dtype=amp_dtype, reg_scale=1.0,
+                    cell_mode=cell_mode_c,
                 )
-                loss_task.backward(retain_graph=True)
-                loss_structural.backward()
-                torch.nn.utils.clip_grad_norm_(pruned_net.parameters(), max_norm=grad_clip)
-                retrain_optimizer.step()
+                if retrain_scaler is not None and retrain_scaler._enabled:
+                    retrain_scaler.scale(loss_task).backward(retain_graph=True)
+                    retrain_scaler.scale(loss_structural).backward()
+                    retrain_scaler.unscale_(retrain_optimizer)
+                    torch.nn.utils.clip_grad_norm_(pruned_net.parameters(), max_norm=grad_clip)
+                    retrain_scaler.step(retrain_optimizer)
+                    retrain_scaler.update()
+                else:
+                    loss_task.backward(retain_graph=True)
+                    loss_structural.backward()
+                    torch.nn.utils.clip_grad_norm_(pruned_net.parameters(), max_norm=grad_clip)
+                    retrain_optimizer.step()
                 tot += float((loss_task + loss_structural).item())
                 nb += 1
             avg = tot / max(1, nb)

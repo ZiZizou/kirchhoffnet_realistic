@@ -403,8 +403,17 @@ def validate(
     val_loader: DataLoader,
     task_fn,
     device: torch.device,
+    *,
+    tau: float | None = None,
+    cell_mode: str = "soft",
 ) -> float:
-    """Mean task loss over the val loader (no ctx — we use a static no-op)."""
+    """Mean task loss over the val loader (no ctx — we use a static no-op).
+
+    ``tau`` and ``cell_mode`` are forwarded to the network forward call so
+    validation matches the current training regime. When ``tau`` is ``None``
+    the network defaults to ``tau=1.0`` (full soft mixing), which is only
+    correct for Phase A. Callers in B1/B2/C must pass the current epoch tau.
+    """
     net.eval()
     total = 0.0
     n = 0
@@ -412,7 +421,8 @@ def validate(
         for u, target in val_loader:
             u = u.to(device)
             target = target.to(device)
-            out, _ = net(u, ctx=None, store_trajectory=False, cell_mode="soft")
+            out, _ = net(u, ctx=None, store_trajectory=False,
+                         cell_mode=cell_mode, tau=tau)
             loss = task_fn(out, target)
             total += float(loss.item()) * u.size(0)
             n += u.size(0)
@@ -1054,7 +1064,8 @@ def main() -> None:
         # ---- validation ----
         do_validate = (epoch % args.validate_every == 0) or (epoch == ab_total - 1)
         if do_validate:
-            val_loss = validate(net, val_loader, task_fn, device)
+            val_loss = validate(net, val_loader, task_fn, device,
+                                tau=tau, cell_mode=cell_mode)
             val_v_history.append(val_loss)
             val_history.append(val_loss)
             val_arg = validate_argmax(net, val_loader, task_fn, lambda b, device=None: None, device)
@@ -1175,7 +1186,8 @@ def main() -> None:
         val_batch = next(iter(val_loader))
         u_v = val_batch[0][:64].to(device)
         y_v = val_batch[1][:64].to(device)
-        out_v, _ = net(u_v, ctx=None, store_trajectory=False, cell_mode="soft")
+        out_v, _ = net(u_v, ctx=None, store_trajectory=False,
+                       cell_mode="soft", tau=0.001)
     plot_output_fit(
         out_v, y_v, loss_name="mse",
         title="Pre-prune output fit (logit space, 7 params flattened)",
@@ -1301,7 +1313,8 @@ def main() -> None:
             retrain_scheduler.step()
 
             if repoch % args.validate_every == 0 or repoch == c_total - 1:
-                val_r = validate(pruned_net, val_loader, task_fn, device)
+                val_r = validate(pruned_net, val_loader, task_fn, device,
+                                 tau=tau_r, cell_mode=cell_mode_c)
                 retrain_val_history.append(val_r)
                 val_arg_r = validate_argmax(pruned_net, val_loader, task_fn, lambda b, device=None: None, device)
                 retrain_val_argmax.append(val_arg_r)
@@ -1356,7 +1369,8 @@ def main() -> None:
             )
 
         with torch.no_grad():
-            out_pruned, _ = pruned_net(u_v, ctx=None, store_trajectory=False, cell_mode="soft")
+            out_pruned, _ = pruned_net(u_v, ctx=None, store_trajectory=False,
+                                       cell_mode="soft", tau=0.001)
         plot_output_fit(
             out_pruned, y_v, loss_name="mse",
             title="Pruned output fit (logit space, 7 params flattened)",
@@ -1388,7 +1402,9 @@ def main() -> None:
     eval_specs = sample_specs(eval_n, seed=123).to(device)
     with torch.no_grad():
         eval_logits_mlp = mlp(eval_specs)
-        eval_logits_kirchhoff, _ = eval_net(eval_specs, ctx=None, store_trajectory=False, cell_mode="soft")
+        eval_logits_kirchhoff, _ = eval_net(eval_specs, ctx=None,
+                                            store_trajectory=False,
+                                            cell_mode="soft", tau=0.001)
     params_mlp = params_from_logits(eval_logits_mlp)
     params_kirchhoff = params_from_logits(eval_logits_kirchhoff)
 

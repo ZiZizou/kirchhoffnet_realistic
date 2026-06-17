@@ -157,7 +157,7 @@ class DifferentialStage(nn.Module):
 
         return (acc - leak_term - clip_term) / self.c_eff
 
-    def compile_rhs(self, backend: str | None = None):
+    def compile_rhs(self, backend: str = "inductor"):
         """Compile `rhs` with `torch.compile` for kernel fusion.
 
         Note: `index_add_` on `acc` is a scatter op that may force a graph

@@ -255,8 +255,8 @@ SCHEDULE_FOUR_PHASE = {
 # Fixed-step Heun solver
 SOLVER = {
     "method": "heun",
-    "t_span": 5.0,
-    "num_steps": 50,
+    "t_span": 10,
+    "num_steps": 100,
 }
 
 # Initialization biases

@@ -182,7 +182,7 @@ class IdealizedCellLibrary(nn.Module):
         i_edge = (mult * weights_b * gate * i_cell).sum(dim=-1)  # [B, E]
         return i_edge
 
-    def compile_forward(self, backend: str | None = None):
+    def compile_forward(self, backend: str = "inductor"):
         """Compile `forward` with `torch.compile` for kernel fusion.
 
         Fuses softmax/tanh/sigmoid/softplus/elementwise math for ~1.3-2×

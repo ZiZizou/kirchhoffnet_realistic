@@ -1,14 +1,16 @@
 """Train a 3-stage grid KirchhoffNet as CTLE inverse design student via 4-phase
-knowledge distillation from a pre-trained BoundedMLP teacher.
+knowledge distillation from a pre-trained RegimeAwareMoE teacher.
 
-The BoundedMLP teacher is loaded from a state-dict checkpoint (e.g.
+The RegimeAwareMoE teacher is loaded from a state-dict checkpoint (e.g.
 ``dagger_student_moe.pt``) and used to label synthetic spec samples for
-training the KirchhoffNet. The 4-phase schedule (A: free fit, B1: cell
-commitment with KD, B2: edge pruning with KD, C: retrain compact network)
-is reused from ``train.py`` with the MLP wrapped as a KirchhoffNet-style
-teacher (compatible with ``compute_loss``'s KD path).
+training the KirchhoffNet. The companion scaler file ``flow_scaler_C.pkl``
+is auto-discovered from the same directory as the checkpoint; override
+with ``--scaler-path`` if stored elsewhere. The 4-phase schedule (A: free
+fit, B1: cell commitment with KD, B2: edge pruning with KD, C: retrain
+compact network) is reused from ``train.py`` with the MoE wrapped as a
+KirchhoffNet-style teacher (compatible with ``compute_loss``'s KD path).
 
-Output is unbounded logits matching ``BoundedMLP.forward()``. Physical
+Output is unbounded logits matching ``RegimeAwareMoE.forward()``. Physical
 parameter conversion via ``params_from_logits()`` is applied post-hoc at
 evaluation time only.
 
@@ -29,6 +31,7 @@ import warnings
 from pathlib import Path
 from typing import Any
 
+import joblib
 import numpy as np
 import torch
 import torch.nn as nn
@@ -86,7 +89,7 @@ from visualize import (
 # CTLE problem constants
 # =============================================================================
 
-# Spec input column order (must match BoundedMLP.forward).
+# Spec input column order (must match RegimeAwareMoE.forward).
 SPEC_INPUT_COLS = ["power", "jitter", "height", "width"]
 
 # Empirical spec sampling ranges (from ctle_ml_dataset.csv, 83k rows).
@@ -98,7 +101,7 @@ SPEC_RANGES = {
     "width": (0.0, 98.5),
 }
 
-# Output parameter column order (matches BoundedMLP's PARAM_LOG_BOUNDS).
+# Output parameter column order (matches RegimeAwareMoE's PARAM_LOG_BOUNDS).
 PARAM_COLS = ["fW", "current", "ind", "Rd", "Cs", "Rs", "VDD"]
 
 # Log10 bounds for the bounded prediction head.
@@ -212,59 +215,110 @@ def make_ctle_grid_preset(
 
 
 # =============================================================================
-# BoundedMLP (teacher) and adapter
+# RegimeAwareMoE (teacher) and adapter
 # =============================================================================
 
-class BoundedMLP(nn.Module):
-    """4-layer MLP that maps 4 specs to 7 unbounded logits.
+class RegimeAwareMoE(nn.Module):
+    """Mixture-of-Experts MLP teacher that maps 4 raw specs to 7 unbounded logits.
 
-    Mirrors the architecture in ``generative-distillation.py`` so that the
-    pre-trained state-dict (``dagger_student_moe.pt``) loads cleanly.
-    ``log_lo`` / ``log_hi`` are non-trainable buffers (they store the
-    PARAM_LOG_BOUNDS in log10 space).
+    Mirrors the architecture in ``generative-distillation-improved-dagger-nuance.py``
+    so that the pre-trained state-dict (``dagger_student_moe.pt``) loads cleanly.
+    Performs internal Q75 + StandardScaler input preprocessing via
+    ``scale_input()``; raw spec tensors ``[N, 4]`` can be passed directly to
+    ``forward()``. ``log_lo`` / ``log_hi`` are non-trainable buffers (they
+    store PARAM_LOG_BOUNDS in log10 space).
     """
 
     def __init__(
         self,
-        hidden_dim: int = 64,
-        num_layers: int = 4,
+        trunk_width: int = 160,
+        trunk_layers: int = 3,
+        num_experts: int = 3,
         input_dim: int = 4,
         output_dim: int = 7,
+        param_log_bounds: dict[str, tuple[float, float]] | None = None,
+        activation: type[nn.Module] = nn.SiLU,
+        use_log_features: bool = True,
+        scaler_p_mean: float = 0.0,
+        scaler_p_scale: float = 1.0,
+        eye_scale_h: float = 1.0,
+        eye_scale_w: float = 1.0,
+        eye_scale_j: float = 1.0,
     ) -> None:
         super().__init__()
+        self.trunk_width = int(trunk_width)
+        self.trunk_layers = int(trunk_layers)
+        self.num_experts = int(num_experts)
         self.input_dim = int(input_dim)
         self.output_dim = int(output_dim)
+        self.activation = activation
+        self.use_log_features = bool(use_log_features)
+        if param_log_bounds is None:
+            param_log_bounds = PARAM_LOG_BOUNDS
 
-        layers: list[nn.Module] = []
-        dims = [input_dim] + [hidden_dim] * num_layers
-        for i in range(num_layers):
-            layers.extend([
-                nn.Linear(dims[i], dims[i + 1]),
-                nn.GELU(),
-                nn.LayerNorm(dims[i + 1]),
-            ])
-        self.backbone = nn.Sequential(*layers)
-        self.head = nn.Linear(hidden_dim, output_dim)
+        trunk_input_dim = input_dim * 2 if use_log_features else input_dim
+        trunk_dims = [trunk_input_dim] + [trunk_width] * trunk_layers
 
-        self.register_buffer("log_lo", torch.zeros(output_dim))
-        self.register_buffer("log_hi", torch.zeros(output_dim))
-        for i, (lo, hi) in enumerate(PARAM_LOG_BOUNDS.values()):
-            self.log_lo[i] = lo
-            self.log_hi[i] = hi
+        trunk_layers_list: list[nn.Module] = []
+        for i in range(trunk_layers):
+            trunk_layers_list.append(nn.Linear(trunk_dims[i], trunk_dims[i + 1]))
+            trunk_layers_list.append(activation())
+        self.trunk = nn.Sequential(*trunk_layers_list)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.head(self.backbone(x))
+        self.gate = nn.Linear(trunk_input_dim, num_experts, bias=False)
+        self.regime_classifier = nn.Linear(trunk_input_dim, num_experts, bias=False)
+
+        self.experts = nn.ModuleList([
+            nn.Linear(trunk_width, output_dim) for _ in range(num_experts)
+        ])
+
+        self.log_lo = nn.Parameter(torch.zeros(output_dim), requires_grad=False)
+        self.log_hi = nn.Parameter(torch.zeros(output_dim), requires_grad=False)
+        for i, (lo, hi) in enumerate(param_log_bounds.values()):
+            self.log_lo.data[i] = lo
+            self.log_hi.data[i] = hi
+
+        self.scaler_p_scale = float(scaler_p_scale)
+        self.scaler_p_mean = float(scaler_p_mean)
+        self._eye_scale_j = float(eye_scale_j)
+        self._eye_scale_h = float(eye_scale_h)
+        self._eye_scale_w = float(eye_scale_w)
+
+    def scale_input(self, x: torch.Tensor) -> torch.Tensor:
+        power_log = torch.log10(x[..., 0].clamp(min=1e-12))
+        power_scaled = (power_log - self.scaler_p_mean) / self.scaler_p_scale
+        jitter_scaled = torch.log10(x[..., 1].clamp(min=1e-12)) / self._eye_scale_j
+        height_scaled = torch.log10(x[..., 2].clamp(min=1e-12)) / self._eye_scale_h
+        width_scaled = torch.log10(x[..., 3].clamp(min=1e-12)) / self._eye_scale_w
+        linear_scaled = torch.stack([power_scaled, jitter_scaled, height_scaled, width_scaled], dim=-1)
+        if self.use_log_features:
+            log_scaled = torch.stack([power_log, torch.log10(x[..., 1].clamp(min=1e-12)),
+                                      torch.log10(x[..., 2].clamp(min=1e-12)),
+                                      torch.log10(x[..., 3].clamp(min=1e-12))], dim=-1)
+            return torch.cat([linear_scaled, log_scaled], dim=-1)
+        return linear_scaled
+
+    def forward(self, x: torch.Tensor, return_regime_loss: bool = False):
+        x_s = self.scale_input(x)
+        h = self.trunk(x_s)
+        gate_weights = F.softmax(self.gate(x_s), dim=-1)
+        expert_outputs = torch.stack([expert(h) for expert in self.experts], dim=-1)
+        logits = (expert_outputs * gate_weights.unsqueeze(-2)).sum(dim=-1)
+
+        if return_regime_loss:
+            return logits, torch.tensor(0.0, device=logits.device)
+        return logits
 
 
 class MLPTeacherWrapper(nn.Module):
-    """Adapter that exposes a BoundedMLP with KirchhoffNet's forward signature.
+    """Adapter that exposes a RegimeAwareMoE with KirchhoffNet's forward signature.
 
     ``compute_loss`` calls ``teacher(u, ctx=..., tau=..., store_trajectory=...,
     cell_mode=...)`` and unpacks ``(y_teacher, _)``. This wrapper ignores the
     KirchhoffNet-specific kwargs and returns ``(mlp(u), None)``.
     """
 
-    def __init__(self, mlp: BoundedMLP) -> None:
+    def __init__(self, mlp: RegimeAwareMoE) -> None:
         super().__init__()
         self.mlp = mlp
 
@@ -309,7 +363,7 @@ def sample_specs(n: int, seed: int = 42) -> torch.Tensor:
 def generate_ctle_dataset(
     n_train: int,
     n_val: int,
-    mlp: BoundedMLP,
+    mlp: RegimeAwareMoE,
     device: torch.device,
     batch_size: int,
     seed: int = 42,
@@ -580,11 +634,23 @@ def resolve_cell_mode(cli_value: str, phase: str) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Train a 3-stage grid KirchhoffNet as CTLE inverse design student via 4-phase KD from a pre-trained BoundedMLP teacher."
+        description="Train a 3-stage grid KirchhoffNet as CTLE inverse design student via 4-phase KD from a pre-trained RegimeAwareMoE teacher."
     )
     parser.add_argument(
         "--teacher-path", type=Path, required=True,
-        help="Path to the BoundedMLP state-dict checkpoint (e.g. dagger_student_moe.pt).",
+        help="Path to the RegimeAwareMoE state-dict checkpoint (e.g. dagger_student_moe.pt).",
+    )
+    parser.add_argument(
+        "--scaler-path", type=Path, default=None,
+        help="Path to flow_scaler_C.pkl (default: auto-discover next to --teacher-path).",
+    )
+    parser.add_argument(
+        "--teacher-hidden", type=int, default=160,
+        help="MoE trunk width (default: 160, matching the published checkpoint).",
+    )
+    parser.add_argument(
+        "--teacher-experts", type=int, default=3,
+        help="Number of MoE experts (default: 3).",
     )
     parser.add_argument(
         "--grid-size", type=int, default=5,
@@ -732,18 +798,48 @@ def main() -> None:
           f"compile={compile_enabled} parallel={parallel_enabled} ({n_gpus} GPUs) "
           f"output={out_dir}")
 
-    # ---- load teacher MLP ----
+    # ---- load teacher MoE ----
     if not args.teacher_path.exists():
         raise FileNotFoundError(f"Teacher checkpoint not found: {args.teacher_path}")
-    mlp = BoundedMLP(hidden_dim=64, num_layers=4, input_dim=4, output_dim=7)
+    scaler_path = args.scaler_path if args.scaler_path is not None else args.teacher_path.parent / "flow_scaler_C.pkl"
+    if not scaler_path.exists():
+        raise FileNotFoundError(
+            f"flow_scaler_C.pkl not found at {scaler_path}. "
+            f"Pass --scaler-path to override the auto-discovered location."
+        )
+    flow_scaler_C = joblib.load(scaler_path)
+    scaler_p_mean = float(flow_scaler_C["scaler_y_p"].mean_[0])
+    scaler_p_scale = float(flow_scaler_C["scaler_y_p"].scale_[0])
+    eye_scale_h = float(flow_scaler_C["eye_scale_h"])
+    eye_scale_w = float(flow_scaler_C["eye_scale_w"])
+    eye_scale_j = float(flow_scaler_C["eye_scale_j"])
+    print(f"[train_ctle] loaded scaler from {scaler_path} "
+          f"(p_mean={scaler_p_mean:.4f}, p_scale={scaler_p_scale:.4f}, "
+          f"eye_h={eye_scale_h:.4f}, eye_w={eye_scale_w:.4f}, eye_j={eye_scale_j:.4f})")
+    mlp = RegimeAwareMoE(
+        trunk_width=args.teacher_hidden,
+        trunk_layers=3,
+        num_experts=args.teacher_experts,
+        input_dim=4,
+        output_dim=7,
+        param_log_bounds=PARAM_LOG_BOUNDS,
+        activation=nn.SiLU,
+        use_log_features=True,
+        scaler_p_mean=scaler_p_mean,
+        scaler_p_scale=scaler_p_scale,
+        eye_scale_h=eye_scale_h,
+        eye_scale_w=eye_scale_w,
+        eye_scale_j=eye_scale_j,
+    )
     state = torch.load(args.teacher_path, map_location="cpu")
     mlp.load_state_dict(state)
     mlp.eval()
     mlp.requires_grad_(False)
     mlp.to(device)
     n_teacher_params = sum(p.numel() for p in mlp.parameters())
-    print(f"[train_ctle] loaded teacher MLP from {args.teacher_path} "
-          f"({n_teacher_params} params)")
+    print(f"[train_ctle] loaded teacher MoE from {args.teacher_path} "
+          f"({n_teacher_params} params, trunk={args.teacher_hidden}, "
+          f"experts={args.teacher_experts})")
 
     # ---- build KirchhoffNet ----
     cell_lib = IdealizedCellLibrary()
@@ -809,7 +905,10 @@ def main() -> None:
     snapshot_path = out_dir / "config_snapshot.txt"
     with snapshot_path.open("w") as f:
         f.write(f"teacher_path: {args.teacher_path}\n")
+        f.write(f"scaler_path: {scaler_path}\n")
         f.write(f"teacher_params: {n_teacher_params}\n")
+        f.write(f"teacher_hidden: {args.teacher_hidden}\n")
+        f.write(f"teacher_experts: {args.teacher_experts}\n")
         f.write(f"grid_size: {args.grid_size}\n")
         f.write(f"num_stages: {args.num_stages}\n")
         f.write(f"hid_count: {net.hid_count}\n")
@@ -958,7 +1057,7 @@ def main() -> None:
             val_loss = validate(net, val_loader, task_fn, device)
             val_v_history.append(val_loss)
             val_history.append(val_loss)
-            val_arg = validate_argmax(net, val_loader, task_fn, lambda b: None, device)
+            val_arg = validate_argmax(net, val_loader, task_fn, lambda b, device=None: None, device)
             val_argmax_history.append(val_arg)
             val_argmax_v_history.append(val_arg)
 
@@ -1204,7 +1303,7 @@ def main() -> None:
             if repoch % args.validate_every == 0 or repoch == c_total - 1:
                 val_r = validate(pruned_net, val_loader, task_fn, device)
                 retrain_val_history.append(val_r)
-                val_arg_r = validate_argmax(pruned_net, val_loader, task_fn, lambda b: None, device)
+                val_arg_r = validate_argmax(pruned_net, val_loader, task_fn, lambda b, device=None: None, device)
                 retrain_val_argmax.append(val_arg_r)
 
                 if repoch % args.validate_every == 0:

@@ -143,6 +143,7 @@ def make_ctle_grid_preset(
     num_stages: int = 3,
     num_proj: int = 7,
     write_mode: str | None = None,
+    bidirectional: bool = False,
 ) -> dict:
     """Build the ctle_grid preset dict for a 4-spec → 7-logit KirchhoffNet.
 
@@ -156,6 +157,11 @@ def make_ctle_grid_preset(
     ``'one_to_one'``), it overrides the default write mapping. ``'dense'``
     uses an all-to-all ``InputMapper``; ``'one_to_one'`` uses
     ``SparseInputMapper`` with the first 4 hidden nodes as write targets.
+
+    When ``bidirectional=True``, each grid_graph edge is realized as two
+    directed edges (i->j and j->i), giving asymmetric cell types (P/rectifier)
+    true bidirectional capability. Edge count is exactly 2× the single-direction
+    count.
     """
     num_hidden = grid_size * grid_size
     n_stages = max(1, num_stages)
@@ -165,7 +171,7 @@ def make_ctle_grid_preset(
         "num_proj": num_proj,
         "num_outputs": 0,
         "hidden_family": "grid",
-        "hidden_kwargs": {"height": grid_size, "width": grid_size, "kernel_size": 3},
+        "hidden_kwargs": {"height": grid_size, "width": grid_size, "kernel_size": 3, "bidirectional": bidirectional},
         "input_pattern": "all_to_all",
         "output_pattern": "all_to_all",
         "proj_pattern": "all_to_all",
@@ -951,6 +957,17 @@ def main() -> None:
         "--grad-log-every", type=int, default=10,
         help="Log gradient norms every N epochs (default: 10, used when --grad-log is enabled).",
     )
+    parser.add_argument(
+        "--bidirectional", dest="bidirectional", action="store_true", default=False,
+        help="Emit two directed edges per unique node pair in the hidden graph "
+             "(i->j AND j->i). Doubles the hidden edge count and gives "
+             "asymmetric cells (P/rectifier) true bidirectional capability. "
+             "Default: off (single edge per pair).",
+    )
+    parser.add_argument(
+        "--no-bidirectional", dest="bidirectional", action="store_false",
+        help="Disable dual edges per node pair (default).",
+    )
     args = parser.parse_args()
 
     # ---- resolve config ----
@@ -1033,6 +1050,7 @@ def main() -> None:
     preset = make_ctle_grid_preset(
         grid_size=args.grid_size, num_stages=args.num_stages,
         write_mode=args.write_mode,
+        bidirectional=args.bidirectional,
     )
     net: KirchhoffNetWithIO = build_net_from_config(preset, cell_lib=cell_lib)
     net.to(device)
@@ -1045,6 +1063,10 @@ def main() -> None:
           f"({n_kirchhoff_params} params)")
     print(f"[train_ctle] write_idx={list(net.write_idx) if net.write_idx is not None else None} "
           f"read_idx={list(net.read_idx) if net.read_idx is not None else None}")
+    if args.bidirectional:
+        edges_per_stage = [s.num_edges() for s in net.core.stages]
+        print(f"[train_ctle] bidirectional=True: {edges_per_stage} edges per stage "
+              f"(2× single-edge baseline)")
 
     # Resolve mapper names for later use.
     _effective_write_mode = (

@@ -433,6 +433,7 @@ def make_smooth2d_grid_preset(
     grid_size: int,
     num_stages: int = 3,
     num_proj: int = 3,
+    bidirectional: bool = False,
 ) -> dict:
     """Dynamically build the smooth2d_grid preset dict for any square grid size.
 
@@ -443,6 +444,11 @@ def make_smooth2d_grid_preset(
     The write fan-out and read indices are computed to match the patterns
     validated in the original git history (5×5 and 4×4 variants). See
     spec/grid-size-cli.md for the exact formulas.
+
+    When ``bidirectional=True``, each grid_graph edge is realized as two
+    directed edges (i->j and j->i), giving asymmetric cell types (P/rectifier)
+    true bidirectional capability. Edge count is exactly 2× the single-direction
+    count.
     """
     num_hidden = grid_size * grid_size
     n_stages = max(1, num_stages)
@@ -452,7 +458,7 @@ def make_smooth2d_grid_preset(
         "num_proj": num_proj,
         "num_outputs": 0,
         "hidden_family": "grid",
-        "hidden_kwargs": {"height": grid_size, "width": grid_size, "kernel_size": 3},
+        "hidden_kwargs": {"height": grid_size, "width": grid_size, "kernel_size": 3, "bidirectional": bidirectional},
         "input_pattern": "all_to_all",
         "output_pattern": "all_to_all",
         "proj_pattern": "all_to_all",
@@ -516,6 +522,7 @@ def make_housing_grid_preset(
     grid_size: int,
     num_stages: int = 3,
     num_proj: int = 3,
+    bidirectional: bool = False,
 ) -> dict:
     """Build the housing_grid preset dict for any square grid size.
 
@@ -532,6 +539,11 @@ def make_housing_grid_preset(
     ``train_script.make_data_housing_grid``. Validation logs are also
     reported in original housing-price units (USD × 100k) via inverse
     normalization of the standardized targets.
+
+    When ``bidirectional=True``, each grid_graph edge is realized as two
+    directed edges (i->j and j->i), giving asymmetric cell types (P/rectifier)
+    true bidirectional capability. Edge count is exactly 2× the single-direction
+    count.
     """
     num_hidden = grid_size * grid_size
     n_stages = max(1, num_stages)
@@ -541,7 +553,7 @@ def make_housing_grid_preset(
         "num_proj": num_proj,
         "num_outputs": 0,
         "hidden_family": "grid",
-        "hidden_kwargs": {"height": grid_size, "width": grid_size, "kernel_size": 3},
+        "hidden_kwargs": {"height": grid_size, "width": grid_size, "kernel_size": 3, "bidirectional": bidirectional},
         "input_pattern": "all_to_all",
         "output_pattern": "all_to_all",
         "proj_pattern": "all_to_all",

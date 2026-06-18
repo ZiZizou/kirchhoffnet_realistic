@@ -87,22 +87,14 @@ class SparseTopology:
 def line_graph(n_nodes: int, radius: int = 1, bidirectional: bool = False) -> SparseTopology:
     """1D chain; node i connects to i+1..i+radius.
 
-    Emits a single directed edge per neighbor pair. L/S cells (odd I-V)
-    provide implicit bidirectional conduction via sign reversal.
+    Emits a single directed edge per neighbor pair by default. L/S cells
+    (odd I-V) provide implicit bidirectional conduction via sign reversal.
 
-    The ``bidirectional`` parameter is deprecated; if ``True`` is passed,
-    a deprecation warning is issued and the function still emits a single
-    edge per pair (matching the new contract).
+    When ``bidirectional=True``, also emits the reverse direction for every
+    edge: for each (i, j) edge, an additional (j, i) edge is added. Edge
+    count is exactly 2× the single-direction count. No self-loops are
+    introduced since the original pairs have i != j.
     """
-    import warnings
-    if bidirectional:
-        warnings.warn(
-            "line_graph(bidirectional=True) is deprecated; only a single "
-            "edge per pair is emitted. Pass bidirectional=False (or omit) "
-            "to silence this warning.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
     if n_nodes <= 0:
         raise ValueError("n_nodes must be positive")
     if radius < 1:
@@ -113,6 +105,8 @@ def line_graph(n_nodes: int, radius: int = 1, bidirectional: bool = False) -> Sp
             j = i + r
             if j < n_nodes:
                 src.append(i); dst.append(j)
+                if bidirectional:
+                    src.append(j); dst.append(i)
     return SparseTopology(
         num_nodes=n_nodes,
         src=src, dst=dst,
@@ -122,12 +116,17 @@ def line_graph(n_nodes: int, radius: int = 1, bidirectional: bool = False) -> Sp
     )
 
 
-def ring_graph(n_nodes: int, radius: int = 1) -> SparseTopology:
+def ring_graph(n_nodes: int, radius: int = 1, bidirectional: bool = False) -> SparseTopology:
     """1D ring with wrap-around; useful for periodic signals.
 
     Emits a single directed edge per neighbor pair: each node i connects to
     (i+r) mod n_nodes for r=1..radius. Reverse direction is implicit via
     sign reversal of L/S cell currents.
+
+    When ``bidirectional=True``, also emits the reverse direction for every
+    edge: for each (i, j) edge, an additional (j, i) edge is added. Edge
+    count is exactly 2× the single-direction count. No self-loops are
+    introduced since the original pairs have i != j (radius * 2 < n_nodes).
     """
     if n_nodes <= 0:
         raise ValueError("n_nodes must be positive")
@@ -140,6 +139,8 @@ def ring_graph(n_nodes: int, radius: int = 1) -> SparseTopology:
         for r in range(1, radius + 1):
             j = (i + r) % n_nodes
             src.append(i); dst.append(j)
+            if bidirectional:
+                src.append(j); dst.append(i)
     return SparseTopology(
         num_nodes=n_nodes,
         src=src, dst=dst,
@@ -149,14 +150,19 @@ def ring_graph(n_nodes: int, radius: int = 1) -> SparseTopology:
     )
 
 
-def grid_graph(height: int, width: int, kernel_size: int = 3) -> SparseTopology:
+def grid_graph(height: int, width: int, kernel_size: int = 3, bidirectional: bool = False) -> SparseTopology:
     """2D local grid; node id = row * width + col.
 
-    Emits a single directed edge per unique neighbor pair (i, j) with j>i.
-    The single-edge representation matches a 2-terminal electrical branch:
-    L/S cells (odd I-V) carry current either direction via sign reversal,
-    and P cells (asymmetric, softplus threshold) conduct only when
-    V_src - V_dst > theta.
+    Emits a single directed edge per unique neighbor pair (i, j) with j>i
+    by default. The single-edge representation matches a 2-terminal
+    electrical branch: L/S cells (odd I-V) carry current either direction
+    via sign reversal, and P cells (asymmetric, softplus threshold)
+    conduct only when V_src - V_dst > theta.
+
+    When ``bidirectional=True``, also emits the reverse direction for every
+    edge: for each (i, j) edge, an additional (j, i) edge is added. Edge
+    count is exactly 2× the single-direction count. No self-loops are
+    introduced since the original pairs have j > i (i != j).
     """
     if height <= 0 or width <= 0:
         raise ValueError("height and width must be positive")
@@ -177,6 +183,8 @@ def grid_graph(height: int, width: int, kernel_size: int = 3) -> SparseTopology:
                         j = nr * width + nc
                         if j > i:
                             src.append(i); dst.append(j)
+                            if bidirectional:
+                                src.append(j); dst.append(i)
     return SparseTopology(
         num_nodes=n,
         src=src, dst=dst,
@@ -186,12 +194,17 @@ def grid_graph(height: int, width: int, kernel_size: int = 3) -> SparseTopology:
     )
 
 
-def cluster_graph(n_nodes: int, edge_prob: float = 0.3, seed: int = 0) -> SparseTopology:
+def cluster_graph(n_nodes: int, edge_prob: float = 0.3, seed: int = 0, bidirectional: bool = False) -> SparseTopology:
     """Erdős-Rényi-like sparse graph with a single directed edge per undirected pair.
 
     For each pair (i, j) with i<j, an edge is emitted with probability
     edge_prob in the direction (i->j). L/S cells (odd I-V) provide implicit
     bidirectional conduction via sign reversal.
+
+    When ``bidirectional=True``, also emits the reverse direction for every
+    accepted edge: for each (i, j) edge, an additional (j, i) edge is added.
+    Edge count is exactly 2× the single-direction count. No self-loops are
+    introduced since the original pairs have i < j (i != j).
     """
     if n_nodes <= 0:
         raise ValueError("n_nodes must be positive")
@@ -203,6 +216,8 @@ def cluster_graph(n_nodes: int, edge_prob: float = 0.3, seed: int = 0) -> Sparse
         for j in range(i + 1, n_nodes):
             if rng.random() < edge_prob:
                 src.append(i); dst.append(j)
+                if bidirectional:
+                    src.append(j); dst.append(i)
     return SparseTopology(
         num_nodes=n_nodes,
         src=src, dst=dst,
@@ -814,6 +829,13 @@ def validate_topology(topo: SparseTopology, max_hidden_density: float = 0.5) -> 
             raise ValueError(f"Self-loop not allowed: edge {s}->{d}")
     n_h = len(topo.hidden_node_ids)
     if n_h > 0:
+        # Max is the count of undirected pairs (i, j) with i < j. For
+        # bidirectional topologies, each pair is realized as 2 directed
+        # edges, so the actual edge count can be up to 2 * max_edges.
+        # The density ratio is therefore (actual_hidden_edges / max_edges),
+        # which can exceed 1.0 in fully bidirectional dense graphs; the
+        # check is intentionally permissive to allow bidirectional mode
+        # (e.g., grid_graph 5x5 with kernel_size=3 reaches 0.27 bidirectional).
         max_edges = n_h * (n_h - 1) // 2
         actual_hidden_edges = sum(1 for t in topo.edge_type if t == EDGE_TYPE_HIDDEN)
         if n_h > 32 and (actual_hidden_edges / max_edges) > max_hidden_density:

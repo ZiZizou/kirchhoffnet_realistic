@@ -2466,6 +2466,16 @@ def main():
     test_mapper_unfreeze_epoch_midpoint()         # MLR-7: midpoint
     test_freeze_mappers_requires_grad_toggle()    # MLR-8: requires_grad toggle
 
+    # Bidirectional topology tests (bidirectional-edges plan, spec order)
+    test_bidir_line_graph_doubles_edges()         # BIDI-1: line primitive
+    test_bidir_ring_graph_doubles_edges()         # BIDI-2: ring primitive
+    test_bidir_grid_graph_doubles_edges()         # BIDI-3: grid primitive
+    test_bidir_cluster_graph_doubles_edges()      # BIDI-4: cluster primitive
+    test_bidir_validate_topology_passes()         # BIDI-5: validation
+    test_bidir_default_is_false()                 # BIDI-6: backward compat
+    test_bidir_preset_factories_accept_param()    # BIDI-7: preset factories
+    test_bidir_full_net_build()                   # BIDI-8: full net build
+
     print()
     print("=" * 60)
     print(f"Smoke test results: {passed} passed, {failed} failed")
@@ -4027,6 +4037,212 @@ def test_freeze_mappers_requires_grad_toggle():
     check("MLR-8: all mapper params have requires_grad=True after unfreeze",
           in_all_true and out_all_true,
           f"in_all_true={in_all_true}, out_all_true={out_all_true}")
+
+
+# ============================================================================
+# Bidirectional topology tests (bidirectional-edges plan)
+# ============================================================================
+
+def test_bidir_line_graph_doubles_edges():
+    """line_graph(bidirectional=True) emits exactly 2x the edges of bidirectional=False."""
+    print("\nTest BIDI-1: line_graph bidirectional doubles edge count")
+    from topology import line_graph
+    l1 = line_graph(8, radius=2, bidirectional=False)
+    l2 = line_graph(8, radius=2, bidirectional=True)
+    check("BIDI-1: line single edges > 0", len(l1.src) > 0,
+          f"single={len(l1.src)}")
+    check("BIDI-1: line bidirectional = 2 * single", len(l2.src) == 2 * len(l1.src),
+          f"single={len(l1.src)}, bidir={len(l2.src)}")
+
+    # Verify every (i, j) has a reverse (j, i).
+    edges_single = set(zip(l1.src, l1.dst))
+    edges_bidir = set(zip(l2.src, l2.dst))
+    all_reversed = all((d, s) in edges_bidir for s, d in edges_single)
+    check("BIDI-1: every single edge has its reverse in bidirectional",
+          all_reversed)
+
+    # No self-loops in bidirectional output.
+    no_self_loops = all(s != d for s, d in edges_bidir)
+    check("BIDI-1: no self-loops in bidirectional", no_self_loops)
+
+    # Hidden node count unchanged.
+    check("BIDI-1: hidden_node_ids unchanged",
+          l1.hidden_node_ids == l2.hidden_node_ids)
+
+    # Edge type unchanged (still hidden).
+    check("BIDI-1: all edges typed HIDDEN",
+          all(t == "hidden" for t in l2.edge_type))
+
+
+def test_bidir_ring_graph_doubles_edges():
+    """ring_graph(bidirectional=True) emits exactly 2x the edges of bidirectional=False."""
+    print("\nTest BIDI-2: ring_graph bidirectional doubles edge count")
+    from topology import ring_graph
+    r1 = ring_graph(10, radius=2, bidirectional=False)
+    r2 = ring_graph(10, radius=2, bidirectional=True)
+    check("BIDI-2: ring single edges > 0", len(r1.src) > 0,
+          f"single={len(r1.src)}")
+    check("BIDI-2: ring bidirectional = 2 * single", len(r2.src) == 2 * len(r1.src),
+          f"single={len(r1.src)}, bidir={len(r2.src)}")
+    edges_single = set(zip(r1.src, r1.dst))
+    edges_bidir = set(zip(r2.src, r2.dst))
+    all_reversed = all((d, s) in edges_bidir for s, d in edges_single)
+    check("BIDI-2: every single edge has its reverse", all_reversed)
+    no_self_loops = all(s != d for s, d in edges_bidir)
+    check("BIDI-2: no self-loops in bidirectional", no_self_loops)
+
+
+def test_bidir_grid_graph_doubles_edges():
+    """grid_graph(bidirectional=True) emits exactly 2x the edges of bidirectional=False."""
+    print("\nTest BIDI-3: grid_graph bidirectional doubles edge count")
+    from topology import grid_graph
+    g1 = grid_graph(5, 5, kernel_size=3, bidirectional=False)
+    g2 = grid_graph(5, 5, kernel_size=3, bidirectional=True)
+    check("BIDI-3: grid single edges > 0", len(g1.src) > 0,
+          f"single={len(g1.src)}")
+    check("BIDI-3: grid bidirectional = 2 * single", len(g2.src) == 2 * len(g1.src),
+          f"single={len(g1.src)}, bidir={len(g2.src)}")
+    edges_single = set(zip(g1.src, g1.dst))
+    edges_bidir = set(zip(g2.src, g2.dst))
+    all_reversed = all((d, s) in edges_bidir for s, d in edges_single)
+    check("BIDI-3: every single edge has its reverse", all_reversed)
+    no_self_loops = all(s != d for s, d in edges_bidir)
+    check("BIDI-3: no self-loops in bidirectional", no_self_loops)
+
+
+def test_bidir_cluster_graph_doubles_edges():
+    """cluster_graph(bidirectional=True) emits exactly 2x the edges of bidirectional=False."""
+    print("\nTest BIDI-4: cluster_graph bidirectional doubles edge count")
+    from topology import cluster_graph
+    c1 = cluster_graph(10, edge_prob=0.5, seed=0, bidirectional=False)
+    c2 = cluster_graph(10, edge_prob=0.5, seed=0, bidirectional=True)
+    check("BIDI-4: cluster single edges > 0", len(c1.src) > 0,
+          f"single={len(c1.src)}")
+    check("BIDI-4: cluster bidirectional = 2 * single", len(c2.src) == 2 * len(c1.src),
+          f"single={len(c1.src)}, bidir={len(c2.src)}")
+    edges_single = set(zip(c1.src, c1.dst))
+    edges_bidir = set(zip(c2.src, c2.dst))
+    all_reversed = all((d, s) in edges_bidir for s, d in edges_single)
+    check("BIDI-4: every single edge has its reverse", all_reversed)
+    no_self_loops = all(s != d for s, d in edges_bidir)
+    check("BIDI-4: no self-loops in bidirectional", no_self_loops)
+
+
+def test_bidir_validate_topology_passes():
+    """validate_topology() accepts bidirectional topologies without error."""
+    print("\nTest BIDI-5: validate_topology passes on bidirectional topologies")
+    from topology import grid_graph, line_graph, ring_graph, cluster_graph, validate_topology
+    g_bi = grid_graph(7, 7, kernel_size=3, bidirectional=True)
+    validate_topology(g_bi)  # Should not raise
+    check("BIDI-5: validate_topology(grid 7x7 bidirectional) passed", True)
+
+    l_bi = line_graph(8, radius=2, bidirectional=True)
+    validate_topology(l_bi)
+    check("BIDI-5: validate_topology(line bidirectional) passed", True)
+
+    r_bi = ring_graph(10, radius=2, bidirectional=True)
+    validate_topology(r_bi)
+    check("BIDI-5: validate_topology(ring bidirectional) passed", True)
+
+    c_bi = cluster_graph(10, edge_prob=0.5, seed=0, bidirectional=True)
+    validate_topology(c_bi)
+    check("BIDI-5: validate_topology(cluster bidirectional) passed", True)
+
+
+def test_bidir_default_is_false():
+    """bidirectional=False is the default and matches the original single-edge behavior."""
+    print("\nTest BIDI-6: bidirectional defaults to False (backward compatibility)")
+    from topology import line_graph, ring_graph, grid_graph, cluster_graph
+    l_default = line_graph(8, radius=2)
+    l_explicit = line_graph(8, radius=2, bidirectional=False)
+    check("BIDI-6: line_graph default == bidirectional=False",
+          len(l_default.src) == len(l_explicit.src))
+
+    g_default = grid_graph(5, 5, kernel_size=3)
+    g_explicit = grid_graph(5, 5, kernel_size=3, bidirectional=False)
+    check("BIDI-6: grid_graph default == bidirectional=False",
+          len(g_default.src) == len(g_explicit.src))
+
+    r_default = ring_graph(10, radius=2)
+    r_explicit = ring_graph(10, radius=2, bidirectional=False)
+    check("BIDI-6: ring_graph default == bidirectional=False",
+          len(r_default.src) == len(r_explicit.src))
+
+    c_default = cluster_graph(10, edge_prob=0.5, seed=0)
+    c_explicit = cluster_graph(10, edge_prob=0.5, seed=0, bidirectional=False)
+    check("BIDI-6: cluster_graph default == bidirectional=False",
+          len(c_default.src) == len(c_explicit.src))
+
+
+def test_bidir_preset_factories_accept_param():
+    """Preset factory functions accept bidirectional and pass it via hidden_kwargs."""
+    print("\nTest BIDI-7: preset factories accept bidirectional parameter")
+    from config import make_smooth2d_grid_preset, make_housing_grid_preset
+
+    # Default: bidirectional key present in hidden_kwargs, set to False
+    s_default = make_smooth2d_grid_preset(grid_size=5)
+    check("BIDI-7: smooth2d default has bidirectional=False in hidden_kwargs",
+          s_default["stages"][0]["hidden_kwargs"].get("bidirectional") is False)
+
+    s_bi = make_smooth2d_grid_preset(grid_size=5, bidirectional=True)
+    check("BIDI-7: smooth2d_grid(bidirectional=True) sets hidden_kwargs.bidirectional=True",
+          s_bi["stages"][0]["hidden_kwargs"].get("bidirectional") is True)
+
+    h_default = make_housing_grid_preset(grid_size=5)
+    check("BIDI-7: housing default has bidirectional=False in hidden_kwargs",
+          h_default["stages"][0]["hidden_kwargs"].get("bidirectional") is False)
+
+    h_bi = make_housing_grid_preset(grid_size=5, bidirectional=True)
+    check("BIDI-7: housing_grid(bidirectional=True) sets hidden_kwargs.bidirectional=True",
+          h_bi["stages"][0]["hidden_kwargs"].get("bidirectional") is True)
+
+
+def test_bidir_full_net_build():
+    """A full KirchhoffNet builds and runs forward with bidirectional hidden topology."""
+    print("\nTest BIDI-8: full KirchhoffNet build with bidirectional hidden graph")
+    from config import make_smooth2d_grid_preset
+    from topology import build_net_from_config
+    from cell_library import make_default_library
+
+    cell_lib = make_default_library()
+    preset_bi = make_smooth2d_grid_preset(grid_size=5, bidirectional=True)
+    net_bi = build_net_from_config(preset_bi, cell_lib=cell_lib)
+    check("BIDI-8: bidirectional net builds successfully", net_bi is not None)
+
+    preset_single = make_smooth2d_grid_preset(grid_size=5, bidirectional=False)
+    net_single = build_net_from_config(preset_single, cell_lib=cell_lib)
+
+    # The bidirectional flag only doubles the hidden grid edges, not the
+    # projection edges (which connect disjoint hidden/proj node sets via
+    # all_to_all). Count only the hidden grid edges: those with both
+    # endpoints in [0, num_hidden).
+    n_hid = net_bi.core.stages[0].num_nodes - net_bi.proj_count
+    src_bi = net_bi.core.stages[0].src.tolist()
+    dst_bi = net_bi.core.stages[0].dst.tolist()
+    hidden_edges_bi = sum(1 for s, d in zip(src_bi, dst_bi) if s < n_hid and d < n_hid)
+    src_single = net_single.core.stages[0].src.tolist()
+    dst_single = net_single.core.stages[0].dst.tolist()
+    hidden_edges_single = sum(1 for s, d in zip(src_single, dst_single) if s < n_hid and d < n_hid)
+    check("BIDI-8: hidden grid edges double in bidirectional stage 0",
+          hidden_edges_bi == 2 * hidden_edges_single,
+          f"single={hidden_edges_single}, bidir={hidden_edges_bi}")
+
+    # Total stage edges: bidirectional stage has more than single (by exactly
+    # the hidden-edge delta), since projection edges are unchanged.
+    e_bi = net_bi.core.stages[0].num_edges()
+    e_single = net_single.core.stages[0].num_edges()
+    check("BIDI-8: bidirectional stage 0 has strictly more total edges",
+          e_bi > e_single,
+          f"single={e_single}, bidir={e_bi}")
+    check("BIDI-8: bidirectional stage 0 edge delta == hidden edge delta",
+          (e_bi - e_single) == (hidden_edges_bi - hidden_edges_single),
+          f"total_delta={e_bi - e_single}, hidden_delta={hidden_edges_bi - hidden_edges_single}")
+
+    # Forward pass on a small random batch.
+    u = torch.rand(4, 2)
+    out, _ = net_bi(u, ctx=None)
+    check("BIDI-8: forward shape (4, 1)", out.shape == (4, 1))
+    check("BIDI-8: forward output is finite", torch.isfinite(out).all().item())
 
 
 if __name__ == "__main__":

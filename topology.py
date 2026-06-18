@@ -22,7 +22,7 @@ from typing import Iterable
 import torch
 import torch.nn as nn
 
-from config import PRESETS, Z_INDEX
+from config import PRESETS
 from differential_stage import DifferentialStage
 from cell_library import IdealizedCellLibrary
 
@@ -584,7 +584,7 @@ def prune_stage(
 
     z = stage.edge_gates().detach().cpu()
     w_logits = stage.logits.detach().cpu()
-    p_z = torch.softmax(w_logits, dim=-1)[:, Z_INDEX]  # [E]
+    p_z = torch.softmax(w_logits, dim=-1)[:, stage.cell_lib.z_index]  # [E]
     eff_score = (1.0 - p_z) * z  # [E]
 
     keep_edge = eff_score > edge_threshold

@@ -38,7 +38,10 @@ _NODE_COLORS = {
     "output": "tab:red",
 }
 
-_CELL_COLORS = {"L": "tab:purple", "S": "tab:brown", "P": "tab:green", "Z": "lightgray"}
+_CELL_COLORS = {
+    "L": "tab:purple", "S": "tab:brown", "P": "tab:green", "Z": "lightgray",
+    "O_weak": "tab:blue", "O_hard": "tab:red", "P0": "tab:green", "N0": "tab:orange", "D1": "tab:cyan",
+}
 _CELL_COLOR_DEFAULT = "tab:gray"
 
 
@@ -130,12 +133,14 @@ def plot_sparse_topology(
 
     # Resolve cell-type info for core edges when a stage is provided
     if stage is not None:
-        from config import CELL_ORDER, Z_INDEX
+        cell_lib = stage.cell_lib
+        cell_order = cell_lib._cell_order
+        z_index = cell_lib.z_index
         probs = torch.softmax(stage.logits.detach(), dim=-1)  # [E_core, Q]
         dominant = probs.argmax(dim=-1)  # [E_core]
         mult = torch.nn.functional.softplus(stage.raw_mult.detach())  # [E_core]
-        p_z = probs[:, Z_INDEX]  # [E_core]
-        cell_colors_core = [_CELL_COLORS[CELL_ORDER[idx]] for idx in dominant.cpu().numpy()]
+        p_z = probs[:, z_index]  # [E_core]
+        cell_colors_core = [_CELL_COLORS[cell_order[idx]] for idx in dominant.cpu().numpy()]
         widths_core = (0.5 + 2.0 * torch.clamp(mult * (1.0 - p_z), max=3.0)).cpu().numpy()
     else:
         cell_colors_core = None
@@ -197,16 +202,16 @@ def plot_sparse_topology(
 
     # Add cell-type swatches to legend when stage is provided
     if stage is not None:
-        from config import CELL_ORDER
+        cell_order = stage.cell_lib._cell_order
         cell_handles = [
             plt.Line2D([0], [0], color=_CELL_COLORS[cn], linewidth=3, label=cn)
-            for cn in CELL_ORDER
+            for cn in cell_order
         ]
         existing_handles = leg.legend_handles if leg is not None else []
         existing_labels = [t.get_text() for t in (leg.get_texts() if leg is not None else [])]
         ax.legend(
             handles=list(existing_handles) + cell_handles,
-            labels=list(existing_labels) + CELL_ORDER,
+            labels=list(existing_labels) + cell_order,
             loc="upper right", fontsize=8, framealpha=0.85,
         )
 

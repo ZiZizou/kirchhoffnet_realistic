@@ -15,10 +15,19 @@ integration window, and ``C_eff`` is a pure scaling. No pretence is made
 that the resulting ω = g/C is a real analog time constant.
 """
 
+# Cell type identifiers for formula dispatch.
+CELL_TYPE_STANDARD = "standard"
+CELL_TYPE_POS_RECT = "pos_rect"
+CELL_TYPE_NEG_RECT = "neg_rect"
+CELL_TYPE_DEAD_ZONE = "dead_zone"
+CELL_TYPE_OFF = "off"
+
 # Cell library: gm (normalized transconductance, μS-scale), isat (sat current,
 # μA-scale), rho (destination feedback coefficient, dimensionless), gleak
 # (residual linear leakage, μS-scale), bias (per-family fixed offset, μA-scale).
+# cell_type: selects the I(u) formula in cell_library.py.
 CELL_L = {
+    "cell_type": CELL_TYPE_STANDARD,
     "gm": 0.2,
     "isat": 10.0,
     "rho": 1.0,
@@ -29,6 +38,7 @@ CELL_L = {
 }
 
 CELL_S = {
+    "cell_type": CELL_TYPE_STANDARD,
     "gm": 1.0,
     "isat": 0.5,
     "rho": 1.0,
@@ -39,6 +49,7 @@ CELL_S = {
 }
 
 CELL_P = {
+    "cell_type": CELL_TYPE_POS_RECT,
     "gm": 1.0,
     "isat": 1.0,
     "rho": 1.0,
@@ -49,6 +60,7 @@ CELL_P = {
 }
 
 CELL_Z = {
+    "cell_type": CELL_TYPE_OFF,
     "gm": 0.0,
     "isat": 0.0,
     "rho": 0.0,
@@ -58,21 +70,108 @@ CELL_Z = {
     "beta": 1.0,
 }
 
-CELL_LIBRARY = {
-    "L": CELL_L,
-    "S": CELL_S,
-    "P": CELL_P,
-    "Z": CELL_Z,
+# ---- v1.5 expanded library cells ----
+
+CELL_O_WEAK = {
+    "cell_type": CELL_TYPE_STANDARD,
+    "gm": 0.3,
+    "isat": 5.0,
+    "rho": 1.0,
+    "gleak": 0.0,
+    "bias": 0.0,
+    "theta": 0.0,
+    "beta": 1.0,
 }
 
-CELL_ORDER = ["L", "S", "P", "Z"]
+CELL_O_HARD = {
+    "cell_type": CELL_TYPE_STANDARD,
+    "gm": 3.0,
+    "isat": 0.3,
+    "rho": 1.0,
+    "gleak": 0.0,
+    "bias": 0.0,
+    "theta": 0.0,
+    "beta": 1.0,
+}
+
+CELL_P0 = {
+    "cell_type": CELL_TYPE_POS_RECT,
+    "gm": 1.0,
+    "isat": 1.0,
+    "rho": 1.0,
+    "gleak": 0.0,
+    "bias": 0.0,
+    "theta": 0.0,
+    "beta": 0.1,
+}
+
+CELL_N0 = {
+    "cell_type": CELL_TYPE_NEG_RECT,
+    "gm": 1.0,
+    "isat": 1.0,
+    "rho": 1.0,
+    "gleak": 0.0,
+    "bias": 0.0,
+    "theta": 0.0,
+    "beta": 0.1,
+}
+
+CELL_D1 = {
+    "cell_type": CELL_TYPE_DEAD_ZONE,
+    "gm": 1.0,
+    "isat": 1.0,
+    "rho": 1.0,
+    "gleak": 0.0,
+    "bias": 0.0,
+    "theta": 0.5,
+    "beta": 0.1,
+}
+
+# Named library configs. Each entry has "cells" (ordered dict), "cell_order"
+# (list), and "z_index" (int). Z is always the LAST cell in every library.
+# Legacy globals (CELL_LIBRARY, CELL_ORDER, NUM_CELLS, Z_INDEX) reflect the
+# "legacy" library for backward compatibility.
+_CELL_LIBRARY_LEGACY = {
+    "cells": {"L": CELL_L, "S": CELL_S, "P": CELL_P, "Z": CELL_Z},
+    "cell_order": ["L", "S", "P", "Z"],
+}
+
+_CELL_LIBRARY_V15 = {
+    "cells": {
+        "O_weak": CELL_O_WEAK,
+        "O_hard": CELL_O_HARD,
+        "P0": CELL_P0,
+        "N0": CELL_N0,
+        "D1": CELL_D1,
+        "Z": CELL_Z,
+    },
+    "cell_order": ["O_weak", "O_hard", "P0", "N0", "D1", "Z"],
+}
+
+CELL_LIBRARIES = {
+    "legacy": _CELL_LIBRARY_LEGACY,
+    "v15": _CELL_LIBRARY_V15,
+}
+
+# Legacy globals for backward compatibility.
+CELL_LIBRARY = _CELL_LIBRARY_LEGACY["cells"]
+CELL_ORDER = _CELL_LIBRARY_LEGACY["cell_order"]
 NUM_CELLS = len(CELL_ORDER)
-Z_INDEX = CELL_ORDER.index("Z")
+Z_INDEX = NUM_CELLS - 1
+
+# Type code mapping for serialization into buffers.
+_CELL_TYPE_CODE = {
+    CELL_TYPE_STANDARD: 0,
+    CELL_TYPE_POS_RECT: 1,
+    CELL_TYPE_NEG_RECT: 2,
+    CELL_TYPE_DEAD_ZONE: 3,
+    CELL_TYPE_OFF: 0,  # Off cells use the standard formula (all zeros).
+}
 
 # Normalized physical limits (R7: not calibrated to real SI units).
 PHYS = {
     "x_max": 3.0,
-    "C_eff": 1.0,
+    "C_eff": 0.5,
     "beta_softness": 0.02,
     "clip_current": 0.05,
     "clip_softness": 0.02,
@@ -208,10 +307,10 @@ SCHEDULE_THREE_PHASE = {
 # distillation (lambda_kd) and STE cell mode. See spec/four-phase-schedule.md.
 SCHEDULE_FOUR_PHASE = {
     # Fraction of total epochs allocated to each phase. Must sum to 1.0.
-    "frac_a": 0.45,            # Phase A: free fit (soft teacher)
+    "frac_a": 0.25,            # Phase A: free fit (soft teacher)
     "frac_b1": 0.20,           # Phase B1: cell commitment (no pruning)
     "frac_b2": 0.15,           # Phase B2: edge pruning (readiness-gated)
-    "frac_c": 0.20,            # Phase C: retrain compact model
+    "frac_c": 0.40,            # Phase C: retrain compact model
     # Tau targets per phase.
     "tau_a": 1.0,              # Fixed tau during free fit
     "tau_b1_init": 1.0,        # Tau at start of B1
@@ -300,16 +399,28 @@ VARIATION = {
 }
 
 
-def cells_to_tensor_dict():
-    """Stack CELL_LIBRARY into a dict of 1-D tensors ordered by CELL_ORDER.
+def cells_to_tensor_dict(library_name: str = "legacy"):
+    """Stack a named library into a dict of 1-D tensors ordered by cell_order.
 
-    Returns dict of tensors with shape [NUM_CELLS] for: gm, isat, rho, gleak,
-    bias, theta, beta. theta/beta are only used by rectifier cells (P); other
-    cells carry neutral dummy values (theta=0, beta=1) for buffer alignment.
+    Args:
+        library_name: Which library to load (``"legacy"`` or ``"v15"``).
+
+    Returns dict of tensors with shape [Q] for: gm, isat, rho, gleak,
+    bias, theta, beta. Also includes ``cell_type_code`` (int codes 0-3)
+    for formula dispatch. theta/beta are only used by rectifier cells;
+    other cells carry neutral dummy values.
     """
     import torch
+    lib = CELL_LIBRARIES[library_name]
+    cell_order = lib["cell_order"]
+    cells = lib["cells"]
     keys = ["gm", "isat", "rho", "gleak", "bias", "theta", "beta"]
-    return {k: torch.tensor([CELL_LIBRARY[c][k] for c in CELL_ORDER], dtype=torch.float32) for k in keys}
+    result = {k: torch.tensor([cells[c][k] for c in cell_order], dtype=torch.float32) for k in keys}
+    result["cell_type_code"] = torch.tensor(
+        [_CELL_TYPE_CODE[cells[c].get("cell_type", CELL_TYPE_STANDARD)] for c in cell_order],
+        dtype=torch.long,
+    )
+    return result
 
 
 # =============================================================================

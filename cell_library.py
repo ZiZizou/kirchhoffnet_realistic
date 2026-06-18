@@ -1,26 +1,23 @@
 """Idealized tanh-based cell library for the reduced differential KirchhoffNet.
 
 Provides IdealizedCellLibrary that computes edge currents from differential
-drive variable u = x_src - rho * x_dst, with soft library selection over
-L (weak linear), S (saturating tanh), P (smooth bounded rectifier), and
-Z (disabled) cell families.
+drive variable u = x_src - rho * x_dst, with soft library selection over a
+set of physically motivated bounded branch macros.
 
-Standard cell formula (L, S, Z):
-    i(u) = isat * tanh((gm * u + bias) / isat) + gleak * u
+Four formula types:
+  - standard:     i = isat * tanh((gm * u + bias) / isat) + gleak * u
+  - pos_rect:     i = isat * tanh(gm * softplus((u - theta) / beta) / isat)
+  - neg_rect:     i = -isat * tanh(gm * softplus((-u - theta) / beta) / isat)
+  - dead_zone:    i = isat * tanh(gm * softplus((u - theta)/beta) / isat)
+                    - isat * tanh(gm * softplus((-u - theta)/beta) / isat)
 
-Rectifier cell formula (P):
-    i_P(u) = isat * tanh(gm * softplus((u - theta) / beta) / isat)
-This gives directionality, thresholding, bounded current, differentiability,
-and physical plausibility as an active rail-powered branch.
+Legacy library:  L (standard, low gm), S (standard, high gm), P (pos_rect), Z (off)
+v1.5 library:    O_weak (standard, low gm), O_hard (standard, high gm),
+                 P0 (pos_rect), N0 (neg_rect), D1 (dead_zone), Z (off)
 
-Cell parameters come from config.CELL_LIBRARY via cells_to_tensor_dict().
-Compliance gating turns the edge off as |x_src| or |x_dst] approaches x_max.
+Cell parameters come from config via cells_to_tensor_dict(library_name).
+Compliance gating turns the edge off as |x_src| or |x_dst| approaches x_max.
 PVT + mismatch from SimContext is injected multiplicatively on gm.
-
-Multiplicity (R3.3): m = softplus(raw_mult), not 1 + softplus(raw_mult).
-A fully Z-selected edge thus has m → 0 in addition to p_Z → 1, so the
-weighted power/area proxy in train.py can be driven to zero by both
-factors.
 """
 
 from __future__ import annotations
@@ -29,54 +26,54 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from config import (
-    CELL_LIBRARY,
-    CELL_ORDER,
-    NUM_CELLS,
-    PHYS,
-    cells_to_tensor_dict,
-)
+from config import CELL_LIBRARIES, PHYS, cells_to_tensor_dict
 
 
 __all__ = ["IdealizedCellLibrary"]
 
 
 class IdealizedCellLibrary(nn.Module):
-    """Tanh-surrogate edge cell library with smooth rectifier support.
+    """Edge cell library with formula dispatch for standard, pos/neg rectifier,
+    and dead-zone cell types.
 
-    Buffers: gm, isat, rho, gleak, bias, theta, beta, each shape [Q].
-    theta/beta are only used by rectifier cells; other cells carry neutral
-    dummy values. The _is_rect buffer flags which cells use the rectifier
-    formula vs the standard tanh formula.
+    Buffers: gm, isat, rho, gleak, bias, theta, beta, cell_type_code,
+    each shape [Q]. cell_type_code stores integer codes for formula dispatch.
     """
 
     def __init__(
         self,
         cell_overrides: dict | None = None,
         beta_softness: float | None = None,
+        library_name: str = "legacy",
     ) -> None:
         super().__init__()
-        tensors = cells_to_tensor_dict()
+        self.library_name = library_name
+        lib_cfg = CELL_LIBRARIES[library_name]
+        self._cell_order = list(lib_cfg["cell_order"])
+        self.z_index = len(self._cell_order) - 1
+
+        tensors = cells_to_tensor_dict(library_name=library_name)
         if cell_overrides is not None:
             for cell_name, overrides in cell_overrides.items():
-                idx = CELL_ORDER.index(cell_name)
+                idx = self._cell_order.index(cell_name)
                 for k, v in overrides.items():
-                    tensors[k][idx] = float(v)
+                    if k in tensors:
+                        tensors[k][idx] = float(v)
         for k, t in tensors.items():
             self.register_buffer(k, t)
         if beta_softness is None:
             beta_softness = PHYS["beta_softness"]
         self.beta_softness = float(beta_softness)
 
-        # Per-cell rectifier mask (True for cells that use the smooth bounded
-        # rectifier formula). Derived from cell name: cells containing 'P' or
-        # 'N' (case-insensitive) are treated as rectifiers.
-        is_rect = torch.tensor(
-            [c.upper() in ("P", "N") for c in CELL_ORDER],
-            dtype=torch.bool,
-        )
-        self.register_buffer("_is_rect", is_rect)
-        self._has_rect = bool(is_rect.any().item())
+        # Per-cell type masks for formula dispatch (bool, derived from
+        # cell_type_code). Registered as persistent=False buffers so they
+        # move with .to(device) but don't pollute state_dict.
+        ctc = self.cell_type_code  # [Q]
+        self.register_buffer("_is_std", ctc == 0, persistent=False)
+        self.register_buffer("_is_pos_rect", ctc == 1, persistent=False)
+        self.register_buffer("_is_neg_rect", ctc == 2, persistent=False)
+        self.register_buffer("_is_dead_zone", ctc == 3, persistent=False)
+        self.register_buffer("_is_rect", (ctc == 1) | (ctc == 2) | (ctc == 3))
 
     @property
     def num_cells(self) -> int:
@@ -108,14 +105,8 @@ class IdealizedCellLibrary(nn.Module):
             ctx: SimContext with optional mismatch.
             tau: Soft library selection temperature.
             cell_mode: Cell selection mode. ``'soft'`` (default) uses
-                standard softmax weighting — a mixture of cells per edge.
-                ``'ste'`` (straight-through estimator, four-phase-redesign)
-                uses one cell per edge in the forward pass
-                (``one_hot(argmax(softmax(logits/tau)))``) and routes the
-                backward pass through the soft weights via
-                ``w_hard + w_soft - w_soft.detach()``. This produces a
-                discrete deployable model while preserving the smooth
-                gradient signal needed for training.
+                standard softmax weighting. ``'ste'`` uses one cell per edge
+                in the forward pass with straight-through soft gradients.
 
         Returns:
             i_edge: [batch, num_edges] edge currents in uA.
@@ -130,16 +121,14 @@ class IdealizedCellLibrary(nn.Module):
 
         w_soft = F.softmax(logits / tau, dim=-1)  # [E, Q]
 
-        # four-phase-redesign/Phase 2a: straight-through hard selection.
-        # Forward uses a one-hot hard selection; backward sees soft grads.
         if cell_mode == "ste":
             idx = w_soft.argmax(dim=-1)  # [E]
             w_hard = F.one_hot(idx, num_classes=Q).to(w_soft.dtype)  # [E, Q]
-            weights = w_hard + w_soft - w_soft.detach()  # STE: hard fwd, soft bwd
+            weights = w_hard + w_soft - w_soft.detach()
         else:
             weights = w_soft
 
-        mult = F.softplus(raw_mult)  # [E] (R3.3: m → 0 as raw_mult → -∞)
+        mult = F.softplus(raw_mult)  # [E]
         mult = mult.unsqueeze(0).unsqueeze(-1)  # [1, E, 1]
 
         gm = self.gm.view(1, 1, Q)  # [1, 1, Q]
@@ -159,20 +148,31 @@ class IdealizedCellLibrary(nn.Module):
 
         u = x_src.unsqueeze(-1) - rho * x_dst.unsqueeze(-1)  # [B, E, Q]
 
-        # Standard tanh formula (L, S, Z): i = isat*tanh((gm*u+bias)/isat) + gleak*u
+        # ---- Compute all formula variants in parallel ----
+
+        # 1. Standard formula: isat * tanh((gm*u + bias) / isat) + gleak*u
         i_standard = isat * torch.tanh((gm * u + bias) / isat) + gleak * u
 
-        if self._has_rect:
-            # Smooth bounded rectifier formula (P):
-            # i_P = isat * tanh(gm * softplus((u - theta) / beta) / isat)
-            theta = self.theta.view(1, 1, Q)  # [1, 1, Q]
-            beta = self.beta.view(1, 1, Q).clamp_min(1e-3)  # [1, 1, Q]
-            inner = F.softplus((u - theta) / beta)
-            i_rect = isat * torch.tanh(gm * inner / isat)
-            is_rect = self._is_rect.view(1, 1, Q)
-            i_cell = torch.where(is_rect, i_rect, i_standard)
-        else:
-            i_cell = i_standard
+        # Shared theta/beta for rectifier and dead-zone variants.
+        theta = self.theta.view(1, 1, Q)  # [1, 1, Q]
+        beta = self.beta.view(1, 1, Q).clamp_min(1e-3)  # [1, 1, Q]
+
+        # 2. Positive rectifier: isat * tanh(gm * softplus((u - theta) / beta) / isat)
+        inner_p = F.softplus((u - theta) / beta)
+        i_pos_rect = isat * torch.tanh(gm * inner_p / isat)
+
+        # 3. Negative rectifier: -isat * tanh(gm * softplus((-u - theta) / beta) / isat)
+        inner_n = F.softplus((-u - theta) / beta)
+        i_neg_rect = -isat * torch.tanh(gm * inner_n / isat)
+
+        # 4. Dead zone: pos_rect(u) - neg_rect(u)  (both use the cell's own theta/beta)
+        i_dead_zone = isat * torch.tanh(gm * inner_p / isat) - isat * torch.tanh(gm * inner_n / isat)
+
+        # ---- Dispatch via per-cell type masks (inline from buffer for device safety) ----
+        ctc = self.cell_type_code.view(1, 1, Q)
+        i_cell = torch.where(ctc == 3, i_dead_zone,
+                   torch.where(ctc == 2, i_neg_rect,
+                   torch.where(ctc == 1, i_pos_rect, i_standard)))
 
         gate_src = torch.sigmoid((x_max - x_src.abs()) / self.beta_softness)  # [B, E]
         gate_dst = torch.sigmoid((x_max - x_dst.abs()) / self.beta_softness)  # [B, E]
@@ -183,14 +183,10 @@ class IdealizedCellLibrary(nn.Module):
         return i_edge
 
     def compile_forward(self, backend: str = "inductor"):
-        """Compile `forward` with `torch.compile` for kernel fusion.
-
-        Fuses softmax/tanh/sigmoid/softplus/elementwise math for ~1.3-2×
-        throughput on T4 Tensor Cores.
-        """
+        """Compile `forward` with `torch.compile` for kernel fusion."""
         self.forward = torch.compile(self.forward, backend=backend)
 
 
 def make_default_library() -> IdealizedCellLibrary:
-    """Convenience constructor that uses config defaults verbatim."""
+    """Convenience constructor that uses config defaults verbatim (legacy)."""
     return IdealizedCellLibrary()

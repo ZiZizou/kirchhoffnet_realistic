@@ -44,7 +44,6 @@ from torch.utils.data import DataLoader, TensorDataset
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config import (
-    CELL_ORDER,
     LAMBDAS,
     OPTIM,
     SCHEDULE_FOUR_PHASE,
@@ -831,6 +830,11 @@ def main() -> None:
         help="Number of ODE stages (default: 3).",
     )
     parser.add_argument(
+        "--cell-library", type=str, default=None, dest="cell_library",
+        choices=["legacy", "v15"],
+        help="Cell library: 'legacy' (L,S,P,Z, default) or 'v15' (O_weak,O_hard,P0,N0,D1,Z).",
+    )
+    parser.add_argument(
         "--output", type=Path, default=Path("./output_ctle"),
         help="Output directory (default: ./output_ctle).",
     )
@@ -1046,7 +1050,8 @@ def main() -> None:
           f"experts={args.teacher_experts})")
 
     # ---- build KirchhoffNet ----
-    cell_lib = IdealizedCellLibrary()
+    lib_name = args.cell_library if args.cell_library is not None else "legacy"
+    cell_lib = IdealizedCellLibrary(library_name=lib_name)
     preset = make_ctle_grid_preset(
         grid_size=args.grid_size, num_stages=args.num_stages,
         write_mode=args.write_mode,
@@ -1455,7 +1460,7 @@ def main() -> None:
             title=f"ctle_grid — Stage {i + 1} (trained, {stage.num_edges()} edges)",
         )
         plot_cell_selection(
-            stage.logits, cell_order=CELL_ORDER,
+            stage.logits, cell_order=stage.cell_lib._cell_order,
             save_path=str(out_dir / f"stage{i + 1}_cell_selection_trained.png"),
             title=f"ctle_grid — Stage {i + 1} cell selection (trained)",
         )
@@ -1635,7 +1640,7 @@ def main() -> None:
                 title=f"ctle_grid — Stage {i + 1} (pruned, {stage.num_edges()} edges, {stage.num_nodes} nodes)",
             )
             plot_cell_selection(
-                stage.logits, cell_order=CELL_ORDER,
+                stage.logits, cell_order=stage.cell_lib._cell_order,
                 save_path=str(out_dir / f"stage{i + 1}_cell_selection_pruned.png"),
                 title=f"ctle_grid — Stage {i + 1} cell selection (pruned)",
             )

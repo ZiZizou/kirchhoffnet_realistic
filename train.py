@@ -30,7 +30,6 @@ from config import (
     SCHEDULE_THREE_PHASE,
     SOLVER,
     TAU,
-    Z_INDEX,
     VARIATION,
 )
 from sim_context import SimContext, sample_random_context
@@ -113,7 +112,7 @@ def _compute_regularizers(
       - power       : Σ_e z_e · m_e · Σ_q w_q · gm_q       (static power proxy)
       - capacitance : C_eff · Σ_j u_j                      (capacitance area proxy)
 
-    The cell-selection sparsity ``Σ w[:, :Z_INDEX]`` is preserved (pushes
+    The cell-selection sparsity ``Σ w[:, :z_idx]`` is preserved (pushes
     individual edges toward the zero-current Z cell as a fine-grained
     selection, distinct from the edge gate which is a coarse on/off).
 
@@ -127,9 +126,10 @@ def _compute_regularizers(
         mult = _stage_multiplicities(stage)
         z = _stage_edge_gates(stage)
         u = _stage_node_gates(stage)
+        z_idx = stage.cell_lib.z_index
 
         # Cell-selection sparsity: push toward Z cell.
-        loss_sparsity = loss_sparsity + w[:, :Z_INDEX].sum()
+        loss_sparsity = loss_sparsity + w[:, :z_idx].sum()
 
         # Edge/node gate penalties: soft count of active edges/nodes.
         loss_edge_gate = loss_edge_gate + z.sum()
@@ -704,7 +704,7 @@ def compute_solidification_metrics(
     Returns a dict of Python floats (safe to log to a text file):
       - ``mean_max_cell_prob``: mean over all edges of max(softmax(logits/τ)).
         1.0 = fully discrete cell selection; ~0.25 (1/4 cells) = uniform.
-      - ``mean_pZ``: mean over all edges of softmax(logits/τ)[:, Z_INDEX].
+      - ``mean_pZ``: mean over all edges of softmax(logits/τ)[:, z_index].
         Probability mass on the zero-current Z cell.
       - ``mean_sigma_z``: mean over all edges of σ(z_logits). Average edge
         gate openness (0..1).
@@ -734,7 +734,7 @@ def compute_solidification_metrics(
 
         weights = F.softmax(stage.logits / float(tau), dim=-1)
         max_probs, _ = weights.max(dim=-1)
-        p_z = weights[:, Z_INDEX]
+        p_z = weights[:, stage.cell_lib.z_index]
         sigma_z = torch.sigmoid(stage.z_logits)
         max_probs_list.append(max_probs.detach())
         p_z_list.append(p_z.detach())

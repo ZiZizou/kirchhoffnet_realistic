@@ -19,7 +19,6 @@ from config import (
     INIT,
     PHYS,
     SOLVER,
-    Z_INDEX,
 )
 from cell_library import IdealizedCellLibrary
 
@@ -40,7 +39,7 @@ class DifferentialStage(nn.Module):
         clip_current: Soft rail clip current magnitude (default from config).
         clip_softness: Soft rail clip transition width (default from config).
         logits_z_bias: Initial bias toward Z (disabled) cell, applied to
-            logits[:, Z_INDEX] in __init__.
+            logits[:, z_index] in __init__.
     """
 
     def __init__(
@@ -79,7 +78,7 @@ class DifferentialStage(nn.Module):
 
         self.logits = nn.Parameter(torch.zeros(E, Q))
         with torch.no_grad():
-            self.logits[:, Z_INDEX] = (
+            self.logits[:, cell_lib.z_index] = (
                 INIT["logits_z_bias"] if logits_z_bias is None else float(logits_z_bias)
             )
 

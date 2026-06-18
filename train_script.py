@@ -692,6 +692,12 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "Only applies when --problem smooth2d_grid or --problem housing_grid.",
     )
     parser.add_argument(
+        "--cell-library", type=str, default=None, dest="cell_library",
+        choices=["legacy", "v15"],
+        help="Cell library: 'legacy' (L,S,P,Z, default) or 'v15' (O_weak,O_hard,P0,N0,D1,Z). "
+             "Overrides the preset's cell_library key if present.",
+    )
+    parser.add_argument(
         "--output", type=Path, default=Path("./output"),
         help="Output directory for artifacts (default: ./output)",
     )
@@ -1156,7 +1162,13 @@ def main():
     write_idx_arg = _parse_int_list(args.write_idx)
     read_idx_arg = _parse_int_list(args.read_idx)
 
-    cell_lib = IdealizedCellLibrary()
+    # Resolve cell library: CLI overrides preset, preset overrides default.
+    lib_name = "legacy"
+    if args.problem in PRESETS:
+        lib_name = PRESETS[args.problem].get("cell_library", "legacy")
+    if args.cell_library is not None:
+        lib_name = args.cell_library
+    cell_lib = IdealizedCellLibrary(library_name=lib_name)
     # Per-problem grid-size default (grid7-gate0: smooth2d_grid=7, housing_grid=5).
     # Explicit --grid-size N overrides either.
     if args.problem == "smooth2d_grid":
@@ -1735,10 +1747,9 @@ def main():
             title=f"{args.problem} — Stage {i + 1} (trained)",
         )
 
-    from config import CELL_ORDER
     for i, stage in enumerate(raw_net.core.stages):
         plot_cell_selection(
-            stage.logits, cell_order=CELL_ORDER,
+            stage.logits, cell_order=stage.cell_lib._cell_order,
             save_path=str(out_dir / f"stage{i + 1}_cell_selection_trained.png"),
             title=f"{args.problem} — Stage {i + 1} cell selection (trained)",
         )
@@ -1762,7 +1773,7 @@ def main():
     )
 
     plot_network(
-        raw_net, cell_order=CELL_ORDER,
+        raw_net, cell_order=raw_net.core.stages[0].cell_lib._cell_order,
         save_path=str(out_dir / "pipeline.png"),
     )
 
@@ -2164,7 +2175,7 @@ def main():
                     title=f"{args.problem} — Stage {i + 1} (pruned, {stage.num_edges()} edges, {stage.num_nodes} nodes)",
                 )
                 plot_cell_selection(
-                    stage.logits, cell_order=CELL_ORDER,
+                    stage.logits, cell_order=stage.cell_lib._cell_order,
                     save_path=str(out_dir / f"stage{i + 1}_cell_selection_pruned.png"),
                     title=f"{args.problem} — Stage {i + 1} cell selection (pruned)",
                 )

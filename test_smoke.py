@@ -2438,6 +2438,17 @@ def main():
     test_mlp_benchmark()
     test_mlp_benchmark_tanh()
     test_rectifier_cell()
+    # v1.5 expanded cell library tests (expanded-cell-library plan)
+    test_v15_cell_library_construction()            # V15-1: build + structure
+    test_v15_cell_boundedness()                     # V15-2: current bound
+    test_v15_negative_rectifier()                   # V15-3: N0 mirror of P0
+    test_v15_dead_zone_odd()                        # V15-4: D1 odd + dead zone
+    test_v15_saturation_scales()                    # V15-5: O_hard > O_weak
+    test_v15_forward_backward()                     # V15-6: forward + gradients
+    test_v15_ste_mode()                             # V15-7: STE mode
+    test_v15_cell_type_mask_consistency()           # V15-8: mask exclusivity
+    test_v15_legacy_library_unchanged()             # V15-9: backward compat
+    test_v15_cell_parameters_preset_smooth2d_grid()  # V15-10: full net build
     test_stage_lr_scale_backward_compat()
     test_stage_lr_scale_multi_group()
     test_stage_lr_scale_scheduler_compat()
@@ -3451,6 +3462,348 @@ def test_rectifier_cell():
     check("P-8: u_logit_init == 0.0 (grid7-gate0: 50% open gates, was 2.0)",
           INIT["u_logit_init"] == 0.0,
           f"got {INIT['u_logit_init']}")
+
+
+# ---- v1.5 expanded cell library tests (expanded-cell-library plan) ----
+
+def test_v15_cell_library_construction():
+    """V15-1: v15 library builds and has correct structure."""
+    print("\nTest V15-1: v15 cell library construction")
+    from cell_library import IdealizedCellLibrary
+    cell_lib = IdealizedCellLibrary(library_name="v15")
+    check("V15-1: v15 num_cells == 6",
+          cell_lib.num_cells == 6,
+          f"got {cell_lib.num_cells}")
+    check("V15-1: v15 z_index == 5 (last cell)",
+          cell_lib.z_index == 5,
+          f"got {cell_lib.z_index}")
+    check("V15-1: v15 has O_weak", "O_weak" in cell_lib._cell_order)
+    check("V15-1: v15 has O_hard", "O_hard" in cell_lib._cell_order)
+    check("V15-1: v15 has P0", "P0" in cell_lib._cell_order)
+    check("V15-1: v15 has N0", "N0" in cell_lib._cell_order)
+    check("V15-1: v15 has D1", "D1" in cell_lib._cell_order)
+    check("V15-1: v15 has Z (last)", cell_lib._cell_order[-1] == "Z")
+    check("V15-1: cell_type_code has 6 entries",
+          cell_lib.cell_type_code.shape[0] == 6)
+    ctc = cell_lib.cell_type_code
+    check("V15-1: O_weak is standard (code 0)", ctc[0].item() == 0)
+    check("V15-1: O_hard is standard (code 0)", ctc[1].item() == 0)
+    check("V15-1: P0 is pos_rect (code 1)", ctc[2].item() == 1)
+    check("V15-1: N0 is neg_rect (code 2)", ctc[3].item() == 2)
+    check("V15-1: D1 is dead_zone (code 3)", ctc[4].item() == 3)
+    check("V15-1: Z is standard (code 0)", ctc[5].item() == 0)
+    check("V15-1: O_weak gm == 0.3",
+          abs(cell_lib.gm[0].item() - 0.3) < 1e-6)
+    check("V15-1: O_hard gm == 3.0",
+          abs(cell_lib.gm[1].item() - 3.0) < 1e-6)
+    check("V15-1: P0 isat == 1.0",
+          abs(cell_lib.isat[2].item() - 1.0) < 1e-6)
+    check("V15-1: N0 theta == 0.0",
+          abs(cell_lib.theta[3].item() - 0.0) < 1e-6)
+    check("V15-1: D1 theta == 0.5",
+          abs(cell_lib.theta[4].item() - 0.5) < 1e-6)
+    # type masks
+    check("V15-1: _is_std[0] True (O_weak)", cell_lib._is_std[0].item())
+    check("V15-1: _is_pos_rect[2] True (P0)", cell_lib._is_pos_rect[2].item())
+    check("V15-1: _is_neg_rect[3] True (N0)", cell_lib._is_neg_rect[3].item())
+    check("V15-1: _is_dead_zone[4] True (D1)", cell_lib._is_dead_zone[4].item())
+
+
+def test_v15_cell_boundedness():
+    """V15-2: all v15 cells produce bounded current |I| <= isat for all u."""
+    print("\nTest V15-2: v15 cell boundedness")
+    from cell_library import IdealizedCellLibrary
+    import torch
+    cell_lib = IdealizedCellLibrary(library_name="v15")
+    Q = cell_lib.num_cells
+    E, B = 1, 200
+    logits = torch.full((E, Q), -1e9)
+
+    u_sweep = torch.linspace(-5.0, 5.0, B).unsqueeze(1)  # [B, 1]
+    raw_mult = torch.zeros(E)
+
+    for cell_idx in range(Q):
+        logits_edge = logits.clone()
+        logits_edge[0, cell_idx] = 0.0  # select this cell
+        with torch.no_grad():
+            i_edge = cell_lib(
+                u_sweep, torch.zeros_like(u_sweep),
+                logits_edge, raw_mult, x_max=10.0, ctx=None,
+            )
+        isat_cell = float(cell_lib.isat[cell_idx].item())
+        i_vals = i_edge.squeeze()
+        max_abs_i = float(i_vals.abs().max().item())
+        check(f"V15-2: cell {cell_lib._cell_order[cell_idx]} bounded |I|<={isat_cell}",
+              max_abs_i <= isat_cell + 1e-4,
+              f"max |I|={max_abs_i:.6f}, I_sat={isat_cell}")
+
+
+def test_v15_negative_rectifier():
+    """V15-3: N0 is the exact mirror of P0: I_N0(u) == -I_P0(-u)."""
+    print("\nTest V15-3: N0 negative rectifier mirror of P0")
+    from cell_library import IdealizedCellLibrary
+    import torch
+    cell_lib = IdealizedCellLibrary(library_name="v15")
+    Q = cell_lib.num_cells
+    E = 1
+    raw_mult = torch.zeros(E)
+
+    P0_idx = cell_lib._cell_order.index("P0")
+    N0_idx = cell_lib._cell_order.index("N0")
+
+    logits_p = torch.full((E, Q), -1e9)
+    logits_p[0, P0_idx] = 0.0
+    logits_n = torch.full((E, Q), -1e9)
+    logits_n[0, N0_idx] = 0.0
+
+    u_test = torch.tensor([[-2.0, -1.0, -0.5, -0.1, 0.0, 0.1, 0.5, 1.0, 2.0]]).T
+    with torch.no_grad():
+        i_p = cell_lib(u_test, torch.zeros_like(u_test), logits_p, raw_mult, x_max=10.0, ctx=None)
+        i_n = cell_lib(u_test, torch.zeros_like(u_test), logits_n, raw_mult, x_max=10.0, ctx=None)
+
+    for j in range(u_test.shape[0]):
+        u_val = float(u_test[j, 0])
+        p_val = float(i_p[j, 0])
+        n_val = float(i_n[j, 0])
+        # P0(-u) = -N0(u)  =>  N0(u) = -P0(-u)
+        u_neg_idx = abs(u_test + u_val).argmin().item()
+        expected_n = -float(i_p[u_neg_idx, 0])
+        check(f"V15-3: N0({u_val:.1f}) == -P0({-u_val:.1f})",
+              abs(n_val - expected_n) < 1e-6,
+              f"N0={n_val:.8f}, -P0(-u)={expected_n:.8f}")
+
+
+def test_v15_dead_zone_odd():
+    """V15-4: D1 is odd: I_D1(-u) == -I_D1(u). And has dead zone near zero."""
+    print("\nTest V15-4: D1 dead-zone odd cell oddness")
+    from cell_library import IdealizedCellLibrary
+    import torch
+    cell_lib = IdealizedCellLibrary(library_name="v15")
+    Q = cell_lib.num_cells
+    E = 1
+    raw_mult = torch.zeros(E)
+
+    D1_idx = cell_lib._cell_order.index("D1")
+    logits = torch.full((E, Q), -1e9)
+    logits[0, D1_idx] = 0.0
+
+    u_test = torch.linspace(-3.0, 3.0, 61).unsqueeze(1)  # step = 0.1
+    with torch.no_grad():
+        i_d1 = cell_lib(u_test, torch.zeros_like(u_test), logits, raw_mult, x_max=10.0, ctx=None)
+
+    # Oddness: I(-u) ≈ -I(u). Center index = 30 (u=0).
+    # Pair u_test[30 + k] with u_test[30 - k] for k = 1..30.
+    center = 30
+    for k in range(1, 31):
+        u_pos = float(u_test[center + k, 0])
+        u_neg = float(u_test[center - k, 0])
+        i_pos = float(i_d1[center + k, 0])
+        i_neg = float(i_d1[center - k, 0])
+        check(f"V15-4: D1({u_pos:.2f}) ≈ -D1({u_neg:.2f})",
+              abs(i_pos + i_neg) < 1e-6,
+              f"D1({u_pos})={i_pos:.8f}, D1({u_neg})={i_neg:.8f}")
+
+    # Dead zone: |I(u)| < 0.05 for |u| < theta/2
+    # (softplus roll-off means the dead zone is not perfectly sharp)
+    theta_d1 = float(cell_lib.theta[D1_idx].item())
+    within_dead = u_test.abs() < theta_d1 / 2
+    max_i_in_dead = float(i_d1[within_dead.squeeze()].abs().max().item())
+    check(f"V15-4: D1 dead zone |I|<0.05 for |u|<{theta_d1/2}",
+          max_i_in_dead < 0.05,
+          f"max|I| in dead zone={max_i_in_dead:.6f}")
+
+
+def test_v15_saturation_scales():
+    """V15-5: O_hard saturates faster (higher gm/isat ratio) than O_weak."""
+    print("\nTest V15-5: O_hard saturates faster than O_weak")
+    from cell_library import IdealizedCellLibrary
+    import torch
+    cell_lib = IdealizedCellLibrary(library_name="v15")
+    Q = cell_lib.num_cells
+    E = 1
+    # Use raw_mult=+1e9 so mult = softplus(1e9) ≈ 1e9, which clips to 1 via
+    # gate+weights. Actually use a simpler approach: set raw_mult so that
+    # m = softplus(raw_mult) ≈ 1.0. softplus(0) = ln(2) ≈ 0.693, so for
+    # m≈1 we need raw_mult such that softplus(x)=1 → x ≈ 0.5413.
+    # Instead, just multiply expected values by softplus(raw_mult=0)=ln(2).
+    raw_mult = torch.zeros(E)
+    mult_factor = float(torch.nn.functional.softplus(torch.tensor(0.0)).item())  # ≈ 0.693
+
+    O_weak_idx = cell_lib._cell_order.index("O_weak")
+    O_hard_idx = cell_lib._cell_order.index("O_hard")
+
+    logits_w = torch.full((E, Q), -1e9)
+    logits_w[0, O_weak_idx] = 0.0
+    logits_h = torch.full((E, Q), -1e9)
+    logits_h[0, O_hard_idx] = 0.0
+
+    u_test = torch.linspace(0.0, 1.0, 20).unsqueeze(1)
+    with torch.no_grad():
+        i_w = cell_lib(u_test, torch.zeros_like(u_test), logits_w, raw_mult, x_max=10.0, ctx=None)
+        i_h = cell_lib(u_test, torch.zeros_like(u_test), logits_h, raw_mult, x_max=10.0, ctx=None)
+
+    # At small u (e.g. 0.25), O_hard should have higher current than O_weak
+    # because O_hard has higher gm
+    i_w_small = float(i_w[5, 0])  # u ≈ 0.25
+    i_h_small = float(i_h[5, 0])
+    check("V15-5: O_hard > O_weak at small drive (higher gm)",
+          i_h_small > i_w_small,
+          f"O_hard={i_h_small:.6f}, O_weak={i_w_small:.6f}")
+
+    # At u=1.0, O_hard should be near saturation.
+    # I = mult * isat * tanh(gm*u/isat) ≈ mult * isat (for gm*u >> isat)
+    # mult = softplus(0) ≈ 0.693, isat=0.3 → sat I ≈ 0.208
+    # O_weak: gm=0.3, isat=5.0, u=1.0 → gm*u/isat=0.06, tanh≈0.06
+    #   I ≈ mult * isat * 0.06 ≈ 0.693 * 0.3 = 0.208? No — O_weak isat=5.0
+    #   I ≈ 0.693 * 5.0 * 0.06 ≈ 0.208 (same ballpark at u=1)
+    # Better test: compare O_hard at u=1 vs u=5 (should be saturated at both)
+    u_high = torch.tensor([[5.0]])
+    with torch.no_grad():
+        i_h_high = cell_lib(u_high, torch.zeros_like(u_high), logits_h, raw_mult, x_max=10.0, ctx=None)
+    i_h_1 = float(i_h[-1, 0])
+    i_h_5 = float(i_h_high[0, 0])
+    sat_expected = mult_factor * float(cell_lib.isat[O_hard_idx].item())  # ≈ 0.208
+    check("V15-5: O_hard at u=1 near saturation",
+          abs(i_h_1 - sat_expected) < 0.02,
+          f"O_hard(1)={i_h_1:.4f}, expected sat≈{sat_expected:.4f}")
+    check("V15-5: O_hard at u=5 also saturated (stable)",
+          abs(i_h_5 - sat_expected) < 0.02,
+          f"O_hard(5)={i_h_5:.4f}, expected sat≈{sat_expected:.4f}")
+
+    # O_weak at u=1.0: isat=5.0, gm=0.3 → still in linear regime (I ≈ gm*u * mult)
+    i_w_1 = float(i_w[-1, 0])
+    i_w_expected_lin = mult_factor * 0.3 * 1.0  # mult * gm * u ≈ 0.208
+    check("V15-5: O_weak at u=1 ≈ linear (not saturated)",
+          abs(i_w_1 - i_w_expected_lin) < 0.05,
+          f"O_weak(1)={i_w_1:.4f}, expected linear≈{i_w_expected_lin:.4f}")
+
+
+def test_v15_forward_backward():
+    """V15-6: v15 library forward pass runs and gradients flow."""
+    print("\nTest V15-6: v15 forward pass and gradient flow")
+    from cell_library import IdealizedCellLibrary
+    import torch
+    cell_lib = IdealizedCellLibrary(library_name="v15")
+    Q = cell_lib.num_cells
+    E = 4
+    B = 8
+    x_src = torch.randn(B, E, requires_grad=True)
+    x_dst = torch.randn(B, E, requires_grad=True)
+    logits = torch.randn(E, Q, requires_grad=True)
+    raw_mult = torch.randn(E, requires_grad=True)
+
+    i_edge = cell_lib(x_src, x_dst, logits, raw_mult, x_max=3.0, ctx=None)
+    check("V15-6: forward output shape (B, E)",
+          i_edge.shape == (B, E),
+          f"got {i_edge.shape}")
+    check("V15-6: forward output is finite",
+          torch.isfinite(i_edge).all().item())
+
+    loss = i_edge.sum()
+    grads = torch.autograd.grad(loss, [logits, raw_mult, x_src], retain_graph=True)
+    check("V15-6: gradients flow to logits",
+          grads[0] is not None and torch.isfinite(grads[0]).all().item())
+    check("V15-6: gradients flow to raw_mult",
+          grads[1] is not None and torch.isfinite(grads[1]).all().item())
+    check("V15-6: gradients flow to x_src",
+          grads[2] is not None and torch.isfinite(grads[2]).all().item())
+
+
+def test_v15_ste_mode():
+    """V15-7: v15 library works in straight-through estimator mode."""
+    print("\nTest V15-7: v15 STE mode")
+    from cell_library import IdealizedCellLibrary
+    import torch
+    cell_lib = IdealizedCellLibrary(library_name="v15")
+    Q = cell_lib.num_cells
+    E = 4
+    B = 8
+    x_src = torch.randn(B, E)
+    x_dst = torch.randn(B, E)
+    logits = torch.randn(E, Q, requires_grad=True)
+    raw_mult = torch.randn(E, requires_grad=True)
+
+    i_edge = cell_lib(x_src, x_dst, logits, raw_mult, x_max=3.0, ctx=None, cell_mode="ste")
+    check("V15-7: STE forward output is finite",
+          torch.isfinite(i_edge).all().item())
+    loss = i_edge.sum()
+    loss.backward()
+    check("V15-7: STE gradients flow via logits",
+          logits.grad is not None and torch.isfinite(logits.grad).all().item())
+
+
+def test_v15_cell_type_mask_consistency():
+    """V15-8: cell_type_mask entries are mutually exclusive."""
+    print("\nTest V15-8: v15 cell type mask consistency")
+    from cell_library import IdealizedCellLibrary
+    cell_lib = IdealizedCellLibrary(library_name="v15")
+    # Each cell should have exactly one type
+    for i in range(cell_lib.num_cells):
+        types = sum([
+            cell_lib._is_std[i].item(),
+            cell_lib._is_pos_rect[i].item(),
+            cell_lib._is_neg_rect[i].item(),
+            cell_lib._is_dead_zone[i].item(),
+        ])
+        check(f"V15-8: cell {cell_lib._cell_order[i]} has exactly one type mask",
+              types == 1,
+              f"got {types} type masks")
+
+
+def test_v15_legacy_library_unchanged():
+    """V15-9: legacy library is unaffected by v15 changes."""
+    print("\nTest V15-9: legacy library unchanged")
+    from cell_library import IdealizedCellLibrary
+    import torch
+    # Legacy library with explicit name
+    cell_lib = IdealizedCellLibrary(library_name="legacy")
+    check("V15-9: legacy num_cells == 4",
+          cell_lib.num_cells == 4,
+          f"got {cell_lib.num_cells}")
+    check("V15-9: legacy z_index == 3",
+          cell_lib.z_index == 3,
+          f"got {cell_lib.z_index}")
+    check("V15-9: legacy cell_order == [L,S,P,Z]",
+          cell_lib._cell_order == ["L", "S", "P", "Z"],
+          f"got {cell_lib._cell_order}")
+    # Default library is also legacy
+    cell_lib_default = IdealizedCellLibrary()
+    check("V15-9: default library is legacy (4 cells)",
+          cell_lib_default.num_cells == 4,
+          f"got {cell_lib_default.num_cells}")
+    # forward pass still works
+    E, Q, B = 2, 4, 4
+    x_src = torch.randn(B, E)
+    x_dst = torch.randn(B, E)
+    logits = torch.randn(E, Q)
+    raw_mult = torch.randn(E)
+    with torch.no_grad():
+        i_edge = cell_lib(x_src, x_dst, logits, raw_mult, x_max=3.0, ctx=None)
+    check("V15-9: legacy forward output finite",
+          torch.isfinite(i_edge).all().item())
+
+
+def test_v15_cell_parameters_preset_smooth2d_grid():
+    """V15-10: v15 library works with build_net_from_preset on smooth2d_grid."""
+    print("\nTest V15-10: v15 library with smooth2d_grid build")
+    from cell_library import IdealizedCellLibrary
+    from topology import build_net_from_preset
+    cell_lib = IdealizedCellLibrary(library_name="v15")
+    net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
+    import torch
+    x = torch.randn(4, 2)
+    with torch.no_grad():
+        y, traj = net(x, ctx=None, store_trajectory=False)
+    check("V15-10: network output finite",
+          torch.isfinite(y).all().item())
+    check("V15-10: network output shape (4, 1)",
+          y.shape == (4, 1),
+          f"got {y.shape}")
+    # Verify logits dimension matches v15
+    for stage in net.core.stages:
+        check(f"V15-10: stage logits shape[-1] == 6",
+              stage.logits.shape[-1] == 6,
+              f"got {stage.logits.shape[-1]}")
 
 
 # ---- Stage-LR scaling tests (stage-lr-scaling plan) ----

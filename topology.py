@@ -697,6 +697,22 @@ def prune_stage(
     new_dst = new_ids[dst_old[edge_mask]].tolist()
 
     num_nodes_new = int(keep_node.sum().item())
+    node_idx_old = torch.nonzero(keep_node, as_tuple=True)[0]
+    node_remap: dict[int, int] = {
+        int(old_id): int(new_id)
+        for old_id, new_id in zip(
+            node_idx_old.tolist(),
+            new_ids[keep_node].tolist(),
+        )
+    }
+
+    # Remap write_idx for persistent drive when the original stage had drive.
+    new_write_idx = None
+    if hasattr(stage, '_has_drive') and stage._has_drive:
+        drive_surviving = [int(idx) for idx in stage._drive_idx.tolist() if int(idx) in node_remap]
+        new_write_idx = [node_remap[int(idx)] for idx in stage._drive_idx.tolist()
+                         if int(idx) in node_remap] if drive_surviving else None
+
     new_stage = DifferentialStage(
         num_nodes=num_nodes_new,
         src=new_src,
@@ -706,9 +722,8 @@ def prune_stage(
         x_max=stage.x_max,
         clip_current=stage.clip_current,
         clip_softness=stage.clip_softness,
+        write_idx=new_write_idx,
     )
-
-    node_idx_old = torch.nonzero(keep_node, as_tuple=True)[0]
 
     if transfer_params:
         with torch.no_grad():
@@ -719,14 +734,16 @@ def prune_stage(
         with torch.no_grad():
             new_stage.raw_leak.data.copy_(stage.raw_leak.data[node_idx_old].cpu())
             new_stage.u_logits.data.copy_(stage.u_logits.data[node_idx_old].cpu())
+        # Transfer raw_drive_g for surviving driven nodes.
+        if new_write_idx is not None and hasattr(stage, 'raw_drive_g'):
+            old_drive_idx_list = stage._drive_idx.tolist()
+            surv_mask = torch.tensor(
+                [int(idx) in node_remap for idx in old_drive_idx_list],
+                dtype=torch.bool,
+            )
+            with torch.no_grad():
+                new_stage.raw_drive_g.data.copy_(stage.raw_drive_g.data[surv_mask].cpu())
 
-    node_remap: dict[int, int] = {
-        int(old_id): int(new_id)
-        for old_id, new_id in zip(
-            node_idx_old.tolist(),
-            new_ids[keep_node].tolist(),
-        )
-    }
     return new_stage, node_remap
 
 
@@ -774,16 +791,20 @@ def prune_network(
     for i, s in enumerate(net.stages):
         if n_stages == 1:
             wi, ri = write_idx, read_idx
-            protected = set(write_idx) if write_idx else None
+            protected = set(write_idx) if write_idx else set()
         elif i == 0:
             wi, ri = write_idx, None
-            protected = set(write_idx) if write_idx else None
+            protected = set(write_idx) if write_idx else set()
         elif i == n_stages - 1:
             wi, ri = None, read_idx
-            protected = None
+            protected = set()
         else:
             wi, ri = None, None
-            protected = None
+            protected = set()
+        # Driven nodes must survive pruning in every stage (persistent drive).
+        if hasattr(s, '_has_drive') and s._has_drive:
+            protected.update(int(idx) for idx in s._drive_idx.tolist())
+        protected = protected if protected else None
         new_s, remap = prune_stage(
             s,
             edge_threshold=edge_threshold,
@@ -857,11 +878,18 @@ def topology_to_stage(
     x_max: float | None = None,
     clip_current: float | None = None,
     clip_softness: float | None = None,
+    write_idx: list[int] | None = None,
 ) -> tuple[DifferentialStage, list[int], dict[int, int]]:
     """Convert a SparseTopology into a DifferentialStage.
 
     Input and output edges are filtered out (they are write/read taps, not
     ODE branches). Hidden + projection nodes are remapped to compact 0..N-1.
+
+    Args:
+        write_idx: Hidden-node indices (in user-facing 0..hid_count-1
+            coordinates) that should receive persistent drive current.
+            These indices map directly to the first hid_count positions
+            of the compact state vector.
 
     Returns:
         stage: DifferentialStage
@@ -887,6 +915,7 @@ def topology_to_stage(
         x_max=x_max,
         clip_current=clip_current,
         clip_softness=clip_softness,
+        write_idx=write_idx,
     )
     return stage, active_nodes, id_map
 
@@ -900,6 +929,7 @@ def build_net_from_preset(
     read_mode: str | None = None,
     write_idx: list[int] | None = None,
     read_idx: list[int] | None = None,
+    enable_drive: bool = False,
 ):
     """Build a full KirchhoffNetWithIO from a config.PRESETS entry.
 
@@ -923,12 +953,13 @@ def build_net_from_preset(
         cfg["write_idx"] = list(write_idx)
     if read_idx is not None:
         cfg["read_idx"] = list(read_idx)
-    return build_net_from_config(cfg, cell_lib=cell_lib)
+    return build_net_from_config(cfg, cell_lib=cell_lib, enable_drive=enable_drive)
 
 
 def build_net_from_config(
     cfg: dict,
     cell_lib: IdealizedCellLibrary,
+    enable_drive: bool = False,
 ):
     """Build a KirchhoffNetWithIO from a full config dict."""
     from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
@@ -956,6 +987,54 @@ def build_net_from_config(
         )
 
     multi = MultiStageTopology.from_config(stages_cfg)
+    in_dim = stages_cfg[0]["num_inputs"]
+    first_topo = multi.stages[0]
+    first_hid = list(first_topo.hidden_node_ids)
+    first_proj = list(first_topo.proj_node_ids)
+    last_topo = multi.stages[-1]
+    last_hid = list(last_topo.hidden_node_ids)
+    last_proj = list(last_topo.proj_node_ids)
+    n_first_hid = len(first_hid)
+    final_state_dim = len(last_hid) + len(last_proj)
+
+    # Resolve write_idx and input mapper.
+    fan_out_map = None
+    if write_mode == "one_to_one":
+        preset_write_idx = cfg.get("write_idx")
+        if preset_write_idx is None:
+            preset_write_idx = list(range(min(in_dim, n_first_hid)))
+        if len(preset_write_idx) != in_dim:
+            raise ValueError(
+                f"write_idx length {len(preset_write_idx)} must equal in_dim {in_dim} "
+                f"for one_to_one mode"
+            )
+        input_mapper = SparseInputMapper(
+            in_dim=in_dim, out_dim=n_first_hid, write_idx=preset_write_idx
+        )
+        write_idx_arg = list(preset_write_idx)
+        if enable_drive:
+            raise ValueError("enable_drive=True requires write_mode='fan_out'")
+    elif write_mode == "fan_out":
+        fan_out_map = cfg.get("write_fan_out")
+        if fan_out_map is None:
+            raise ValueError(
+                "write_mode='fan_out' requires 'write_fan_out' in config: "
+                "dict mapping input index to list of target hidden-node indices"
+            )
+        input_mapper = FanOutInputMapper(
+            in_dim=in_dim, out_dim=n_first_hid, fan_out_map=fan_out_map
+        )
+        write_idx_arg = sorted(
+            {t for targets in fan_out_map.values() for t in targets}
+        )
+    else:
+        MapperCls = RobustInputMapper if use_robust else InputMapper
+        input_mapper = MapperCls(in_dim=in_dim, out_dim=n_first_hid)
+        write_idx_arg = None
+        if enable_drive:
+            raise ValueError("enable_drive=True requires write_mode='fan_out'")
+
+    # Build stages with optional write_idx for persistent drive.
     stage_modules = []
     transfers = []
     stage_times = []
@@ -963,7 +1042,9 @@ def build_net_from_config(
     first_id_map: dict[int, int] = {}
 
     for stage_idx, topo in enumerate(multi.stages):
-        stage, active_nodes, id_map = topology_to_stage(topo, cell_lib=cell_lib)
+        stage, active_nodes, id_map = topology_to_stage(
+            topo, cell_lib=cell_lib, write_idx=write_idx_arg if enable_drive else None,
+        )
         stage_modules.append(stage)
         stage_times.append(float(stages_cfg[stage_idx].get("t_span", 0.5)))
         stage_steps.append(int(stages_cfg[stage_idx].get("num_steps", 20)))
@@ -984,46 +1065,17 @@ def build_net_from_config(
         stage_steps=stage_steps,
     )
 
-    in_dim = stages_cfg[0]["num_inputs"]
-    first_topo = multi.stages[0]
-    first_hid = list(first_topo.hidden_node_ids)
-    first_proj = list(first_topo.proj_node_ids)
-    last_topo = multi.stages[-1]
-    last_hid = list(last_topo.hidden_node_ids)
-    last_proj = list(last_topo.proj_node_ids)
-    n_first_hid = len(first_hid)
-    final_state_dim = len(last_hid) + len(last_proj)
-
-    if write_mode == "one_to_one":
-        preset_write_idx = cfg.get("write_idx")
-        if preset_write_idx is None:
-            preset_write_idx = list(range(min(in_dim, n_first_hid)))
-        if len(preset_write_idx) != in_dim:
-            raise ValueError(
-                f"write_idx length {len(preset_write_idx)} must equal in_dim {in_dim} "
-                f"for one_to_one mode"
+    # Build per-stage drive mappers when persistent drive is enabled.
+    drive_mappers_list = None
+    if enable_drive and fan_out_map is not None:
+        drive_mappers_list = [
+            FanOutInputMapper(
+                in_dim=in_dim,
+                out_dim=len(first_hid),
+                fan_out_map=fan_out_map,
             )
-        input_mapper = SparseInputMapper(
-            in_dim=in_dim, out_dim=n_first_hid, write_idx=preset_write_idx
-        )
-        write_idx_arg = list(preset_write_idx)
-    elif write_mode == "fan_out":
-        fan_out_map = cfg.get("write_fan_out")
-        if fan_out_map is None:
-            raise ValueError(
-                "write_mode='fan_out' requires 'write_fan_out' in config: "
-                "dict mapping input index to list of target hidden-node indices"
-            )
-        input_mapper = FanOutInputMapper(
-            in_dim=in_dim, out_dim=n_first_hid, fan_out_map=fan_out_map
-        )
-        write_idx_arg = sorted(
-            {t for targets in fan_out_map.values() for t in targets}
-        )
-    else:
-        MapperCls = RobustInputMapper if use_robust else InputMapper
-        input_mapper = MapperCls(in_dim=in_dim, out_dim=n_first_hid)
-        write_idx_arg = None
+            for _ in range(len(stages_cfg))
+        ]
 
     if read_mode == "sparse":
         preset_read_idx = cfg.get("read_idx")
@@ -1056,6 +1108,8 @@ def build_net_from_config(
         final_proj_count=len(last_proj),
         write_idx=write_idx_arg,
         read_idx=read_idx_arg,
+        enable_drive=enable_drive,
+        drive_mappers=drive_mappers_list,
     )
 
     # Hard topology check: write_idx → read_idx must be >1 hop on the core

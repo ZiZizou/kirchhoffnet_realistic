@@ -133,7 +133,13 @@ def _compute_regularizers(
 
         # Edge/node gate penalties: soft count of active edges/nodes.
         loss_edge_gate = loss_edge_gate + z.sum()
-        loss_node_gate = loss_node_gate + u.sum()
+        # Exclude driven nodes from node gate / capacitance penalties:
+        # their u_logits are forced to 1.0 in rhs() and should not be regularized.
+        if hasattr(stage, '_has_drive') and stage._has_drive:
+            u_driven = u[stage._drive_idx].sum()
+            loss_node_gate = loss_node_gate + (u.sum() - u_driven)
+        else:
+            loss_node_gate = loss_node_gate + u.sum()
 
         # Static power proxy: z_e · m_e · weighted gm sum per edge.
         # gm values per cell come from the shared cell library.
@@ -141,8 +147,11 @@ def _compute_regularizers(
         effective_gm = (w * gm_per_cell.unsqueeze(0)).sum(dim=-1)  # [E]
         loss_power = loss_power + (z * mult * effective_gm).sum()
 
-        # Capacitance area proxy: C_eff · Σ_j u_j.
-        loss_capacitance = loss_capacitance + stage.c_eff * u.sum()
+        # Capacitance area proxy: C_eff · Σ_j u_j (excludes driven nodes).
+        if hasattr(stage, '_has_drive') and stage._has_drive:
+            loss_capacitance = loss_capacitance + stage.c_eff * (u.sum() - u_driven)
+        else:
+            loss_capacitance = loss_capacitance + stage.c_eff * u.sum()
 
         loss_rail = loss_rail + _stage_rail_loss(stage, traj)
 

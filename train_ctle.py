@@ -529,6 +529,43 @@ def _worst_dim_label(stats: dict) -> tuple[str, float]:
     return PARAM_COLS[idx], float(stats["per_dim_mse"][idx])
 
 
+def _log_drive_diagnostics(
+    net: torch.nn.Module, val_loader, device: torch.device,
+    log_path: Path, epoch: int,
+) -> None:
+    """Log persistent drive metrics per stage to ``log_path``."""
+    if not hasattr(net, 'enable_drive') or not net.enable_drive:
+        return
+    if not log_path.exists():
+        with log_path.open("w") as f:
+            f.write("epoch\tstage\tmean_drive_error\tmean_abs_i_drive\tfrac_near_rail\n")
+    net.eval()
+    with torch.no_grad():
+        val_batch = next(iter(val_loader))
+        u, _ = val_batch
+        u = u[:4].to(device)  # small batch
+        hidden_drives = [dm(u) for dm in net.drive_mappers]
+        full_drives = [net._make_full_drive(hd) for hd in hidden_drives]
+        y, trajs = net(u, ctx=None, tau=1.0, store_trajectory=True)
+    with log_path.open("a") as f:
+        for s_idx, stage in enumerate(net.core.stages):
+            if not stage._has_drive:
+                continue
+            x_drive = full_drives[s_idx]
+            traj = trajs[s_idx]  # [B, N, steps+1]
+            x_final = traj[:, :, -1]  # [B, N]
+            # Mean absolute drive error at final state.
+            err = (x_final[:, stage._drive_idx] - x_drive[:, stage._drive_idx]).abs().mean().item()
+            # Expected drive current magnitude at final state.
+            g_in = F.softplus(stage.raw_drive_g).unsqueeze(0)
+            err_i = x_drive[:, stage._drive_idx] - x_final[:, stage._drive_idx]
+            i_drive = stage.drive_isat * torch.tanh(g_in * err_i / stage.drive_isat)
+            mean_i = i_drive.abs().mean().item()
+            # Fraction of driven nodes near rail.
+            frac_rail = (x_final[:, stage._drive_idx].abs() > 0.9 * stage.x_max).float().mean().item()
+            f.write(f"{epoch}\t{s_idx}\t{err:.6e}\t{mean_i:.6e}\t{frac_rail:.6e}\n")
+
+
 def _plot_per_dim_diagnostics(history: list[dict], save_path: Path,
                                norm_label: str = "(normalized)",
                                suptitle: str = "Per-dimension diagnostics") -> None:
@@ -972,6 +1009,13 @@ def main() -> None:
         "--no-bidirectional", dest="bidirectional", action="store_false",
         help="Disable dual edges per node pair (default).",
     )
+    parser.add_argument(
+        "--persistent-drive", dest="persistent_drive", action="store_true", default=False,
+        help="Enable persistent bounded drive current in all stages. Each stage "
+             "receives a tanh-bounded source current pulling driven hidden nodes "
+             "toward an input-derived target pattern. Requires write_mode='fan_out'. "
+             "Drive scale decays [1.0, 0.5, 0.25] across stages.",
+    )
     args = parser.parse_args()
 
     # ---- resolve config ----
@@ -1057,7 +1101,9 @@ def main() -> None:
         write_mode=args.write_mode,
         bidirectional=args.bidirectional,
     )
-    net: KirchhoffNetWithIO = build_net_from_config(preset, cell_lib=cell_lib)
+    net: KirchhoffNetWithIO = build_net_from_config(
+        preset, cell_lib=cell_lib, enable_drive=args.persistent_drive,
+    )
     net.to(device)
     n_kirchhoff_params = sum(p.numel() for p in net.parameters())
     in_mapper_name = type(net.input_mapper).__name__
@@ -1067,7 +1113,8 @@ def main() -> None:
           f"input_mapper={in_mapper_name} output_mapper={out_mapper_name} "
           f"({n_kirchhoff_params} params)")
     print(f"[train_ctle] write_idx={list(net.write_idx) if net.write_idx is not None else None} "
-          f"read_idx={list(net.read_idx) if net.read_idx is not None else None}")
+          f"read_idx={list(net.read_idx) if net.read_idx is not None else None}"
+          f" persistent_drive={args.persistent_drive}")
     if args.bidirectional:
         edges_per_stage = [s.num_edges() for s in net.core.stages]
         print(f"[train_ctle] bidirectional=True: {edges_per_stage} edges per stage "
@@ -1129,6 +1176,7 @@ def main() -> None:
         f.write(f"proj_count: {net.proj_count}\n")
         f.write(f"write_idx: {list(net.write_idx) if net.write_idx is not None else None}\n")
         f.write(f"read_idx: {list(net.read_idx) if net.read_idx is not None else None}\n")
+        f.write(f"persistent_drive: {args.persistent_drive}\n")
         f.write(f"kirchhoff_params: {n_kirchhoff_params}\n")
         f.write(f"epochs: {epochs}\n")
         f.write(f"lr: {lr}\n")
@@ -1308,6 +1356,8 @@ def main() -> None:
             val_history.append(val_loss)
             _log_per_dim_stats(per_dim_log_path, epoch, phase, stats)
             per_dim_history.append({"epoch": epoch, "phase": phase, **stats})
+            _log_drive_diagnostics(raw_net, val_loader, device,
+                                   out_dir / "drive_stats.txt", epoch)
 
             val_arg = validate_argmax(net, val_loader, task_fn, lambda b, device=None: None, device)
             val_argmax_history.append(val_arg)
@@ -1509,12 +1559,33 @@ def main() -> None:
             raw_net.output_mapper, raw_read_idx, last_remap, pruned_last_n, out_dim,
         )
 
+        # Rebuild drive mappers for the pruned network when persistent drive was active.
+        drive_mappers_pruned = None
+        enable_drive_pruned = False
+        if raw_net.enable_drive:
+            pruned_widths = [s.num_nodes for s in pruned_core.stages]
+            if len(set(pruned_widths)) == 1:
+                from io_mapper import FanOutInputMapper
+                pruned_fan_out = input_mapper_pruned.fan_out_map
+                drive_mappers_pruned = [
+                    FanOutInputMapper(
+                        in_dim=in_dim, out_dim=pruned_first_n, fan_out_map=pruned_fan_out,
+                    )
+                    for _ in range(len(pruned_core.stages))
+                ]
+                enable_drive_pruned = True
+            else:
+                print(f"[prune] WARNING: stages pruned to different widths {pruned_widths}; "
+                      f"disabling persistent drive for retrain")
+
         pruned_net = KirchhoffNetWithIO(
             input_mapper_pruned, pruned_core, output_mapper_pruned,
             hid_count=pruned_first_n, proj_count=0,
             final_hid_count=pruned_last_n, final_proj_count=0,
             write_idx=None,  # fan_out mode uses fan_out_map
             read_idx=pruned_read_idx,
+            enable_drive=enable_drive_pruned,
+            drive_mappers=drive_mappers_pruned,
         )
         pruned_net.to(device)
         n_pruned = sum(p.numel() for p in pruned_net.parameters())
@@ -1589,6 +1660,8 @@ def main() -> None:
                 retrain_val_argmax.append(val_arg_r)
                 _log_per_dim_stats(per_dim_log_path, global_epoch, "C", c_stats)
                 retrain_per_dim_history.append({"epoch": global_epoch, "phase": "C", **c_stats})
+                _log_drive_diagnostics(pruned_net, val_loader, device,
+                                       out_dir / "drive_stats.txt", global_epoch)
 
                 if repoch % args.validate_every == 0:
                     c_metrics = compute_solidification_metrics(pruned_net, tau=tau_r)

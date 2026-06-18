@@ -22,6 +22,7 @@ import warnings
 import torch
 import torch.nn as nn
 
+from config import DRIVE
 from differential_stage import DifferentialStage
 from stage_transfer import StageTransfer
 
@@ -78,6 +79,8 @@ class KirchhoffNet(nn.Module):
         tau: float | None = None,
         store_trajectory: bool = False,
         cell_mode: str = "soft",
+        drive_targets: list[torch.Tensor] | None = None,
+        drive_scales: list[float] | None = None,
     ):
         from sim_context import SimContext
 
@@ -94,6 +97,8 @@ class KirchhoffNet(nn.Module):
                     global_gain_shift=ctx.global_gain_shift,
                     edge_mismatch=ctx.edge_mismatch[start:end],
                 )
+            x_drive_i = None if drive_targets is None else drive_targets[i]
+            drive_scale_i = 0.0 if drive_scales is None else drive_scales[i]
             x, traj = stage(
                 x0=x,
                 ctx=stage_ctx,
@@ -102,6 +107,8 @@ class KirchhoffNet(nn.Module):
                 tau=tau_i,
                 store_trajectory=store_trajectory,
                 cell_mode=cell_mode,
+                x_drive=x_drive_i,
+                drive_scale=drive_scale_i,
             )
             if store_trajectory and traj is not None:
                 all_trajs.append(traj)
@@ -177,6 +184,9 @@ class KirchhoffNetWithIO(nn.Module):
         final_proj_count: int | None = None,
         write_idx: list[int] | None = None,
         read_idx: list[int] | None = None,
+        enable_drive: bool = False,
+        drive_mappers: list | None = None,
+        drive_scales: list[float] | None = None,
     ) -> None:
         super().__init__()
         if hid_count < 0 or proj_count < 0:
@@ -194,6 +204,33 @@ class KirchhoffNetWithIO(nn.Module):
         self.final_proj_count = int(proj_count if final_proj_count is None else final_proj_count)
         self.write_idx = list(write_idx) if write_idx is not None else None
         self.read_idx = list(read_idx) if read_idx is not None else None
+        self.enable_drive = bool(enable_drive)
+        if self.enable_drive:
+            if drive_mappers is None:
+                raise ValueError("enable_drive=True requires drive_mappers list")
+            if len(drive_mappers) != len(core.stages):
+                raise ValueError(
+                    f"drive_mappers length {len(drive_mappers)} must equal "
+                    f"num_stages {len(core.stages)}"
+                )
+            self.drive_mappers = nn.ModuleList(drive_mappers)
+            # Validate all stages have the same width for drive target shape match.
+            stage_widths = [s.num_nodes for s in core.stages]
+            if len(set(stage_widths)) != 1:
+                raise ValueError(
+                    f"enable_drive=True requires all stages to have the same width, "
+                    f"got {stage_widths}"
+                )
+            self.drive_scales = [float(s) for s in (drive_scales or DRIVE["drive_scales"])]
+            if len(self.drive_scales) != len(core.stages):
+                self.drive_scales = self.drive_scales[:len(core.stages)]
+                if len(self.drive_scales) < len(core.stages):
+                    self.drive_scales = self.drive_scales + [0.0] * (
+                        len(core.stages) - len(self.drive_scales)
+                    )
+        else:
+            self.drive_mappers = None
+            self.drive_scales = []
         if self.write_idx is not None:
             if any(i < 0 or i >= self.hid_count for i in self.write_idx):
                 raise ValueError(
@@ -225,6 +262,13 @@ class KirchhoffNetWithIO(nn.Module):
             self.read_dim = self.final_proj_count
         self.read_slice = slice(self.read_start, self.read_start + self.read_dim)
 
+    def _make_full_drive(self, hidden_drive: torch.Tensor) -> torch.Tensor:
+        B = hidden_drive.shape[0]
+        if self.proj_count > 0:
+            proj_zeros = hidden_drive.new_zeros(B, self.proj_count)
+            return torch.cat([hidden_drive, proj_zeros], dim=1)
+        return hidden_drive
+
     def forward(
         self,
         u: torch.Tensor,
@@ -243,12 +287,24 @@ class KirchhoffNetWithIO(nn.Module):
             x0_full = torch.cat([x0, pad], dim=1)
         else:
             x0_full = x0
+
+        # Build per-stage drive targets when persistent drive is enabled.
+        if self.enable_drive and self.drive_mappers is not None:
+            drive_targets = []
+            for dm in self.drive_mappers:
+                hidden_drive = dm(u)
+                drive_targets.append(self._make_full_drive(hidden_drive))
+        else:
+            drive_targets = None
+
         if all(t == 0.0 for t in self.core.stage_times):
             x_final, trajs = x0_full, None
         else:
             x_final, trajs = self.core(
                 x0_full, ctx=ctx, tau=tau, store_trajectory=store_trajectory,
                 cell_mode=cell_mode,
+                drive_targets=drive_targets,
+                drive_scales=self.drive_scales if self.enable_drive else None,
             )
         if self.read_idx is not None:
             x_read = x_final

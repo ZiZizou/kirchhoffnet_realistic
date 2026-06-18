@@ -16,6 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from config import (
+    DRIVE,
     INIT,
     PHYS,
     SOLVER,
@@ -40,6 +41,12 @@ class DifferentialStage(nn.Module):
         clip_softness: Soft rail clip transition width (default from config).
         logits_z_bias: Initial bias toward Z (disabled) cell, applied to
             logits[:, z_index] in __init__.
+        write_idx: Indices of hidden nodes that receive persistent bounded
+            drive current. When provided, a drive source is created with
+            learnable per-node conductance ``raw_drive_g``. ``None`` disables
+            drive for this stage.
+        drive_isat: Saturation current for the bounded drive source. When
+            ``None``, uses ``config.DRIVE["drive_isat"]``.
     """
 
     def __init__(
@@ -53,6 +60,8 @@ class DifferentialStage(nn.Module):
         clip_current: float | None = None,
         clip_softness: float | None = None,
         logits_z_bias: float | None = None,
+        write_idx: list[int] | None = None,
+        drive_isat: float | None = None,
     ) -> None:
         super().__init__()
         self.num_nodes = int(num_nodes)
@@ -72,6 +81,23 @@ class DifferentialStage(nn.Module):
 
         self.register_buffer("src", torch.tensor(src, dtype=torch.long))
         self.register_buffer("dst", torch.tensor(dst, dtype=torch.long))
+
+        # Persistent drive: optional bounded input-current source.
+        if write_idx is not None:
+            if any(i < 0 or i >= self.num_nodes for i in write_idx):
+                raise ValueError(f"write_idx entries must be in [0, {self.num_nodes}), got {write_idx}")
+            if len(set(write_idx)) != len(write_idx):
+                raise ValueError(f"write_idx entries must be unique, got {write_idx}")
+            self.register_buffer("_drive_idx", torch.tensor(write_idx, dtype=torch.long))
+            self.raw_drive_g = nn.Parameter(
+                torch.full((len(write_idx),), float(DRIVE["raw_drive_g_init"]))
+            )
+            self.drive_isat = float(drive_isat if drive_isat is not None else DRIVE["drive_isat"])
+            self._has_drive = True
+        else:
+            self.register_buffer("_drive_idx", torch.empty(0, dtype=torch.long))
+            self._has_drive = False
+            self.drive_isat = 0.0
 
         E = len(src)
         Q = cell_lib.num_cells
@@ -97,7 +123,21 @@ class DifferentialStage(nn.Module):
     def num_edges(self) -> int:
         return int(self.src.numel())
 
-    def rhs(self, x: torch.Tensor, ctx, tau: float = 1.0, cell_mode: str = "soft") -> torch.Tensor:
+    def drive_current(
+        self, x: torch.Tensor, x_drive: torch.Tensor | None, drive_scale: float
+    ) -> torch.Tensor:
+        if x_drive is None or not self._has_drive or drive_scale == 0.0:
+            return torch.zeros_like(x)
+        g_in = F.softplus(self.raw_drive_g).unsqueeze(0)
+        err = x_drive[:, self._drive_idx] - x[:, self._drive_idx]
+        i = self.drive_isat * torch.tanh(g_in * err / self.drive_isat)
+        i = float(drive_scale) * i
+        out = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
+        out[:, self._drive_idx] = i
+        return out.to(dtype=x.dtype)
+
+    def rhs(self, x: torch.Tensor, ctx, tau: float = 1.0, cell_mode: str = "soft",
+            x_drive: torch.Tensor | None = None, drive_scale: float = 0.0) -> torch.Tensor:
         """Compute dx/dt at state x. x: [batch, num_nodes].
 
         Gate application (CP-2):
@@ -114,7 +154,11 @@ class DifferentialStage(nn.Module):
         in the forward pass with straight-through soft gradients.
         """
         # Node gate: scale node voltages before computing edge inputs.
+        # Driven nodes are forced open so persistent input is not gated away.
         node_mask = torch.sigmoid(self.u_logits)  # [N]
+        if self._has_drive:
+            node_mask = node_mask.clone()
+            node_mask[self._drive_idx] = 1.0
         x_gated = x * node_mask.unsqueeze(0)  # [B, N]
 
         x_src = x_gated[:, self.src]
@@ -154,7 +198,8 @@ class DifferentialStage(nn.Module):
         clip = clip - torch.sigmoid((-x - self.x_max) / self.clip_softness)
         clip_term = self.clip_current * clip
 
-        return (acc - leak_term - clip_term) / self.c_eff
+        i_drive = self.drive_current(x, x_drive, drive_scale)
+        return (acc + i_drive - leak_term - clip_term) / self.c_eff
 
     def compile_rhs(self, backend: str = "inductor"):
         """Compile `rhs` with `torch.compile` for kernel fusion.
@@ -174,6 +219,8 @@ class DifferentialStage(nn.Module):
         tau: float | None = None,
         store_trajectory: bool = True,
         cell_mode: str = "soft",
+        x_drive: torch.Tensor | None = None,
+        drive_scale: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Integrate stage with fixed-step Heun. Returns (x_final, traj).
 
@@ -193,9 +240,11 @@ class DifferentialStage(nn.Module):
         traj_chunks = [x] if store_trajectory else None
 
         for _ in range(num_steps):
-            k1 = self.rhs(x, ctx=ctx, tau=tau, cell_mode=cell_mode)
+            k1 = self.rhs(x, ctx=ctx, tau=tau, cell_mode=cell_mode,
+                          x_drive=x_drive, drive_scale=drive_scale)
             x_pred = x + dt * k1
-            k2 = self.rhs(x_pred, ctx=ctx, tau=tau, cell_mode=cell_mode)
+            k2 = self.rhs(x_pred, ctx=ctx, tau=tau, cell_mode=cell_mode,
+                          x_drive=x_drive, drive_scale=drive_scale)
             x = x + 0.5 * dt * (k1 + k2)
             if store_trajectory:
                 traj_chunks.append(x)

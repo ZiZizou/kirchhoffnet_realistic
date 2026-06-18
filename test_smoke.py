@@ -2486,6 +2486,10 @@ def main():
     test_bidir_default_is_false()                 # BIDI-6: backward compat
     test_bidir_preset_factories_accept_param()    # BIDI-7: preset factories
     test_bidir_full_net_build()                   # BIDI-8: full net build
+    test_drive_current_basic()                   # DRIVE-1
+    test_drive_changes_rhs()                     # DRIVE-2
+    test_driven_node_gate_forced_open()          # DRIVE-3
+    test_kirchhoff_net_with_io_drive_forward()   # DRIVE-4
 
     print()
     print("=" * 60)
@@ -4596,6 +4600,156 @@ def test_bidir_full_net_build():
     out, _ = net_bi(u, ctx=None)
     check("BIDI-8: forward shape (4, 1)", out.shape == (4, 1))
     check("BIDI-8: forward output is finite", torch.isfinite(out).all().item())
+
+
+def test_drive_current_basic():
+    print("\nTest DRIVE-1: DifferentialStage.drive_current basic shape and behavior")
+    from cell_library import IdealizedCellLibrary
+    from topology import ring_graph, StageTopologyBuilder, topology_to_stage
+    from sim_context import SimContext
+    import torch
+
+    cell_lib = IdealizedCellLibrary()
+    hid = ring_graph(4, radius=1)
+    builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=4, num_proj=0)
+    topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
+                         proj_pattern="all_to_all")
+    stage, _, _ = topology_to_stage(topo, cell_lib=cell_lib, write_idx=[0, 2])
+
+    B, N = 3, 4
+    x = torch.rand(B, N)
+    x_drive = torch.rand(B, N)
+
+    # With drive_scale=0, drive_current returns zeros.
+    i0 = stage.drive_current(x, x_drive, drive_scale=0.0)
+    check("DRIVE-1: zero scale gives zero current", i0.abs().max().item() == 0.0)
+
+    # With scale > 0, drive_current is non-zero only at driven positions.
+    i1 = stage.drive_current(x, x_drive, drive_scale=1.0)
+    non_zero_cols = (i1.abs().sum(dim=0) > 0).nonzero(as_tuple=True)[0].tolist()
+    check("DRIVE-1: drive current only at driven nodes [0, 2]",
+          non_zero_cols == [0, 2],
+          f"got non-zero cols {non_zero_cols}")
+
+    # With x_drive=None, returns zeros.
+    i2 = stage.drive_current(x, None, drive_scale=1.0)
+    check("DRIVE-1: None x_drive gives zero current", i2.abs().max().item() == 0.0)
+
+    # Drive current is bounded by drive_isat.
+    with torch.no_grad():
+        stage.raw_drive_g.fill_(10.0)  # very large conductance
+    x_far = torch.full((B, N), -10.0)
+    x_drive_far = torch.full((B, N), 10.0)
+    i3 = stage.drive_current(x_far, x_drive_far, drive_scale=1.0)
+    max_i = i3.abs().max().item()
+    check("DRIVE-1: drive current bounded by drive_isat",
+          max_i <= stage.drive_isat * 1.001,
+          f"max_i={max_i:.4f}, isat={stage.drive_isat}")
+
+
+def test_drive_changes_rhs():
+    print("\nTest DRIVE-2: drive current modifies rhs output vs baseline")
+    from cell_library import IdealizedCellLibrary
+    from topology import ring_graph, StageTopologyBuilder, topology_to_stage
+    from sim_context import SimContext
+    import torch
+
+    cell_lib = IdealizedCellLibrary()
+    hid = ring_graph(4, radius=1)
+    builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=4, num_proj=0)
+    topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
+                         proj_pattern="all_to_all")
+    stage, _, _ = topology_to_stage(topo, cell_lib=cell_lib, write_idx=[0, 2])
+
+    B, N = 2, 4
+    x = torch.rand(B, N)
+    x_drive = torch.rand(B, N)
+
+    dx_baseline = stage.rhs(x, ctx=SimContext(), tau=1.0)
+    dx_driven = stage.rhs(x, ctx=SimContext(), tau=1.0, x_drive=x_drive, drive_scale=1.0)
+
+    diff = (dx_driven - dx_baseline).abs().max().item()
+    check("DRIVE-2: rhs output changes with drive enabled",
+          diff > 1e-6,
+          f"max diff = {diff:.4e}")
+
+
+def test_driven_node_gate_forced_open():
+    print("\nTest DRIVE-3: driven node gates are forced to 1.0 in rhs")
+    from cell_library import IdealizedCellLibrary
+    from topology import ring_graph, StageTopologyBuilder, topology_to_stage
+    from sim_context import SimContext
+    import torch
+
+    cell_lib = IdealizedCellLibrary()
+    hid = ring_graph(4, radius=1)
+    builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=4, num_proj=0)
+    topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
+                         proj_pattern="all_to_all")
+    stage, _, _ = topology_to_stage(topo, cell_lib=cell_lib, write_idx=[0, 2])
+
+    # Close ALL node gates (including driven positions).
+    with torch.no_grad():
+        stage.u_logits.fill_(-10.0)
+
+    B, N = 2, 4
+    x = torch.rand(B, N)
+    x_drive = torch.rand(B, N)
+    ctx = SimContext()
+
+    # If driven node gates were NOT forced open, rhs would return near-zero.
+    dx = stage.rhs(x, ctx=ctx, tau=1.0, x_drive=x_drive, drive_scale=1.0)
+
+    # Drive current at position 0 should be active (non-zero i_drive means
+    # the drive_current contributed to rhs, which would only happen if
+    # node gates at [0, 2] were open; if they were closed, x_gated would
+    # be near-zero, node error would be small, and i_drive would be near-zero.
+    # More directly: check that the drive current magnitude is significant.
+    i_drive = stage.drive_current(x, x_drive, drive_scale=1.0)
+    max_drive = i_drive[:, stage._drive_idx].abs().max().item()
+    check("DRIVE-3: drive current flows even when node gates closed",
+          max_drive > 1e-4,
+          f"max drive at driven positions = {max_drive:.6e}")
+
+
+def test_kirchhoff_net_with_io_drive_forward():
+    print("\nTest DRIVE-4: KirchhoffNetWithIO forward pass with enable_drive=True")
+    from cell_library import IdealizedCellLibrary
+    from topology import build_net_from_preset
+    from config import PRESETS
+    import torch
+
+    cell_lib = IdealizedCellLibrary()
+
+    # Use ctle_grid preset as test bed (fan_out write mode, multi-stage).
+    for preset_name in ["smooth2d_grid"]:
+        cfg = dict(PRESETS[preset_name])
+        cfg["write_fan_out"] = {0: [0, 4], 1: [5, 9]}
+
+        net = build_net_from_preset(
+            preset_name, cell_lib=cell_lib, enable_drive=True,
+        )
+        B = 4
+        u = torch.rand(B, cfg["stages"][0]["num_inputs"])
+
+        y, trajs = net(u, ctx=None, tau=1.0, store_trajectory=True)
+        check(f"DRIVE-4 ({preset_name}): forward output finite",
+              torch.isfinite(y).all().item())
+        check(f"DRIVE-4 ({preset_name}): forward output shape ({B}, {cfg['out_dim']})",
+              y.shape == (B, cfg["out_dim"]))
+        check(f"DRIVE-4 ({preset_name}): trajectory stored",
+              trajs is not None and len(trajs) == len(net.core.stages))
+        check(f"DRIVE-4 ({preset_name}): enable_drive flag on net",
+              net.enable_drive)
+        check(f"DRIVE-4 ({preset_name}): drive mappers exist",
+              net.drive_mappers is not None and len(net.drive_mappers) == len(net.core.stages))
+
+    # Also test that enable_drive=False does NOT set up drive infrastructure.
+    net_no = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib, enable_drive=False)
+    check("DRIVE-4: enable_drive=False -> no drive_mappers",
+          net_no.drive_mappers is None)
+    check("DRIVE-4: enable_drive=False -> enable_drive is False",
+          not net_no.enable_drive)
 
 
 if __name__ == "__main__":

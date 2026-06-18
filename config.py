@@ -307,10 +307,10 @@ SCHEDULE_THREE_PHASE = {
 # distillation (lambda_kd) and STE cell mode. See spec/four-phase-schedule.md.
 SCHEDULE_FOUR_PHASE = {
     # Fraction of total epochs allocated to each phase. Must sum to 1.0.
-    "frac_a": 0.25,            # Phase A: free fit (soft teacher)
+    "frac_a": 0.45,            # Phase A: free fit (soft teacher)
     "frac_b1": 0.20,           # Phase B1: cell commitment (no pruning)
     "frac_b2": 0.15,           # Phase B2: edge pruning (readiness-gated)
-    "frac_c": 0.40,            # Phase C: retrain compact model
+    "frac_c": 0.20,            # Phase C: retrain compact model
     # Tau targets per phase.
     "tau_a": 1.0,              # Fixed tau during free fit
     "tau_b1_init": 1.0,        # Tau at start of B1
@@ -354,8 +354,8 @@ SCHEDULE_FOUR_PHASE = {
 # Fixed-step Heun solver
 SOLVER = {
     "method": "heun",
-    "t_span": 10,
-    "num_steps": 100,
+    "t_span": 5.0,
+    "num_steps": 50,
 }
 
 # Initialization biases
@@ -377,6 +377,14 @@ SOLVER = {
 # accepted because the prior 88% open was effectively permanent — gates
 # never closed anyway. A 50% start that CAN close is more useful than
 # 88% that cannot.)
+# Drive current defaults for persistent bounded source (persistent-drive plan).
+# Units: drive_isat in μA, raw_drive_g in dimensionless log-space.
+DRIVE = {
+    "drive_isat": 0.5,
+    "raw_drive_g_init": -1.0,
+    "drive_scales": [1.0, 0.5, 0.25],
+}
+
 INIT = {
     "logits_z_bias": 0.0,
     "raw_mult_init": 0.0,

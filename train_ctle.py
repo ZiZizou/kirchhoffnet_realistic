@@ -32,6 +32,9 @@ from pathlib import Path
 from typing import Any
 
 import joblib
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as _plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -367,12 +370,24 @@ def generate_ctle_dataset(
     device: torch.device,
     batch_size: int,
     seed: int = 42,
-) -> tuple[DataLoader, DataLoader]:
+    normalize: bool = True,
+) -> tuple[DataLoader, DataLoader, torch.Tensor, torch.Tensor]:
     """Build train/val DataLoaders of (specs, mlp_logits) pairs.
 
     Generates ``n_train + n_val`` spec samples, labels them via the MLP,
     then takes the first ``n_train`` as training and the remaining
     ``n_val`` as validation. Both subsets are deterministic via ``seed``.
+
+    When ``normalize`` is True (default), the per-dim mean and std of the
+    teacher logits are computed on the **training set** and used to
+    normalize both train and val targets to zero mean / unit variance.
+    The student learns to predict normalized logits; callers should
+    denormalize at eval time via ``logits = output * std + mean``.
+
+    Returns:
+      (train_loader, val_loader, target_mean, target_std).
+      When ``normalize`` is False, ``target_mean`` is zeros and
+      ``target_std`` is ones (identity transform).
     """
     mlp.eval()
     mlp.to(device)
@@ -386,48 +401,187 @@ def generate_ctle_dataset(
             all_logits.append(mlp(batch).detach().to("cpu"))
         logits = torch.cat(all_logits, dim=0)
 
-    train_ds = TensorDataset(specs[:n_train].to("cpu"), logits[:n_train])
-    val_ds = TensorDataset(specs[n_train:].to("cpu"), logits[n_train:])
+    train_logits_raw = logits[:n_train]
+    if normalize:
+        target_mean = train_logits_raw.mean(dim=0)
+        target_std = train_logits_raw.std(dim=0).clamp(min=1e-6)
+    else:
+        target_mean = torch.zeros(train_logits_raw.shape[1], dtype=train_logits_raw.dtype)
+        target_std = torch.ones(train_logits_raw.shape[1], dtype=train_logits_raw.dtype)
+
+    train_targets = (train_logits_raw - target_mean) / target_std
+    val_targets = (logits[n_train:] - target_mean) / target_std
+
+    train_ds = TensorDataset(specs[:n_train].to("cpu"), train_targets)
+    val_ds = TensorDataset(specs[n_train:].to("cpu"), val_targets)
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, drop_last=False)
-    return train_loader, val_loader
+    return train_loader, val_loader, target_mean, target_std
 
 
 # =============================================================================
 # Validation helpers
 # =============================================================================
 
-def validate(
+def compute_per_dim_stats(
     net: KirchhoffNetWithIO,
-    val_loader: DataLoader,
-    task_fn,
+    loader: DataLoader,
     device: torch.device,
     *,
     tau: float | None = None,
     cell_mode: str = "soft",
-) -> float:
-    """Mean task loss over the val loader (no ctx — we use a static no-op).
+) -> dict[str, np.ndarray | float]:
+    """Compute per-dimension MSE, R², and target variance over ``loader``.
 
-    ``tau`` and ``cell_mode`` are forwarded to the network forward call so
-    validation matches the current training regime. When ``tau`` is ``None``
-    the network defaults to ``tau=1.0`` (full soft mixing), which is only
-    correct for Phase A. Callers in B1/B2/C must pass the current epoch tau.
+    Returns a dict with keys:
+      agg_mse       — scalar, mean MSE across all dims and samples
+      per_dim_mse   — np.ndarray of shape [D], per-dim MSE in normalized space
+      per_dim_r2    — np.ndarray of shape [D], per-dim R² vs val-set variance
+      per_dim_var   — np.ndarray of shape [D], val-set target variance per dim
+
+    All metrics are computed in the (possibly normalized) target space. R² uses
+    the validation set's own target variance as the denominator so it measures
+    explained variance on held-out data.
     """
     net.eval()
-    total = 0.0
-    n = 0
+    sumsq = None
+    target_sumsq = None
+    target_sum = None
+    n_samples = 0
     with torch.no_grad():
-        for u, target in val_loader:
+        for u, target in loader:
             u = u.to(device)
             target = target.to(device)
             out, _ = net(u, ctx=None, store_trajectory=False,
                          cell_mode=cell_mode, tau=tau)
-            loss = task_fn(out, target)
-            total += float(loss.item()) * u.size(0)
-            n += u.size(0)
+            sq = (out - target) ** 2
+            if sumsq is None:
+                sumsq = sq.sum(dim=0).detach().to("cpu").double()
+                target_sumsq = (target ** 2).sum(dim=0).detach().to("cpu").double()
+                target_sum = target.sum(dim=0).detach().to("cpu").double()
+            else:
+                sumsq += sq.sum(dim=0).detach().to("cpu").double()
+                target_sumsq += (target ** 2).sum(dim=0).detach().to("cpu").double()
+                target_sum += target.sum(dim=0).detach().to("cpu").double()
+            n_samples += u.size(0)
     net.train()
-    return total / max(1, n)
+    if sumsq is None or n_samples == 0:
+        empty = np.zeros(len(PARAM_COLS), dtype=np.float64)
+        return {
+            "agg_mse": float("nan"),
+            "per_dim_mse": empty,
+            "per_dim_r2": empty,
+            "per_dim_var": empty,
+        }
+    per_dim_mse = (sumsq / n_samples).numpy()
+    target_mean = (target_sum / n_samples).numpy()
+    per_dim_var = (target_sumsq / n_samples).numpy() - target_mean ** 2
+    per_dim_var = np.maximum(per_dim_var, 1e-12)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        per_dim_r2 = 1.0 - per_dim_mse / per_dim_var
+    agg_mse = float(per_dim_mse.mean())
+    return {
+        "agg_mse": agg_mse,
+        "per_dim_mse": per_dim_mse,
+        "per_dim_r2": per_dim_r2,
+        "per_dim_var": per_dim_var,
+    }
+
+
+def _per_dim_stats_header() -> list[str]:
+    cols = ["epoch", "phase", "agg_mse"]
+    for name in PARAM_COLS:
+        cols.append(f"mse_{name}")
+    for name in PARAM_COLS:
+        cols.append(f"r2_{name}")
+    for name in PARAM_COLS:
+        cols.append(f"var_{name}")
+    return cols
+
+
+def _log_per_dim_stats(log_path: Path, epoch: int, phase: str,
+                       stats: dict) -> None:
+    """Append one row of per-dimension stats to ``log_path`` (TSV)."""
+    cols = _per_dim_stats_header()
+    if not log_path.exists() or log_path.stat().st_size == 0:
+        with log_path.open("w") as f:
+            f.write("\t".join(cols) + "\n")
+    row = [str(epoch), phase, f"{stats['agg_mse']:.6e}"]
+    for v in stats["per_dim_mse"]:
+        row.append(f"{v:.6e}")
+    for v in stats["per_dim_r2"]:
+        row.append(f"{v:.6e}")
+    for v in stats["per_dim_var"]:
+        row.append(f"{v:.6e}")
+    with log_path.open("a") as f:
+        f.write("\t".join(row) + "\n")
+
+
+def _worst_dim_label(stats: dict) -> tuple[str, float]:
+    """Return (param_name, mse_value) for the worst-fit dimension this epoch."""
+    idx = int(np.argmax(stats["per_dim_mse"]))
+    return PARAM_COLS[idx], float(stats["per_dim_mse"][idx])
+
+
+def _plot_per_dim_diagnostics(history: list[dict], save_path: Path,
+                               norm_label: str = "(normalized)",
+                               suptitle: str = "Per-dimension diagnostics") -> None:
+    """Generate a 2×2 summary plot from a list of per-dim stats dicts.
+
+    ``history`` entries must have keys ``epoch``, ``per_dim_mse``, ``per_dim_r2``,
+    ``per_dim_var`` (the last entry's ``per_dim_var`` is used for the variance bar
+    chart). Saves to ``save_path``.
+    """
+    epochs_h = [h["epoch"] for h in history]
+    mse_arr = np.stack([h["per_dim_mse"] for h in history], axis=0)
+    r2_arr = np.stack([h["per_dim_r2"] for h in history], axis=0)
+    var_arr = history[-1]["per_dim_var"]
+
+    fig, axes = _plt.subplots(2, 2, figsize=(12, 8))
+    cmap = _plt.get_cmap("tab10")
+    for i, name in enumerate(PARAM_COLS):
+        axes[0, 0].plot(epochs_h, mse_arr[:, i], label=name, color=cmap(i), marker="o", markersize=2)
+    axes[0, 0].set_yscale("log")
+    axes[0, 0].set_xlabel("epoch")
+    axes[0, 0].set_ylabel(f"per-dim MSE {norm_label}")
+    axes[0, 0].set_title("Per-dim validation MSE over epochs")
+    axes[0, 0].legend(fontsize=8, ncol=2)
+    axes[0, 0].grid(True, alpha=0.3)
+
+    for i, name in enumerate(PARAM_COLS):
+        axes[0, 1].plot(epochs_h, r2_arr[:, i], label=name, color=cmap(i), marker="o", markersize=2)
+    axes[0, 1].axhline(0.0, color="grey", linewidth=0.5, linestyle="--")
+    axes[0, 1].axhline(1.0, color="grey", linewidth=0.5, linestyle=":")
+    axes[0, 1].set_xlabel("epoch")
+    axes[0, 1].set_ylabel("R²")
+    axes[0, 1].set_title("Per-dim validation R² over epochs")
+    axes[0, 1].legend(fontsize=8, ncol=2)
+    axes[0, 1].grid(True, alpha=0.3)
+
+    axes[1, 0].bar(PARAM_COLS, var_arr, color=[cmap(i) for i in range(len(PARAM_COLS))])
+    axes[1, 0].set_ylabel(f"target variance {norm_label}")
+    axes[1, 0].set_title("Per-dim target variance (val set)")
+    axes[1, 0].tick_params(axis="x", rotation=45)
+    axes[1, 0].grid(True, alpha=0.3, axis="y")
+
+    final_mse = mse_arr[-1]
+    final_r2 = r2_arr[-1]
+    axes[1, 1].scatter(final_mse, final_r2,
+                       c=[cmap(i) for i in range(len(PARAM_COLS))], s=60)
+    for i, name in enumerate(PARAM_COLS):
+        axes[1, 1].annotate(name, (final_mse[i], final_r2[i]),
+                             fontsize=8, xytext=(4, 4), textcoords="offset points")
+    axes[1, 1].set_xlabel("final val MSE")
+    axes[1, 1].set_ylabel("final val R²")
+    axes[1, 1].set_title("Per-dim fit (final epoch)")
+    axes[1, 1].axhline(0.0, color="k", linewidth=0.5, linestyle="--")
+    axes[1, 1].grid(True, alpha=0.3)
+
+    fig.suptitle(suptitle, fontsize=12)
+    fig.tight_layout()
+    fig.savefig(str(save_path), dpi=120, bbox_inches="tight")
+    _plt.close(fig)
 
 
 # =============================================================================
@@ -703,6 +857,14 @@ def main() -> None:
         help="Skip pruning (train only, no retrain).",
     )
     parser.add_argument(
+        "--normalize-targets", dest="normalize_targets", action="store_true", default=True,
+        help="Per-dim zero-mean/unit-var normalize teacher logits before training (default: on).",
+    )
+    parser.add_argument(
+        "--no-normalize-targets", dest="normalize_targets", action="store_false",
+        help="Disable per-dim normalization (train on raw teacher logits).",
+    )
+    parser.add_argument(
         "--device", default=None,
         help="Device 'cpu' or 'cuda' (default: auto-detect).",
     )
@@ -954,6 +1116,7 @@ def main() -> None:
         f.write(f"grad_log: {args.grad_log}\n")
         f.write(f"grad_log_every: {args.grad_log_every}\n")
         f.write(f"prune: {args.prune}\n")
+        f.write(f"normalize_targets: {args.normalize_targets}\n")
         f.write(f"\nLAMBDAS (effective):\n")
         for k, v in preset["lambdas"].items():
             f.write(f"  {k}: {v}\n")
@@ -963,15 +1126,27 @@ def main() -> None:
 
     # ---- generate dataset ----
     print(f"[train_ctle] generating {args.n_train + args.n_val} synthetic spec samples "
-          f"(train={args.n_train}, val={args.n_val})...")
-    train_loader, val_loader = generate_ctle_dataset(
+          f"(train={args.n_train}, val={args.n_val}, "
+          f"normalize_targets={args.normalize_targets})...")
+    train_loader, val_loader, target_mean, target_std = generate_ctle_dataset(
         n_train=args.n_train,
         n_val=args.n_val,
         mlp=mlp,
         device=device,
         batch_size=batch_size,
+        normalize=args.normalize_targets,
     )
     print(f"[train_ctle] train batches={len(train_loader)} val batches={len(val_loader)}")
+    if args.normalize_targets:
+        norm_msg = ", ".join(
+            f"{n}={float(m):+.2f}/{float(s):.2f}"
+            for n, m, s in zip(PARAM_COLS, target_mean, target_std)
+        )
+        print(f"[train_ctle] per-dim target stats (mean/std): {norm_msg}")
+        torch.save(
+            {"mean": target_mean, "std": target_std, "params": PARAM_COLS},
+            out_dir / "target_norm_stats.pt",
+        )
 
     task_fn = F.mse_loss
 
@@ -1025,6 +1200,12 @@ def main() -> None:
     val_v_history: list[float] = []
     val_argmax_v_history: list[float] = []
     solid_metrics_history: list[dict] = []
+
+    per_dim_log_path = out_dir / "per_dim_stats.txt"
+    per_dim_history: list[dict] = []
+    print(f"[train_ctle] per-dimension stats logging enabled -> {per_dim_log_path}")
+
+
 
     readiness_prune_fired = False
     readiness_prune_epoch = -1
@@ -1093,10 +1274,14 @@ def main() -> None:
         # ---- validation ----
         do_validate = (epoch % args.validate_every == 0) or (epoch == ab_total - 1)
         if do_validate:
-            val_loss = validate(net, val_loader, task_fn, device,
-                                tau=tau, cell_mode=cell_mode)
+            stats = compute_per_dim_stats(net, val_loader, device,
+                                          tau=tau, cell_mode=cell_mode)
+            val_loss = stats["agg_mse"]
             val_v_history.append(val_loss)
             val_history.append(val_loss)
+            _log_per_dim_stats(per_dim_log_path, epoch, phase, stats)
+            per_dim_history.append({"epoch": epoch, "phase": phase, **stats})
+
             val_arg = validate_argmax(net, val_loader, task_fn, lambda b, device=None: None, device)
             val_argmax_history.append(val_arg)
             val_argmax_v_history.append(val_arg)
@@ -1164,10 +1349,15 @@ def main() -> None:
                     stop_training = True
 
         scheduler.step()
+        if do_validate and per_dim_history:
+            worst_name, worst_val = _worst_dim_label(per_dim_history[-1])
+            worst_str = f"  worst_dim={worst_name}({worst_val:.3f})"
+        else:
+            worst_str = ""
         print(
             f"  epoch {epoch:4d} [{phase}]  train={avg_train:.4f}  "
             f"val={val_loss:.4f}  val_argmax={val_argmax_history[-1] if val_argmax_history else 0:.4f}  "
-            f"tau={tau:.3f}  lr={optimizer.param_groups[0]['lr']:.2e}"
+            f"tau={tau:.3f}  lr={optimizer.param_groups[0]['lr']:.2e}{worst_str}"
         )
 
     # ---- end of Phase A+B1+B2 ----
@@ -1193,9 +1383,6 @@ def main() -> None:
             f.write(f"{i}\t{t:.6e}\t{v:.6e}\t{va:.6e}\t{p}\n")
 
     # loss curve
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as _plt
     fig, ax = _plt.subplots(figsize=(8, 4.5))
     ax.plot(history, label="train", color="C0")
     ax.plot(val_history, label="val (soft)", color="C3")
@@ -1210,6 +1397,16 @@ def main() -> None:
     fig.savefig(out_dir / "loss_curve.png", dpi=120, bbox_inches="tight")
     _plt.close(fig)
 
+    # per-dimension summary plot
+    if per_dim_history:
+        _plot_per_dim_diagnostics(
+            per_dim_history, out_dir / "per_dim_stats.png",
+            norm_label="(normalized)" if args.normalize_targets else "(logit space)",
+            suptitle="Per-dimension diagnostics (ctle_grid) — A+B1+B2",
+        )
+
+    # output fit (logit space)
+
     # output fit (logit space)
     with torch.no_grad():
         val_batch = next(iter(val_loader))
@@ -1217,9 +1414,14 @@ def main() -> None:
         y_v = val_batch[1][:64].to(device)
         out_v, _ = net(u_v, ctx=None, store_trajectory=False,
                        cell_mode="soft", tau=0.001)
+    fit_title = (
+        "Pre-prune output fit (normalized logit space, 7 params flattened)"
+        if args.normalize_targets
+        else "Pre-prune output fit (logit space, 7 params flattened)"
+    )
     plot_output_fit(
         out_v, y_v, loss_name="mse",
-        title="Pre-prune output fit (logit space, 7 params flattened)",
+        title=fit_title,
         save_path=str(out_dir / "output_fit.png"),
     )
 
@@ -1304,6 +1506,7 @@ def main() -> None:
         retrain_history: list[float] = []
         retrain_val_history: list[float] = []
         retrain_val_argmax: list[float] = []
+        retrain_per_dim_history: list[dict] = []
         best_val_pruned = float("inf")
         best_epoch_pruned = -1
         best_state_pruned: dict | None = None
@@ -1352,11 +1555,13 @@ def main() -> None:
             retrain_scheduler.step()
 
             if repoch % args.validate_every == 0 or repoch == c_total - 1:
-                val_r = validate(pruned_net, val_loader, task_fn, device,
-                                 tau=tau_r, cell_mode=cell_mode_c)
-                retrain_val_history.append(val_r)
+                c_stats = compute_per_dim_stats(pruned_net, val_loader, device,
+                                                tau=tau_r, cell_mode=cell_mode_c)
+                retrain_val_history.append(c_stats["agg_mse"])
                 val_arg_r = validate_argmax(pruned_net, val_loader, task_fn, lambda b, device=None: None, device)
                 retrain_val_argmax.append(val_arg_r)
+                _log_per_dim_stats(per_dim_log_path, global_epoch, "C", c_stats)
+                retrain_per_dim_history.append({"epoch": global_epoch, "phase": "C", **c_stats})
 
                 if repoch % args.validate_every == 0:
                     c_metrics = compute_solidification_metrics(pruned_net, tau=tau_r)
@@ -1380,10 +1585,16 @@ def main() -> None:
                 if retrain_val_argmax:
                     retrain_val_argmax.append(retrain_val_argmax[-1])
 
+            _on_retrain_val = (repoch % args.validate_every == 0 or repoch == c_total - 1)
+            if _on_retrain_val and retrain_per_dim_history:
+                wn, wv = _worst_dim_label(retrain_per_dim_history[-1])
+                worst_c = f"  worst_dim={wn}({wv:.3f})"
+            else:
+                worst_c = ""
             print(
                 f"  phase-C epoch {repoch:4d}  train={avg:.4f}  "
                 f"val={retrain_val_history[-1]:.4f}  val_argmax={retrain_val_argmax[-1]:.4f}  "
-                f"tau={tau_r:.3f}"
+                f"tau={tau_r:.3f}{worst_c}"
             )
 
         if best_state_pruned is not None:
@@ -1410,9 +1621,14 @@ def main() -> None:
         with torch.no_grad():
             out_pruned, _ = pruned_net(u_v, ctx=None, store_trajectory=False,
                                        cell_mode="soft", tau=0.001)
+        pruned_fit_title = (
+            "Pruned output fit (normalized logit space, 7 params flattened)"
+            if args.normalize_targets
+            else "Pruned output fit (logit space, 7 params flattened)"
+        )
         plot_output_fit(
             out_pruned, y_v, loss_name="mse",
-            title="Pruned output fit (logit space, 7 params flattened)",
+            title=pruned_fit_title,
             save_path=str(out_dir / "output_fit_pruned.png"),
         )
 
@@ -1433,6 +1649,15 @@ def main() -> None:
             f.write(f"best_val_pruned: {best_val_pruned:.6f}\n")
             f.write(f"best_epoch_pruned: {best_epoch_pruned}\n")
 
+        # Combined per-dim plot (pre-prune + retrain)
+        if retrain_per_dim_history:
+            _plot_per_dim_diagnostics(
+                per_dim_history + retrain_per_dim_history,
+                out_dir / "per_dim_stats.png",
+                norm_label="(normalized)" if args.normalize_targets else "(logit space)",
+                suptitle="Per-dimension diagnostics (ctle_grid) — all phases",
+            )
+
     # ---- physical-domain evaluation ----
     print("[train_ctle] physical-domain evaluation (relative error per param)...")
     eval_net = pruned_net if (args.prune and best_state_pruned is not None) else net
@@ -1444,6 +1669,10 @@ def main() -> None:
         eval_logits_kirchhoff, _ = eval_net(eval_specs, ctx=None,
                                             store_trajectory=False,
                                             cell_mode="soft", tau=0.001)
+    if args.normalize_targets:
+        mean_d = target_mean.to(eval_logits_kirchhoff.device)
+        std_d = target_std.to(eval_logits_kirchhoff.device)
+        eval_logits_kirchhoff = eval_logits_kirchhoff * std_d + mean_d
     params_mlp = params_from_logits(eval_logits_mlp)
     params_kirchhoff = params_from_logits(eval_logits_kirchhoff)
 

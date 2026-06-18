@@ -170,8 +170,8 @@ _CELL_TYPE_CODE = {
 
 # Normalized physical limits (R7: not calibrated to real SI units).
 PHYS = {
-    "x_max": 3.0,
-    "C_eff": 0.5,
+    "x_max": 5.0,
+    "C_eff": 1.0,
     "beta_softness": 0.02,
     "clip_current": 0.05,
     "clip_softness": 0.02,

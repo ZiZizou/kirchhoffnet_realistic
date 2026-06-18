@@ -1565,7 +1565,6 @@ def main() -> None:
         if raw_net.enable_drive:
             pruned_widths = [s.num_nodes for s in pruned_core.stages]
             if len(set(pruned_widths)) == 1:
-                from io_mapper import FanOutInputMapper
                 pruned_fan_out = input_mapper_pruned.fan_out_map
                 drive_mappers_pruned = [
                     FanOutInputMapper(

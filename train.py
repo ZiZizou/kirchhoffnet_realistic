@@ -34,6 +34,7 @@ from config import (
 )
 from sim_context import SimContext, sample_random_context
 from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
+from cell_library import SimpleEdgeLibrary
 
 
 __all__ = [
@@ -65,10 +66,16 @@ __all__ = [
 # ---------- regularizers ----------
 
 def _stage_soft_weights(stage) -> torch.Tensor:
+    if stage.logits is None:
+        E = stage.num_edges()
+        return torch.ones(E, 1, device=stage.z_logits.device, dtype=stage.z_logits.dtype)
     return F.softmax(stage.logits, dim=-1)
 
 
 def _stage_multiplicities(stage) -> torch.Tensor:
+    if stage.raw_mult is None:
+        E = stage.num_edges()
+        return torch.ones(E, device=stage.z_logits.device, dtype=stage.z_logits.dtype)
     return F.softplus(stage.raw_mult)
 
 
@@ -155,9 +162,10 @@ def _compute_regularizers(
 
         loss_rail = loss_rail + _stage_rail_loss(stage, traj)
 
-        weights_tau = F.softmax(stage.logits / tau, dim=-1)
-        entropy = -(weights_tau * torch.log(weights_tau + 1e-10)).sum(dim=-1).mean()
-        entropy_bonus = entropy_bonus + entropy
+        if stage.logits is not None:
+            weights_tau = F.softmax(stage.logits / tau, dim=-1)
+            entropy = -(weights_tau * torch.log(weights_tau + 1e-10)).sum(dim=-1).mean()
+            entropy_bonus = entropy_bonus + entropy
 
     lambda_entropy = float(lambdas.get("entropy", 0.0)) * tau
     return (
@@ -735,18 +743,21 @@ def compute_solidification_metrics(
     total_nodes = 0
 
     for stage in stages:
-        n_edges = int(stage.logits.shape[0])
+        n_edges = int(stage.logits.shape[0]) if stage.logits is not None else stage.num_edges()
         n_nodes = int(stage.u_logits.shape[0]) if hasattr(stage, "u_logits") and stage.u_logits.numel() > 0 else 0
         if n_edges == 0:
             total_nodes += n_nodes
             continue
 
-        weights = F.softmax(stage.logits / float(tau), dim=-1)
-        max_probs, _ = weights.max(dim=-1)
-        p_z = weights[:, stage.cell_lib.z_index]
         sigma_z = torch.sigmoid(stage.z_logits)
-        max_probs_list.append(max_probs.detach())
-        p_z_list.append(p_z.detach())
+        sigma_z_list.append(sigma_z.detach())
+
+        if stage.logits is not None:
+            weights = F.softmax(stage.logits / float(tau), dim=-1)
+            max_probs, _ = weights.max(dim=-1)
+            p_z = weights[:, stage.cell_lib.z_index]
+            max_probs_list.append(max_probs.detach())
+            p_z_list.append(p_z.detach())
         sigma_z_list.append(sigma_z.detach())
 
         if n_nodes > 0:
@@ -1261,8 +1272,12 @@ def apply_ablation(net, ablation: str) -> None:
         for stage in net.core.stages:
             stage.src = stage.src.new_zeros(0)
             stage.dst = stage.dst.new_zeros(0)
-            stage.logits = nn.Parameter(stage.logits.new_zeros(0, stage.logits.shape[-1]))
-            stage.raw_mult = nn.Parameter(stage.raw_mult.new_zeros(0))
+            if stage.logits is not None:
+                stage.logits = nn.Parameter(stage.logits.new_zeros(0, stage.logits.shape[-1]))
+            if stage.raw_mult is not None:
+                stage.raw_mult = nn.Parameter(stage.raw_mult.new_zeros(0))
+            if isinstance(getattr(stage, 'cell_lib', None), SimpleEdgeLibrary):
+                stage.cell_lib.param = nn.Parameter(stage.cell_lib.param.new_zeros(3, 0))
             stage.raw_leak = nn.Parameter(stage.raw_leak.new_zeros(stage.num_nodes))
             stage.z_logits = nn.Parameter(stage.z_logits.new_zeros(0))
         return

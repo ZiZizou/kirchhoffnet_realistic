@@ -53,7 +53,7 @@ from config import (
     make_smooth2d_grid_preset,
     make_housing_grid_preset,
 )
-from cell_library import IdealizedCellLibrary
+from cell_library import IdealizedCellLibrary, make_cell_library, SimpleEdgeLibrary
 from topology import build_net_from_preset
 from sim_context import SimContext, sample_random_context
 from train import (
@@ -598,6 +598,9 @@ def collect_gradient_norms(raw_net):
                 if name.endswith("." + comp):
                     stage_idx = int(name.split(".stages.")[1].split(".")[0])
                     stage_sq.setdefault(f"stage{stage_idx}_{comp}", 0.0)
+            if name.endswith(".cell_lib.param"):
+                stage_idx = int(name.split(".stages.")[1].split(".")[0])
+                stage_sq.setdefault(f"stage{stage_idx}_device_param", 0.0)
 
     # Second pass: accumulate squared norms where gradients exist.
     for name, p in raw_net.named_parameters():
@@ -610,6 +613,10 @@ def collect_gradient_norms(raw_net):
                     stage_idx = int(name.split(".stages.")[1].split(".")[0])
                     key = f"stage{stage_idx}_{comp}"
                     stage_sq[key] = stage_sq.get(key, 0.0) + gnorm_sq
+            if name.endswith(".cell_lib.param"):
+                stage_idx = int(name.split(".stages.")[1].split(".")[0])
+                key = f"stage{stage_idx}_device_param"
+                stage_sq[key] = stage_sq.get(key, 0.0) + gnorm_sq
         if "transfers" in name or "stage_transfer" in name:
             transfer_sq += gnorm_sq
             transfer_found = True
@@ -693,8 +700,9 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--cell-library", type=str, default=None, dest="cell_library",
-        choices=["legacy", "v15"],
-        help="Cell library: 'legacy' (L,S,P,Z, default) or 'v15' (O_weak,O_hard,P0,N0,D1,Z). "
+        choices=["legacy", "v15", "relu", "tanh"],
+        help="Cell library: 'legacy' (L,S,P,Z, default), 'v15' (O_weak,O_hard,P0,N0,D1,Z), "
+             "'relu' (I=ReLU(p0*Vsrc+p1*Vdest+p2)), 'tanh' (I=tanh(p0*Vsrc+p1*Vdest+p2)). "
              "Overrides the preset's cell_library key if present.",
     )
     parser.add_argument(
@@ -1168,7 +1176,7 @@ def main():
         lib_name = PRESETS[args.problem].get("cell_library", "legacy")
     if args.cell_library is not None:
         lib_name = args.cell_library
-    cell_lib = IdealizedCellLibrary(library_name=lib_name)
+    cell_lib = make_cell_library(lib_name)
     # Per-problem grid-size default (grid7-gate0: smooth2d_grid=7, housing_grid=5).
     # Explicit --grid-size N overrides either.
     if args.problem == "smooth2d_grid":

@@ -21,7 +21,7 @@ from config import (
     PHYS,
     SOLVER,
 )
-from cell_library import IdealizedCellLibrary
+from cell_library import IdealizedCellLibrary, SimpleEdgeLibrary
 
 
 __all__ = ["DifferentialStage"]
@@ -100,15 +100,19 @@ class DifferentialStage(nn.Module):
             self.drive_isat = 0.0
 
         E = len(src)
-        Q = cell_lib.num_cells
+        self._is_simple = isinstance(cell_lib, SimpleEdgeLibrary)
 
-        self.logits = nn.Parameter(torch.zeros(E, Q))
-        with torch.no_grad():
-            self.logits[:, cell_lib.z_index] = (
-                INIT["logits_z_bias"] if logits_z_bias is None else float(logits_z_bias)
-            )
-
-        self.raw_mult = nn.Parameter(torch.full((E,), float(INIT["raw_mult_init"])))
+        if self._is_simple:
+            self.logits = None
+            self.raw_mult = None
+        else:
+            Q = cell_lib.num_cells
+            self.logits = nn.Parameter(torch.zeros(E, Q))
+            with torch.no_grad():
+                self.logits[:, cell_lib.z_index] = (
+                    INIT["logits_z_bias"] if logits_z_bias is None else float(logits_z_bias)
+                )
+            self.raw_mult = nn.Parameter(torch.full((E,), float(INIT["raw_mult_init"])))
         self.raw_leak = nn.Parameter(torch.full((num_nodes,), float(INIT["raw_leak_init"])))
 
         # Gate parameters for complexity-regularized pruning (CP-1, CP-2).
@@ -122,6 +126,11 @@ class DifferentialStage(nn.Module):
 
     def num_edges(self) -> int:
         return int(self.src.numel())
+
+    @property
+    def is_simple_device(self) -> bool:
+        """Check if this stage uses a SimpleEdgeLibrary."""
+        return self._is_simple
 
     def drive_current(
         self, x: torch.Tensor, x_drive: torch.Tensor | None, drive_scale: float
@@ -270,17 +279,22 @@ class DifferentialStage(nn.Module):
 
     def parameter_breakdown(self) -> dict:
         """Return parameter counts including gate parameters (for diagnostics)."""
+        logits_n = int(self.logits.numel()) if self.logits is not None else 0
+        raw_mult_n = int(self.raw_mult.numel()) if self.raw_mult is not None else 0
+        device_n = int(self.cell_lib.param.numel()) if isinstance(self.cell_lib, SimpleEdgeLibrary) else 0
         return {
-            "logits": int(self.logits.numel()),
-            "raw_mult": int(self.raw_mult.numel()),
+            "logits": logits_n,
+            "raw_mult": raw_mult_n,
             "raw_leak": int(self.raw_leak.numel()),
             "z_logits": int(self.z_logits.numel()),
             "u_logits": int(self.u_logits.numel()),
+            "device_param": device_n,
             "total": (
-                int(self.logits.numel())
-                + int(self.raw_mult.numel())
+                logits_n
+                + raw_mult_n
                 + int(self.raw_leak.numel())
                 + int(self.z_logits.numel())
                 + int(self.u_logits.numel())
+                + device_n
             ),
         }

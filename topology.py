@@ -24,7 +24,7 @@ import torch.nn as nn
 
 from config import PRESETS
 from differential_stage import DifferentialStage
-from cell_library import IdealizedCellLibrary
+from cell_library import IdealizedCellLibrary, SimpleEdgeLibrary, make_cell_library
 
 
 __all__ = [
@@ -583,9 +583,12 @@ def prune_stage(
     from differential_stage import DifferentialStage
 
     z = stage.edge_gates().detach().cpu()
-    w_logits = stage.logits.detach().cpu()
-    p_z = torch.softmax(w_logits, dim=-1)[:, stage.cell_lib.z_index]  # [E]
-    eff_score = (1.0 - p_z) * z  # [E]
+    if getattr(stage.cell_lib, 'has_z_cell', True):
+        w_logits = stage.logits.detach().cpu()
+        p_z = torch.softmax(w_logits, dim=-1)[:, stage.cell_lib.z_index]  # [E]
+        eff_score = (1.0 - p_z) * z  # [E]
+    else:
+        eff_score = z  # no Z cell: gate alone determines activity
 
     keep_edge = eff_score > edge_threshold
     if prune_nodes_by_gate:
@@ -713,11 +716,17 @@ def prune_stage(
         new_write_idx = [node_remap[int(idx)] for idx in stage._drive_idx.tolist()
                          if int(idx) in node_remap] if drive_surviving else None
 
+    is_simple = isinstance(stage.cell_lib, SimpleEdgeLibrary)
+    if is_simple:
+        new_lib = SimpleEdgeLibrary(num_edges=len(new_src), mode=stage.cell_lib._mode)
+    else:
+        new_lib = stage.cell_lib
+
     new_stage = DifferentialStage(
         num_nodes=num_nodes_new,
         src=new_src,
         dst=new_dst,
-        cell_lib=stage.cell_lib,
+        cell_lib=new_lib,
         c_eff=stage.c_eff,
         x_max=stage.x_max,
         clip_current=stage.clip_current,
@@ -728,8 +737,11 @@ def prune_stage(
     if transfer_params:
         with torch.no_grad():
             edge_idx_old = torch.nonzero(edge_mask, as_tuple=True)[0]
-            new_stage.logits.data.copy_(stage.logits.data[edge_idx_old].cpu())
-            new_stage.raw_mult.data.copy_(stage.raw_mult.data[edge_idx_old].cpu())
+            if is_simple:
+                new_stage.cell_lib.param.data.copy_(stage.cell_lib.param.data[:, edge_idx_old].cpu())
+            else:
+                new_stage.logits.data.copy_(stage.logits.data[edge_idx_old].cpu())
+                new_stage.raw_mult.data.copy_(stage.raw_mult.data[edge_idx_old].cpu())
             new_stage.z_logits.data.copy_(stage.z_logits.data[edge_idx_old].cpu())
         with torch.no_grad():
             new_stage.raw_leak.data.copy_(stage.raw_leak.data[node_idx_old].cpu())
@@ -905,6 +917,9 @@ def topology_to_stage(
 
     remapped_src = [id_map[s] for s in core_src]
     remapped_dst = [id_map[d] for d in core_dst]
+
+    if isinstance(cell_lib, SimpleEdgeLibrary):
+        cell_lib = SimpleEdgeLibrary(num_edges=len(remapped_src), mode=cell_lib._mode)
 
     stage = DifferentialStage(
         num_nodes=len(active_nodes),

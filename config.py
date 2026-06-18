@@ -151,6 +151,8 @@ _CELL_LIBRARY_V15 = {
 CELL_LIBRARIES = {
     "legacy": _CELL_LIBRARY_LEGACY,
     "v15": _CELL_LIBRARY_V15,
+    "relu": {"cells": {}, "cell_order": ["S"], "device": "relu"},
+    "tanh": {"cells": {}, "cell_order": ["S"], "device": "tanh"},
 }
 
 # Legacy globals for backward compatibility.

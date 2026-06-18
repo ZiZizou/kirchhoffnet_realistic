@@ -2491,6 +2491,12 @@ def main():
     test_driven_node_gate_forced_open()          # DRIVE-3
     test_kirchhoff_net_with_io_drive_forward()   # DRIVE-4
 
+    # Simple-edge family tests (simple-edge-family plan)
+    test_simple_edge_build_forward()             # SE-1
+    test_simple_edge_prune()                     # SE-2
+    test_simple_edge_regularizers()              # SE-3
+    test_simple_edge_diagnostics()               # SE-4
+
     print()
     print("=" * 60)
     print(f"Smoke test results: {passed} passed, {failed} failed")
@@ -4750,6 +4756,130 @@ def test_kirchhoff_net_with_io_drive_forward():
           net_no.drive_mappers is None)
     check("DRIVE-4: enable_drive=False -> enable_drive is False",
           not net_no.enable_drive)
+
+
+def test_simple_edge_build_forward():
+    print("\nTest SE-1: SimpleEdgeLibrary build + forward (relu and tanh)")
+    from cell_library import SimpleEdgeLibrary, make_cell_library
+    from topology import build_net_from_config
+    from config import PRESETS
+
+    for mode in ("relu", "tanh"):
+        cell_lib = make_cell_library(mode)
+        l = cell_lib
+        check(f"SE-1 ({mode}): num_cells=1", l.num_cells == 1, f"got {l.num_cells}")
+        check(f"SE-1 ({mode}): z_index=0", l.z_index == 0, f"got {l.z_index}")
+        check(f"SE-1 ({mode}): has_z_cell=False", not l.has_z_cell, f"got {l.has_z_cell}")
+
+        preset = dict(PRESETS["smooth2d_grid"])
+        preset["stages"] = preset["stages"][:1]
+        net = build_net_from_config(preset, cell_lib=cell_lib, enable_drive=False)
+        stage = net.core.stages[0]
+        check(f"SE-1 ({mode}): stage uses SimpleEdgeLibrary",
+              isinstance(stage.cell_lib, SimpleEdgeLibrary))
+        check(f"SE-1 ({mode}): logits is None", stage.logits is None)
+        check(f"SE-1 ({mode}): raw_mult is None", stage.raw_mult is None)
+        check(f"SE-1 ({mode}): param shape [3, E]", stage.cell_lib.param.shape == (3, stage.num_edges()),
+              f"got {stage.cell_lib.param.shape}")
+
+        out, _ = net(torch.randn(4, 2), ctx=None, store_trajectory=False)
+        check(f"SE-1 ({mode}): output finite", torch.isfinite(out).all().item())
+        check(f"SE-1 ({mode}): output shape (4,1)", out.shape == (4, 1), f"got {out.shape}")
+
+        loss = out.sum()
+        loss.backward()
+        check(f"SE-1 ({mode}): grad on param", stage.cell_lib.param.grad is not None)
+        check(f"SE-1 ({mode}): grad on z_logits", stage.z_logits.grad is not None)
+        check(f"SE-1 ({mode}): grad on u_logits", stage.u_logits.grad is not None)
+        check(f"SE-1 ({mode}): grad on raw_leak", stage.raw_leak.grad is not None)
+
+
+def test_simple_edge_prune():
+    print("\nTest SE-2: SimpleEdgeLibrary pruning")
+    from cell_library import SimpleEdgeLibrary, make_cell_library
+    from topology import build_net_from_config, prune_network
+    from config import PRESETS
+
+    cell_lib = make_cell_library("tanh")
+    preset = dict(PRESETS["smooth2d_grid"])
+    preset["stages"] = preset["stages"][:2]
+    net = build_net_from_config(preset, cell_lib=cell_lib, enable_drive=False)
+
+    for stage in net.core.stages:
+        with torch.no_grad():
+            stage.z_logits.fill_(2.0)
+            n = stage.z_logits.numel()
+            stage.z_logits[:n // 2] = -3.0
+
+    pruned_core, remaps = prune_network(net.core, edge_threshold=0.5, prune_nodes_by_gate=False)
+    check("SE-2: pruned has fewer edges",
+          sum(s.num_edges() for s in pruned_core.stages) < sum(s.num_edges() for s in net.core.stages))
+    check("SE-2: pruned uses SimpleEdgeLibrary",
+          isinstance(pruned_core.stages[0].cell_lib, SimpleEdgeLibrary))
+    for i, stage in enumerate(pruned_core.stages):
+        check(f"SE-2: stage {i} param shape matches edges",
+              stage.cell_lib.param.shape[1] == stage.num_edges(),
+              f"param {stage.cell_lib.param.shape} vs edges {stage.num_edges()}")
+    check("SE-2: cell_lib is not shared",
+          pruned_core.stages[0].cell_lib is not net.core.stages[0].cell_lib)
+
+
+def test_simple_edge_regularizers():
+    print("\nTest SE-3: SimpleEdgeLibrary regularizers (manual)")
+    from cell_library import SimpleEdgeLibrary, make_cell_library
+    from topology import build_net_from_config
+    from config import PRESETS, LAMBDAS
+    from train import _stage_soft_weights, _stage_multiplicities, _stage_edge_gates, _stage_node_gates, _stage_rail_loss
+    import math
+
+    cell_lib = make_cell_library("relu")
+    preset = dict(PRESETS["smooth2d_grid"])
+    preset["stages"] = preset["stages"][:1]
+    net = build_net_from_config(preset, cell_lib=cell_lib, enable_drive=False)
+
+    u = torch.randn(4, 2)
+    out, trajs = net(u, ctx=None, store_trajectory=True)
+
+    stage = net.core.stages[0]
+    traj = trajs[0]
+    w = _stage_soft_weights(stage)
+    mult = _stage_multiplicities(stage)
+    z = _stage_edge_gates(stage)
+    u_gates = _stage_node_gates(stage)
+    z_idx = stage.cell_lib.z_index
+
+    check("SE-3: soft_weights has 1 column", w.shape[-1] == 1, f"got {w.shape[-1]}")
+    check("SE-3: soft_weights all 1.0", float(w.mean().item()) == 1.0, f"got {float(w.mean().item())}")
+    check("SE-3: multiplicities all 1.0", float(mult.mean().item()) == 1.0, f"got {float(mult.mean().item())}")
+    check("SE-3: edge_gates mean in (0,1)", 0 < float(z.mean().item()) < 1)
+    check("SE-3: node_gates mean in (0,1)", 0 < float(u_gates.mean().item()) < 1)
+    check("SE-3: sparsity w[:,:0] = 0", float(w[:, :z_idx].sum().item()) == 0.0)
+    check("SE-3: rail finite", math.isfinite(float(_stage_rail_loss(stage, traj).item())))
+
+
+def test_simple_edge_diagnostics():
+    print("\nTest SE-4: SimpleEdgeLibrary diagnostics (compute_solidification_metrics)")
+    from cell_library import SimpleEdgeLibrary, make_cell_library
+    from topology import build_net_from_config
+    from config import PRESETS
+    from train import compute_solidification_metrics
+
+    cell_lib = make_cell_library("tanh")
+    preset = dict(PRESETS["smooth2d_grid"])
+    preset["stages"] = preset["stages"][:1]
+    net = build_net_from_config(preset, cell_lib=cell_lib, enable_drive=False)
+
+    metrics = compute_solidification_metrics(net, tau=1.0)
+    check("SE-4: mean_sigma_z present", "mean_sigma_z" in metrics)
+    check("SE-4: mean_sigma_u present", "mean_sigma_u" in metrics)
+    check("SE-4: num_edges > 0", metrics["num_edges"] > 0)
+    check("SE-4: num_nodes > 0", metrics["num_nodes"] > 0)
+    check("SE-4: mean_max_cell_prob == 0 (no logits)",
+          metrics["mean_max_cell_prob"] == 0.0,
+          f"got {metrics['mean_max_cell_prob']}")
+    check("SE-4: mean_pZ == 0 (no Z cell)",
+          metrics["mean_pZ"] == 0.0,
+          f"got {metrics['mean_pZ']}")
 
 
 if __name__ == "__main__":

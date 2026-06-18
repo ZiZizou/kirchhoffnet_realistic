@@ -50,7 +50,7 @@ from config import (
     SOLVER,
     TAU,
 )
-from cell_library import IdealizedCellLibrary
+from cell_library import IdealizedCellLibrary, make_cell_library, SimpleEdgeLibrary
 from io_mapper import FanOutInputMapper, SparseInputMapper
 from kirchhoff_net import KirchhoffNetWithIO
 from topology import build_net_from_config, prune_network
@@ -747,6 +747,9 @@ def collect_gradient_norms(raw_net):
                 if name.endswith("." + comp):
                     stage_idx = int(name.split(".stages.")[1].split(".")[0])
                     stage_sq.setdefault(f"stage{stage_idx}_{comp}", 0.0)
+            if name.endswith(".cell_lib.param"):
+                stage_idx = int(name.split(".stages.")[1].split(".")[0])
+                stage_sq.setdefault(f"stage{stage_idx}_device_param", 0.0)
 
     for name, p in raw_net.named_parameters():
         if p.grad is None:
@@ -758,6 +761,10 @@ def collect_gradient_norms(raw_net):
                     stage_idx = int(name.split(".stages.")[1].split(".")[0])
                     key = f"stage{stage_idx}_{comp}"
                     stage_sq[key] = stage_sq.get(key, 0.0) + gnorm_sq
+            if name.endswith(".cell_lib.param"):
+                stage_idx = int(name.split(".stages.")[1].split(".")[0])
+                key = f"stage{stage_idx}_device_param"
+                stage_sq[key] = stage_sq.get(key, 0.0) + gnorm_sq
         if "transfers" in name or "stage_transfer" in name:
             transfer_sq += gnorm_sq
             transfer_found = True
@@ -868,8 +875,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--cell-library", type=str, default=None, dest="cell_library",
-        choices=["legacy", "v15"],
-        help="Cell library: 'legacy' (L,S,P,Z, default) or 'v15' (O_weak,O_hard,P0,N0,D1,Z).",
+        choices=["legacy", "v15", "relu", "tanh"],
+        help="Cell library: 'legacy' (L,S,P,Z, default), 'v15' (O_weak,O_hard,P0,N0,D1,Z), "
+             "'relu' (I=ReLU(p0*Vsrc+p1*Vdest+p2)), 'tanh' (I=tanh(p0*Vsrc+p1*Vdest+p2)).",
     )
     parser.add_argument(
         "--output", type=Path, default=Path("./output_ctle"),
@@ -1095,7 +1103,7 @@ def main() -> None:
 
     # ---- build KirchhoffNet ----
     lib_name = args.cell_library if args.cell_library is not None else "legacy"
-    cell_lib = IdealizedCellLibrary(library_name=lib_name)
+    cell_lib = make_cell_library(lib_name)
     preset = make_ctle_grid_preset(
         grid_size=args.grid_size, num_stages=args.num_stages,
         write_mode=args.write_mode,
@@ -1509,11 +1517,12 @@ def main() -> None:
             save_path=str(out_dir / f"stage{i + 1}_graph_trained.png"),
             title=f"ctle_grid — Stage {i + 1} (trained, {stage.num_edges()} edges)",
         )
-        plot_cell_selection(
-            stage.logits, cell_order=stage.cell_lib._cell_order,
-            save_path=str(out_dir / f"stage{i + 1}_cell_selection_trained.png"),
-            title=f"ctle_grid — Stage {i + 1} cell selection (trained)",
-        )
+        if stage.logits is not None:
+            plot_cell_selection(
+                stage.logits, cell_order=stage.cell_lib._cell_order,
+                save_path=str(out_dir / f"stage{i + 1}_cell_selection_trained.png"),
+                title=f"ctle_grid — Stage {i + 1} cell selection (trained)",
+            )
 
     torch.save(net.state_dict(), out_dir / "model.pt")
     print(f"[train_ctle] saved pre-prune model to {out_dir / 'model.pt'}")
@@ -1711,11 +1720,12 @@ def main() -> None:
                 save_path=str(out_dir / f"stage{i + 1}_graph_pruned.png"),
                 title=f"ctle_grid — Stage {i + 1} (pruned, {stage.num_edges()} edges, {stage.num_nodes} nodes)",
             )
-            plot_cell_selection(
-                stage.logits, cell_order=stage.cell_lib._cell_order,
-                save_path=str(out_dir / f"stage{i + 1}_cell_selection_pruned.png"),
-                title=f"ctle_grid — Stage {i + 1} cell selection (pruned)",
-            )
+            if stage.logits is not None:
+                plot_cell_selection(
+                    stage.logits, cell_order=stage.cell_lib._cell_order,
+                    save_path=str(out_dir / f"stage{i + 1}_cell_selection_pruned.png"),
+                    title=f"ctle_grid — Stage {i + 1} cell selection (pruned)",
+                )
 
         with torch.no_grad():
             out_pruned, _ = pruned_net(u_v, ctx=None, store_trajectory=False,

@@ -29,7 +29,7 @@ import torch.nn.functional as F
 from config import CELL_LIBRARIES, PHYS, cells_to_tensor_dict
 
 
-__all__ = ["IdealizedCellLibrary"]
+__all__ = ["IdealizedCellLibrary", "SimpleEdgeLibrary", "make_cell_library"]
 
 
 class IdealizedCellLibrary(nn.Module):
@@ -78,6 +78,11 @@ class IdealizedCellLibrary(nn.Module):
     @property
     def num_cells(self) -> int:
         return int(self.gm.numel())
+
+    @property
+    def has_z_cell(self) -> bool:
+        """Check whether the Z (disabled) cell exists (gm == 0 at z_index)."""
+        return self.gm[self.z_index].item() == 0.0
 
     def gm_values(self) -> torch.Tensor:
         """Return per-cell gm (transconductance) values, shape [Q]."""
@@ -185,6 +190,91 @@ class IdealizedCellLibrary(nn.Module):
     def compile_forward(self, backend: str = "inductor"):
         """Compile `forward` with `torch.compile` for kernel fusion."""
         self.forward = torch.compile(self.forward, backend=backend)
+
+
+class SimpleEdgeLibrary(nn.Module):
+    """Single-cell edge device with per-edge learnable parameters.
+
+    Two modes:
+      - ``mode="relu"``:  I = ReLU(p0 * Vsrc + p1 * Vdest + p2)
+      - ``mode="tanh"``:  I = tanh(p0 * Vsrc + p1 * Vdest + p2)
+
+    Holds a single ``nn.Parameter`` of shape ``[3, E]`` for per-edge
+    learnable weights.  No cell selection, no multiplicity, no Z cell.
+    Compliance gating (src/dst rail clamp) is applied.
+    """
+
+    def __init__(self, num_edges: int, mode: str) -> None:
+        super().__init__()
+        if mode not in ("relu", "tanh"):
+            raise ValueError(f"SimpleEdgeLibrary mode must be 'relu' or 'tanh', got {mode!r}")
+        self._mode = mode
+        self._act = torch.relu if mode == "relu" else torch.tanh
+        self.param = nn.Parameter(torch.randn(3, num_edges))
+        self._cell_order = ["S"]
+        self.z_index = 0
+        self._beta_softness = float(PHYS["beta_softness"])
+
+    @property
+    def num_cells(self) -> int:
+        return 1
+
+    @property
+    def has_z_cell(self) -> bool:
+        """No Z (disabled) cell in this library."""
+        return False
+
+    def gm_values(self) -> torch.Tensor:
+        """Per-cell gm proxy: shape [1] (Q=1). Returns 0 — no per-cell-type
+        gm concept for simple devices; the actual per-edge conductance is
+        captured by ``self.param``."""
+        return torch.zeros(1, device=self.param.device)
+
+    def forward(
+        self,
+        x_src: torch.Tensor,
+        x_dst: torch.Tensor,
+        logits: torch.Tensor,
+        raw_mult: torch.Tensor,
+        x_max: float,
+        ctx,
+        tau: float = 1.0,
+        cell_mode: str = "soft",
+    ) -> torch.Tensor:
+        """Compute edge currents.
+
+        ``logits``, ``raw_mult``, ``tau``, and ``cell_mode`` are ignored
+        (no cell selection / multiplicity for this library).
+        """
+        batch, num_edges = x_src.shape
+        u = (self.param[0].unsqueeze(0) * x_src
+             + self.param[1].unsqueeze(0) * x_dst
+             + self.param[2].unsqueeze(0))
+        i_cell = self._act(u)
+
+        # Compliance gating (same as IdealizedCellLibrary).
+        gate_src = torch.sigmoid((x_max - x_src.abs()) / self._beta_softness)
+        gate_dst = torch.sigmoid((x_max - x_dst.abs()) / self._beta_softness)
+        gate = gate_src * gate_dst
+
+        return gate * i_cell
+
+    def compile_forward(self, backend: str = "inductor"):
+        pass
+
+
+def make_cell_library(library_name: str, num_edges: int | None = None) -> IdealizedCellLibrary | SimpleEdgeLibrary:
+    """Factory: returns ``SimpleEdgeLibrary`` for ``relu``/``tanh``,
+    ``IdealizedCellLibrary`` otherwise.
+
+    When ``num_edges`` is ``None`` (template), the returned
+    ``SimpleEdgeLibrary`` is created with ``num_edges=1`` and must be
+    replaced with a per-stage instance via
+    ``SimpleEdgeLibrary(num_edges=actual, mode=...)`` before use.
+    """
+    if library_name in ("relu", "tanh"):
+        return SimpleEdgeLibrary(num_edges=num_edges if num_edges is not None else 1, mode=library_name)
+    return IdealizedCellLibrary(library_name=library_name)
 
 
 def make_default_library() -> IdealizedCellLibrary:

@@ -134,70 +134,127 @@ def params_from_logits(logits: torch.Tensor) -> dict[str, torch.Tensor]:
 
 
 # =============================================================================
-# CTLE grid preset
+# CTLE preset factory (grid + cluster families)
 # =============================================================================
 
-def make_ctle_grid_preset(
+def make_ctle_preset(
+    family: str = "grid",
     grid_size: int = 5,
+    num_hidden: int | None = None,
     num_stages: int = 3,
-    num_proj: int = 7,
+    num_proj: int | None = None,
     write_mode: str | None = None,
     bidirectional: bool = False,
+    cluster_edge_prob: float = 1.0,
+    cluster_seed: int = 0,
 ) -> dict:
-    """Build the ctle_grid preset dict for a 4-spec → 7-logit KirchhoffNet.
+    """Build a 4-spec → 7-logit CTLE KirchhoffNet preset for a given family.
 
-    Each stage has ``grid_size**2`` hidden nodes, ``num_proj`` projection
-    nodes, and 4 input nodes (one per spec). The write mapping is fan-out
-    from 4 inputs to 4 grid quadrants; the read mapping gathers the
-    center column + all projection nodes (5 + num_proj features) and
-    projects them to 7 logits.
+    ``family='grid'`` (default, backward compatible):
+        Each stage has ``grid_size**2`` hidden nodes laid out on a 2D grid
+        with 3x3 convolution-style neighborhood edges, plus ``num_proj``
+        projection nodes and 4 input nodes. Write mapping is fan-out from
+        4 inputs to 4 grid corners; read mapping gathers the center column
+        + all projection nodes (grid_size + num_proj features).
 
-    When ``write_mode`` is provided (one of ``'fan_out'``, ``'dense'``,
-    ``'one_to_one'``), it overrides the default write mapping. ``'dense'``
-    uses an all-to-all ``InputMapper``; ``'one_to_one'`` uses
-    ``SparseInputMapper`` with the first 4 hidden nodes as write targets.
+    ``family='cluster'``:
+        Each stage has ``num_hidden`` hidden nodes wired as a fully (or
+        partially) connected Erdos-Renyi graph via
+        ``cluster_graph(num_hidden, edge_prob=cluster_edge_prob)``. Since
+        every node connects to every other, ``num_proj=0`` (no structural
+        benefit for projection nodes) and ``read_idx=list(range(num_hidden))``
+        reads every hidden node. Write mapping defaults to ``dense``
+        (all-to-all ``InputMapper``).
 
-    When ``bidirectional=True``, each grid_graph edge is realized as two
-    directed edges (i->j and j->i), giving asymmetric cell types (P/rectifier)
-    true bidirectional capability. Edge count is exactly 2× the single-direction
-    count.
+    Args:
+        family: 'grid' or 'cluster'.
+        grid_size: Square grid side length (grid family).
+        num_hidden: Hidden node count (cluster family). Required when family='cluster'.
+        num_stages: Number of ODE stages.
+        num_proj: Projection node count (grid family default 7; cluster always 0).
+        write_mode: 'fan_out' | 'dense' | 'one_to_one' | None (default per family).
+        bidirectional: Emit two directed edges per node pair.
+        cluster_edge_prob: Edge probability for cluster family (default 1.0 = fully connected).
+        cluster_seed: RNG seed for cluster edge sampling.
     """
-    num_hidden = grid_size * grid_size
     n_stages = max(1, num_stages)
-    _stage_cfg = {
-        "num_inputs": 4,
-        "num_hidden": num_hidden,
-        "num_proj": num_proj,
-        "num_outputs": 0,
-        "hidden_family": "grid",
-        "hidden_kwargs": {"height": grid_size, "width": grid_size, "kernel_size": 3, "bidirectional": bidirectional},
-        "input_pattern": "all_to_all",
-        "output_pattern": "all_to_all",
-        "proj_pattern": "all_to_all",
-        "t_span": SOLVER["t_span"] / n_stages,
-        "num_steps": round(SOLVER["num_steps"] / n_stages),
-    }
 
-    # Resolve effective write mode.
-    eff_write = write_mode if write_mode is not None else "fan_out"
+    if family == "grid":
+        if num_proj is None:
+            num_proj = 7
+        n_hidden = grid_size * grid_size
+        if num_hidden is not None and num_hidden != n_hidden:
+            print(f"[make_ctle_preset] note: grid mode ignores num_hidden={num_hidden}; "
+                  f"using grid_size**2={n_hidden}")
+        _stage_cfg = {
+            "num_inputs": 4,
+            "num_hidden": n_hidden,
+            "num_proj": num_proj,
+            "num_outputs": 0,
+            "hidden_family": "grid",
+            "hidden_kwargs": {"height": grid_size, "width": grid_size,
+                              "kernel_size": 3, "bidirectional": bidirectional},
+            "input_pattern": "all_to_all",
+            "output_pattern": "all_to_all",
+            "proj_pattern": "all_to_all",
+            "t_span": SOLVER["t_span"] / n_stages,
+            "num_steps": round(SOLVER["num_steps"] / n_stages),
+        }
+        eff_write = write_mode if write_mode is not None else "fan_out"
 
-    # Fan-out write: each of 4 inputs writes to 2 corner grid nodes.
-    # Layout: input 0 (power)  → top-left, input 1 (jitter) → top-right,
-    #         input 2 (height) → bottom-left, input 3 (width) → bottom-right.
-    # Use 2 rows per corner (top half = rows 0,1 ; bottom half = rows N-2, N-1).
-    top_rows = [0, 1]
-    bot_rows = [grid_size - 2, grid_size - 1]
-    fan_out = {
-        0: [r * grid_size + 0 for r in top_rows],
-        1: [r * grid_size + (grid_size - 1) for r in top_rows],
-        2: [r * grid_size + 0 for r in bot_rows],
-        3: [r * grid_size + (grid_size - 1) for r in bot_rows],
-    }
+        # Fan-out write: each of 4 inputs writes to 2 corner grid nodes.
+        top_rows = [0, 1]
+        bot_rows = [grid_size - 2, grid_size - 1]
+        fan_out = {
+            0: [r * grid_size + 0 for r in top_rows],
+            1: [r * grid_size + (grid_size - 1) for r in top_rows],
+            2: [r * grid_size + 0 for r in bot_rows],
+            3: [r * grid_size + (grid_size - 1) for r in bot_rows],
+        }
+        center_col = grid_size // 2
+        center_nodes = [r * grid_size + center_col for r in range(grid_size)]
+        read_idx = center_nodes + list(range(n_hidden, n_hidden + num_proj))
 
-    # Read: center column hidden nodes + all projection nodes.
-    center_col = grid_size // 2
-    center_nodes = [r * grid_size + center_col for r in range(grid_size)]
-    read_idx = center_nodes + list(range(num_hidden, num_hidden + num_proj))
+    elif family == "cluster":
+        if num_hidden is None:
+            raise ValueError(
+                "make_ctle_preset(family='cluster') requires num_hidden to be set. "
+                "Pass --num-hidden N on the CLI or num_hidden=N to the factory."
+            )
+        if num_hidden < 2:
+            raise ValueError(f"num_hidden must be >= 2 for cluster family (got {num_hidden})")
+        if num_proj is not None and num_proj != 0:
+            print(f"[make_ctle_preset] note: cluster mode forces num_proj=0 "
+                  f"(was {num_proj}); all hidden nodes are already fully connected.")
+        n_hidden = int(num_hidden)
+        num_proj = 0
+        _stage_cfg = {
+            "num_inputs": 4,
+            "num_hidden": n_hidden,
+            "num_proj": num_proj,
+            "num_outputs": 0,
+            "hidden_family": "cluster",
+            "hidden_kwargs": {"edge_prob": cluster_edge_prob,
+                              "seed": cluster_seed,
+                              "bidirectional": bidirectional},
+            "input_pattern": "all_to_all",
+            "output_pattern": "all_to_all",
+            "proj_pattern": "all_to_all",
+            "t_span": SOLVER["t_span"] / n_stages,
+            "num_steps": round(SOLVER["num_steps"] / n_stages),
+        }
+        if write_mode == "fan_out":
+            print(f"[make_ctle_preset] note: cluster mode has no spatial grid corners; "
+                  f"falling back from 'fan_out' to 'dense' write mode.")
+            eff_write = "dense"
+        else:
+            eff_write = write_mode if write_mode is not None else "dense"
+        # Fully connected: read every hidden node.
+        read_idx = list(range(n_hidden))
+        fan_out = None
+
+    else:
+        raise ValueError(f"Unknown family: {family!r} (expected 'grid' or 'cluster')")
 
     preset: dict[str, Any] = {
         "stages": [_stage_cfg] * n_stages,
@@ -217,9 +274,30 @@ def make_ctle_grid_preset(
         },
         "tau_anneal": True,
     }
-    if eff_write == "fan_out":
+    if eff_write == "fan_out" and fan_out is not None:
         preset["write_fan_out"] = fan_out
     return preset
+
+
+def make_ctle_grid_preset(
+    grid_size: int = 5,
+    num_stages: int = 3,
+    num_proj: int = 7,
+    write_mode: str | None = None,
+    bidirectional: bool = False,
+) -> dict:
+    """Backward-compatible thin wrapper for the grid CTLE preset.
+
+    Equivalent to ``make_ctle_preset(family='grid', grid_size=grid_size, ...)``.
+    """
+    return make_ctle_preset(
+        family="grid",
+        grid_size=grid_size,
+        num_stages=num_stages,
+        num_proj=num_proj,
+        write_mode=write_mode,
+        bidirectional=bidirectional,
+    )
 
 
 # =============================================================================
@@ -693,7 +771,7 @@ def _transfer_output_mapper(raw_mapper, raw_read_idx, last_remap, pruned_last_n,
             new_mapper.proj.bias.data.copy_(raw_mapper.proj.bias.data)
         return new_mapper, new_read_idx
 
-    raise TypeError("transfer_output_mapper: ctle_grid requires read_idx")
+    raise TypeError("transfer_output_mapper: ctle preset requires read_idx")
 
 
 # =============================================================================
@@ -867,7 +945,29 @@ def main() -> None:
     )
     parser.add_argument(
         "--grid-size", type=int, default=5,
-        help="Hidden grid height/width (default: 5, total hidden = grid_size^2 per stage).",
+        help="Hidden grid height/width (default: 5, total hidden = grid_size^2 per stage). "
+             "Used only when --hidden-family=grid.",
+    )
+    parser.add_argument(
+        "--hidden-family", choices=["grid", "cluster"], default="grid",
+        dest="hidden_family",
+        help="Hidden graph family (default: grid). 'cluster' uses "
+             "Erdos-Renyi cluster_graph with --num-hidden nodes; 'grid' uses "
+             "2D grid_graph with --grid-size. Cluster mode reads from all "
+             "hidden nodes and uses dense write mode.",
+    )
+    parser.add_argument(
+        "--num-hidden", type=int, default=None, dest="num_hidden",
+        help="Number of hidden nodes per stage (cluster family only). "
+             "Required when --hidden-family=cluster; ignored for grid.",
+    )
+    parser.add_argument(
+        "--cluster-edge-prob", type=float, default=1.0, dest="cluster_edge_prob",
+        help="Erdos-Renyi edge probability for cluster family (default: 1.0 = fully connected).",
+    )
+    parser.add_argument(
+        "--cluster-seed", type=int, default=0, dest="cluster_seed",
+        help="RNG seed for cluster_graph edge sampling (default: 0).",
     )
     parser.add_argument(
         "--num-stages", type=int, default=3,
@@ -1026,6 +1126,19 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # ---- early validation: cluster requires num_hidden ----
+    if args.hidden_family == "cluster":
+        if args.num_hidden is None:
+            raise ValueError(
+                "--num-hidden is required when --hidden-family=cluster. "
+                "Pass an integer (e.g. --num-hidden 25) to specify the number "
+                "of hidden nodes per stage."
+            )
+        if args.num_hidden < 2:
+            raise ValueError(
+                f"--num-hidden must be >= 2 for cluster family (got {args.num_hidden})"
+            )
+
     # ---- resolve config ----
     epochs = args.epochs if args.epochs is not None else int(OPTIM["epochs"])
     lr = args.lr if args.lr is not None else float(OPTIM["lr"])
@@ -1053,7 +1166,9 @@ def main() -> None:
     parallel_enabled = args.parallel if args.parallel is not None else (n_gpus >= 2)
 
     print(f"[train_ctle] device={device} epochs={epochs} lr={lr} batch_size={batch_size} "
-          f"grid_size={args.grid_size} num_stages={args.num_stages} "
+          f"hidden_family={args.hidden_family} "
+          f"grid_size={args.grid_size} num_hidden={args.num_hidden} "
+          f"num_stages={args.num_stages} "
           f"compile={compile_enabled} parallel={parallel_enabled} "
           f"amp={amp_enabled} amp_dtype={args.amp_dtype} ({n_gpus} GPUs) "
           f"output={out_dir}")
@@ -1104,10 +1219,15 @@ def main() -> None:
     # ---- build KirchhoffNet ----
     lib_name = args.cell_library if args.cell_library is not None else "legacy"
     cell_lib = make_cell_library(lib_name)
-    preset = make_ctle_grid_preset(
-        grid_size=args.grid_size, num_stages=args.num_stages,
+    preset = make_ctle_preset(
+        family=args.hidden_family,
+        grid_size=args.grid_size,
+        num_hidden=args.num_hidden,
+        num_stages=args.num_stages,
         write_mode=args.write_mode,
         bidirectional=args.bidirectional,
+        cluster_edge_prob=args.cluster_edge_prob,
+        cluster_seed=args.cluster_seed,
     )
     net: KirchhoffNetWithIO = build_net_from_config(
         preset, cell_lib=cell_lib, enable_drive=args.persistent_drive,
@@ -1123,6 +1243,7 @@ def main() -> None:
     print(f"[train_ctle] write_idx={list(net.write_idx) if net.write_idx is not None else None} "
           f"read_idx={list(net.read_idx) if net.read_idx is not None else None}"
           f" persistent_drive={args.persistent_drive}")
+    topo_label = f"ctle_{args.hidden_family}"
     if args.bidirectional:
         edges_per_stage = [s.num_edges() for s in net.core.stages]
         print(f"[train_ctle] bidirectional=True: {edges_per_stage} edges per stage "
@@ -1134,6 +1255,23 @@ def main() -> None:
         else "one_to_one" if isinstance(net.input_mapper, SparseInputMapper)
         else "dense"
     )
+
+    # Cluster-specific guards must fire before the generic fan_out check below,
+    # because cluster always uses dense write mode — the generic check would
+    # raise a confusing ValueError instead of a graceful warning.
+
+    if args.prune and args.hidden_family == "cluster":
+        print(f"[train_ctle] WARNING: --prune is not supported with --hidden-family=cluster "
+              f"(cluster uses dense write mode, incompatible with fan_out-based "
+              f"transfer_input_mapper). Disabling --prune.")
+        args.prune = False
+
+    if args.persistent_drive and args.hidden_family == "cluster":
+        print(f"[train_ctle] WARNING: --persistent-drive is not supported with "
+              f"--hidden-family=cluster (cluster uses dense write mode; "
+              f"persistent_drive requires fan_out write mode). Disabling --persistent-drive.")
+        args.persistent_drive = False
+
     if args.prune and _effective_write_mode != "fan_out":
         raise ValueError(
             f"--prune with --write-mode={_effective_write_mode} is not supported; "
@@ -1170,6 +1308,9 @@ def main() -> None:
 
     raw_net = _unwrap(net)
 
+    # Effective num_hidden (args.num_hidden for cluster, grid_size**2 for grid).
+    _eff_num_hidden = args.num_hidden if args.num_hidden is not None else (args.grid_size ** 2)
+
     # Save config snapshot
     snapshot_path = out_dir / "config_snapshot.txt"
     with snapshot_path.open("w") as f:
@@ -1178,7 +1319,12 @@ def main() -> None:
         f.write(f"teacher_params: {n_teacher_params}\n")
         f.write(f"teacher_hidden: {args.teacher_hidden}\n")
         f.write(f"teacher_experts: {args.teacher_experts}\n")
+        f.write(f"hidden_family: {args.hidden_family}\n")
         f.write(f"grid_size: {args.grid_size}\n")
+        f.write(f"num_hidden: {_eff_num_hidden}\n")
+        if args.hidden_family == "cluster":
+            f.write(f"cluster_edge_prob: {args.cluster_edge_prob}\n")
+            f.write(f"cluster_seed: {args.cluster_seed}\n")
         f.write(f"num_stages: {args.num_stages}\n")
         f.write(f"hid_count: {net.hid_count}\n")
         f.write(f"proj_count: {net.proj_count}\n")
@@ -1238,7 +1384,7 @@ def main() -> None:
         plot_stage_graph(
             stage,
             save_path=str(out_dir / f"stage{i + 1}_graph_init.png"),
-            title=f"ctle_grid — Stage {i + 1} (init)",
+            title=f"{topo_label} — Stage {i + 1} (init)",
         )
 
     # ---- schedule boundaries ----
@@ -1475,7 +1621,7 @@ def main() -> None:
         ax.plot(val_argmax_history, label="val (argmax)", color="C2", linestyle="--")
     ax.set_xlabel("epoch")
     ax.set_ylabel("MSE (logit space)")
-    ax.set_title(f"ctle_grid (KD from MLP) — 4-phase training (total {epochs} epochs)")
+    ax.set_title(f"{topo_label} (KD from MLP) — 4-phase training (total {epochs} epochs)")
     ax.legend()
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
@@ -1487,7 +1633,7 @@ def main() -> None:
         _plot_per_dim_diagnostics(
             per_dim_history, out_dir / "per_dim_stats.png",
             norm_label="(normalized)" if args.normalize_targets else "(logit space)",
-            suptitle="Per-dimension diagnostics (ctle_grid) — A+B1+B2",
+            suptitle=f"Per-dimension diagnostics ({topo_label}) — A+B1+B2",
         )
 
     # output fit (logit space)
@@ -1515,13 +1661,13 @@ def main() -> None:
         plot_stage_graph(
             stage,
             save_path=str(out_dir / f"stage{i + 1}_graph_trained.png"),
-            title=f"ctle_grid — Stage {i + 1} (trained, {stage.num_edges()} edges)",
+            title=f"{topo_label} — Stage {i + 1} (trained, {stage.num_edges()} edges)",
         )
         if stage.logits is not None:
             plot_cell_selection(
                 stage.logits, cell_order=stage.cell_lib._cell_order,
                 save_path=str(out_dir / f"stage{i + 1}_cell_selection_trained.png"),
-                title=f"ctle_grid — Stage {i + 1} cell selection (trained)",
+                title=f"{topo_label} — Stage {i + 1} cell selection (trained)",
             )
 
     torch.save(net.state_dict(), out_dir / "model.pt")
@@ -1718,13 +1864,13 @@ def main() -> None:
             plot_stage_graph(
                 stage,
                 save_path=str(out_dir / f"stage{i + 1}_graph_pruned.png"),
-                title=f"ctle_grid — Stage {i + 1} (pruned, {stage.num_edges()} edges, {stage.num_nodes} nodes)",
+                title=f"{topo_label} — Stage {i + 1} (pruned, {stage.num_edges()} edges, {stage.num_nodes} nodes)",
             )
             if stage.logits is not None:
                 plot_cell_selection(
                     stage.logits, cell_order=stage.cell_lib._cell_order,
                     save_path=str(out_dir / f"stage{i + 1}_cell_selection_pruned.png"),
-                    title=f"ctle_grid — Stage {i + 1} cell selection (pruned)",
+                    title=f"{topo_label} — Stage {i + 1} cell selection (pruned)",
                 )
 
         with torch.no_grad():
@@ -1764,7 +1910,7 @@ def main() -> None:
                 per_dim_history + retrain_per_dim_history,
                 out_dir / "per_dim_stats.png",
                 norm_label="(normalized)" if args.normalize_targets else "(logit space)",
-                suptitle="Per-dimension diagnostics (ctle_grid) — all phases",
+                suptitle=f"Per-dimension diagnostics ({topo_label}) — all phases",
             )
 
     # ---- physical-domain evaluation ----

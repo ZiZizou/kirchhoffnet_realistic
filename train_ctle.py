@@ -147,6 +147,7 @@ def make_ctle_preset(
     bidirectional: bool = False,
     cluster_edge_prob: float = 1.0,
     cluster_seed: int = 0,
+    q75_input: bool = False,
 ) -> dict:
     """Build a 4-spec → 7-logit CTLE KirchhoffNet preset for a given family.
 
@@ -166,6 +167,10 @@ def make_ctle_preset(
         reads every hidden node. Write mapping defaults to ``dense``
         (all-to-all ``InputMapper``).
 
+    When ``q75_input=True``, ``family='cluster'``, and ``num_inputs`` becomes
+    8 (teacher's scale_input(): log10 + StandardScaler/Q75 expansion).
+    Caller must apply the same scaling to training inputs.
+
     Args:
         family: 'grid' or 'cluster'.
         grid_size: Square grid side length (grid family).
@@ -176,6 +181,7 @@ def make_ctle_preset(
         bidirectional: Emit two directed edges per node pair.
         cluster_edge_prob: Edge probability for cluster family (default 1.0 = fully connected).
         cluster_seed: RNG seed for cluster edge sampling.
+        q75_input: When True and family='cluster', set num_inputs=8 (Q75-scaled features).
     """
     n_stages = max(1, num_stages)
 
@@ -186,6 +192,9 @@ def make_ctle_preset(
         if num_hidden is not None and num_hidden != n_hidden:
             print(f"[make_ctle_preset] note: grid mode ignores num_hidden={num_hidden}; "
                   f"using grid_size**2={n_hidden}")
+        if q75_input:
+            print(f"[make_ctle_preset] note: --q75-input is ignored for grid family "
+                  f"(only supported with cluster). num_inputs stays at 4.")
         _stage_cfg = {
             "num_inputs": 4,
             "num_hidden": n_hidden,
@@ -228,8 +237,9 @@ def make_ctle_preset(
                   f"(was {num_proj}); all hidden nodes are already fully connected.")
         n_hidden = int(num_hidden)
         num_proj = 0
+        n_inputs = 8 if q75_input else 4
         _stage_cfg = {
-            "num_inputs": 4,
+            "num_inputs": n_inputs,
             "num_hidden": n_hidden,
             "num_proj": num_proj,
             "num_outputs": 0,
@@ -285,10 +295,12 @@ def make_ctle_grid_preset(
     num_proj: int = 7,
     write_mode: str | None = None,
     bidirectional: bool = False,
+    q75_input: bool = False,
 ) -> dict:
     """Backward-compatible thin wrapper for the grid CTLE preset.
 
     Equivalent to ``make_ctle_preset(family='grid', grid_size=grid_size, ...)``.
+    Note: q75_input has no effect with grid family (only supported with cluster).
     """
     return make_ctle_preset(
         family="grid",
@@ -297,6 +309,7 @@ def make_ctle_grid_preset(
         num_proj=num_proj,
         write_mode=write_mode,
         bidirectional=bidirectional,
+        q75_input=q75_input,
     )
 
 
@@ -454,6 +467,7 @@ def generate_ctle_dataset(
     batch_size: int,
     seed: int = 42,
     normalize: bool = True,
+    q75_input: bool = False,
 ) -> tuple[DataLoader, DataLoader, torch.Tensor, torch.Tensor]:
     """Build train/val DataLoaders of (specs, mlp_logits) pairs.
 
@@ -467,6 +481,11 @@ def generate_ctle_dataset(
     The student learns to predict normalized logits; callers should
     denormalize at eval time via ``logits = output * std + mean``.
 
+    When ``q75_input`` is True, the input specs are preprocessed through
+    the teacher's ``scale_input()`` (log10 + StandardScaler/Q75 expansion,
+    4-dim → 8-dim). The student then sees well-conditioned 8-feature inputs
+    and its InputMapper becomes ``Linear(8, num_hidden)``.
+
     Returns:
       (train_loader, val_loader, target_mean, target_std).
       When ``normalize`` is False, ``target_mean`` is zeros and
@@ -476,11 +495,17 @@ def generate_ctle_dataset(
     mlp.to(device)
 
     n_total = n_train + n_val
-    specs = sample_specs(n_total, seed=seed).to(device)
+    specs_raw = sample_specs(n_total, seed=seed).to(device)
+    if q75_input:
+        with torch.no_grad():
+            specs = mlp.scale_input(specs_raw).detach()
+    else:
+        specs = specs_raw
+
     with torch.no_grad():
         all_logits: list[torch.Tensor] = []
         for i in range(0, n_total, batch_size):
-            batch = specs[i:i + batch_size]
+            batch = specs_raw[i:i + batch_size]
             all_logits.append(mlp(batch).detach().to("cpu"))
         logits = torch.cat(all_logits, dim=0)
 
@@ -1124,6 +1149,27 @@ def main() -> None:
              "toward an input-derived target pattern. Requires write_mode='fan_out'. "
              "Drive scale decays [1.0, 0.5, 0.25] across stages.",
     )
+    parser.add_argument(
+        "--q75-input", dest="q75_input", action="store_true", default=False,
+        help="Apply teacher's Q75 input scaling (log10 + StandardScaler/Q75 normalization) "
+             "to spec inputs at data-generation time. Transforms 4 raw specs into 8 "
+             "well-conditioned features, matching the RegimeAwareMoE's scale_input() "
+             "preprocessing. Cluster family only (grid fan_out assumes 4 inputs).",
+    )
+    parser.add_argument(
+        "--no-q75-input", dest="q75_input", action="store_false",
+        help="Use raw 4-dim spec inputs (default).",
+    )
+    parser.add_argument(
+        "--weight-decay", type=float, default=None, dest="weight_decay",
+        help=f"AdamW weight decay (default: {OPTIM.get('weight_decay', 0.0)}). "
+             "Pass 1e-4 to match distill_ctle_kirchhoff.py.",
+    )
+    parser.add_argument(
+        "--grad-clip", type=float, default=None, dest="grad_clip",
+        help=f"Max gradient norm for clipping (default: {OPTIM.get('grad_clip_norm', 0.0)}). "
+             "Pass 1.0 to match distill_ctle_kirchhoff.py. 0 or negative = no clipping.",
+    )
     args = parser.parse_args()
 
     # ---- early validation: cluster requires num_hidden ----
@@ -1138,6 +1184,20 @@ def main() -> None:
             raise ValueError(
                 f"--num-hidden must be >= 2 for cluster family (got {args.num_hidden})"
             )
+
+    # ---- early validation: --q75-input is cluster-only ----
+    if args.q75_input and args.hidden_family != "cluster":
+        raise ValueError(
+            "--q75-input is only supported with --hidden-family=cluster. "
+            "The grid family's fan_out mapping hard-codes 4-input-to-corner "
+            "assumptions that break under the 8-feature Q75 expansion. "
+            "Either switch to --hidden-family cluster or omit --q75-input."
+        )
+
+    if args.q75_input and float(SCHEDULE_FOUR_PHASE.get("lambda_kd", 0.0)) > 0.0:
+        print("[train_ctle] warning: --q75-input is incompatible with teacher KD; "
+              "KD is disabled for B1/B2 phases (the teacher network expects raw "
+              "4-dim specs, not pre-scaled 8-dim features).")
 
     # ---- resolve config ----
     epochs = args.epochs if args.epochs is not None else int(OPTIM["epochs"])
@@ -1169,6 +1229,9 @@ def main() -> None:
           f"hidden_family={args.hidden_family} "
           f"grid_size={args.grid_size} num_hidden={args.num_hidden} "
           f"num_stages={args.num_stages} "
+          f"q75_input={args.q75_input} "
+          f"weight_decay={args.weight_decay if args.weight_decay is not None else OPTIM['weight_decay']} "
+          f"grad_clip={args.grad_clip if args.grad_clip is not None else OPTIM['grad_clip_norm']} "
           f"compile={compile_enabled} parallel={parallel_enabled} "
           f"amp={amp_enabled} amp_dtype={args.amp_dtype} ({n_gpus} GPUs) "
           f"output={out_dir}")
@@ -1228,6 +1291,7 @@ def main() -> None:
         bidirectional=args.bidirectional,
         cluster_edge_prob=args.cluster_edge_prob,
         cluster_seed=args.cluster_seed,
+        q75_input=args.q75_input,
     )
     net: KirchhoffNetWithIO = build_net_from_config(
         preset, cell_lib=cell_lib, enable_drive=args.persistent_drive,
@@ -1236,7 +1300,8 @@ def main() -> None:
     n_kirchhoff_params = sum(p.numel() for p in net.parameters())
     in_mapper_name = type(net.input_mapper).__name__
     out_mapper_name = type(net.output_mapper).__name__
-    print(f"[train_ctle] built KirchhoffNet: in_dim=4 out_dim=7 "
+    _in_dim = 8 if args.q75_input else 4
+    print(f"[train_ctle] built KirchhoffNet: in_dim={_in_dim} out_dim=7 "
           f"hid={net.hid_count} proj={net.proj_count} stages={len(net.core.stages)} "
           f"input_mapper={in_mapper_name} output_mapper={out_mapper_name} "
           f"({n_kirchhoff_params} params)")
@@ -1346,6 +1411,9 @@ def main() -> None:
         f.write(f"grad_log_every: {args.grad_log_every}\n")
         f.write(f"prune: {args.prune}\n")
         f.write(f"normalize_targets: {args.normalize_targets}\n")
+        f.write(f"q75_input: {args.q75_input}\n")
+        f.write(f"weight_decay: {args.weight_decay if args.weight_decay is not None else OPTIM['weight_decay']}\n")
+        f.write(f"grad_clip: {args.grad_clip if args.grad_clip is not None else OPTIM['grad_clip_norm']}\n")
         f.write(f"\nLAMBDAS (effective):\n")
         for k, v in preset["lambdas"].items():
             f.write(f"  {k}: {v}\n")
@@ -1356,7 +1424,7 @@ def main() -> None:
     # ---- generate dataset ----
     print(f"[train_ctle] generating {args.n_train + args.n_val} synthetic spec samples "
           f"(train={args.n_train}, val={args.n_val}, "
-          f"normalize_targets={args.normalize_targets})...")
+          f"normalize_targets={args.normalize_targets}, q75_input={args.q75_input})...")
     train_loader, val_loader, target_mean, target_std = generate_ctle_dataset(
         n_train=args.n_train,
         n_val=args.n_val,
@@ -1364,6 +1432,7 @@ def main() -> None:
         device=device,
         batch_size=batch_size,
         normalize=args.normalize_targets,
+        q75_input=args.q75_input,
     )
     print(f"[train_ctle] train batches={len(train_loader)} val batches={len(val_loader)}")
     if args.normalize_targets:
@@ -1401,6 +1470,7 @@ def main() -> None:
 
     optimizer = make_optimizer(
         net, lr=lr,
+        weight_decay=args.weight_decay,
         stage_lr_scale=args.stage_lr_scale,
         mapper_lr_scale=args.mapper_lr_scale,
     )
@@ -1408,7 +1478,9 @@ def main() -> None:
         optimizer, T_max=max(1, ab_total), eta_min=float(OPTIM["scheduler_eta_min"]),
     )
 
-    grad_clip = float(OPTIM["grad_clip_norm"])
+    grad_clip = float(args.grad_clip) if args.grad_clip is not None else float(OPTIM["grad_clip_norm"])
+    if grad_clip <= 0.0:
+        grad_clip = float("inf")
     history: list[float] = []
     val_history: list[float] = []
     val_argmax_history: list[float] = []
@@ -1471,7 +1543,9 @@ def main() -> None:
             tgt_b = tgt_b.to(device)
 
             # Teacher KD is active in B1/B2 only.
-            kd_teacher = teacher_net if (phase in ("B1", "B2")) else None
+            # KD is incompatible with --q75-input because the teacher network
+            # expects raw 4-dim specs, not pre-scaled 8-dim features.
+            kd_teacher = (teacher_net if (phase in ("B1", "B2") and not args.q75_input) else None)
             kd_lambda = float(SCHEDULE_FOUR_PHASE.get("lambda_kd", 1.0)) if kd_teacher is not None else 0.0
 
             loss_task, loss_structural, _ = compute_loss(
@@ -1749,6 +1823,7 @@ def main() -> None:
         # ---- Phase C retrain ----
         retrain_optimizer = make_optimizer(
             pruned_net, lr=retrain_lr,
+            weight_decay=args.weight_decay,
             stage_lr_scale=1.0, mapper_lr_scale=1.0,
         )
         retrain_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(

@@ -127,6 +127,88 @@ CELL_D1 = {
     "beta": 0.1,
 }
 
+# ---- v2 library: standardized "OTA slice" basis with mix / bias / threshold codes ----
+# (cell-library-v2 spec, see library_improvements.md). Each v2 cell carries
+# per-cell src_gain/dst_gain mix coefficients (replacing rho) and has
+# gleak=0 (strict mathematical boundedness). Bias codes are normalized
+# (gm/Id-style) pairs of (gm, isat).
+
+# Mix codes: preactivation u = src_gain * x_src - dst_gain * x_dst.
+MIX_CODES = {
+    "M11": {"src_gain": 1.0, "dst_gain": 1.0},
+    "M10": {"src_gain": 1.0, "dst_gain": 0.5},
+    "M01": {"src_gain": 0.5, "dst_gain": 1.0},
+}
+
+# Bias codes: discrete (gm, isat) pairs standing in for gm/Id inversion levels.
+BIAS_CODES = {
+    "Bsoft": {"gm": 0.25, "isat": 1.50},
+    "Bmid":  {"gm": 0.80, "isat": 0.80},
+    "Bhard": {"gm": 1.40, "isat": 0.45},
+}
+
+# Threshold codes: discrete preactivation offsets for rectifying cells.
+THRESH_CODES = {
+    "T0": 0.00,
+    "T1": 0.35,
+}
+
+
+def _v2_cell(
+    family: str,
+    mix: str,
+    bias: str,
+    thresh: str,
+    beta: float,
+    cell_type: str | None = None,
+) -> dict:
+    """Build a v2 cell dict from (family, mix, bias, threshold) code refs.
+
+    Resolves the MIX/BIAS/THRESH codes into explicit numeric values and
+    uses the supplied ``beta`` (family-specific softness for rectifier/dead-zone
+    cells; 1.0 for standard). ``cell_type`` defaults to ``family``.
+    """
+    m = MIX_CODES[mix]
+    b = BIAS_CODES[bias]
+    t = THRESH_CODES[thresh]
+    if cell_type is None:
+        cell_type = family
+    return {
+        "cell_type": cell_type,
+        "gm": b["gm"],
+        "isat": b["isat"],
+        "src_gain": m["src_gain"],
+        "dst_gain": m["dst_gain"],
+        "gleak": 0.0,
+        "bias": 0.0,
+        "theta": t,
+        "beta": beta,
+    }
+
+
+# v2 cell definitions (factorized from codes). beta differs by family:
+# P/N use 0.08, D uses 0.10, O and Z use 1.0 (unused for non-rectifier cells).
+CELL_V2_Z    = {
+    "cell_type": CELL_TYPE_OFF,
+    "gm": 0.0,
+    "isat": 0.0,
+    "src_gain": 0.0,
+    "dst_gain": 0.0,
+    "gleak": 0.0,
+    "bias": 0.0,
+    "theta": 0.0,
+    "beta": 1.0,
+}
+CELL_V2_O_W11 = _v2_cell("standard", "M11", "Bsoft", "T0", beta=1.0)
+CELL_V2_O_H11 = _v2_cell("standard", "M11", "Bhard", "T0", beta=1.0)
+CELL_V2_O_H10 = _v2_cell("standard", "M10", "Bhard", "T0", beta=1.0)
+CELL_V2_O_H01 = _v2_cell("standard", "M01", "Bhard", "T0", beta=1.0)
+CELL_V2_P0   = _v2_cell(CELL_TYPE_POS_RECT,  "M11", "Bmid", "T0", beta=0.08)
+CELL_V2_P1   = _v2_cell(CELL_TYPE_POS_RECT,  "M11", "Bmid", "T1", beta=0.08)
+CELL_V2_N0   = _v2_cell(CELL_TYPE_NEG_RECT,  "M11", "Bmid", "T0", beta=0.08)
+CELL_V2_N1   = _v2_cell(CELL_TYPE_NEG_RECT,  "M11", "Bmid", "T1", beta=0.08)
+CELL_V2_D1   = _v2_cell(CELL_TYPE_DEAD_ZONE, "M11", "Bmid", "T1", beta=0.10)
+
 # Named library configs. Each entry has "cells" (ordered dict), "cell_order"
 # (list), and "z_index" (int). Z is always the LAST cell in every library.
 # Legacy globals (CELL_LIBRARY, CELL_ORDER, NUM_CELLS, Z_INDEX) reflect the
@@ -148,9 +230,30 @@ _CELL_LIBRARY_V15 = {
     "cell_order": ["O_weak", "O_hard", "P0", "N0", "D1", "Z"],
 }
 
+# v2 library: 10-cell bounded OTA slice basis with per-cell src_gain/dst_gain
+# mix coefficients (MIX_CODES), standardized bias codes (BIAS_CODES), and
+# discrete thresholds (THRESH_CODES). Adds 4 cells vs v1.5: P1, N1, O_h10,
+# O_h01. Z is always last.
+_CELL_LIBRARY_V2 = {
+    "cells": {
+        "O_w11": CELL_V2_O_W11,
+        "O_h11": CELL_V2_O_H11,
+        "O_h10": CELL_V2_O_H10,
+        "O_h01": CELL_V2_O_H01,
+        "P0": CELL_V2_P0,
+        "P1": CELL_V2_P1,
+        "N0": CELL_V2_N0,
+        "N1": CELL_V2_N1,
+        "D1": CELL_V2_D1,
+        "Z": CELL_V2_Z,
+    },
+    "cell_order": ["O_w11", "O_h11", "O_h10", "O_h01", "P0", "P1", "N0", "N1", "D1", "Z"],
+}
+
 CELL_LIBRARIES = {
     "legacy": _CELL_LIBRARY_LEGACY,
     "v15": _CELL_LIBRARY_V15,
+    "v2": _CELL_LIBRARY_V2,
     "relu": {"cells": {}, "cell_order": ["S"], "device": "relu"},
     "tanh": {"cells": {}, "cell_order": ["S"], "device": "tanh"},
 }
@@ -413,19 +516,39 @@ def cells_to_tensor_dict(library_name: str = "legacy"):
     """Stack a named library into a dict of 1-D tensors ordered by cell_order.
 
     Args:
-        library_name: Which library to load (``"legacy"`` or ``"v15"``).
+        library_name: Which library to load (``"legacy"``, ``"v15"``, or ``"v2"``).
 
-    Returns dict of tensors with shape [Q] for: gm, isat, rho, gleak,
-    bias, theta, beta. Also includes ``cell_type_code`` (int codes 0-3)
-    for formula dispatch. theta/beta are only used by rectifier cells;
-    other cells carry neutral dummy values.
+    Returns dict of tensors with shape [Q] for: gm, isat, gleak, bias, theta,
+    beta. Also includes ``cell_type_code`` (int codes 0-3) for formula
+    dispatch. theta/beta are only used by rectifier cells; other cells carry
+    neutral dummy values.
+
+    Preactivation coefficients:
+      - ``legacy``/``v15`` libraries: emits ``rho`` (single destination gain;
+        preactivation u = x_src - rho * x_dst).
+      - ``v2`` library: emits ``src_gain`` and ``dst_gain`` (per-cell mix
+        coefficients; preactivation u = src_gain * x_src - dst_gain * x_dst).
+
+    ``IdealizedCellLibrary`` auto-detects which set is present via buffer
+    introspection.
     """
     import torch
     lib = CELL_LIBRARIES[library_name]
     cell_order = lib["cell_order"]
     cells = lib["cells"]
-    keys = ["gm", "isat", "rho", "gleak", "bias", "theta", "beta"]
+    keys = ["gm", "isat", "gleak", "bias", "theta", "beta"]
     result = {k: torch.tensor([cells[c][k] for c in cell_order], dtype=torch.float32) for k in keys}
+    if all("src_gain" in cells[c] for c in cell_order):
+        result["src_gain"] = torch.tensor(
+            [cells[c]["src_gain"] for c in cell_order], dtype=torch.float32,
+        )
+        result["dst_gain"] = torch.tensor(
+            [cells[c]["dst_gain"] for c in cell_order], dtype=torch.float32,
+        )
+    else:
+        result["rho"] = torch.tensor(
+            [cells[c]["rho"] for c in cell_order], dtype=torch.float32,
+        )
     result["cell_type_code"] = torch.tensor(
         [_CELL_TYPE_CODE[cells[c].get("cell_type", CELL_TYPE_STANDARD)] for c in cell_order],
         dtype=torch.long,

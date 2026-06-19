@@ -2449,6 +2449,15 @@ def main():
     test_v15_cell_type_mask_consistency()           # V15-8: mask exclusivity
     test_v15_legacy_library_unchanged()             # V15-9: backward compat
     test_v15_cell_parameters_preset_smooth2d_grid()  # V15-10: full net build
+    test_v2_library_construction()                  # V2-1: build + structure
+    test_v2_factorization_codes()                    # V2-2: MIX/BIAS/THRESH dicts
+    test_v2_cell_parameters()                        # V2-3: per-cell parameter values
+    test_v2_boundedness()                            # V2-4: |I| <= isat for all cells
+    test_v2_mix_code_asymmetry()                     # V2-5: O_h10 vs O_h01 differ
+    test_v2_threshold_cells()                        # V2-6: P1/N1 vs P0/N0 fire
+    test_v2_forward_backward()                       # V2-7: forward + gradients
+    test_v2_legacy_v15_unchanged()                   # V2-8: rho preserved
+    test_v2_preset_routing()                         # V2-9: make_cell_library('v2')
     test_stage_lr_scale_backward_compat()
     test_stage_lr_scale_multi_group()
     test_stage_lr_scale_scheduler_compat()
@@ -3814,6 +3823,392 @@ def test_v15_cell_parameters_preset_smooth2d_grid():
         check(f"V15-10: stage logits shape[-1] == 6",
               stage.logits.shape[-1] == 6,
               f"got {stage.logits.shape[-1]}")
+
+
+# ---- v2 library tests (cell-library-v2 spec) ----
+
+def test_v2_library_construction():
+    """V2-1: v2 library builds with correct structure (10 cells, Z last, mix mode)."""
+    print("\nTest V2-1: v2 library construction")
+    from cell_library import IdealizedCellLibrary
+    cell_lib = IdealizedCellLibrary(library_name="v2")
+    check("V2-1: v2 num_cells == 10",
+          cell_lib.num_cells == 10,
+          f"got {cell_lib.num_cells}")
+    check("V2-1: v2 z_index == 9 (last cell)",
+          cell_lib.z_index == 9,
+          f"got {cell_lib.z_index}")
+    check("V2-1: v2 _use_mix is True",
+          cell_lib._use_mix is True,
+          f"got {cell_lib._use_mix}")
+    check("V2-1: v2 has src_gain buffer",
+          hasattr(cell_lib, "src_gain"))
+    check("V2-1: v2 has dst_gain buffer",
+          hasattr(cell_lib, "dst_gain"))
+    check("V2-1: v2 has no rho buffer",
+          not hasattr(cell_lib, "rho"),
+          "rho should not be present in v2 library")
+    expected_order = ["O_w11", "O_h11", "O_h10", "O_h01", "P0", "P1", "N0", "N1", "D1", "Z"]
+    check("V2-1: v2 cell_order matches spec",
+          cell_lib._cell_order == expected_order,
+          f"got {cell_lib._cell_order}")
+    check("V2-1: Z is the last cell",
+          cell_lib._cell_order[-1] == "Z")
+    z_idx_v2 = cell_lib._cell_order.index("Z")
+    check("V2-1: Z has gm=0 (truly off)",
+          abs(float(cell_lib.gm[z_idx_v2].item())) < 1e-9,
+          f"gm={float(cell_lib.gm[z_idx_v2].item())}")
+    check("V2-1: Z has isat=0",
+          abs(float(cell_lib.isat[z_idx_v2].item())) < 1e-9,
+          f"isat={float(cell_lib.isat[z_idx_v2].item())}")
+    check("V2-1: Z has src_gain=0",
+          abs(float(cell_lib.src_gain[z_idx_v2].item())) < 1e-9,
+          f"src_gain={float(cell_lib.src_gain[z_idx_v2].item())}")
+    check("V2-1: Z has dst_gain=0",
+          abs(float(cell_lib.dst_gain[z_idx_v2].item())) < 1e-9,
+          f"dst_gain={float(cell_lib.dst_gain[z_idx_v2].item())}")
+    check("V2-1: Z cell triggers has_z_cell=True",
+          cell_lib.has_z_cell is True,
+          f"has_z_cell={cell_lib.has_z_cell}")
+    check("V2-1: cell_type_code has 10 entries",
+          cell_lib.cell_type_code.shape[0] == 10)
+    ctc = cell_lib.cell_type_code
+    # O_w11, O_h11, O_h10, O_h01 are standard (code 0)
+    check("V2-1: O_w11 is standard (code 0)", ctc[0].item() == 0)
+    check("V2-1: O_h11 is standard (code 0)", ctc[1].item() == 0)
+    check("V2-1: O_h10 is standard (code 0)", ctc[2].item() == 0)
+    check("V2-1: O_h01 is standard (code 0)", ctc[3].item() == 0)
+    # P0, P1 are pos_rect (code 1)
+    check("V2-1: P0 is pos_rect (code 1)", ctc[4].item() == 1)
+    check("V2-1: P1 is pos_rect (code 1)", ctc[5].item() == 1)
+    # N0, N1 are neg_rect (code 2)
+    check("V2-1: N0 is neg_rect (code 2)", ctc[6].item() == 2)
+    check("V2-1: N1 is neg_rect (code 2)", ctc[7].item() == 2)
+    # D1 is dead_zone (code 3)
+    check("V2-1: D1 is dead_zone (code 3)", ctc[8].item() == 3)
+    # Z is off -> code 0
+    check("V2-1: Z is off (code 0)", ctc[9].item() == 0)
+
+
+def test_v2_factorization_codes():
+    """V2-2: MIX_CODES, BIAS_CODES, THRESH_CODES have spec values."""
+    print("\nTest V2-2: v2 factorization codes")
+    from config import MIX_CODES, BIAS_CODES, THRESH_CODES
+    check("V2-2: MIX_CODES M11 src_gain=1.0",
+          MIX_CODES["M11"]["src_gain"] == 1.0)
+    check("V2-2: MIX_CODES M11 dst_gain=1.0",
+          MIX_CODES["M11"]["dst_gain"] == 1.0)
+    check("V2-2: MIX_CODES M10 dst_gain=0.5",
+          MIX_CODES["M10"]["dst_gain"] == 0.5)
+    check("V2-2: MIX_CODES M01 src_gain=0.5",
+          MIX_CODES["M01"]["src_gain"] == 0.5)
+    check("V2-2: BIAS_CODES Bsoft gm=0.25",
+          BIAS_CODES["Bsoft"]["gm"] == 0.25)
+    check("V2-2: BIAS_CODES Bsoft isat=1.50",
+          BIAS_CODES["Bsoft"]["isat"] == 1.50)
+    check("V2-2: BIAS_CODES Bmid gm=0.80",
+          BIAS_CODES["Bmid"]["gm"] == 0.80)
+    check("V2-2: BIAS_CODES Bmid isat=0.80",
+          BIAS_CODES["Bmid"]["isat"] == 0.80)
+    check("V2-2: BIAS_CODES Bhard gm=1.40",
+          BIAS_CODES["Bhard"]["gm"] == 1.40)
+    check("V2-2: BIAS_CODES Bhard isat=0.45",
+          BIAS_CODES["Bhard"]["isat"] == 0.45)
+    check("V2-2: THRESH_CODES T0=0.0",
+          THRESH_CODES["T0"] == 0.0)
+    check("V2-2: THRESH_CODES T1=0.35",
+          THRESH_CODES["T1"] == 0.35)
+
+
+def test_v2_cell_parameters():
+    """V2-3: per-cell gm/isat/theta/beta/src_gain/dst_gain match spec."""
+    print("\nTest V2-3: v2 cell parameter values")
+    from cell_library import IdealizedCellLibrary
+    cell_lib = IdealizedCellLibrary(library_name="v2")
+    order = cell_lib._cell_order
+    idx = {name: order.index(name) for name in order}
+
+    # src_gain / dst_gain per cell
+    check("V2-3: O_w11 src_gain=1.0, dst_gain=1.0 (M11)",
+          abs(float(cell_lib.src_gain[idx["O_w11"]]) - 1.0) < 1e-6
+          and abs(float(cell_lib.dst_gain[idx["O_w11"]]) - 1.0) < 1e-6)
+    check("V2-3: O_h11 src_gain=1.0, dst_gain=1.0 (M11)",
+          abs(float(cell_lib.src_gain[idx["O_h11"]]) - 1.0) < 1e-6
+          and abs(float(cell_lib.dst_gain[idx["O_h11"]]) - 1.0) < 1e-6)
+    check("V2-3: O_h10 src_gain=1.0, dst_gain=0.5 (M10)",
+          abs(float(cell_lib.src_gain[idx["O_h10"]]) - 1.0) < 1e-6
+          and abs(float(cell_lib.dst_gain[idx["O_h10"]]) - 0.5) < 1e-6)
+    check("V2-3: O_h01 src_gain=0.5, dst_gain=1.0 (M01)",
+          abs(float(cell_lib.src_gain[idx["O_h01"]]) - 0.5) < 1e-6
+          and abs(float(cell_lib.dst_gain[idx["O_h01"]]) - 1.0) < 1e-6)
+
+    # gm / isat per cell (Bsoft, Bmid, Bhard codes)
+    check("V2-3: O_w11 gm=0.25, isat=1.50 (Bsoft)",
+          abs(float(cell_lib.gm[idx["O_w11"]]) - 0.25) < 1e-6
+          and abs(float(cell_lib.isat[idx["O_w11"]]) - 1.50) < 1e-6)
+    check("V2-3: O_h11 gm=1.40, isat=0.45 (Bhard)",
+          abs(float(cell_lib.gm[idx["O_h11"]]) - 1.40) < 1e-6
+          and abs(float(cell_lib.isat[idx["O_h11"]]) - 0.45) < 1e-6)
+    check("V2-3: P0 gm=0.80, isat=0.80 (Bmid)",
+          abs(float(cell_lib.gm[idx["P0"]]) - 0.80) < 1e-6
+          and abs(float(cell_lib.isat[idx["P0"]]) - 0.80) < 1e-6)
+    check("V2-3: N1 gm=0.80, isat=0.80 (Bmid)",
+          abs(float(cell_lib.gm[idx["N1"]]) - 0.80) < 1e-6
+          and abs(float(cell_lib.isat[idx["N1"]]) - 0.80) < 1e-6)
+    check("V2-3: D1 gm=0.80, isat=0.80 (Bmid)",
+          abs(float(cell_lib.gm[idx["D1"]]) - 0.80) < 1e-6
+          and abs(float(cell_lib.isat[idx["D1"]]) - 0.80) < 1e-6)
+
+    # theta: T0=0.0 for O/P0/N0, T1=0.35 for P1/N1/D1
+    check("V2-3: O_w11 theta=0.0 (T0)",
+          abs(float(cell_lib.theta[idx["O_w11"]])) < 1e-6)
+    check("V2-3: P0 theta=0.0 (T0)",
+          abs(float(cell_lib.theta[idx["P0"]])) < 1e-6)
+    check("V2-3: P1 theta=0.35 (T1)",
+          abs(float(cell_lib.theta[idx["P1"]]) - 0.35) < 1e-6)
+    check("V2-3: N1 theta=0.35 (T1)",
+          abs(float(cell_lib.theta[idx["N1"]]) - 0.35) < 1e-6)
+    check("V2-3: D1 theta=0.35 (T1)",
+          abs(float(cell_lib.theta[idx["D1"]]) - 0.35) < 1e-6)
+
+    # beta: P/N=0.08, D=0.10, O=1.0
+    check("V2-3: P0 beta=0.08",
+          abs(float(cell_lib.beta[idx["P0"]]) - 0.08) < 1e-6)
+    check("V2-3: P1 beta=0.08",
+          abs(float(cell_lib.beta[idx["P1"]]) - 0.08) < 1e-6)
+    check("V2-3: N0 beta=0.08",
+          abs(float(cell_lib.beta[idx["N0"]]) - 0.08) < 1e-6)
+    check("V2-3: D1 beta=0.10",
+          abs(float(cell_lib.beta[idx["D1"]]) - 0.10) < 1e-6)
+    check("V2-3: O_w11 beta=1.0 (unused for standard)",
+          abs(float(cell_lib.beta[idx["O_w11"]]) - 1.0) < 1e-6)
+
+    # gleak: all v2 cells are 0 (strict mathematical boundedness)
+    check("V2-3: all v2 cells have gleak=0",
+          torch.all(cell_lib.gleak == 0).item())
+
+
+def test_v2_boundedness():
+    """V2-4: every v2 cell is bounded |I| <= isat over a large u sweep."""
+    print("\nTest V2-4: v2 cell boundedness |I| <= isat")
+    from cell_library import IdealizedCellLibrary
+    import torch
+    cell_lib = IdealizedCellLibrary(library_name="v2")
+    Q = cell_lib.num_cells
+    E, B = 1, 200
+    logits = torch.full((E, Q), -1e9)
+
+    u_sweep = torch.linspace(-5.0, 5.0, B).unsqueeze(1)
+    raw_mult = torch.zeros(E)
+
+    for cell_idx in range(Q):
+        logits_edge = logits.clone()
+        logits_edge[0, cell_idx] = 0.0
+        with torch.no_grad():
+            i_edge = cell_lib(
+                u_sweep, torch.zeros_like(u_sweep),
+                logits_edge, raw_mult, x_max=10.0, ctx=None,
+            )
+        isat_cell = float(cell_lib.isat[cell_idx].item())
+        i_vals = i_edge.squeeze()
+        max_abs_i = float(i_vals.abs().max().item())
+        check(f"V2-4: cell {cell_lib._cell_order[cell_idx]} bounded |I|<={isat_cell}",
+              max_abs_i <= isat_cell + 1e-4,
+              f"max |I|={max_abs_i:.6f}, I_sat={isat_cell}")
+
+    # Verify the Z cell outputs are truly zero (not just bounded)
+    logits_z = logits.clone()
+    z_idx_v2 = cell_lib._cell_order.index("Z")
+    logits_z[0, z_idx_v2] = 0.0
+    with torch.no_grad():
+        i_z = cell_lib(u_sweep, torch.zeros_like(u_sweep), logits_z, raw_mult, x_max=10.0, ctx=None)
+    max_abs_i_z = float(i_z.abs().max().item())
+    check("V2-4: Z cell outputs near-zero current (truly off)",
+          max_abs_i_z < 1e-6,
+          f"max |I_Z|={max_abs_i_z:.10f}")
+
+
+def test_v2_mix_code_asymmetry():
+    """V2-5: O_h10 vs O_h01 produce different currents under asymmetric inputs.
+
+    O_h10 (M10: src=1.0, dst=0.5) is source-dominant.
+    O_h01 (M01: src=0.5, dst=1.0) is destination-dominant.
+    For x_src=2, x_dst=0: O_h10 sees u=2, O_h01 sees u=1.
+    For x_src=0, x_dst=2: O_h10 sees u=-1, O_h01 sees u=-2.
+    Hence O_h10(2,0) and O_h01(0,2) should differ.
+    """
+    print("\nTest V2-5: v2 mix code asymmetry (O_h10 vs O_h01)")
+    from cell_library import IdealizedCellLibrary
+    import torch
+    cell_lib = IdealizedCellLibrary(library_name="v2")
+    Q = cell_lib.num_cells
+    E = 1
+    raw_mult = torch.zeros(E)
+
+    h10_idx = cell_lib._cell_order.index("O_h10")
+    h01_idx = cell_lib._cell_order.index("O_h01")
+
+    logits_h10 = torch.full((E, Q), -1e9)
+    logits_h10[0, h10_idx] = 0.0
+    logits_h01 = torch.full((E, Q), -1e9)
+    logits_h01[0, h01_idx] = 0.0
+
+    # Case A: large source, zero destination
+    x_src_A = torch.tensor([[2.0]])
+    x_dst_A = torch.tensor([[0.0]])
+    # Case B: zero source, large destination
+    x_src_B = torch.tensor([[0.0]])
+    x_dst_B = torch.tensor([[2.0]])
+
+    with torch.no_grad():
+        i_h10_A = cell_lib(x_src_A, x_dst_A, logits_h10, raw_mult, x_max=10.0, ctx=None)
+        i_h01_B = cell_lib(x_src_B, x_dst_B, logits_h01, raw_mult, x_max=10.0, ctx=None)
+
+    i_h10_A_val = float(i_h10_A[0, 0])
+    i_h01_B_val = float(i_h01_B[0, 0])
+    check("V2-5: O_h10(src=2, dst=0) ≠ O_h01(src=0, dst=2)",
+          abs(i_h10_A_val - i_h01_B_val) > 0.01,
+          f"O_h10(A)={i_h10_A_val:.6f}, O_h01(B)={i_h01_B_val:.6f}")
+    # O_h10 is source-dominant: u=src_gain*2 - dst_gain*0 = 2.0
+    # O_h01 is dst-dominant: u=src_gain*0 - dst_gain*2 = -2.0
+    # tanh is odd, so O_h10(2,0) ≈ -O_h01(0,2) (both at hard saturation
+    # because gm=1.4 and |u|=2 => gm*u/isat = 1.4*2/0.45 = 6.22, very saturated)
+    check("V2-5: O_h10(src=2, dst=0) ≈ -O_h01(src=0, dst=2) (mirror via oddness)",
+          abs(i_h10_A_val + i_h01_B_val) < 1e-4,
+          f"O_h10(A)={i_h10_A_val:.6f}, O_h01(B)={i_h01_B_val:.6f}")
+
+
+def test_v2_threshold_cells():
+    """V2-6: P1 fires at u>theta, P0 fires at u>0. Likewise N1 vs N0."""
+    print("\nTest V2-6: v2 threshold cells (P1/N1 vs P0/N0)")
+    from cell_library import IdealizedCellLibrary
+    import torch
+    cell_lib = IdealizedCellLibrary(library_name="v2")
+    Q = cell_lib.num_cells
+    E = 1
+    raw_mult = torch.zeros(E)
+
+    P0_idx = cell_lib._cell_order.index("P0")
+    P1_idx = cell_lib._cell_order.index("P1")
+    N0_idx = cell_lib._cell_order.index("N0")
+    N1_idx = cell_lib._cell_order.index("N1")
+
+    logits_p0 = torch.full((E, Q), -1e9)
+    logits_p0[0, P0_idx] = 0.0
+    logits_p1 = torch.full((E, Q), -1e9)
+    logits_p1[0, P1_idx] = 0.0
+    logits_n0 = torch.full((E, Q), -1e9)
+    logits_n0[0, N0_idx] = 0.0
+    logits_n1 = torch.full((E, Q), -1e9)
+    logits_n1[0, N1_idx] = 0.0
+
+    # At u=0.1: P0 (theta=0) fires immediately; P1 (theta=0.35) is
+    # significantly suppressed by softplus rolloff.
+    u_small = torch.tensor([[0.1]])
+    with torch.no_grad():
+        i_p0_small = cell_lib(u_small, torch.zeros_like(u_small), logits_p0, raw_mult, x_max=10.0, ctx=None)
+        i_p1_small = cell_lib(u_small, torch.zeros_like(u_small), logits_p1, raw_mult, x_max=10.0, ctx=None)
+
+    i_p0 = float(i_p0_small[0, 0])
+    i_p1 = float(i_p1_small[0, 0])
+    check("V2-6: P0 fires at u=0.1 (theta=0)",
+          i_p0 > 0.01,
+          f"P0(0.1)={i_p0:.6f}")
+    # P1 is much smaller than P0 at u=0.1 (softplus rolloff near theta=0.35).
+    check("V2-6: P1 strongly suppressed at u=0.1 (theta=0.35)",
+          i_p1 < 0.15 * i_p0,
+          f"P1(0.1)={i_p1:.6f}, P0(0.1)={i_p0:.6f}")
+
+    # At u=0.5: P1 fires; P0 also fires (u > theta_P1=0.35).
+    u_large = torch.tensor([[0.5]])
+    with torch.no_grad():
+        i_p1_large = cell_lib(u_large, torch.zeros_like(u_large), logits_p1, raw_mult, x_max=10.0, ctx=None)
+        i_n1_large = cell_lib(-u_large, torch.zeros_like(u_large), logits_n1, raw_mult, x_max=10.0, ctx=None)
+
+    i_p1_l = float(i_p1_large[0, 0])
+    i_n1_l = float(i_n1_large[0, 0])
+    check("V2-6: P1 fires at u=0.5",
+          i_p1_l > 0.05,
+          f"P1(0.5)={i_p1_l:.6f}")
+    # N1 is the mirror of P1: N1(-u) == -P1(u). At u=0.5, N1(-0.5) fires
+    # (in the negative direction).
+    check("V2-6: N1(-0.5) fires (negative current)",
+          i_n1_l < -0.05,
+          f"N1(-0.5)={i_n1_l:.6f}")
+
+
+def test_v2_forward_backward():
+    """V2-7: v2 forward + backward gradients flow correctly."""
+    print("\nTest V2-7: v2 forward + gradient flow")
+    from cell_library import IdealizedCellLibrary
+    import torch
+    cell_lib = IdealizedCellLibrary(library_name="v2")
+    Q = cell_lib.num_cells
+    E = 4
+    B = 8
+    x_src = torch.randn(B, E, requires_grad=True)
+    x_dst = torch.randn(B, E, requires_grad=True)
+    logits = torch.randn(E, Q, requires_grad=True)
+    raw_mult = torch.randn(E, requires_grad=True)
+
+    i_edge = cell_lib(x_src, x_dst, logits, raw_mult, x_max=3.0, ctx=None)
+    check("V2-7: forward output shape (B, E)",
+          i_edge.shape == (B, E),
+          f"got {i_edge.shape}")
+    check("V2-7: forward output is finite",
+          torch.isfinite(i_edge).all().item())
+
+    loss = i_edge.sum()
+    grads = torch.autograd.grad(loss, [logits, raw_mult, x_src], retain_graph=True)
+    check("V2-7: gradients flow to logits",
+          grads[0] is not None and torch.isfinite(grads[0]).all().item())
+    check("V2-7: gradients flow to raw_mult",
+          grads[1] is not None and torch.isfinite(grads[1]).all().item())
+    check("V2-7: gradients flow to x_src",
+          grads[2] is not None and torch.isfinite(grads[2]).all().item())
+
+
+def test_v2_legacy_v15_unchanged():
+    """V2-8: legacy/v15 libraries still use rho (backward compat preserved)."""
+    print("\nTest V2-8: legacy/v15 rho-based preactivation unchanged")
+    from cell_library import IdealizedCellLibrary
+    import torch
+    for lib_name in ("legacy", "v15"):
+        cell_lib = IdealizedCellLibrary(library_name=lib_name)
+        check(f"V2-8: {lib_name} _use_mix is False",
+              cell_lib._use_mix is False,
+              f"got {cell_lib._use_mix}")
+        check(f"V2-8: {lib_name} has rho buffer",
+              hasattr(cell_lib, "rho"))
+        check(f"V2-8: {lib_name} has no src_gain buffer",
+              not hasattr(cell_lib, "src_gain"),
+              "src_gain should not be present in legacy/v15")
+        check(f"V2-8: {lib_name} has no dst_gain buffer",
+              not hasattr(cell_lib, "dst_gain"),
+              "dst_gain should not be present in legacy/v15")
+        # Forward pass still works
+        E, B = 2, 4
+        x_src = torch.randn(B, E)
+        x_dst = torch.randn(B, E)
+        logits = torch.randn(E, cell_lib.num_cells)
+        raw_mult = torch.randn(E)
+        with torch.no_grad():
+            i_edge = cell_lib(x_src, x_dst, logits, raw_mult, x_max=3.0, ctx=None)
+        check(f"V2-8: {lib_name} forward output finite",
+              torch.isfinite(i_edge).all().item())
+
+
+def test_v2_preset_routing():
+    """V2-9: make_cell_library('v2') dispatches to IdealizedCellLibrary with 10 cells."""
+    print("\nTest V2-9: v2 preset routing via make_cell_library")
+    from cell_library import make_cell_library, IdealizedCellLibrary
+    cell_lib = make_cell_library("v2")
+    check("V2-9: make_cell_library('v2') returns IdealizedCellLibrary",
+          isinstance(cell_lib, IdealizedCellLibrary))
+    check("V2-9: v2 library has 10 cells",
+          cell_lib.num_cells == 10)
+    check("V2-9: v2 library is in mix mode",
+          cell_lib._use_mix is True)
 
 
 # ---- Stage-LR scaling tests (stage-lr-scaling plan) ----

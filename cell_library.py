@@ -36,8 +36,16 @@ class IdealizedCellLibrary(nn.Module):
     """Edge cell library with formula dispatch for standard, pos/neg rectifier,
     and dead-zone cell types.
 
-    Buffers: gm, isat, rho, gleak, bias, theta, beta, cell_type_code,
-    each shape [Q]. cell_type_code stores integer codes for formula dispatch.
+    Buffers: gm, isat, gleak, bias, theta, beta, cell_type_code, each
+    shape [Q]. cell_type_code stores integer codes for formula dispatch.
+
+    Preactivation coefficients (one of, not both):
+      - ``rho`` (legacy/v15): single destination gain; u = x_src - rho * x_dst.
+      - ``src_gain`` / ``dst_gain`` (v2): per-cell mix; u = src_gain*x_src - dst_gain*x_dst.
+
+    The presence of the ``src_gain`` buffer (set by ``cells_to_tensor_dict``
+    based on the library name) selects mix mode. ``_use_mix`` is True iff
+    src_gain/dst_gain are present.
     """
 
     def __init__(
@@ -64,6 +72,15 @@ class IdealizedCellLibrary(nn.Module):
         if beta_softness is None:
             beta_softness = PHYS["beta_softness"]
         self.beta_softness = float(beta_softness)
+
+        # Preactivation mix mode: v2 libraries carry src_gain/dst_gain
+        # buffers (per-cell mix); legacy/v15 carry a single rho buffer.
+        self._use_mix = "src_gain" in tensors
+        if self._use_mix and "rho" in tensors:
+            raise ValueError(
+                f"Library {library_name!r} emitted both src_gain and rho; "
+                "cells_to_tensor_dict should produce exactly one set."
+            )
 
         # Per-cell type masks for formula dispatch (bool, derived from
         # cell_type_code). Registered as persistent=False buffers so they
@@ -138,7 +155,6 @@ class IdealizedCellLibrary(nn.Module):
 
         gm = self.gm.view(1, 1, Q)  # [1, 1, Q]
         isat = self.isat.view(1, 1, Q).clamp_min(1e-6)  # [1, 1, Q]
-        rho = self.rho.view(1, 1, Q)  # [1, 1, Q]
         gleak = self.gleak.view(1, 1, Q)  # [1, 1, Q]
         bias = self.bias.view(1, 1, Q)  # [1, 1, Q]
 
@@ -151,7 +167,16 @@ class IdealizedCellLibrary(nn.Module):
             shift = torch.tensor(ctx.global_gain_shift, dtype=gm.dtype, device=gm.device)
             gm = gm * torch.exp(shift)
 
-        u = x_src.unsqueeze(-1) - rho * x_dst.unsqueeze(-1)  # [B, E, Q]
+        # Preactivation: v2 uses per-cell src_gain/dst_gain mix; legacy/v15
+        # use a single rho destination gain. v2 cells have gleak=0 and bias=0
+        # so the standard-formula additive terms are no-ops (correct for v2).
+        if self._use_mix:
+            src_gain = self.src_gain.view(1, 1, Q)  # [1, 1, Q]
+            dst_gain = self.dst_gain.view(1, 1, Q)  # [1, 1, Q]
+            u = src_gain * x_src.unsqueeze(-1) - dst_gain * x_dst.unsqueeze(-1)
+        else:
+            rho = self.rho.view(1, 1, Q)  # [1, 1, Q]
+            u = x_src.unsqueeze(-1) - rho * x_dst.unsqueeze(-1)  # [B, E, Q]
 
         # ---- Compute all formula variants in parallel ----
 
@@ -265,7 +290,8 @@ class SimpleEdgeLibrary(nn.Module):
 
 def make_cell_library(library_name: str, num_edges: int | None = None) -> IdealizedCellLibrary | SimpleEdgeLibrary:
     """Factory: returns ``SimpleEdgeLibrary`` for ``relu``/``tanh``,
-    ``IdealizedCellLibrary`` otherwise.
+    ``IdealizedCellLibrary`` for ``legacy``/``v15``/``v2`` (and any other
+    bounded macro library registered in ``CELL_LIBRARIES``).
 
     When ``num_edges`` is ``None`` (template), the returned
     ``SimpleEdgeLibrary`` is created with ``num_edges=1`` and must be

@@ -48,6 +48,7 @@ from config import (
     PRESETS,
     LAMBDAS,
     SCHEDULE_FOUR_PHASE,
+    SOLVER,
     TAU,
     VARIATION,
     make_smooth2d_grid_preset,
@@ -241,6 +242,179 @@ def _apply_ablation_set(args, schedule_mode: str) -> None:
             "[ablation-set=edge-only] node-gate pruning disabled, "
             "edge threshold 0.05, stage_lr_scale=1.0, mapper_lr_scale=1.0"
         )
+
+
+def _validate_hidden_family_args(args) -> None:
+    """Validate --hidden-family / --num-hidden / --num-stages / --edge-repeats
+    combinations before any expensive setup. Raises ``ValueError`` on bad
+    combos so argparse-style early failure is obvious to the user.
+
+    Rules:
+      - --hidden-family=cluster requires --num-hidden N (N >= 2)
+      - --hidden-family=cluster + --grid-size is an error
+        (cluster ignores grid; mixing is misleading)
+      - --edge-repeats must be in [1, 8]
+      - --num-stages must be >= 1
+      - --num-hidden without --hidden-family emits a warning (ignored)
+    """
+    hf = args.hidden_family
+    nh = args.num_hidden
+    gs = args.grid_size
+    er = args.edge_repeats
+    ns = args.num_stages
+
+    if er is not None and (er < 1 or er > 8):
+        raise ValueError(
+            f"--edge-repeats must be in [1, 8], got {er}"
+        )
+    if ns is not None and ns < 1:
+        raise ValueError(
+            f"--num-stages must be >= 1, got {ns}"
+        )
+
+    if hf is None:
+        if nh is not None:
+            print(
+                f"[train] WARNING: --num-hidden={nh} is ignored because "
+                f"--hidden-family was not specified"
+            )
+        return
+
+    if hf == "cluster":
+        if nh is None:
+            raise ValueError(
+                "--hidden-family=cluster requires --num-hidden N to be set. "
+                "Pass an integer (e.g. --num-hidden 25) to specify the "
+                "number of hidden nodes."
+            )
+        if nh < 2:
+            raise ValueError(
+                f"--num-hidden must be >= 2 for cluster family, got {nh}"
+            )
+        if gs is not None:
+            raise ValueError(
+                "--grid-size is not compatible with --hidden-family=cluster "
+                "(cluster has no spatial grid; --num-hidden controls size)."
+            )
+    elif hf == "grid":
+        if nh is not None:
+            print(
+                f"[train] note: --num-hidden={nh} is ignored for grid family; "
+                f"use --grid-size N (default per problem)"
+            )
+
+
+def _make_dynamic_preset(
+    problem: str,
+    hidden_family: str,
+    num_hidden: int,
+    num_stages: int = 1,
+    edge_repeats: int = 2,
+    grid_size: int | None = None,
+    write_mode_override: str | None = None,
+    read_mode_override: str | None = None,
+) -> dict:
+    """Build a fresh preset dict that overrides the topology of the named
+    problem. Preserves problem-specific fields (num_inputs, loss, out_dim,
+    use_robust_input, schedule, lambdas, tau_anneal, write_idx default).
+
+    Args:
+        problem: Base problem name (e.g. 'housing', 'sinx').
+        hidden_family: 'grid' or 'cluster'.
+        num_hidden: Number of hidden nodes. For 'grid', must equal
+            grid_size**2 (we recompute grid_size from num_hidden if not
+            given). For 'cluster', used directly.
+        num_stages: Number of ODE stages (default 1).
+        edge_repeats: Parallel edges per hidden pair (default 2).
+        grid_size: For 'grid' family; height/width. If None and family='grid',
+            defaults to 5 (matches housing_grid default).
+        write_mode_override: If set, use this write_mode instead of
+            family default. CLI --write-mode takes precedence.
+        read_mode_override: If set, use this read_mode instead of family
+            default. CLI --read-mode takes precedence.
+
+    Returns:
+        Fresh dict ready to assign to ``PRESETS[problem]`` before calling
+        ``build_net_from_preset(problem)``.
+    """
+    from config import SOLVER
+    base = dict(PRESETS[problem])
+    # Use the FIRST stage's num_inputs as the canonical input dimension
+    # (multi-stage presets all share num_inputs; this is just defensive).
+    num_inputs = int(base["stages"][0]["num_inputs"])
+    n_stages = max(1, int(num_stages))
+    er = int(edge_repeats)
+
+    if hidden_family == "cluster":
+        num_proj = 0
+        eff_num_hidden = int(num_hidden)
+        hidden_kwargs = {
+            "edge_prob": 1.0,
+            "seed": 0,
+            "bidirectional": False,
+        }
+        eff_write_mode = (
+            write_mode_override if write_mode_override is not None else "dense"
+        )
+        read_idx = list(range(eff_num_hidden))
+        eff_read_mode = "sparse" if read_mode_override is None else read_mode_override
+        # Remove preset write_idx (incompatible with dense write).
+        base.pop("write_idx", None)
+    elif hidden_family == "grid":
+        if grid_size is None:
+            grid_size = max(2, round(int(num_hidden) ** 0.5))
+        eff_num_hidden = grid_size * grid_size
+        if num_hidden is not None and eff_num_hidden != int(num_hidden):
+            print(
+                f"[train] note: --num-hidden={num_hidden} rounded to "
+                f"grid_size={grid_size} (eff_num_hidden={eff_num_hidden})"
+            )
+        num_proj = 3
+        hidden_kwargs = {
+            "height": grid_size,
+            "width": grid_size,
+            "kernel_size": 3,
+            "bidirectional": False,
+        }
+        eff_write_mode = (
+            write_mode_override if write_mode_override is not None
+            else base.get("write_mode", "fan_out")
+        )
+        if grid_size >= 3:
+            center_col = grid_size // 2
+            center_nodes = [r * grid_size + center_col for r in range(grid_size)]
+            read_idx = center_nodes + list(range(eff_num_hidden, eff_num_hidden + num_proj))
+        else:
+            read_idx = list(range(eff_num_hidden, eff_num_hidden + num_proj))
+        eff_read_mode = "sparse" if read_mode_override is None else read_mode_override
+    else:
+        raise ValueError(f"Unknown hidden_family: {hidden_family!r}")
+
+    stage_cfg = {
+        "num_inputs": num_inputs,
+        "num_hidden": eff_num_hidden,
+        "num_proj": num_proj,
+        "num_outputs": 0,
+        "hidden_family": hidden_family,
+        "hidden_kwargs": hidden_kwargs,
+        "edge_repeats": er,
+        "input_pattern": "all_to_all",
+        "output_pattern": "all_to_all",
+        "proj_pattern": "all_to_all",
+        "t_span": SOLVER["t_span"] / n_stages,
+        "num_steps": round(SOLVER["num_steps"] / n_stages),
+    }
+
+    new_preset = dict(base)
+    new_preset["stages"] = [stage_cfg] * n_stages
+    new_preset["write_mode"] = eff_write_mode
+    new_preset["read_idx"] = read_idx
+    new_preset["read_mode"] = eff_read_mode
+    # Remove schedule/lambdas overrides if present so dynamic topology uses
+    # the global defaults from LAMBDAS. Per-problem schedules (e.g. housing's
+    # default 'three_phase') are still preserved by the explicit
+    # base.get('schedule') check below.
+    return new_preset
 
 
 def _log_solidification(log_path, epoch: int, metrics: dict) -> None:
@@ -700,10 +874,42 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--cell-library", type=str, default=None, dest="cell_library",
-        choices=["legacy", "v15", "relu", "tanh"],
+        choices=["legacy", "v15", "v2", "relu", "tanh"],
         help="Cell library: 'legacy' (L,S,P,Z, default), 'v15' (O_weak,O_hard,P0,N0,D1,Z), "
+             "'v2' (mix-code/bias-code bounded library), "
              "'relu' (I=ReLU(p0*Vsrc+p1*Vdest+p2)), 'tanh' (I=tanh(p0*Vsrc+p1*Vdest+p2)). "
              "Overrides the preset's cell_library key if present.",
+    )
+    parser.add_argument(
+        "--hidden-family", type=str, default=None, dest="hidden_family",
+        choices=["grid", "cluster"],
+        help="Hidden-node topology family (default: from preset). "
+             "'grid' uses a 2D grid graph (requires --grid-size). "
+             "'cluster' uses a fully connected Erdos-Renyi graph "
+             "(requires --num-hidden). When set, dynamically rebuilds the "
+             "preset's stages config to use the specified family instead "
+             "of the hardcoded preset topology. Mutually exclusive with "
+             "the preset's default family when combined with --grid-size.",
+    )
+    parser.add_argument(
+        "--num-hidden", type=int, default=None, dest="num_hidden",
+        help="Number of hidden nodes (default: from preset). "
+             "Required when --hidden-family=cluster (must be >= 2). "
+             "Ignored for grid family (uses --grid-size).",
+    )
+    parser.add_argument(
+        "--num-stages", type=int, default=None, dest="num_stages",
+        help="Number of ODE stages (default: from preset, or 1 if not "
+             "specified). Each stage gets an identical topology. "
+             "t_span and num_steps are divided evenly across stages.",
+    )
+    parser.add_argument(
+        "--edge-repeats", type=int, default=None, dest="edge_repeats",
+        help="Parallel edges per hidden node pair (default: 2, range 1-8). "
+             "Each repeated edge gets independent logits/gate/multiplier. "
+             "I/O and projection edges are NOT repeated. Composes "
+             "multiplicatively with --bidirectional (not exposed here, "
+             "see train_ctle.py).",
     )
     parser.add_argument(
         "--output", type=Path, default=Path("./output"),
@@ -1135,6 +1341,10 @@ def main():
     # overrides BEFORE any other flag is consumed (e.g. before the
     # pruning-threshold resolution below).
     _apply_ablation_set(args, schedule_mode)
+    # cluster-topology CLI: validate new --hidden-family/--num-hidden/
+    # --edge-repeats/--num-stages combinations early (cheap, before any
+    # expensive setup like data loading or model construction).
+    _validate_hidden_family_args(args)
     if schedule_mode == "three_phase":
         a_end, b_end, c_end = phase_boundaries(epochs)
         print(
@@ -1192,6 +1402,34 @@ def main():
     else:
         resolved_grid_size = args.grid_size
     args.grid_size = resolved_grid_size
+    # cluster-topology CLI: when --hidden-family is specified, dynamically
+    # rebuild the problem's preset to use the requested family. Done AFTER
+    # grid-size resolution so the cluster-family branch can read
+    # args.grid_size (for error detection).
+    if args.hidden_family is not None:
+        eff_num_hidden = (
+            args.num_hidden if args.num_hidden is not None
+            else (resolved_grid_size ** 2 if resolved_grid_size else 5)
+        )
+        eff_num_stages = args.num_stages if args.num_stages is not None else 1
+        eff_edge_repeats = args.edge_repeats if args.edge_repeats is not None else 2
+        new_preset = _make_dynamic_preset(
+            problem=args.problem,
+            hidden_family=args.hidden_family,
+            num_hidden=eff_num_hidden,
+            num_stages=eff_num_stages,
+            edge_repeats=eff_edge_repeats,
+            grid_size=resolved_grid_size,
+            write_mode_override=args.write_mode,
+            read_mode_override=args.read_mode,
+        )
+        PRESETS[args.problem] = new_preset
+        print(
+            f"[train] dynamic preset (hidden_family={args.hidden_family}): "
+            f"num_hidden={eff_num_hidden} num_stages={eff_num_stages} "
+            f"edge_repeats={eff_edge_repeats} "
+            f"write_mode={new_preset['write_mode']} read_mode={new_preset['read_mode']}"
+        )
     net = build_net_from_preset(
         args.problem,
         cell_lib=cell_lib,

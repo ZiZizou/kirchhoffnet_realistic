@@ -2,3 +2,4 @@ results
 __pycache__
 network_visualization
 test_smoke.py
+different_configuration_output_logs.md

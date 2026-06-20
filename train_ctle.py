@@ -148,6 +148,7 @@ def make_ctle_preset(
     cluster_edge_prob: float = 1.0,
     cluster_seed: int = 0,
     q75_input: bool = False,
+    edge_repeats: int = 2,
 ) -> dict:
     """Build a 4-spec → 7-logit CTLE KirchhoffNet preset for a given family.
 
@@ -182,7 +183,13 @@ def make_ctle_preset(
         cluster_edge_prob: Edge probability for cluster family (default 1.0 = fully connected).
         cluster_seed: RNG seed for cluster edge sampling.
         q75_input: When True and family='cluster', set num_inputs=8 (Q75-scaled features).
+        edge_repeats: Number of parallel edges per hidden node pair (default 2,
+            range 1-8). Composes multiplicatively with ``bidirectional``. Each
+            repeated edge gets independent cell-type logits, gate, and
+            multiplier. I/O and projection edges are NOT repeated.
     """
+    if edge_repeats < 1 or edge_repeats > 8:
+        raise ValueError(f"edge_repeats must be in [1, 8], got {edge_repeats}")
     n_stages = max(1, num_stages)
 
     if family == "grid":
@@ -203,6 +210,7 @@ def make_ctle_preset(
             "hidden_family": "grid",
             "hidden_kwargs": {"height": grid_size, "width": grid_size,
                               "kernel_size": 3, "bidirectional": bidirectional},
+            "edge_repeats": edge_repeats,
             "input_pattern": "all_to_all",
             "output_pattern": "all_to_all",
             "proj_pattern": "all_to_all",
@@ -247,6 +255,7 @@ def make_ctle_preset(
             "hidden_kwargs": {"edge_prob": cluster_edge_prob,
                               "seed": cluster_seed,
                               "bidirectional": bidirectional},
+            "edge_repeats": edge_repeats,
             "input_pattern": "all_to_all",
             "output_pattern": "all_to_all",
             "proj_pattern": "all_to_all",
@@ -296,6 +305,7 @@ def make_ctle_grid_preset(
     write_mode: str | None = None,
     bidirectional: bool = False,
     q75_input: bool = False,
+    edge_repeats: int = 2,
 ) -> dict:
     """Backward-compatible thin wrapper for the grid CTLE preset.
 
@@ -310,6 +320,7 @@ def make_ctle_grid_preset(
         write_mode=write_mode,
         bidirectional=bidirectional,
         q75_input=q75_input,
+        edge_repeats=edge_repeats,
     )
 
 
@@ -1143,6 +1154,14 @@ def main() -> None:
         help="Disable dual edges per node pair (default).",
     )
     parser.add_argument(
+        "--edge-repeats", type=int, default=2, choices=range(1, 9),
+        help="Number of parallel edges per hidden node pair (1-8, default: 2). "
+             "Each repeated edge gets independent cell-type logits, gate, and "
+             "multiplier. Composes multiplicatively with --bidirectional. "
+             "I/O and projection edges are not repeated. Set to 1 for the "
+             "previous single-edge behavior.",
+    )
+    parser.add_argument(
         "--persistent-drive", dest="persistent_drive", action="store_true", default=False,
         help="Enable persistent bounded drive current in all stages. Each stage "
              "receives a tanh-bounded source current pulling driven hidden nodes "
@@ -1292,6 +1311,7 @@ def main() -> None:
         cluster_edge_prob=args.cluster_edge_prob,
         cluster_seed=args.cluster_seed,
         q75_input=args.q75_input,
+        edge_repeats=args.edge_repeats,
     )
     net: KirchhoffNetWithIO = build_net_from_config(
         preset, cell_lib=cell_lib, enable_drive=args.persistent_drive,
@@ -1309,10 +1329,12 @@ def main() -> None:
           f"read_idx={list(net.read_idx) if net.read_idx is not None else None}"
           f" persistent_drive={args.persistent_drive}")
     topo_label = f"ctle_{args.hidden_family}"
-    if args.bidirectional:
+    if args.bidirectional or args.edge_repeats > 1:
         edges_per_stage = [s.num_edges() for s in net.core.stages]
-        print(f"[train_ctle] bidirectional=True: {edges_per_stage} edges per stage "
-              f"(2× single-edge baseline)")
+        mult = 2 if args.bidirectional else 1
+        mult *= args.edge_repeats
+        print(f"[train_ctle] bidirectional={args.bidirectional} edge_repeats={args.edge_repeats}: "
+              f"{edges_per_stage} edges per stage ({mult}× single-edge baseline)")
 
     # Resolve mapper names for later use.
     _effective_write_mode = (

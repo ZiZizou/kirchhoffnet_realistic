@@ -678,6 +678,7 @@ def make_smooth2d_grid_preset(
     num_stages: int = 3,
     num_proj: int = 3,
     bidirectional: bool = False,
+    edge_repeats: int = 2,
 ) -> dict:
     """Dynamically build the smooth2d_grid preset dict for any square grid size.
 
@@ -693,7 +694,13 @@ def make_smooth2d_grid_preset(
     directed edges (i->j and j->i), giving asymmetric cell types (P/rectifier)
     true bidirectional capability. Edge count is exactly 2× the single-direction
     count.
+
+    ``edge_repeats`` (default 2) controls the number of parallel edges per
+    hidden node pair. Composes multiplicatively with ``bidirectional``; each
+    repeated edge gets independent per-edge parameters in DifferentialStage.
     """
+    if edge_repeats < 1 or edge_repeats > 8:
+        raise ValueError(f"edge_repeats must be in [1, 8], got {edge_repeats}")
     num_hidden = grid_size * grid_size
     n_stages = max(1, num_stages)
     _stage_cfg = {
@@ -703,6 +710,7 @@ def make_smooth2d_grid_preset(
         "num_outputs": 0,
         "hidden_family": "grid",
         "hidden_kwargs": {"height": grid_size, "width": grid_size, "kernel_size": 3, "bidirectional": bidirectional},
+        "edge_repeats": edge_repeats,
         "input_pattern": "all_to_all",
         "output_pattern": "all_to_all",
         "proj_pattern": "all_to_all",
@@ -767,6 +775,7 @@ def make_housing_grid_preset(
     num_stages: int = 3,
     num_proj: int = 3,
     bidirectional: bool = False,
+    edge_repeats: int = 2,
 ) -> dict:
     """Build the housing_grid preset dict for any square grid size.
 
@@ -788,7 +797,13 @@ def make_housing_grid_preset(
     directed edges (i->j and j->i), giving asymmetric cell types (P/rectifier)
     true bidirectional capability. Edge count is exactly 2× the single-direction
     count.
+
+    ``edge_repeats`` (default 2) controls the number of parallel edges per
+    hidden node pair. Composes multiplicatively with ``bidirectional``; each
+    repeated edge gets independent per-edge parameters in DifferentialStage.
     """
+    if edge_repeats < 1 or edge_repeats > 8:
+        raise ValueError(f"edge_repeats must be in [1, 8], got {edge_repeats}")
     num_hidden = grid_size * grid_size
     n_stages = max(1, num_stages)
     _stage_cfg = {
@@ -798,6 +813,7 @@ def make_housing_grid_preset(
         "num_outputs": 0,
         "hidden_family": "grid",
         "hidden_kwargs": {"height": grid_size, "width": grid_size, "kernel_size": 3, "bidirectional": bidirectional},
+        "edge_repeats": edge_repeats,
         "input_pattern": "all_to_all",
         "output_pattern": "all_to_all",
         "proj_pattern": "all_to_all",

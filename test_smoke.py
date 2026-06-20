@@ -2495,6 +2495,18 @@ def main():
     test_bidir_default_is_false()                 # BIDI-6: backward compat
     test_bidir_preset_factories_accept_param()    # BIDI-7: preset factories
     test_bidir_full_net_build()                   # BIDI-8: full net build
+
+    # Parallel edge repeats tests (parallel-edge-repeats plan)
+    test_repeat_edges_identity()                  # REP-1: n=1 identity
+    test_repeat_edges_multiplies_hidden_only()    # REP-2: hidden only
+    test_repeat_edges_composes_with_bidirectional()  # REP-3: composition
+    test_repeat_edges_per_pair_count()            # REP-4: per-pair count
+    test_repeat_edges_rejects_invalid_n()          # REP-5: validation
+    test_repeat_edges_validate_topology_passes()  # REP-6: validate_topology
+    test_repeat_edges_from_config_wires_through() # REP-7: from_config wiring
+    test_repeat_edges_full_net_build()            # REP-8: full net build
+    test_repeat_edges_preset_factories_accept_param()  # REP-9: preset factories
+    test_repeat_edges_compose_with_bidirectional_full_net()  # REP-10: compose
     test_drive_current_basic()                   # DRIVE-1
     test_drive_changes_rhs()                     # DRIVE-2
     test_driven_node_gate_forced_open()          # DRIVE-3
@@ -2680,12 +2692,14 @@ def test_smooth2d_grid_preset():
     # 7x7 grid with 8-neighbor (kernel_size=3), single-edge-per-pair:
     # Degree: 4 corners*3 + 20 edge*5 + 25 interior*8 = 12+100+200 = 312
     # Single-branch (1 directed per pair) = 312/2 = 156.
+    # Default edge_repeats=2 doubles hidden edges to 312.
     n_hidden_edges = 156
+    n_hidden_repeat = n_hidden_edges * 2  # edge_repeats=2 default
     # Projection edges: n_hidden * n_proj (unidirectional hidden->proj)
     n_proj_edges = n_hidden * n_proj
-    expected_total = n_hidden_edges + n_proj_edges
+    expected_total = n_hidden_repeat + n_proj_edges
     for i, stage in enumerate(net.core.stages):
-        check(f"smooth2d_grid: stage {i} edge count = {expected_total} (grid 156 + proj 147)",
+        check(f"smooth2d_grid: stage {i} edge count = {expected_total} (grid 312 + proj 147)",
               int(stage.src.shape[0]) == expected_total,
               f"got {int(stage.src.shape[0])}")
         check(f"smooth2d_grid: stage {i} num_nodes=52 (49 hid + 3 proj)",
@@ -2832,11 +2846,12 @@ def test_housing_grid_preset():
 
     n_hidden = 25
     n_proj = 3
-    n_hidden_edges = 72
+    n_hidden_edges = 72  # single direction, 5x5 grid
+    n_hidden_repeat = n_hidden_edges * 2  # edge_repeats=2 default
     n_proj_edges = n_hidden * n_proj
-    expected_total = n_hidden_edges + n_proj_edges
+    expected_total = n_hidden_repeat + n_proj_edges
     for i, stage in enumerate(net.core.stages):
-        check(f"housing_grid: stage {i} edge count = {expected_total} (grid 72 + proj {n_proj_edges})",
+        check(f"housing_grid: stage {i} edge count = {expected_total} (grid 144 + proj {n_proj_edges})",
               int(stage.src.shape[0]) == expected_total,
               f"got {int(stage.src.shape[0])}")
         check(f"housing_grid: stage {i} num_nodes=28 (25 hid + 3 proj)",
@@ -5001,6 +5016,257 @@ def test_bidir_full_net_build():
     out, _ = net_bi(u, ctx=None)
     check("BIDI-8: forward shape (4, 1)", out.shape == (4, 1))
     check("BIDI-8: forward output is finite", torch.isfinite(out).all().item())
+
+
+# ============================================================================
+# Parallel edge repeats tests (parallel-edge-repeats plan)
+# ============================================================================
+
+def test_repeat_edges_identity():
+    """repeat_edges(topo, 1) returns an equivalent topology (no duplication)."""
+    print("\nTest REP-1: repeat_edges(n=1) is identity")
+    from topology import line_graph, grid_graph, repeat_edges
+    g = grid_graph(4, 4, kernel_size=3, bidirectional=False)
+    g_rep = repeat_edges(g, 1)
+    check("REP-1: grid repeat_edges(n=1) preserves edge count",
+          len(g_rep.src) == len(g.src),
+          f"original={len(g.src)}, repeated={len(g_rep.src)}")
+    check("REP-1: grid repeat_edges(n=1) preserves all edge types",
+          g_rep.edge_type == g.edge_type)
+    check("REP-1: grid repeat_edges(n=1) preserves node ids",
+          g_rep.input_node_ids == g.input_node_ids
+          and g_rep.output_node_ids == g.output_node_ids
+          and g_rep.hidden_node_ids == g.hidden_node_ids)
+
+    l = line_graph(6, radius=2, bidirectional=False)
+    l_rep = repeat_edges(l, 1)
+    check("REP-1: line repeat_edges(n=1) preserves edge count",
+          len(l_rep.src) == len(l.src))
+
+
+def test_repeat_edges_multiplies_hidden_only():
+    """repeat_edges(topo, n) duplicates only hidden edges, n times."""
+    print("\nTest REP-2: repeat_edges(n) duplicates only hidden edges")
+    from topology import grid_graph, repeat_edges
+    g = grid_graph(4, 4, kernel_size=3, bidirectional=False)
+    base_hidden = sum(1 for t in g.edge_type if t == "hidden")
+    base_non_hidden = sum(1 for t in g.edge_type if t != "hidden")
+    g_rep = repeat_edges(g, 3)
+    rep_hidden = sum(1 for t in g_rep.edge_type if t == "hidden")
+    rep_non_hidden = sum(1 for t in g_rep.edge_type if t != "hidden")
+    check("REP-2: hidden edge count == 3x original",
+          rep_hidden == 3 * base_hidden,
+          f"base={base_hidden}, rep={rep_hidden}")
+    check("REP-2: non-hidden edge count is preserved",
+          rep_non_hidden == base_non_hidden,
+          f"base_non_hidden={base_non_hidden}, rep_non_hidden={rep_non_hidden}")
+
+
+def test_repeat_edges_composes_with_bidirectional():
+    """edge_repeats=3 with bidirectional=True produces 6x hidden edges per unique pair."""
+    print("\nTest REP-3: repeat_edges composes multiplicatively with bidirectional")
+    from topology import grid_graph, repeat_edges
+    g_single = grid_graph(4, 4, kernel_size=3, bidirectional=False)
+    g_bidi = grid_graph(4, 4, kernel_size=3, bidirectional=True)
+    g_bidi_rep3 = repeat_edges(g_bidi, 3)
+    check("REP-3: bidi+rep3 = 6x single",
+          len(g_bidi_rep3.src) == 6 * len(g_single.src),
+          f"single={len(g_single.src)}, bidi+rep3={len(g_bidi_rep3.src)}")
+
+
+def test_repeat_edges_per_pair_count():
+    """Each original hidden edge appears exactly n times after repeat_edges."""
+    print("\nTest REP-4: repeat_edges preserves per-pair multiplicity")
+    from topology import line_graph, repeat_edges
+    l = line_graph(5, radius=1, bidirectional=False)
+    l_rep3 = repeat_edges(l, 3)
+    from collections import Counter
+    base_pairs = Counter(zip(l.src, l.dst))
+    rep_pairs = Counter(zip(l_rep3.src, l_rep3.dst))
+    # Each base pair (hidden) should appear 3 times; no extra pairs.
+    for p, c in base_pairs.items():
+        check(f"REP-4: pair {p} appears 3x", rep_pairs[p] == 3,
+              f"base={c}, rep={rep_pairs[p]}")
+    extras = set(rep_pairs) - set(base_pairs)
+    check("REP-4: no new (src, dst) pairs introduced", len(extras) == 0,
+          f"extras={extras}")
+
+
+def test_repeat_edges_rejects_invalid_n():
+    """repeat_edges raises on n < 1."""
+    print("\nTest REP-5: repeat_edges rejects n < 1")
+    from topology import line_graph, repeat_edges
+    l = line_graph(4, radius=1)
+    raised = False
+    try:
+        repeat_edges(l, 0)
+    except ValueError:
+        raised = True
+    check("REP-5: n=0 raises ValueError", raised)
+
+
+def test_repeat_edges_validate_topology_passes():
+    """validate_topology() accepts repeated topologies (uses unique-pair density)."""
+    print("\nTest REP-6: validate_topology passes on repeated topologies")
+    from topology import grid_graph, line_graph, repeat_edges, validate_topology
+    g = grid_graph(7, 7, kernel_size=3, bidirectional=False)
+    for n in [2, 4, 8]:
+        g_rep = repeat_edges(g, n)
+        validate_topology(g_rep)
+        check(f"REP-6: validate_topology(grid 7x7 rep={n}) passed", True)
+    l = line_graph(8, radius=2, bidirectional=False)
+    for n in [2, 4, 8]:
+        l_rep = repeat_edges(l, n)
+        validate_topology(l_rep)
+        check(f"REP-6: validate_topology(line rep={n}) passed", True)
+
+
+def test_repeat_edges_from_config_wires_through():
+    """MultiStageTopology.from_config() applies edge_repeats to hidden edges only."""
+    print("\nTest REP-7: from_config applies edge_repeats to hidden edges only")
+    from topology import (
+        grid_graph, MultiStageTopology,
+    )
+    g = grid_graph(4, 4, kernel_size=3, bidirectional=False)
+    base_hidden = sum(1 for t in g.edge_type if t == "hidden")
+
+    cfg = {
+        "num_inputs": 2,
+        "num_hidden": 16,
+        "num_proj": 3,
+        "num_outputs": 0,
+        "hidden_family": "grid",
+        "hidden_kwargs": {"height": 4, "width": 4, "kernel_size": 3, "bidirectional": False},
+        "edge_repeats": 3,
+        "input_pattern": "all_to_all",
+        "output_pattern": "all_to_all",
+        "proj_pattern": "all_to_all",
+    }
+    mst = MultiStageTopology.from_config([cfg])
+    topo = mst.stages[0]
+    rep_hidden = sum(1 for t in topo.edge_type if t == "hidden")
+    # Reference: same config with edge_repeats=1 to get the baseline hidden count.
+    cfg_ref = dict(cfg, edge_repeats=1)
+    mst_ref = MultiStageTopology.from_config([cfg_ref])
+    topo_ref = mst_ref.stages[0]
+    ref_hidden = sum(1 for t in topo_ref.edge_type if t == "hidden")
+    check("REP-7: hidden edges = 3x baseline (edge_repeats=1)",
+          rep_hidden == 3 * ref_hidden,
+          f"ref={ref_hidden}, rep={rep_hidden}")
+    # Non-hidden edges (input->hidden + hidden->proj) are unchanged by repeats.
+    rep_non_hidden = sum(1 for t in topo.edge_type if t != "hidden")
+    ref_non_hidden = sum(1 for t in topo_ref.edge_type if t != "hidden")
+    check("REP-7: non-hidden count preserved with edge_repeats",
+          rep_non_hidden == ref_non_hidden,
+          f"ref_non_hidden={ref_non_hidden}, rep_non_hidden={rep_non_hidden}")
+
+
+def test_repeat_edges_full_net_build():
+    """A full KirchhoffNet builds and runs forward with edge_repeats=3 hidden topology."""
+    print("\nTest REP-8: full KirchhoffNet build with edge_repeats=3")
+    from config import make_smooth2d_grid_preset
+    from topology import build_net_from_config
+    from cell_library import make_default_library
+
+    cell_lib = make_default_library()
+    preset_rep = make_smooth2d_grid_preset(grid_size=5, edge_repeats=3)
+    net_rep = build_net_from_config(preset_rep, cell_lib=cell_lib)
+    check("REP-8: edge_repeats=3 net builds successfully", net_rep is not None)
+
+    preset_single = make_smooth2d_grid_preset(grid_size=5, edge_repeats=1)
+    net_single = build_net_from_config(preset_single, cell_lib=cell_lib)
+
+    n_hid = net_rep.core.stages[0].num_nodes - net_rep.proj_count
+    src_rep = net_rep.core.stages[0].src.tolist()
+    dst_rep = net_rep.core.stages[0].dst.tolist()
+    hidden_edges_rep = sum(1 for s, d in zip(src_rep, dst_rep) if s < n_hid and d < n_hid)
+    src_single = net_single.core.stages[0].src.tolist()
+    dst_single = net_single.core.stages[0].dst.tolist()
+    hidden_edges_single = sum(1 for s, d in zip(src_single, dst_single) if s < n_hid and d < n_hid)
+    check("REP-8: hidden grid edges = 3x single",
+          hidden_edges_rep == 3 * hidden_edges_single,
+          f"single={hidden_edges_single}, rep={hidden_edges_rep}")
+
+    # Forward pass on a small random batch.
+    u = torch.rand(4, 2)
+    out, _ = net_rep(u, ctx=None)
+    check("REP-8: forward shape (4, 1)", out.shape == (4, 1))
+    check("REP-8: forward output is finite", torch.isfinite(out).all().item())
+
+
+def test_repeat_edges_preset_factories_accept_param():
+    """Preset factory functions accept edge_repeats and pass it via stage config."""
+    print("\nTest REP-9: preset factories accept edge_repeats parameter")
+    from config import make_smooth2d_grid_preset, make_housing_grid_preset
+
+    # Default: edge_repeats == 2 in stage config
+    s_default = make_smooth2d_grid_preset(grid_size=5)
+    check("REP-9: smooth2d default has edge_repeats=2",
+          s_default["stages"][0].get("edge_repeats") == 2,
+          f"got {s_default['stages'][0].get('edge_repeats')}")
+
+    s_rep = make_smooth2d_grid_preset(grid_size=5, edge_repeats=4)
+    check("REP-9: smooth2d_grid(edge_repeats=4) sets stage config edge_repeats=4",
+          s_rep["stages"][0].get("edge_repeats") == 4)
+
+    h_default = make_housing_grid_preset(grid_size=5)
+    check("REP-9: housing default has edge_repeats=2",
+          h_default["stages"][0].get("edge_repeats") == 2)
+
+    h_rep = make_housing_grid_preset(grid_size=5, edge_repeats=8)
+    check("REP-9: housing_grid(edge_repeats=8) sets stage config edge_repeats=8",
+          h_rep["stages"][0].get("edge_repeats") == 8)
+
+    # Out-of-range value must raise.
+    raised = False
+    try:
+        make_smooth2d_grid_preset(grid_size=5, edge_repeats=9)
+    except ValueError:
+        raised = True
+    check("REP-9: edge_repeats=9 raises ValueError", raised)
+
+
+def test_repeat_edges_compose_with_bidirectional_full_net():
+    """bidirectional=True with edge_repeats=3 yields 6x hidden edges per unique pair."""
+    print("\nTest REP-10: bidirectional + edge_repeats compose in full net")
+    from config import make_smooth2d_grid_preset
+    from topology import build_net_from_config
+    from cell_library import make_default_library
+
+    cell_lib = make_default_library()
+    preset = make_smooth2d_grid_preset(
+        grid_size=5, bidirectional=True, edge_repeats=3,
+    )
+    net = build_net_from_config(preset, cell_lib=cell_lib)
+    check("REP-10: bidi+rep3 net builds successfully", net is not None)
+
+    n_hid = net.core.stages[0].num_nodes - net.proj_count
+    src = net.core.stages[0].src.tolist()
+    dst = net.core.stages[0].dst.tolist()
+    hidden_edges = sum(1 for s, d in zip(src, dst) if s < n_hid and d < n_hid)
+
+    # Reference: single-direction (no bidi, no repeats)
+    preset_ref = make_smooth2d_grid_preset(
+        grid_size=5, bidirectional=False, edge_repeats=1,
+    )
+    net_ref = build_net_from_config(preset_ref, cell_lib=cell_lib)
+    n_hid_ref = net_ref.core.stages[0].num_nodes - net_ref.proj_count
+    src_ref = net_ref.core.stages[0].src.tolist()
+    dst_ref = net_ref.core.stages[0].dst.tolist()
+    hidden_edges_ref = sum(
+        1 for s, d in zip(src_ref, dst_ref)
+        if s < n_hid_ref and d < n_hid_ref
+    )
+
+    check("REP-10: bidi+rep3 = 6x single-direction hidden edges",
+          hidden_edges == 6 * hidden_edges_ref,
+          f"ref={hidden_edges_ref}, compound={hidden_edges}")
+
+    # Forward pass on a small random batch.
+    u = torch.rand(4, 2)
+    out, _ = net(u, ctx=None)
+    check("REP-10: forward shape (4, 1)", out.shape == (4, 1))
+    check("REP-10: forward output is finite", torch.isfinite(out).all().item())
 
 
 def test_drive_current_basic():

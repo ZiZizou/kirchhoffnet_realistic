@@ -34,6 +34,7 @@ __all__ = [
     "grid_graph",
     "cluster_graph",
     "empty_graph",
+    "repeat_edges",
     "connect_bipartite",
     "connect_projection",
     "StageTopologyBuilder",
@@ -237,6 +238,65 @@ def empty_graph(n_nodes: int) -> SparseTopology:
     )
 
 
+def repeat_edges(topo: SparseTopology, n: int) -> SparseTopology:
+    """Duplicate every ``EDGE_TYPE_HIDDEN`` edge ``n`` times (total count).
+
+    Non-hidden edges (``input``, ``proj``, ``output``) are NOT duplicated.
+    Each repeated edge gets independent per-edge parameters (cell-type
+    logits, gate, multiplier) in ``DifferentialStage``; their currents
+    sum naturally in KCL via scatter-add (physically: parallel branches).
+
+    Args:
+        topo: Source topology.
+        n: Total number of copies per hidden edge. ``n=1`` is identity
+            (no duplication). ``n>=2`` produces parallel edges. Must be
+            ``>= 1``.
+
+    Returns:
+        New ``SparseTopology`` with the same non-hidden edges and
+        ``n`` hidden-edge copies per original hidden edge.
+    """
+    if n < 1:
+        raise ValueError(f"repeat_edges requires n >= 1, got {n}")
+    if n == 1:
+        # Identity: return a shallow copy to keep the API symmetric.
+        return SparseTopology(
+            num_nodes=topo.num_nodes,
+            src=list(topo.src),
+            dst=list(topo.dst),
+            edge_type=list(topo.edge_type),
+            node_kind=list(topo.node_kind),
+            input_node_ids=list(topo.input_node_ids),
+            output_node_ids=list(topo.output_node_ids),
+            hidden_node_ids=list(topo.hidden_node_ids),
+            proj_node_ids=list(topo.proj_node_ids),
+        )
+    new_src: list[int] = []
+    new_dst: list[int] = []
+    new_type: list[str] = []
+    for s, d, t in zip(topo.src, topo.dst, topo.edge_type):
+        if t == EDGE_TYPE_HIDDEN:
+            for _ in range(n):
+                new_src.append(s)
+                new_dst.append(d)
+                new_type.append(t)
+        else:
+            new_src.append(s)
+            new_dst.append(d)
+            new_type.append(t)
+    return SparseTopology(
+        num_nodes=topo.num_nodes,
+        src=new_src,
+        dst=new_dst,
+        edge_type=new_type,
+        node_kind=list(topo.node_kind),
+        input_node_ids=list(topo.input_node_ids),
+        output_node_ids=list(topo.output_node_ids),
+        hidden_node_ids=list(topo.hidden_node_ids),
+        proj_node_ids=list(topo.proj_node_ids),
+    )
+
+
 # ---------- connectors ----------
 
 def connect_bipartite(
@@ -402,6 +462,9 @@ class MultiStageTopology:
                 hid = empty_graph(cfg["num_hidden"])
             else:
                 raise ValueError(f"Unknown hidden_family: {family!r}")
+            edge_repeats = int(cfg.get("edge_repeats", 1))
+            if edge_repeats > 1:
+                hid = repeat_edges(hid, edge_repeats)
             topo = builder.build(
                 hid,
                 input_pattern=cfg.get("input_pattern", "one_to_one"),
@@ -862,18 +925,25 @@ def validate_topology(topo: SparseTopology, max_hidden_density: float = 0.5) -> 
             raise ValueError(f"Self-loop not allowed: edge {s}->{d}")
     n_h = len(topo.hidden_node_ids)
     if n_h > 0:
-        # Max is the count of undirected pairs (i, j) with i < j. For
-        # bidirectional topologies, each pair is realized as 2 directed
-        # edges, so the actual edge count can be up to 2 * max_edges.
-        # The density ratio is therefore (actual_hidden_edges / max_edges),
-        # which can exceed 1.0 in fully bidirectional dense graphs; the
-        # check is intentionally permissive to allow bidirectional mode
-        # (e.g., grid_graph 5x5 with kernel_size=3 reaches 0.27 bidirectional).
-        max_edges = n_h * (n_h - 1) // 2
-        actual_hidden_edges = sum(1 for t in topo.edge_type if t == EDGE_TYPE_HIDDEN)
-        if n_h > 32 and (actual_hidden_edges / max_edges) > max_hidden_density:
+        # Density is measured on UNIQUE directed (src, dst) pairs, not raw
+        # edge count. This keeps the metric aligned with graph connectivity
+        # rather than counting parallel branches (which are intentional
+        # duplicates created by ``repeat_edges``). For bidirectional graphs
+        # each undirected pair contributes 2 directed pairs (i->j, j->i),
+        # and for ``edge_repeats=N`` each pair still counts as 1 unique
+        # directed edge. The check is intentionally permissive to allow
+        # bidirectional mode (e.g., grid_graph 5x5 with kernel_size=3
+        # reaches 0.27 bidirectional).
+        max_edges = n_h * (n_h - 1)  # max directed pairs
+        unique_directed_pairs = len({
+            (s, d)
+            for s, d, t in zip(topo.src, topo.dst, topo.edge_type)
+            if t == EDGE_TYPE_HIDDEN
+        })
+        if n_h > 32 and (unique_directed_pairs / max_edges) > max_hidden_density:
             raise ValueError(
-                f"Hidden core too dense: {actual_hidden_edges} / {max_edges} > {max_hidden_density}"
+                f"Hidden core too dense: {unique_directed_pairs} unique directed "
+                f"pairs / {max_edges} max > {max_hidden_density}"
             )
     for i in topo.input_node_ids:
         if i not in topo.src:

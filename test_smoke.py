@@ -2427,6 +2427,7 @@ def main():
     test_smooth2d_grid_preset()
     test_housing_grid_preset()
     test_housing_grid_data_huber_loss()
+    test_housing_data_normalization_float16_safe()
     test_fan_out_input_mapper_basic()
     test_fan_out_input_mapper_param_count()
     test_fan_out_input_mapper_gradients()
@@ -2929,6 +2930,55 @@ def test_housing_grid_data_huber_loss():
     check("denormalize_targets: y = y_norm * y_std + y_mean",
           torch.allclose(y_orig, expected),
           f"got {y_orig.tolist()}, expected {expected.tolist()}")
+
+
+def test_housing_data_normalization_float16_safe():
+    """Regression test for the AMP float16 overflow bug in make_data_housing.
+
+    California Housing's Longitude feature is negative (~-124 to ~-114).
+    The original divide-by-column-max normalization clamped the negative
+    max to 1e-6, producing values of ~-1.2e8 that overflow float16 under
+    AMP. The backward pass then computes 0 * inf = NaN (IEEE 754), killing
+    all gradients. This test verifies that all normalized features stay
+    within the float16 representable range (< 65504 in absolute value).
+    """
+    print("\nTest NN5: housing data normalization is float16-safe (AMP overflow guard)")
+    try:
+        from train_script import make_data_housing
+    except ImportError as e:
+        check("import make_data_housing", False, f"failed: {e}")
+        return
+    try:
+        from sklearn.datasets import fetch_california_housing
+    except ImportError:
+        check("sklearn available", True, "sklearn not installed, skipping data test")
+        return
+
+    train_loader, val_loader, task_fn, inverse_stats = make_data_housing(batch_size=128)
+    check("make_data_housing: returns 4-tuple with inverse_stats",
+          inverse_stats is not None and "y_mean" in inverse_stats and "y_std" in inverse_stats)
+
+    FLOAT16_MAX = 65504.0
+    for u_b, y_b in train_loader:
+        check("housing: input batch shape (B, 8)", u_b.shape[1] == 8)
+        check("housing: target batch shape (B, 1)", y_b.shape[1] == 1)
+        check("housing: input values in [0, 1] (min-max scaling)",
+              u_b.min() >= -1e-6 and u_b.max() <= 1.0 + 1e-6)
+        check("housing: abs(X).max() < float16 max (AMP-safe)",
+              u_b.abs().max().item() < FLOAT16_MAX,
+              f"got abs(X).max()={u_b.abs().max().item():.4e}, threshold={FLOAT16_MAX}")
+        check("housing: no NaN in features", torch.isfinite(u_b).all().item())
+        check("housing: no NaN in targets", torch.isfinite(y_b).all().item())
+        break
+
+    import torch.nn.functional as F
+    a = torch.tensor([0.0, 0.5, 1.0, 2.0])
+    b = torch.tensor([0.5, 0.5, 0.5, 0.5])
+    l1 = task_fn(a, b)
+    expected = F.l1_loss(a, b)
+    check("housing: task_fn is L1 (MAE) loss",
+          abs(float(l1) - float(expected)) < 1e-6,
+          f"got {float(l1):.6f}, expected {float(expected):.6f}")
 
 
 

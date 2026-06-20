@@ -330,7 +330,7 @@ TAU = {
 # and are merged over this global LAMBDAS by train_script.)
 LAMBDAS = {
     "sparsity": 1e-3,
-    "rail": 1.0,
+    "rail": 0.0,
     "edge_gate": 5e-4,
     "node_gate": 1e-4,
     "power": 1e-4,
@@ -412,10 +412,10 @@ SCHEDULE_THREE_PHASE = {
 # distillation (lambda_kd) and STE cell mode. See spec/four-phase-schedule.md.
 SCHEDULE_FOUR_PHASE = {
     # Fraction of total epochs allocated to each phase. Must sum to 1.0.
-    "frac_a": 0.45,            # Phase A: free fit (soft teacher)
-    "frac_b1": 0.20,           # Phase B1: cell commitment (no pruning)
-    "frac_b2": 0.15,           # Phase B2: edge pruning (readiness-gated)
-    "frac_c": 0.20,            # Phase C: retrain compact model
+    "frac_a": 0.3,            # Phase A: free fit (soft teacher)
+    "frac_b1": 0.2,           # Phase B1: cell commitment (no pruning)
+    "frac_b2": 0.2,           # Phase B2: edge pruning (readiness-gated)
+    "frac_c": 0.3,            # Phase C: retrain compact model
     # Tau targets per phase.
     "tau_a": 1.0,              # Fixed tau during free fit
     "tau_b1_init": 1.0,        # Tau at start of B1

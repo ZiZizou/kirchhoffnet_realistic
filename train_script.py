@@ -543,18 +543,34 @@ def _make_data_split(
     )
 
 
-def make_data_housing(batch_size: int, val_size: int = 0):
+def make_data_housing(batch_size: int):
+    """California-housing regression on the line topology.
+
+    Features are min-max scaled to [0, 1] per column. This handles both
+    non-negative features (Population) and signed features (Longitude ~-124
+    to -114): dividing by column max alone would clamp the negative
+    Longitude max to 1e-6 and produce values of ~-1e8 that overflow float16
+    under AMP (zeroing all gradients via 0*inf=NaN in the backward pass).
+    Targets are standardized. Training loss is L1 (MAE).
+
+    Returns ``(train_loader, val_loader, task_fn, inverse_stats)`` where
+    ``inverse_stats`` is ``{"y_mean": ..., "y_std": ...}`` for
+    denormalizing validation predictions back to original units.
+    """
     X, y_norm, y_mean, y_std = _load_california_housing_data()
 
-    x_max = X.max(dim=0, keepdim=True).values.clamp(min=1e-6)
-    X = X / x_max
+    x_min = X.min(dim=0, keepdim=True).values
+    x_max = X.max(dim=0, keepdim=True).values
+    x_range = (x_max - x_min).clamp(min=1e-6)
+    X = (X - x_min) / x_range
 
     train_loader, val_loader = _make_data_split(X, y_norm, batch_size)
 
     def task_fn(y_pred, y_target):
         return F.l1_loss(y_pred, y_target)
 
-    return train_loader, val_loader, task_fn
+    inverse_stats = {"y_mean": y_mean, "y_std": y_std}
+    return train_loader, val_loader, task_fn, inverse_stats
 
 
 def make_data_housing_grid(batch_size: int, huber_delta: float = 1.0):
@@ -1866,10 +1882,8 @@ def main():
         lr_str = f"{min(_lrs):.1e}..{max(_lrs):.1e}" if len(_lrs) > 1 else f"{_lrs[0]:.2e}"
         phase_tag = f" [{phase}]" if phase else ""
         if tqdm is not None:
-            postfix_dict = dict(
-                train=f"{avg_train:.4f}", val=f"{val_loss:.4f}", tau=f"{tau:.3f}",
-                lr=lr_str,
-            )
+            ab_iter.set_description_str(f"{ab_desc}  train={avg_train:.4f}  val={val_loss:.4f}")
+            postfix_dict = dict(tau=f"{tau:.3f}", lr=lr_str)
             if schedule_mode == "legacy":
                 postfix_dict["reg"] = f"{reg_scale:.2f}"
             ab_iter.set_postfix(**postfix_dict)

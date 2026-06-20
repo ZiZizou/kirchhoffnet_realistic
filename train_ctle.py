@@ -2018,7 +2018,12 @@ def main() -> None:
     eval_specs = sample_specs(eval_n, seed=123).to(device)
     with torch.no_grad():
         eval_logits_mlp = mlp(eval_specs)
-        eval_logits_kirchhoff, _ = eval_net(eval_specs, ctx=None,
+        # When q75_input is active, the student expects 8-dim Q75-scaled
+        # features (the same transformation applied during training,
+        # see make_ctle_data mid-loop). The teacher handles raw 4-dim
+        # internally via its own scale_input() in forward().
+        eval_specs_student = mlp.scale_input(eval_specs) if args.q75_input else eval_specs
+        eval_logits_kirchhoff, _ = eval_net(eval_specs_student, ctx=None,
                                             store_trajectory=False,
                                             cell_mode="soft", tau=0.001)
     if args.normalize_targets:

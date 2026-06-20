@@ -935,9 +935,9 @@ def compute_loss(
         # node_gate/power/capacitance/entropy) which depend only on
         # `net.module`'s parameters and have no business being
         # averaged across replicas.  The caller is expected to call
-        # `backward(retain_graph=True)` on `total_task` and then
-        # `backward()` on `structural` so the structural gradients
-        # accumulate directly onto `net.module`'s parameters.
+        # `backward()` on `total_task + structural` (a single combined
+        # backward call to remain compatible with torch.compile, which
+        # forbids retain_graph=True on the first of two backward calls).
         total_task = (
             loss_task
             + float(lambdas.get("rail", 0.0)) * loss_rail
@@ -1335,15 +1335,13 @@ def train_epoch(
             cell_mode=cell_mode,
         )
         if scaler is not None:
-            scaler.scale(loss_task).backward(retain_graph=True)
-            scaler.scale(loss_structural).backward()
+            ( scaler.scale(loss_task) + scaler.scale(loss_structural) ).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=grad_clip_norm)
             scaler.step(optimizer)
             scaler.update()
         else:
-            loss_task.backward(retain_graph=True)
-            loss_structural.backward()
+            (loss_task + loss_structural).backward()
             torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=grad_clip_norm)
             optimizer.step()
         total_loss += float((loss_task + loss_structural).item())

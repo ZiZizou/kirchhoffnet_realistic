@@ -146,7 +146,7 @@ def make_ctle_preset(
     write_mode: str | None = None,
     bidirectional: bool = False,
     cluster_edge_prob: float = 1.0,
-    cluster_seed: int = 0,
+    cluster_seed: int | None = None,
     q75_input: bool = False,
     edge_repeats: int = 2,
 ) -> dict:
@@ -246,6 +246,9 @@ def make_ctle_preset(
         n_hidden = int(num_hidden)
         num_proj = 0
         n_inputs = 8 if q75_input else 4
+        if cluster_seed is None:
+            # Default to 0 if no seed was provided (caller didn't derive one).
+            cluster_seed = 0
         _stage_cfg = {
             "num_inputs": n_inputs,
             "num_hidden": n_hidden,
@@ -470,6 +473,42 @@ def sample_specs(n: int, seed: int = 42) -> torch.Tensor:
     return torch.from_numpy(specs)
 
 
+def seed_everything(seed: int) -> None:
+    """Seed Python, NumPy, and PyTorch RNGs for reproducibility.
+
+    Seeding covers CPU and CUDA. cuDNN auto-tuner (``cudnn.benchmark``) and
+    deterministic mode (``cudnn.deterministic``) are intentionally left at
+    their defaults: this is "partial" determinism (bit-identical weights and
+    data sampling, but slight non-determinism from cuDNN's algorithm choice
+    under varying batch sizes). For full bit-exact reproducibility across
+    runs, set ``torch.backends.cudnn.deterministic = True`` manually.
+
+    Args:
+        seed: Integer seed value.
+    """
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _seeded_worker_init_fn(worker_id: int) -> None:
+    """DataLoader worker_init_fn that seeds each worker's RNG deterministically.
+
+    Uses ``base_seed + worker_id`` so multi-worker loading is reproducible
+    when ``base_seed`` is fixed. ``base_seed`` is set as a module-level
+    attribute by ``seed_everything``-style callers via the closure below.
+    """
+    base = getattr(_seeded_worker_init_fn, "_base_seed", 0)
+    import random
+    seed = (base + worker_id) % (2**32)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
 def generate_ctle_dataset(
     n_train: int,
     n_val: int,
@@ -534,7 +573,13 @@ def generate_ctle_dataset(
     train_ds = TensorDataset(specs[:n_train].to("cpu"), train_targets)
     val_ds = TensorDataset(specs[n_train:].to("cpu"), val_targets)
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
+    # Seeded DataLoader for reproducible shuffling across runs.
+    g = torch.Generator()
+    g.manual_seed(seed)
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True, drop_last=False,
+        generator=g, worker_init_fn=_seeded_worker_init_fn,
+    )
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, drop_last=False)
     return train_loader, val_loader, target_mean, target_std
 
@@ -1002,8 +1047,16 @@ def main() -> None:
         help="Erdos-Renyi edge probability for cluster family (default: 1.0 = fully connected).",
     )
     parser.add_argument(
-        "--cluster-seed", type=int, default=0, dest="cluster_seed",
-        help="RNG seed for cluster_graph edge sampling (default: 0).",
+        "--cluster-seed", type=int, default=None, dest="cluster_seed",
+        help="RNG seed for cluster_graph edge sampling (default: derived "
+             "from --seed if not provided).",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42, dest="seed",
+        help="Global RNG seed for Python, NumPy, PyTorch (CPU+CUDA), and "
+             "data generation (default: 42). Use the same value across "
+             "runs to reproduce model initialization and training data. "
+             "cuDNN auto-tuner remains enabled (partial determinism).",
     )
     parser.add_argument(
         "--num-stages", type=int, default=3,
@@ -1191,6 +1244,14 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # ---- seed global RNGs early (before any model/data construction) ----
+    seed_everything(args.seed)
+    # Derive cluster_seed from global seed when not explicitly overridden.
+    if args.cluster_seed is None:
+        args.cluster_seed = args.seed
+    # Set base_seed for DataLoader worker_init_fn.
+    _seeded_worker_init_fn._base_seed = args.seed
+
     # ---- early validation: cluster requires num_hidden ----
     if args.hidden_family == "cluster":
         if args.num_hidden is None:
@@ -1253,6 +1314,7 @@ def main() -> None:
           f"grad_clip={args.grad_clip if args.grad_clip is not None else OPTIM['grad_clip_norm']} "
           f"compile={compile_enabled} parallel={parallel_enabled} "
           f"amp={amp_enabled} amp_dtype={args.amp_dtype} ({n_gpus} GPUs) "
+          f"seed={args.seed} cluster_seed={args.cluster_seed} "
           f"output={out_dir}")
 
     # ---- load teacher MoE ----
@@ -1409,6 +1471,7 @@ def main() -> None:
         f.write(f"hidden_family: {args.hidden_family}\n")
         f.write(f"grid_size: {args.grid_size}\n")
         f.write(f"num_hidden: {_eff_num_hidden}\n")
+        f.write(f"seed: {args.seed}\n")
         if args.hidden_family == "cluster":
             f.write(f"cluster_edge_prob: {args.cluster_edge_prob}\n")
             f.write(f"cluster_seed: {args.cluster_seed}\n")
@@ -1453,6 +1516,7 @@ def main() -> None:
         mlp=mlp,
         device=device,
         batch_size=batch_size,
+        seed=args.seed,
         normalize=args.normalize_targets,
         q75_input=args.q75_input,
     )

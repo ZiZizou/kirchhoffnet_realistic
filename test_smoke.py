@@ -2518,6 +2518,11 @@ def main():
     test_simple_edge_regularizers()              # SE-3
     test_simple_edge_diagnostics()               # SE-4
 
+    # Fixed seed tests (fixed-seed plan)
+    test_seed_everything_deterministic()         # SEED-1: model init determinism
+    test_seed_everything_seeds_numpy()           # SEED-2: NumPy RNG
+    test_seed_everything_seeds_python_random()   # SEED-3: Python random
+
     print()
     print("=" * 60)
     print(f"Smoke test results: {passed} passed, {failed} failed")
@@ -5541,6 +5546,82 @@ def test_simple_edge_diagnostics():
     check("SE-4: mean_pZ == 0 (no Z cell)",
           metrics["mean_pZ"] == 0.0,
           f"got {metrics['mean_pZ']}")
+
+
+# ============================================================================
+# Fixed seed tests (fixed-seed plan)
+# ============================================================================
+
+def test_seed_everything_deterministic():
+    """seed_everything() makes model init deterministic across calls."""
+    print("\nTest SEED-1: seed_everything yields identical params across calls")
+    import random
+    import numpy as np
+    from train_ctle import seed_everything
+    from cell_library import IdealizedCellLibrary
+    from topology import build_net_from_config
+    from config import PRESETS
+
+    # Build a 1-stage net. OutputMapper.proj is nn.Linear with xavier_uniform_
+    # (properly seeded by torch.manual_seed), making it a good comparison target.
+    preset = dict(PRESETS["smooth2d_grid"])
+    preset["stages"] = preset["stages"][:1]
+
+    seed_everything(123)
+    cell_lib_a = IdealizedCellLibrary()
+    net_a = build_net_from_config(preset, cell_lib=cell_lib_a, enable_drive=False)
+    a_weight = net_a.output_mapper.proj.weight.detach().clone()
+
+    # Second: build with the SAME seed; should match exactly.
+    seed_everything(123)
+    cell_lib_b = IdealizedCellLibrary()
+    net_b = build_net_from_config(preset, cell_lib=cell_lib_b, enable_drive=False)
+    b_weight = net_b.output_mapper.proj.weight.detach().clone()
+
+    check("SEED-1: same seed -> identical OutputMapper weights",
+          torch.allclose(a_weight, b_weight),
+          f"max abs diff = {(a_weight - b_weight).abs().max().item():.2e}")
+
+    # Third: different seed -> should differ.
+    seed_everything(456)
+    cell_lib_c = IdealizedCellLibrary()
+    net_c = build_net_from_config(preset, cell_lib=cell_lib_c, enable_drive=False)
+    c_weight = net_c.output_mapper.proj.weight.detach().clone()
+    differs = not torch.allclose(a_weight, c_weight)
+    check("SEED-1: different seed -> OutputMapper weights differ", differs,
+          f"max abs diff vs seed 123 = {(a_weight - c_weight).abs().max().item():.2e}")
+
+
+def test_seed_everything_seeds_numpy():
+    """seed_everything() also seeds NumPy."""
+    print("\nTest SEED-2: seed_everything seeds numpy.random")
+    import numpy as np
+    from train_ctle import seed_everything
+
+    seed_everything(7)
+    a1 = np.random.rand(5)
+    a2 = np.random.rand(5)
+    seed_everything(7)
+    b1 = np.random.rand(5)
+    b2 = np.random.rand(5)
+    check("SEED-2: numpy.rand reproducible with same seed",
+          np.allclose(a1, b1) and np.allclose(a2, b2),
+          f"a1={a1[:2]}, b1={b1[:2]}")
+
+
+def test_seed_everything_seeds_python_random():
+    """seed_everything() also seeds Python's random module."""
+    print("\nTest SEED-3: seed_everything seeds Python random")
+    import random
+    from train_ctle import seed_everything
+
+    seed_everything(11)
+    a = [random.random() for _ in range(5)]
+    seed_everything(11)
+    b = [random.random() for _ in range(5)]
+    check("SEED-3: random.random reproducible with same seed",
+          a == b,
+          f"a[:2]={a[:2]}, b[:2]={b[:2]}")
 
 
 if __name__ == "__main__":

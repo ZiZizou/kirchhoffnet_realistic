@@ -122,6 +122,11 @@ class DifferentialStage(nn.Module):
         z_init = float(INIT.get("z_logit_init", 5.0))
         u_init = float(INIT.get("u_logit_init", 5.0))
         self.z_logits = nn.Parameter(torch.full((E,), z_init))
+        # DEPRECATED (deprecate-node-gates): u_logits is no longer used in the
+        # forward pass (see ``rhs``) or in any regularizer; nodes are pruned
+        # only by connectivity. The parameter is retained for backward
+        # compatibility with existing checkpoints — the optimizer still has
+        # it as a no-op parameter and its state_dict entry persists.
         self.u_logits = nn.Parameter(torch.full((num_nodes,), u_init))
 
     def num_edges(self) -> int:
@@ -150,9 +155,12 @@ class DifferentialStage(nn.Module):
         """Compute dx/dt at state x. x: [batch, num_nodes].
 
         Gate application (CP-2):
-        - Node gate: x_gated = x * sigmoid(u_logits) — gates node voltage before
-          being used as edge input. When u_j -> 0 the node is effectively
-          disconnected from all edges.
+        - Node gate: DEPRECATED (deprecate-node-gates). The previous
+          ``x * sigmoid(u_logits)`` masking is bypassed: node voltages are
+          passed through unchanged. Nodes are now pruned only by
+          connectivity (the prune_stage dead-island purge removes nodes
+          that become fully disconnected from I/O). The ``u_logits``
+          parameter is retained for checkpoint compat but is unused here.
         - Edge gate: i_edge *= sigmoid(z_logits) — multiplies the edge current
           after cell-library evaluation. When z_e -> 0 the edge contributes
           zero current regardless of cell type.
@@ -162,12 +170,10 @@ class DifferentialStage(nn.Module):
         uses a softmax mixture (default). ``'ste'`` uses one cell per edge
         in the forward pass with straight-through soft gradients.
         """
-        # Node gate: scale node voltages before computing edge inputs.
-        # Driven nodes are forced open so persistent input is not gated away.
-        node_mask = torch.sigmoid(self.u_logits)  # [N]
-        if self._has_drive:
-            node_mask = node_mask.clone()
-            node_mask[self._drive_idx] = 1.0
+        # DEPRECATED (deprecate-node-gates): node mask is all-ones; u_logits
+        # is not used here. The previous driven-node force-open logic is no
+        # longer needed because the mask is already identity.
+        node_mask = torch.ones(self.num_nodes, device=x.device, dtype=x.dtype)
         x_gated = x * node_mask.unsqueeze(0)  # [B, N]
 
         x_src = x_gated[:, self.src]
@@ -266,16 +272,49 @@ class DifferentialStage(nn.Module):
         return torch.sigmoid(self.z_logits)
 
     def node_gates(self) -> torch.Tensor:
-        """Return node gate values u_j = σ(u_logits), shape [N]."""
-        return torch.sigmoid(self.u_logits)
+        """Return node gate values u_j = σ(u_logits), shape [N].
+
+        DEPRECATED (deprecate-node-gates): node gates are no longer used
+        in the forward pass or in pruning. The values are vestigial and
+        will be constant (sigmoid of the un-trained ``u_logits`` parameter)
+        in practice. Returns an all-ones tensor (or, if you want the raw
+        sigmoid value, call :func:`torch.sigmoid` on ``self.u_logits``
+        directly) so that any caller that accidentally uses this method
+        will not corrupt the dynamics.
+        """
+        import warnings as _warnings
+        _warnings.warn(
+            "DifferentialStage.node_gates() is deprecated (deprecate-node-gates); "
+            "node gates are no longer used in the forward pass or pruning. "
+            "Returns an all-ones tensor.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return torch.ones(self.num_nodes, device=self.u_logits.device,
+                           dtype=self.u_logits.dtype)
 
     def active_edge_mask(self, threshold: float = 0.01) -> torch.Tensor:
         """Boolean mask of edges that survive pruning at the given threshold."""
         return self.edge_gates() > threshold
 
     def active_node_mask(self, threshold: float = 0.01) -> torch.Tensor:
-        """Boolean mask of nodes that survive pruning at the given threshold."""
-        return self.node_gates() > threshold
+        """Boolean mask of nodes that survive pruning at the given threshold.
+
+        DEPRECATED (deprecate-node-gates): always returns an all-True
+        tensor. Node pruning is now connectivity-only — see
+        ``topology.prune_stage`` dead-island purge and the I/O
+        connectivity backstop for the only mechanisms that remove nodes.
+        """
+        import warnings as _warnings
+        _warnings.warn(
+            "DifferentialStage.active_node_mask() is deprecated "
+            "(deprecate-node-gates); node pruning is connectivity-only. "
+            "Returns an all-True tensor.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return torch.ones(self.num_nodes, dtype=torch.bool,
+                           device=self.u_logits.device)
 
     def parameter_breakdown(self) -> dict:
         """Return parameter counts including gate parameters (for diagnostics)."""

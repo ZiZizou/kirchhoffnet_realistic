@@ -85,8 +85,22 @@ def _stage_edge_gates(stage) -> torch.Tensor:
 
 
 def _stage_node_gates(stage) -> torch.Tensor:
-    """Node gate values u_j = σ(u_logits), shape [N]."""
-    return torch.sigmoid(stage.u_logits)
+    """Node gate values u_j = σ(u_logits), shape [N].
+
+    DEPRECATED (deprecate-node-gates): node gates are no longer used in
+    the forward pass, in any regularizer, or in pruning. Returns an
+    all-ones tensor so any stray caller gets a no-op result instead of
+    corrupting the dynamics.
+    """
+    import warnings as _warnings
+    _warnings.warn(
+        "train._stage_node_gates() is deprecated (deprecate-node-gates); "
+        "node gates are no longer used. Returns an all-ones tensor.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return torch.ones(stage.num_nodes, device=stage.u_logits.device,
+                       dtype=stage.u_logits.dtype)
 
 
 def _stage_rail_loss(stage, traj: torch.Tensor) -> torch.Tensor:
@@ -109,22 +123,27 @@ def _compute_regularizers(
     tau: float,
     lambdas: dict,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
-    """Shared regularizer computation: sparsity, edge_gate, node_gate, power,
-    capacitance, rail, entropy.
+    """Shared regularizer computation: sparsity, edge_gate, power, rail, entropy.
 
-    The four complexity terms (CP-4) decompose the previous single ``complexity``
+    DEPRECATED (deprecate-node-gates): the ``node_gate`` and ``capacitance``
+    regularizers are no longer accumulated. Both return zero tensors
+    (preserved in the return tuple for backward compatibility with callers
+    that read ``parts["node_gate"]`` / ``parts["capacitance"]``). The
+    corresponding ``lambdas["node_gate"]`` and ``lambdas["capacitance"]``
+    entries are kept at 0.0 across all configs.
+
+    The remaining complexity terms decompose the previous single ``complexity``
     proxy into per-component hardware terms:
       - edge_gate   : Σ_e σ(z_logits)                       (active edge count)
-      - node_gate   : Σ_j σ(u_logits)                       (active node count)
       - power       : Σ_e z_e · m_e · Σ_q w_q · gm_q       (static power proxy)
-      - capacitance : C_eff · Σ_j u_j                      (capacitance area proxy)
 
     The cell-selection sparsity ``Σ w[:, :z_idx]`` is preserved (pushes
     individual edges toward the zero-current Z cell as a fine-grained
     selection, distinct from the edge gate which is a coarse on/off).
 
     Returns ``(loss_sparsity, loss_edge_gate, loss_node_gate, loss_power,
-    loss_capacitance, loss_rail, entropy_bonus, lambda_entropy)``.
+    loss_capacitance, loss_rail, entropy_bonus, lambda_entropy)``. The
+    ``loss_node_gate`` and ``loss_capacitance`` entries are always zero.
     """
     stages = net.core.stages if isinstance(net, KirchhoffNetWithIO) else net.stages
     loss_sparsity = loss_edge_gate = loss_node_gate = loss_power = loss_capacitance = loss_rail = entropy_bonus = trajs[0].new_zeros(())
@@ -132,21 +151,13 @@ def _compute_regularizers(
         w = _stage_soft_weights(stage)
         mult = _stage_multiplicities(stage)
         z = _stage_edge_gates(stage)
-        u = _stage_node_gates(stage)
         z_idx = stage.cell_lib.z_index
 
         # Cell-selection sparsity: push toward Z cell.
         loss_sparsity = loss_sparsity + w[:, :z_idx].sum()
 
-        # Edge/node gate penalties: soft count of active edges/nodes.
+        # Edge gate penalty: soft count of active edges.
         loss_edge_gate = loss_edge_gate + z.sum()
-        # Exclude driven nodes from node gate / capacitance penalties:
-        # their u_logits are forced to 1.0 in rhs() and should not be regularized.
-        if hasattr(stage, '_has_drive') and stage._has_drive:
-            u_driven = u[stage._drive_idx].sum()
-            loss_node_gate = loss_node_gate + (u.sum() - u_driven)
-        else:
-            loss_node_gate = loss_node_gate + u.sum()
 
         # Static power proxy: z_e · m_e · weighted gm sum per edge.
         # gm values per cell come from the shared cell library.
@@ -154,11 +165,11 @@ def _compute_regularizers(
         effective_gm = (w * gm_per_cell.unsqueeze(0)).sum(dim=-1)  # [E]
         loss_power = loss_power + (z * mult * effective_gm).sum()
 
-        # Capacitance area proxy: C_eff · Σ_j u_j (excludes driven nodes).
-        if hasattr(stage, '_has_drive') and stage._has_drive:
-            loss_capacitance = loss_capacitance + stage.c_eff * (u.sum() - u_driven)
-        else:
-            loss_capacitance = loss_capacitance + stage.c_eff * u.sum()
+        # DEPRECATED (deprecate-node-gates): node_gate and capacitance
+        # regularizers are no longer accumulated — both ``loss_node_gate``
+        # and ``loss_capacitance`` stay at the initial zero tensor. Node
+        # pruning is connectivity-only; the C_eff·Σu proxy would be a
+        # constant per stage and thus useless as a regularizer.
 
         loss_rail = loss_rail + _stage_rail_loss(stage, traj)
 
@@ -728,8 +739,11 @@ def compute_solidification_metrics(
       - ``frac_sigma_z_below_01/005/001``: fraction of edge gates with
         σ(z_logits) below the listed threshold. Measures how many edges
         are effectively off (eligible for pruning).
-      - ``mean_sigma_u``: mean over all nodes of σ(u_logits). Average
-        node gate openness.
+      - ``mean_sigma_u``: **VESTIGIAL** (deprecate-node-gates): mean over
+        all nodes of σ(u_logits). Node gates are no longer used in the
+        forward pass, regularizers, or pruning — this metric reflects the
+        stale ``u_logits`` parameter values (which receive no gradient
+        pressure) and should not be interpreted as meaningful.
       - ``num_edges``, ``num_nodes``: total counts across all stages.
       - ``tau``: the tau value used (echoed for the log file).
     """

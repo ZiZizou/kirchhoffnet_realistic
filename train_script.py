@@ -227,11 +227,8 @@ def _apply_ablation_set(args, schedule_mode: str) -> None:
             "tau anneals normally, --prune disabled"
         )
     elif args.ablation_set == "edge-only":
-        # C: edge-only pruning test. Disable node-gate pruning, lower the
-        # edge threshold. These are the same defaults as SCHEDULE_THREE_PHASE
-        # after four-phase-redesign/1a, so this preset is mostly a no-op
-        # for users who want to be explicit.
-        _set_if_unset("prune_nodes_by_gate", False)
+        # C: edge-only pruning test (DEPRECATED: node-gate pruning is
+        # permanently disabled; this ablation set is a no-op).
         _set_if_unset("prune_edge_threshold", 0.05)
         _set_if_unset("stage_lr_scale", 1.0)
         _set_if_unset("retrain_stage_lr_scale", 1.0)
@@ -239,8 +236,9 @@ def _apply_ablation_set(args, schedule_mode: str) -> None:
         _set_if_unset("retrain_mapper_lr_scale", 1.0)
         _set_if_unset("freeze_mappers", False)
         print(
-            "[ablation-set=edge-only] node-gate pruning disabled, "
-            "edge threshold 0.05, stage_lr_scale=1.0, mapper_lr_scale=1.0"
+            "[ablation-set=edge-only] node-gate pruning permanently disabled "
+            "(deprecate-node-gates), edge threshold 0.05, "
+            "stage_lr_scale=1.0, mapper_lr_scale=1.0"
         )
 
 
@@ -1087,20 +1085,15 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--prune-nodes-by-gate", dest="prune_nodes_by_gate",
         action="store_true", default=None,
-        help="Prune nodes independently by σ(u_logits) > node_threshold "
-             "(legacy behavior). Default is set by the config (see "
-             "PRUNE['prune_nodes_by_gate']); when neither this flag nor "
-             "the config specify a value, the legacy behavior is used. "
-             "Disable with --no-prune-nodes-by-gate to skip node-gate "
-             "pruning — nodes then only die via the connectivity "
-             "backstop (dead island purge), preserving edges whose "
-             "endpoints had low u but high eff_score.",
+        help="DEPRECATED (deprecate-node-gates): no-op, kept for backward "
+             "compat. Node pruning is now connectivity-only regardless of "
+             "this flag. Use --no-prune-nodes-by-gate to silence the warning.",
     )
     parser.add_argument(
         "--no-prune-nodes-by-gate", dest="prune_nodes_by_gate",
         action="store_false",
-        help="Skip node-gate pruning; rely on the connectivity backstop "
-             "to remove disconnected nodes only.",
+        help="DEPRECATED (deprecate-node-gates): no-op, kept for backward "
+             "compat. Nodes are pruned by connectivity only.",
     )
     parser.add_argument(
         "--retrain-epochs", type=int, default=None,
@@ -2045,8 +2038,7 @@ def main():
         from topology import prune_network
         from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
 
-        # Always import SCHEDULE_THREE_PHASE for the prune_nodes_by_gate
-        # resolution below, regardless of which threshold path we take.
+        # Import SCHEDULE_THREE_PHASE for schedule-specific edge/node thresholds.
         from config import SCHEDULE_THREE_PHASE
 
         # For phased schedules, use schedule-specific thresholds;
@@ -2067,25 +2059,24 @@ def main():
             edge_thresh = args.prune_edge_threshold if args.prune_edge_threshold is not None else float(PRUNE["edge_threshold"])
             node_thresh = args.prune_node_threshold if args.prune_node_threshold is not None else float(PRUNE["node_threshold"])
 
-        # Resolve prune_nodes_by_gate: CLI flag > schedule config > PRUNE config.
+        # DEPRECATED (deprecate-node-gates): prune_nodes_by_gate is always
+        # False; the CLI flag is kept as a deprecated no-op.
         if args.prune_nodes_by_gate is not None:
-            pnbg = bool(args.prune_nodes_by_gate)
-        else:
-            if schedule_mode == "four_phase":
-                pnbg = bool(SCHEDULE_FOUR_PHASE.get("prune_nodes_by_gate",
-                                                     PRUNE.get("prune_nodes_by_gate", True)))
-            elif schedule_mode == "three_phase":
-                pnbg = bool(SCHEDULE_THREE_PHASE.get("prune_nodes_by_gate",
-                                                     PRUNE.get("prune_nodes_by_gate", True)))
-            else:
-                pnbg = bool(PRUNE.get("prune_nodes_by_gate", True))
+            import warnings
+            warnings.warn(
+                "--prune-nodes-by-gate / --no-prune-nodes-by-gate is deprecated "
+                "(deprecate-node-gates); node pruning is connectivity-only "
+                "regardless of this flag.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        pnbg = False
 
         pre_edges = sum(s.num_edges() for s in raw_net.core.stages)
         pre_nodes = sum(s.num_nodes for s in raw_net.core.stages)
         print(
             f"[prune] pre-prune: {pre_edges} edges, {pre_nodes} nodes "
-            f"(edge_thresh={edge_thresh}, node_thresh={node_thresh}, "
-            f"prune_nodes_by_gate={pnbg})"
+            f"(edge_thresh={edge_thresh}, prune_nodes_by_gate={pnbg})"
         )
 
         pruned_core, stage_remaps = prune_network(

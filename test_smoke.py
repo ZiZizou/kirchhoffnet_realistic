@@ -60,12 +60,12 @@ def test_config_loads():
           abs(config.LAMBDAS["rail"] - 1.0) < 1e-12)
     check("LAMBDAS has edge_gate=5e-4 (CP: per-component decomposition, was 1e-3 in CP-v1)",
           abs(config.LAMBDAS["edge_gate"] - 5e-4) < 1e-12)
-    check("LAMBDAS has node_gate=1e-4 (CP: per-component decomposition)",
-          abs(config.LAMBDAS["node_gate"] - 1e-4) < 1e-12)
+    check("LAMBDAS has node_gate=0.0 (deprecate-node-gates: always 0)",
+          abs(config.LAMBDAS["node_gate"] - 0.0) < 1e-12)
     check("LAMBDAS has power=1e-4 (CP: static power proxy)",
           abs(config.LAMBDAS["power"] - 1e-4) < 1e-12)
-    check("LAMBDAS has capacitance=1e-5 (CP: cap area proxy)",
-          abs(config.LAMBDAS["capacitance"] - 1e-5) < 1e-12)
+    check("LAMBDAS has capacitance=0.0 (deprecate-node-gates: always 0)",
+          abs(config.LAMBDAS["capacitance"] - 0.0) < 1e-12)
     check("LAMBDAS no longer has 'complexity' (CP: decomposed into 4 terms)",
           "complexity" not in config.LAMBDAS)
     check("PRUNE has edge_threshold=0.1 (three-phase-schedule: was 0.01, too forgiving for gate-trained regime)",
@@ -940,14 +940,14 @@ def test_smooth2d_grid_sparsity_zero_override():
     check("smooth2d-grid: preset legacy lambdas edge_gate=5e-6",
           abs(sg_lambdas["edge_gate"] - 5e-6) < 1e-12,
           f"got {sg_lambdas['edge_gate']}")
-    check("smooth2d-grid: preset legacy lambdas node_gate=1e-5",
-          abs(sg_lambdas["node_gate"] - 1e-5) < 1e-12,
+    check("smooth2d-grid: preset legacy lambdas node_gate=0.0 (deprecate-node-gates)",
+          abs(sg_lambdas["node_gate"] - 0.0) < 1e-12,
           f"got {sg_lambdas['node_gate']}")
     check("smooth2d-grid: preset legacy lambdas power=1e-5",
           abs(sg_lambdas["power"] - 1e-5) < 1e-12,
           f"got {sg_lambdas['power']}")
-    check("smooth2d-grid: preset legacy lambdas capacitance=1e-6",
-          abs(sg_lambdas["capacitance"] - 1e-6) < 1e-12,
+    check("smooth2d-grid: preset legacy lambdas capacitance=0.0 (deprecate-node-gates)",
+          abs(sg_lambdas["capacitance"] - 0.0) < 1e-12,
           f"got {sg_lambdas['capacitance']}")
     check("smooth2d-grid: Phase B schedule sparsity=5e-5",
           abs(float(SCHEDULE_THREE_PHASE["lambdas_b"]["sparsity"]) - 5e-5) < 1e-12,
@@ -1097,13 +1097,13 @@ def test_gate_initialization():
     u = stage.node_gates()
     check("CP-1: edge_gates() returns σ(z_logits)",
           z.shape == (stage.num_edges(),))
-    check("CP-1: node_gates() returns σ(u_logits)",
+    check("CP-1 (deprecate-node-gates): node_gates() returns all-ones",
           u.shape == (stage.num_nodes,))
     check("grid7-gate0: σ(z_logit_init=0) = 0.5 (50% open gates, max gradient)",
           abs(float(z[0].item()) - 0.5) < 1e-3,
           f"got {float(z[0].item()):.4f}")
-    check("grid7-gate0: σ(u_logit_init=0) = 0.5 (50% open gates, max gradient)",
-          abs(float(u[0].item()) - 0.5) < 1e-3,
+    check("grid7-gate0 (deprecate-node-gates): node_gates returns all-ones",
+          abs(float(u[0].item()) - 1.0) < 1e-6,
           f"got {float(u[0].item()):.4f}")
     expected_grad = 0.5 * (1 - 0.5)
     check("grid7-gate0: σ'(z_logit=0) = 0.25 (max gradient sensitivity, 2.4x z=2.0)",
@@ -1112,7 +1112,7 @@ def test_gate_initialization():
 
 
 def test_gate_application_in_rhs():
-    print("\nTest 47: gates applied in DifferentialStage.rhs (CP-2)")
+    print("\nTest 47: gates applied in DifferentialStage.rhs (CP-2, deprecate-node-gates)")
     from cell_library import IdealizedCellLibrary
     from topology import ring_graph, StageTopologyBuilder, topology_to_stage
     from sim_context import SimContext
@@ -1125,7 +1125,9 @@ def test_gate_application_in_rhs():
                          proj_pattern="all_to_all")
     stage, _, _ = topology_to_stage(topo, cell_lib=cell_lib)
 
-    # Force all edge gates and node gates to zero; the output should be ~0.
+    # DEPRECATED (deprecate-node-gates): node gates are bypassed — the mask
+    # is always 1.0 in rhs(). Setting u_logits to -10 has NO effect on rhs.
+    # Only edge gates (z_logits) still affect the output.
     with torch.no_grad():
         stage.z_logits.fill_(-10.0)
         stage.u_logits.fill_(-10.0)
@@ -1133,22 +1135,31 @@ def test_gate_application_in_rhs():
     x = torch.randn(2, 3) * 0.1
     dx = stage.rhs(x, ctx=SimContext(), tau=1.0)
 
-    # With all gates ~0, the gated x is ~0, edges contribute ~0, and dx = (0 - leak - clip) / C
+    # With edge gates closed (z~0), i_edge ~ 0, dx = (0 - leak - clip) / C.
     # Leak is F.softplus(-3) ~ 0.05, so leak_term ~ 0.005, clip ~ 0 for small x.
-    # Therefore dx ~ small but finite. Just check it's NOT identical to the un-gated case.
+    # Therefore dx ~ small but finite. Check it's different from the edge-gates-open case.
     with torch.no_grad():
         stage.z_logits.fill_(5.0)
-        stage.u_logits.fill_(5.0)
-    dx_open = stage.rhs(x, ctx=SimContext(), tau=1.0)
+        # u_logits stays -10 — node gates are bypassed so this shouldn't affect rhs.
+    dx_open_edge = stage.rhs(x, ctx=SimContext(), tau=1.0)
 
-    diff = (dx - dx_open).abs().max().item()
-    check("CP-2: gates actually modify the RHS output (closed vs open differ)",
+    diff = (dx - dx_open_edge).abs().max().item()
+    check("CP-2: edge gates modify RHS output (closed vs open differ)",
           diff > 1e-3,
           f"max abs diff = {diff:.4e}")
 
+    # Verify node gates have NO effect in rhs.
+    with torch.no_grad():
+        stage.u_logits.fill_(5.0)
+    dx_u_open = stage.rhs(x, ctx=SimContext(), tau=1.0)
+    diff_u = (dx_open_edge - dx_u_open).abs().max().item()
+    check("CP-2 (deprecate-node-gates): node gate changes do NOT affect RHS output",
+          diff_u < 1e-6,
+          f"max abs diff with u_logits = {diff_u:.4e}")
+
 
 def test_complexity_regularizers():
-    print("\nTest 48: per-component complexity regularizers (CP-4)")
+    print("\nTest 48: per-component complexity regularizers (CP-4, deprecate-node-gates)")
     from cell_library import IdealizedCellLibrary
     from topology import ring_graph, StageTopologyBuilder, topology_to_stage
     from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
@@ -1165,7 +1176,6 @@ def test_complexity_regularizers():
     stage, _, _ = topology_to_stage(topo, cell_lib=cell_lib)
 
     z = _stage_edge_gates(stage)
-    u = _stage_node_gates(stage)
     mult = _stage_multiplicities(stage)
 
     # Edge gate: σ(z_logit_init=0) = 0.5 for each edge (grid7-gate0).
@@ -1174,11 +1184,13 @@ def test_complexity_regularizers():
           abs(float(z.sum().item()) - expected_z) < 1e-2,
           f"got {float(z.sum().item()):.4f}, expected {expected_z:.4f}")
 
-    # Node gate: σ(u_logit_init=0) = 0.5 for each node (grid7-gate0).
-    expected_u = stage.num_nodes * 0.5
-    check("CP-4: node_gate = Σu_j at init ≈ num_nodes * 0.5 (u_logit_init=0)",
-          abs(float(u.sum().item()) - expected_u) < 1e-2,
-          f"got {float(u.sum().item()):.4f}, expected {expected_u:.4f}")
+    # DEPRECATED (deprecate-node-gates): _stage_node_gates now returns
+    # all-ones (node gates are bypassed). The raw sigmoid of u_logits
+    # is no longer the correct node gate proxy.
+    u = _stage_node_gates(stage)
+    check("CP-4: node_gate is deprecated — returns all-ones",
+          abs(float(u.sum().item()) - stage.num_nodes) < 1e-6,
+          f"got {float(u.sum().item()):.4f}, expected {stage.num_nodes}")
 
     # Force all edge gates to zero; verify power and edge_gate go to zero.
     with torch.no_grad():
@@ -1188,12 +1200,15 @@ def test_complexity_regularizers():
           float(z_closed.sum().item()) < 1e-3,
           f"got {float(z_closed.sum().item()):.4e}")
 
-    # Force all node gates to zero.
+    # DEPRECATED: node gate raw sigmoid still responds to u_logits changes,
+    # but the regularizer uses the deprecated all-ones return. Verify the
+    # deprecated API still works (returns all-ones).
     with torch.no_grad():
         stage.u_logits.fill_(-10.0)
     u_closed = _stage_node_gates(stage)
-    check("CP-4: when all u_logits -> -∞, node_gate -> 0",
-          float(u_closed.sum().item()) < 1e-3,
+    check("CP-4 (deprecate-node-gates): _stage_node_gates returns all-ones "
+          "regardless of u_logits values",
+          abs(float(u_closed.sum().item()) - stage.num_nodes) < 1e-6,
           f"got {float(u_closed.sum().item()):.4e}")
 
 
@@ -1213,17 +1228,24 @@ def test_prune_stage():
     pre_edges = stage.num_edges()
     pre_nodes = stage.num_nodes
 
-    # Force some gates to be closed.
+    # Force some edges to be closed (DEPRECATED: node gates have no effect).
     with torch.no_grad():
         stage.z_logits.data[0] = -10.0  # edge 0 is below threshold
         stage.z_logits.data[2] = -10.0  # edge 2 is below threshold
-        stage.u_logits.data[3] = -10.0  # node 3 is below threshold
 
     pruned, _remap = prune_stage(stage, edge_threshold=0.01, node_threshold=0.01)
 
-    check("CP-5: pruned stage has fewer edges", pruned.num_edges() < pre_edges,
+    check("CP-5: pruned stage has fewer edges (2 edges removed)",
+          pruned.num_edges() < pre_edges,
           f"pre={pre_edges}, post={pruned.num_edges()}")
-    check("CP-5: pruned stage has fewer nodes", pruned.num_nodes < pre_nodes,
+    # Node count depends on connectivity: node 3 may survive if its incident
+    # edges (which are not explicitly killed) keep it connected. We only check
+    # that nodes are removed IF they become disconnected. Since the 4-node
+    # ring 0-1-2-3-0 is connected, and only edges 0 and 2 are pruned, the
+    # surviving edges 1 and 3 keep all nodes connected via paths.
+    # Node-gate pruning is bypassed, so expect all 4 nodes to survive.
+    check("CP-5: pruned stage keeps all nodes (node gates bypassed, all connected)",
+          pruned.num_nodes == pre_nodes,
           f"pre={pre_nodes}, post={pruned.num_nodes}")
     check("CP-5: pruned stage gates preserve init z_logit value (z=0 → σ=0.5, grid7-gate0)",
           pruned.z_logits is not None and abs(float(pruned.edge_gates().mean()) - 0.5) < 0.05,
@@ -1335,7 +1357,7 @@ def test_prune_network():
 
     with torch.no_grad():
         stage.z_logits.data[0] = -10.0
-        stage.u_logits.data[3] = -10.0
+        # DEPRECATED: u_logits has no effect on pruning.
 
     core = KirchhoffNet(stages=[stage], transfers=[], stage_times=[0.3], stage_steps=[5])
     pruned_core, _remaps = prune_network(core, edge_threshold=0.01, node_threshold=0.01)
@@ -1678,15 +1700,15 @@ def test_prune_stage_protects_write_target():
 
 
 def test_prune_stage_min_read_nodes_guard():
-    print("\nTest 62b: prune_stage raises when all read nodes are pruned (PIO-3)")
+    print("\nTest 62b: prune_stage raises when all read nodes pruned via edge (PIO-3)")
     import torch
     from cell_library import IdealizedCellLibrary
     from differential_stage import DifferentialStage
     from topology import prune_stage
 
     cell_lib = IdealizedCellLibrary()
-    # Single-stage, no write_idx so the backstop doesn't fire; min_read_nodes
-    # guard catches the "all reads gated dead" case.
+    # Since node gates are bypassed, trigger the min_read_nodes guard by
+    # Z-pruning the edges that lead to read nodes.
     stage = DifferentialStage(
         num_nodes=3,
         src=[0, 1],
@@ -1694,18 +1716,19 @@ def test_prune_stage_min_read_nodes_guard():
         cell_lib=cell_lib,
     )
     with torch.no_grad():
+        # Make edges leading to reads Z-dominant (eff_score -> 0)
+        stage.logits.data[:, 3] = 5.0   # P(Z) ≈ 1 for all edges
+        stage.logits.data[:, 0] = -5.0
         stage.z_logits.fill_(5.0)
-        stage.u_logits.data[0] = 5.0
-        stage.u_logits.data[1] = -10.0   # read node 1 gated dead
-        stage.u_logits.data[2] = -10.0   # read node 2 gated dead
 
     try:
-        prune_stage(stage, edge_threshold=0.01, node_threshold=0.01,
+        prune_stage(stage, edge_threshold=0.1, node_threshold=0.05,
                     read_idx=[1, 2], min_read_nodes=1)
-        check("PIO-3: prune with all reads dead raises ValueError", False, "did not raise")
+        check("PIO-3: prune with all reads disconnected raises ValueError", False, "did not raise")
     except ValueError as e:
-        check("PIO-3: prune with all reads dead raises ValueError",
-              "min_read_nodes" in str(e) or "read nodes survived" in str(e),
+        check("PIO-3: prune with all reads disconnected raises ValueError",
+              "min_read_nodes" in str(e) or "read nodes survived" in str(e)
+              or "pruning removed all edges" in str(e),
               f"got: {e}")
 
 
@@ -1812,8 +1835,8 @@ def test_prune_network_multi_stage_protects_write():
 
 
 def test_prune_stage_edge_only_keeps_low_u_node_with_incident_edge():
-    print("\nTest 62f: prune_stage with prune_nodes_by_gate=False keeps "
-          "low-u node that has a surviving incident edge (EOP-1)")
+    print("\nTest 62f: prune_stage with node gates bypassed keeps "
+          "low-u node that has a surviving incident edge (EOP-1, deprecate-node-gates)")
     import torch
     from cell_library import IdealizedCellLibrary
     from differential_stage import DifferentialStage
@@ -1821,11 +1844,10 @@ def test_prune_stage_edge_only_keeps_low_u_node_with_incident_edge():
 
     cell_lib = IdealizedCellLibrary()
     # Stage: nodes 0, 1, 2, 3. Edges 0->1, 1->2, 2->3.
-    # Nodes 1 and 2 have very low u (legacy would prune them, taking
-    # incident edges with them). Edges 0->1 and 1->2 have high eff_score.
-    # Edge 2->3 is Z-dominant (low eff_score) so it prunes either way.
-    # No read_idx/write_idx passed — skips the connectivity backstop so
-    # edge-only mode completes.
+    # Nodes 1 and 2 have very low u_logits (no effect — node gates bypassed).
+    # Edges 0->1 and 1->2 have high eff_score. Edge 2->3 is Z-dominant.
+    # Node gates are bypassed so low-u does NOT cause node removal.
+    # No read_idx/write_idx passed.
     stage = DifferentialStage(
         num_nodes=4,
         src=[0, 1, 2],
@@ -1840,46 +1862,26 @@ def test_prune_stage_edge_only_keeps_low_u_node_with_incident_edge():
         stage.logits.data[2, 3] = 5.0     # P(Z) ≈ 1 for edge 2->3 (prune by Z)
         stage.logits.data[2, 0] = -5.0
         stage.z_logits.fill_(5.0)
-        stage.u_logits.data[0] = 5.0
-        stage.u_logits.data[1] = -10.0    # low u
-        stage.u_logits.data[2] = -10.0    # low u
-        stage.u_logits.data[3] = 5.0
+        # u_logits values have no effect on pruning
+        stage.u_logits.data[1] = -10.0
+        stage.u_logits.data[2] = -10.0
 
-    # Legacy mode (gate) may raise "all edges removed" because node-gate
-    # pruning cascades through edges. Catch that — it's the symptom of
-    # collateral damage that the new edge-only mode is meant to fix.
-    gate_raised = False
-    try:
-        pruned_gate, _ = prune_stage(
-            stage, edge_threshold=0.1, node_threshold=0.05,
-            prune_nodes_by_gate=True,
-        )
-        gate_edges = pruned_gate.num_edges()
-    except ValueError:
-        gate_raised = True
-        gate_edges = 0
-
-    pruned_edge, _ = prune_stage(
+    pruned, _ = prune_stage(
         stage, edge_threshold=0.1, node_threshold=0.05,
-        prune_nodes_by_gate=False,
     )
     # Nodes 0,1,2 survive via edges 0->1, 1->2. Node 3 is a dead island
     # (edge 2->3 pruned via Z-dominance, no other incident edge).
-    check("EOP-1: edge-only mode keeps 3 nodes (0,1,2; node 3 dead island)",
-          pruned_edge.num_nodes == 3,
-          f"got {pruned_edge.num_nodes} nodes, expected 3")
-    check("EOP-1: edge-only mode keeps 2 active edges (0->1 and 1->2)",
-          pruned_edge.num_edges() == 2,
-          f"got {pruned_edge.num_edges()} edges, expected 2")
-    check("EOP-1: edge-only mode preserves more capacity than legacy gate mode",
-          pruned_edge.num_edges() > gate_edges,
-          f"gate_edges={gate_edges} (raised={gate_raised}), "
-          f"edge_only_edges={pruned_edge.num_edges()}")
+    check("EOP-1: node gates bypassed — keeps 3 nodes (0,1,2; node 3 dead island)",
+          pruned.num_nodes == 3,
+          f"got {pruned.num_nodes} nodes, expected 3")
+    check("EOP-1: keeps 2 active edges (0->1 and 1->2)",
+          pruned.num_edges() == 2,
+          f"got {pruned.num_edges()} edges, expected 2")
 
 
 def test_prune_stage_edge_only_disconnected_node_removed():
-    print("\nTest 62g: prune_stage with prune_nodes_by_gate=False still removes "
-          "a node that becomes fully disconnected after edge pruning (EOP-2)")
+    print("\nTest 62g: prune_stage removes nodes that become fully "
+          "disconnected after edge pruning (EOP-2, deprecate-node-gates)")
     import torch
     from cell_library import IdealizedCellLibrary
     from differential_stage import DifferentialStage
@@ -1888,8 +1890,7 @@ def test_prune_stage_edge_only_disconnected_node_removed():
     cell_lib = IdealizedCellLibrary()
     # Stage: nodes 0, 1, 2, 3. Edges 0->1 (Z-dominant) and 2->3 (active).
     # After edge pruning: 0->1 dies, 2->3 survives. Nodes 0, 1 become
-    # dead islands (0 has no surviving incident edge; 1 only had 0->1).
-    # Nodes 2, 3 stay alive via the surviving 2->3 edge.
+    # dead islands. Nodes 2, 3 stay alive via the surviving 2->3 edge.
     stage = DifferentialStage(
         num_nodes=4,
         src=[0, 2],
@@ -1902,25 +1903,21 @@ def test_prune_stage_edge_only_disconnected_node_removed():
         stage.logits.data[1, 0] = 5.0     # P(L) ≈ 1 for edge 2->3
         stage.logits.data[1, 3] = -5.0
         stage.z_logits.fill_(5.0)
-        stage.u_logits.fill_(5.0)
 
     pruned, _remap = prune_stage(
         stage, edge_threshold=0.1, node_threshold=0.05,
-        prune_nodes_by_gate=False,
     )
-    # Nodes 0 and 1 are fully disconnected (edge 0->1 was Z-pruned).
-    # Nodes 2 and 3 stay alive via the surviving edge 2->3.
-    check("EOP-2: edge-only mode prunes disconnected nodes (0, 1)",
+    # Nodes 0 and 1 are fully disconnected. Nodes 2 and 3 stay alive.
+    check("EOP-2: prunes disconnected nodes (0, 1); keeps 2,3",
           pruned.num_nodes == 2,
           f"got {pruned.num_nodes} nodes, expected 2")
-    check("EOP-2: edge-only mode keeps the surviving active edge 2->3",
+    check("EOP-2: keeps the surviving active edge 2->3",
           pruned.num_edges() == 1,
           f"got {pruned.num_edges()} edges, expected 1")
 
 
 def test_prune_stage_edge_only_matches_legacy_when_no_node_collateral():
-    print("\nTest 62h: prune_stage edge-only matches legacy when all low-u "
-          "nodes also have no surviving incident edges (EOP-3)")
+    print("\nTest 62h: prune_stage connectivity-only mode (EOP-3, deprecate-node-gates)")
     import torch
     from cell_library import IdealizedCellLibrary
     from differential_stage import DifferentialStage
@@ -1928,10 +1925,10 @@ def test_prune_stage_edge_only_matches_legacy_when_no_node_collateral():
 
     cell_lib = IdealizedCellLibrary()
     # Stage: nodes 0, 1, 2, 3. Edges 0->1, 0->2, 2->3.
-    # Make edges 0->1 and 0->2 Z-dominant (eff_score -> 0) so they prune.
-    # Edge 2->3 stays active. Node 2 has low u (would be legacy-pruned),
-    # but its incident edge 2->3 has high eff_score and survives.
-    # No read_idx/write_idx passed — skips the connectivity backstop.
+    # Edges 0->1 and 0->2 are Z-dominant (pruned). Edge 2->3 stays active.
+    # Node 2 has low u_logits — node gates are bypassed so this has no effect.
+    # Nodes 0, 1 are dead islands; nodes 2, 3 stay alive via edge 2->3.
+    # No read_idx/write_idx passed — dead island purge runs without I/O check.
     stage = DifferentialStage(
         num_nodes=4,
         src=[0, 0, 2],
@@ -1946,41 +1943,23 @@ def test_prune_stage_edge_only_matches_legacy_when_no_node_collateral():
         stage.logits.data[2, 0] = 5.0
         stage.logits.data[2, 3] = -5.0
         stage.z_logits.fill_(5.0)
-        stage.u_logits.fill_(-10.0)  # all low-u (legacy would prune all)
+        # u_logits values have no effect on pruning
+        stage.u_logits.fill_(-10.0)
 
-    # Legacy mode: with all u low, every node gets pruned; the single
-    # active edge 2->3 is then collateral-damaged too. This raises.
-    gate_raised = False
-    try:
-        pruned_gate, _ = prune_stage(
-            stage, edge_threshold=0.1, node_threshold=0.05,
-            prune_nodes_by_gate=True,
-        )
-        gate_result = "completed"
-    except ValueError:
-        gate_raised = True
-        gate_result = "raised"
-
-    pruned_edge, _ = prune_stage(
+    pruned, _ = prune_stage(
         stage, edge_threshold=0.1, node_threshold=0.05,
-        prune_nodes_by_gate=False,
     )
-    # Edge-only: nodes 2, 3 stay alive (2->3 edge has high eff_score).
-    # Nodes 0, 1 are dead islands (all incident edges Z-pruned).
-    check("EOP-3: legacy gate-mode either raises or prunes all (demonstrates collateral)",
-          gate_raised or (pruned_gate.num_edges() == 0),
-          f"legacy result: {gate_result}, "
-          f"gate edges={pruned_gate.num_edges() if not gate_raised else 'N/A'}")
-    check("EOP-3: edge-only mode retains nodes 2, 3 (edge 2->3 active, node 0 also dead island)",
-          pruned_edge.num_nodes == 2,
-          f"got {pruned_edge.num_nodes} nodes, expected 2")
-    check("EOP-3: edge-only mode retains the single active edge",
-          pruned_edge.num_edges() == 1,
-          f"got {pruned_edge.num_edges()} edges, expected 1")
+    # Nodes 2, 3 stay alive (edge 2->3 survives). Nodes 0, 1 are dead islands.
+    check("EOP-3: retains nodes 2, 3 (edge 2->3 active)",
+          pruned.num_nodes == 2,
+          f"got {pruned.num_nodes} nodes, expected 2")
+    check("EOP-3: retains the single active edge",
+          pruned.num_edges() == 1,
+          f"got {pruned.num_edges()} edges, expected 1")
 
 
 def test_prune_network_edge_only_preserves_more_capacity():
-    print("\nTest 62i: prune_stage edge-only vs gate mode (EOP-4)")
+    print("\nTest 62i: prune_stage connectivity-only (EOP-4, deprecate-node-gates)")
     import torch
     from cell_library import IdealizedCellLibrary
     from differential_stage import DifferentialStage
@@ -1988,10 +1967,8 @@ def test_prune_network_edge_only_preserves_more_capacity():
 
     cell_lib = IdealizedCellLibrary()
     # Single stage: 4 nodes, edges 0->1 (hi-z), 0->2 (lo-z), 1->3 (hi-z).
-    # Node 1 has low u_logits (gate mode kills it, severing the 0->1->3 path
-    # and disconnecting read_idx=[3] from write_idx=[0]).
-    # Edge-only mode keeps node 1 alive (high-z incident edge 0->1), so
-    # the I/O path remains intact and read_idx=[3] stays reachable.
+    # Edge 0->2 has low z_logits so it gets pruned. Edges 0->1 and 1->3
+    # survive, keeping write_idx=[0] connected to read_idx=[3].
     stage = DifferentialStage(
         num_nodes=4,
         src=[0, 0, 1],
@@ -2000,60 +1977,39 @@ def test_prune_network_edge_only_preserves_more_capacity():
     )
     with torch.no_grad():
         stage.z_logits.data[0] = 5.0    # hi gate for edge 0->1
-        stage.z_logits.data[1] = -10.0  # lo gate for edge 0->2
+        stage.z_logits.data[1] = -10.0  # lo gate for edge 0->2 (prune)
         stage.z_logits.data[2] = 5.0    # hi gate for edge 1->3
-        stage.u_logits.data[0] = 5.0    # hi u (write target)
-        stage.u_logits.data[1] = -10.0  # low u (gate mode kills this)
-        stage.u_logits.data[2] = 5.0    # hi u
-        stage.u_logits.data[3] = 5.0    # hi u (read target)
         stage.logits.data[:, 0] = 5.0   # P(L) ≈ 1 for all edges
         stage.logits.data[:, 3] = -5.0  # P(Z) ≈ 0
 
-    gate_raised = False
-    try:
-        pruned_gate, _ = prune_stage(
-            stage, edge_threshold=0.1, node_threshold=0.05,
-            write_idx=[0], read_idx=[3],
-            prune_nodes_by_gate=True,
-        )
-        gate_edges = pruned_gate.num_edges()
-        gate_nodes = pruned_gate.num_nodes
-    except ValueError:
-        gate_raised = True
-        gate_edges, gate_nodes = 0, 0
-
-    pruned_edge, _ = prune_stage(
+    pruned, _ = prune_stage(
         stage, edge_threshold=0.1, node_threshold=0.05,
         write_idx=[0], read_idx=[3],
-        prune_nodes_by_gate=False,
     )
-    edge_edges = pruned_edge.num_edges()
-    edge_nodes = pruned_edge.num_nodes
-    check("EOP-4: edge-only mode completes (keeps I/O path intact)",
-          not gate_raised or edge_edges > 0,
-          f"gate_raised={gate_raised}, edge_edges={edge_edges}")
-    check("EOP-4: edge-only mode keeps more edges than gate mode",
-          edge_edges > gate_edges,
-          f"gate={gate_edges}, edge_only={edge_edges}")
-    check("EOP-4: edge-only mode keeps at least as many nodes as gate mode",
-          edge_nodes >= gate_nodes,
-          f"gate={gate_nodes}, edge_only={edge_nodes}")
+    # Nodes 0, 1, 3 stay alive (I/O path via edges 0->1, 1->3).
+    # Node 2 has no surviving incident edge → dead island.
+    check("EOP-4: I/O path intact (0->1->3), node 2 dead island",
+          pruned.num_nodes == 3,
+          f"got {pruned.num_nodes} nodes, expected 3")
+    check("EOP-4: 2 surviving edges (0->1 and 1->3)",
+          pruned.num_edges() == 2,
+          f"got {pruned.num_edges()} edges, expected 2")
 
 
 def test_prune_nodes_by_gate_config_default():
-    print("\nTest 62j: PRUNE['prune_nodes_by_gate'] is True by default (EOP-5)")
+    print("\nTest 62j: PRUNE['prune_nodes_by_gate'] is False everywhere (deprecate-node-gates)")
     from config import PRUNE
-    check("EOP-5: PRUNE['prune_nodes_by_gate'] is True (backward compat)",
-          PRUNE.get("prune_nodes_by_gate", True) is True,
+    check("deprecate-node-gates: PRUNE['prune_nodes_by_gate'] is False",
+          PRUNE.get("prune_nodes_by_gate", True) is False,
           f"got {PRUNE.get('prune_nodes_by_gate', True)}")
     from config import SCHEDULE_THREE_PHASE
-    # four-phase-redesign/Phase 1a: SCHEDULE_THREE_PHASE default flipped
-    # to False to disable node-gate pruning (nodes only die via the
-    # connectivity backstop). The legacy PRUNE['prune_nodes_by_gate']
-    # still defaults to True for backward compat with non-schedule users.
-    check("EOP-5: SCHEDULE_THREE_PHASE['prune_nodes_by_gate'] is False (four-phase-redesign 1a)",
+    check("deprecate-node-gates: SCHEDULE_THREE_PHASE['prune_nodes_by_gate'] is False",
           SCHEDULE_THREE_PHASE.get("prune_nodes_by_gate", True) is False,
           f"got {SCHEDULE_THREE_PHASE.get('prune_nodes_by_gate', True)}")
+    from config import SCHEDULE_FOUR_PHASE
+    check("deprecate-node-gates: SCHEDULE_FOUR_PHASE['prune_nodes_by_gate'] is False",
+          SCHEDULE_FOUR_PHASE.get("prune_nodes_by_gate", True) is False,
+          f"got {SCHEDULE_FOUR_PHASE.get('prune_nodes_by_gate', True)}")
 
 
 def test_reg_defaults_topology_fix():
@@ -2524,6 +2480,8 @@ def main():
     test_seed_everything_seeds_numpy()           # SEED-2: NumPy RNG
     test_seed_everything_seeds_python_random()   # SEED-3: Python random
 
+    test_deprecate_node_gates_warnings()         # DNG-1: deprecation warnings
+
     print()
     print("=" * 60)
     print(f"Smoke test results: {passed} passed, {failed} failed")
@@ -2660,12 +2618,12 @@ def test_smooth2d_grid_preset():
           s.get("proj_pattern") == "all_to_all")
     check("smooth2d_grid: legacy preset lambdas edge_gate=5e-6",
           cfg.get("lambdas", {}).get("edge_gate") == 5e-6)
-    check("smooth2d_grid: legacy preset lambdas node_gate=1e-5",
-          cfg.get("lambdas", {}).get("node_gate") == 1e-5)
+    check("smooth2d_grid: legacy preset lambdas node_gate=0.0 (deprecate-node-gates)",
+          cfg.get("lambdas", {}).get("node_gate") == 0.0)
     check("smooth2d_grid: legacy preset lambdas power=1e-5",
           cfg.get("lambdas", {}).get("power") == 1e-5)
-    check("smooth2d_grid: legacy preset lambdas capacitance=1e-6",
-          cfg.get("lambdas", {}).get("capacitance") == 1e-6)
+    check("smooth2d_grid: legacy preset lambdas capacitance=0.0 (deprecate-node-gates)",
+          cfg.get("lambdas", {}).get("capacitance") == 0.0)
 
     cell_lib = make_default_library()
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
@@ -2814,12 +2772,12 @@ def test_housing_grid_preset():
           and cfg["read_idx"][5:] == [25, 26, 27])
     check("housing_grid: preset lambdas edge_gate=5e-6",
           cfg.get("lambdas", {}).get("edge_gate") == 5e-6)
-    check("housing_grid: preset lambdas node_gate=1e-5",
-          cfg.get("lambdas", {}).get("node_gate") == 1e-5)
+    check("housing_grid: preset lambdas node_gate=0.0 (deprecate-node-gates)",
+          cfg.get("lambdas", {}).get("node_gate") == 0.0)
     check("housing_grid: preset lambdas power=1e-5",
           cfg.get("lambdas", {}).get("power") == 1e-5)
-    check("housing_grid: preset lambdas capacitance=1e-6",
-          cfg.get("lambdas", {}).get("capacitance") == 1e-6)
+    check("housing_grid: preset lambdas capacitance=0.0 (deprecate-node-gates)",
+          cfg.get("lambdas", {}).get("capacitance") == 0.0)
     check("housing_grid: preset lambdas rail=0.1",
           cfg.get("lambdas", {}).get("rail") == 0.1)
 
@@ -3328,9 +3286,14 @@ def test_grad_log_file_output():
         # but all other groups should have real gradients.
         header = lines[0].split("\t")[1:]
         vals = lines[1].split("\t")[1:]
-        expected_numeric = [k for k in header if k != "stage_transfer"]
+        skip_keys = {"stage_transfer"}
+        # u_logits keys have no gradient (deprecated, bypassed in rhs)
+        skip_keys.update(k for k in header if k.endswith("_u_logits"))
         for k, v in zip(header, vals):
-            if k == "stage_transfer":
+            if k in skip_keys:
+                if k.endswith("_u_logits"):
+                    check(f"GG-3: {k} is dash (no gradient, deprecated)",
+                          v == "-", f"got {v}")
                 continue
             check(f"GG-3: {k} has numeric value (not dash)",
                   v != "-", f"got dash for {k}")
@@ -5506,7 +5469,9 @@ def test_simple_edge_build_forward():
         loss.backward()
         check(f"SE-1 ({mode}): grad on param", stage.cell_lib.param.grad is not None)
         check(f"SE-1 ({mode}): grad on z_logits", stage.z_logits.grad is not None)
-        check(f"SE-1 ({mode}): grad on u_logits", stage.u_logits.grad is not None)
+        check(f"SE-1 ({mode}) deprecate-node-gates: u_logits has no grad (bypassed in rhs)",
+              stage.u_logits.grad is None,
+              f"got grad={stage.u_logits.grad}")
         check(f"SE-1 ({mode}): grad on raw_leak", stage.raw_leak.grad is not None)
 
 
@@ -5568,7 +5533,7 @@ def test_simple_edge_regularizers():
     check("SE-3: soft_weights all 1.0", float(w.mean().item()) == 1.0, f"got {float(w.mean().item())}")
     check("SE-3: multiplicities all 1.0", float(mult.mean().item()) == 1.0, f"got {float(mult.mean().item())}")
     check("SE-3: edge_gates mean in (0,1)", 0 < float(z.mean().item()) < 1)
-    check("SE-3: node_gates mean in (0,1)", 0 < float(u_gates.mean().item()) < 1)
+    check("SE-3: node_gates mean = 1.0 (deprecated, returns all-ones)", float(u_gates.mean().item()) == 1.0)
     check("SE-3: sparsity w[:,:0] = 0", float(w[:, :z_idx].sum().item()) == 0.0)
     check("SE-3: rail finite", math.isfinite(float(_stage_rail_loss(stage, traj).item())))
 
@@ -5601,6 +5566,45 @@ def test_simple_edge_diagnostics():
 # ============================================================================
 # Fixed seed tests (fixed-seed plan)
 # ============================================================================
+
+def test_deprecate_node_gates_warnings():
+    print("\nTest DNG-1: deprecate-node-gates warnings")
+    import warnings
+    from cell_library import IdealizedCellLibrary
+    from differential_stage import DifferentialStage
+    from topology import prune_stage
+    from train import _stage_node_gates
+
+    cell_lib = IdealizedCellLibrary()
+    stage = DifferentialStage(num_nodes=2, src=[0], dst=[1], cell_lib=cell_lib)
+
+    # 1) prune_stage with prune_nodes_by_gate=True emits DeprecationWarning
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        prune_stage(stage, edge_threshold=0.0, prune_nodes_by_gate=True)
+        dw = [x for x in w if issubclass(x.category, DeprecationWarning)]
+        check("DNG-1: prune_stage(True) emits DeprecationWarning",
+              any("deprecated" in str(x.message).lower() for x in dw),
+              f"got {[str(x.message) for x in dw]}")
+
+    # 2) _stage_node_gates emits DeprecationWarning
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        _stage_node_gates(stage)
+        dw = [x for x in w if issubclass(x.category, DeprecationWarning)]
+        check("DNG-1: _stage_node_gates emits DeprecationWarning",
+              any("deprecated" in str(x.message).lower() for x in dw),
+              f"got {[str(x.message) for x in dw]}")
+
+    # 3) active_node_mask emits DeprecationWarning
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        _ = stage.active_node_mask()
+        dw = [x for x in w if issubclass(x.category, DeprecationWarning)]
+        check("DNG-1: active_node_mask emits DeprecationWarning",
+              any("deprecated" in str(x.message).lower() for x in dw),
+              f"got {[str(x.message) for x in dw]}")
+
 
 def test_seed_everything_deterministic():
     """seed_everything() makes model init deterministic across calls."""

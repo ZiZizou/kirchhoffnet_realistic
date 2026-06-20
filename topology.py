@@ -577,7 +577,7 @@ def prune_stage(
     read_idx: list[int] | None = None,
     protected_nodes: set[int] | None = None,
     min_read_nodes: int = 1,
-    prune_nodes_by_gate: bool = True,
+    prune_nodes_by_gate: bool = False,
 ) -> tuple["DifferentialStage", dict[int, int]]:
     """Rebuild a DifferentialStage with edges and nodes removed.
 
@@ -586,16 +586,13 @@ def prune_stage(
     probability (gm_Z ≈ 0 ⇒ no current) and the edge gate (σ(z_logits) ≈ 0)
     into a single effective-activity score.
 
-    Node pruning behavior depends on ``prune_nodes_by_gate``:
-      - ``True`` (default, backward-compat): nodes with
-        ``σ(u_logits) ≤ node_threshold`` are independently removed. This
-        causes collateral edge removal: an edge with high eff_score is
-        still pruned if either endpoint has a low node gate.
-      - ``False``: no independent node pruning. All nodes start alive;
+    Node pruning behavior (DEPRECATED: ``prune_nodes_by_gate`` is always
+    treated as ``False``; node pruning is connectivity-only):
+      - ``True``: emits a ``DeprecationWarning`` and is treated as
+        ``False`` — no independent node pruning. All nodes start alive;
         they are only removed by the connectivity backstop (dead island
         purge) if they become fully disconnected from I/O after edge
-        pruning. This preserves the maximum number of edges and nodes
-        consistent with the I/O connectivity constraint.
+        pruning.
 
     ``protected_nodes`` are forced to survive pruning regardless of their
     gate value. This is the input-side guard: write targets (the hidden
@@ -654,14 +651,20 @@ def prune_stage(
         eff_score = z  # no Z cell: gate alone determines activity
 
     keep_edge = eff_score > edge_threshold
+    # DEPRECATED (deprecate-node-gates): prune_nodes_by_gate is ignored.
+    # When True is passed, emit a deprecation warning and fall through to
+    # the connectivity-only behavior (all nodes start alive; the backstop
+    # removes fully disconnected nodes).
     if prune_nodes_by_gate:
-        u = stage.node_gates().detach().cpu()
-        keep_node = u > node_threshold
-    else:
-        # Edge-only pruning: all nodes start alive. The connectivity
-        # backstop will only remove nodes that become fully disconnected
-        # (no surviving incident edges).
-        keep_node = torch.ones(stage.num_nodes, dtype=torch.bool)
+        import warnings as _w
+        _w.warn(
+            "prune_nodes_by_gate=True is deprecated (deprecate-node-gates); "
+            "treated as False. Node pruning is connectivity-only.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        prune_nodes_by_gate = False
+    keep_node = torch.ones(stage.num_nodes, dtype=torch.bool)
 
     src_old = stage.src.detach().cpu()
     dst_old = stage.dst.detach().cpu()
@@ -688,8 +691,7 @@ def prune_stage(
         if unreachable_reads:
             hint = (
                 f"lower edge_threshold={edge_threshold}"
-                + (f" or node_threshold={node_threshold}" if prune_nodes_by_gate
-                   else " (node-gate pruning already disabled)")
+                " (node-gate pruning is deprecated and disabled)"
             )
             raise ValueError(
                 f"prune_stage: read_idx {unreachable_reads} are unreachable from "
@@ -753,7 +755,7 @@ def prune_stage(
     if int(edge_mask.sum().item()) == 0:
         hint = (
             f"lower edge_threshold={edge_threshold}"
-            + (f" or node_threshold={node_threshold}" if prune_nodes_by_gate else "")
+            " (node-gate pruning is deprecated and disabled)"
         )
         raise ValueError(
             f"prune_stage: pruning removed all edges; consider {hint}"
@@ -830,7 +832,7 @@ def prune_network(
     write_idx: list[int] | None = None,
     read_idx: list[int] | None = None,
     min_read_nodes: int = 1,
-    prune_nodes_by_gate: bool = True,
+    prune_nodes_by_gate: bool = False,
 ) -> tuple["KirchhoffNet", list[dict[int, int]]]:
     """Apply prune_stage to every stage of a KirchhoffNet core.
 
@@ -847,8 +849,9 @@ def prune_network(
     Read nodes are NOT protected; elastic readout pruning is allowed, but
     the prune fails if fewer than ``min_read_nodes`` read nodes survive.
 
-    ``prune_nodes_by_gate`` is forwarded to each stage's ``prune_stage``;
-    see that function for the semantics.
+    ``prune_nodes_by_gate`` DEPRECATED (deprecate-node-gates): forwarded
+    to each stage's ``prune_stage`` but has no effect; node pruning is
+    always connectivity-only.
 
     Returns:
         A tuple ``(new_core, stage_remaps)`` where:

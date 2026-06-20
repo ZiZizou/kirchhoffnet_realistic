@@ -164,8 +164,9 @@ CLI flags (SR5): `--write-mode {one_to_one,dense}`, `--read-mode {sparse,dense}`
 
 ### 2.6 Staged regularizer warm-up (RR-A)
 
-By default, the five auxiliary regularizers (sparsity, edge_gate, node_gate,
-power, capacitance) are **ramped in** over the first 150 epochs so the
+By default, the four auxiliary regularizers (sparsity, edge_gate,
+power, rail) are **ramped in** over the first 150 epochs (node_gate and capacitance
+regularizers are deprecated — see §8).
 network can learn the task first without penalty fighting:
 - **Epochs 0–99 (`W=100`)**: all five are multiplied by 0.0 (free phase).
 - **Epochs 100–149 (`W+A=150`)**: linear anneal from 0.0 → 1.0.
@@ -191,9 +192,9 @@ motivated terms** for finer-grained control over the pruning process:
 | Regularizer | What it penalizes | Default weight |
 |-------------|-------------------|----------------|
 | `edge_gate` | `Σ σ(z_e)` — open edge count | 5e-4 |
-| `node_gate` | `Σ σ(u_j)` — open node count | 1e-4 |
-| `power` | `Σ_e σ(z_e) · m_e · Σ_q p(L\|e,q) · gm_q` — static power proxy | 1e-4 |
-| `capacitance` | `Σ_j σ(u_j)` — node capacitance area proxy | 1e-5 |
+| `node_gate` | `Σ σ(u_j)` — open node count **(deprecated, always 0.0)** | 0.0 |
+| `power` | `Σ_e σ(z_e) · m_e · Σ_q p(L|e,q) · gm_q` — static power proxy | 1e-4 |
+| `capacitance` | `Σ_j σ(u_j)` — node capacitance area proxy **(deprecated, always 0.0)** | 0.0 |
 
 The edge gate regularizer encourages inactive edges to close, the node
 gate regularizer encourages inactive nodes to close, the power term uses
@@ -205,9 +206,9 @@ In addition, **learnable gate parameters** are added to every
 - `z_logits [E]` — edge open-logit (init 0.0 → `σ(0) ≈ 0.50`).
   Each `i_edge` is multiplied by `σ(z_logits[e])` in `rhs()`,
   so a closed edge contributes zero current.
-- `u_logits [N]` — node open-logit (init 0.0 → `σ(0) ≈ 0.50`).
-  The state `x` is multiplied elementwise by `σ(u_logits)` before
-  voltage differences are computed, so a closed node is pinned to ~0.
+- `u_logits [N]` — node open-logit **(deprecated, bypassed in `rhs()`)**.
+  No longer applied in forward pass — node mask is always 1.0.
+  Parameter kept for checkpoint compatibility only.
 
 The gate init was lowered to 0.0 (four-phase-redesign) to place gates
 at the **maximum-gradient** point of the sigmoid (`dσ/dz = 0.25` at
@@ -220,14 +221,15 @@ and gates can actually respond to structural pressure.
 
 Helper methods on `DifferentialStage`:
 - `edge_gates()` — returns `σ(z_logits)`
-- `node_gates()` — returns `σ(u_logits)`
+- `node_gates()` — returns `σ(u_logits)` **(deprecated, always all-ones)**
 - `active_edge_mask(threshold=0.01)` — edge gates above threshold
-- `active_node_mask(threshold=0.01)` — node gates above threshold
+- `active_node_mask(threshold=0.01)` — node gates above threshold **(deprecated, always all-True)**
 - `parameter_breakdown()` — returns dict with gate values
 
-The gate regularizers (edge_gate, node_gate, power, capacitance) go
+The gate regularizers (edge_gate, power) go
 through the same staged warm-up as sparsity (RR-A, free phase
-for first 50 epochs).
+for first 50 epochs). node_gate and capacitance are deprecated
+(hard-coded to 0.0).
 
 Old single `complexity` key is removed from `LAMBDAS`. Backward
 compatibility with checkpoints is handled via `dict.get()` fallback
@@ -260,10 +262,12 @@ survive pruning regardless of gate value. Read nodes are NOT protected
 (elastic readout is allowed, meaning pruned read nodes are dropped from
 the read_idx list and the OutputMapper is rebuilt with fewer features).
 
-**Edge-only mode.** When `prune_nodes_by_gate=False`, node gates are
-ignored for independent pruning. Nodes are only removed via the
-connectivity backstop (dead island purge). This preserves the maximum
-number of edges consistent with I/O connectivity.
+**Edge-only mode (default).** Node gates are deprecated and bypassed in
+`rhs()`. Pruning is exclusively connectivity-based — `prune_nodes_by_gate`
+defaults to `False` (setting it to `True` emits a `DeprecationWarning` and
+is treated as `False`). Nodes are only removed via the connectivity
+backstop (dead island purge). This preserves the maximum number of edges
+consistent with I/O connectivity.
 
 **I/O mapper transfer.** After pruning, the InputMapper and OutputMapper
 are rebuilt with weights transferred from the pre-prune network.
@@ -295,7 +299,7 @@ structural regularizer magnitudes:
 | Phase | Epochs | Tau | Regularizers | Action |
 |-------|--------|-----|-------------|--------|
 | **A** (fit) | 0–30% | Fixed 1.0 | All zero — free fit | Network learns task without structure pressure |
-| **B** (compress) | 30–70% | 1.0→0.6 anneal | Gate penalties ramped in | Gate logits pushed toward 0 (closed) or stay open; node_gate disabled |
+| **B** (compress) | 30–70% | 1.0→0.6 anneal | Gate penalties ramped in | Gate logits pushed toward 0 (closed) or stay open; node_gate deprecated (0.0) |
 | **C** (retrain) | 70–100% | 0.6→0.1 anneal | Only sparsity (1e-5) + rail | Auto-prune at B→C boundary, retrain compact network |
 
 **Phase A (fit, epochs 0–30%).** All structural regularizers are zeroed.
@@ -306,11 +310,10 @@ freely. Rail is always active as a safety net.
 (gentle specialization — capping at 0.6 instead of 0.1 prevents Z-death
 from prematurely locking edges to the zero cell). Structural
 regularizers are ramped from 0 to full over the first 50% of Phase B:
-sparsity=5e-5, edge_gate=1e-5, power=1e-5, capacitance=1e-6.
-**node_gate is 0.0** during Phase B — the node gate regularizer was
-found to be too destructive when combined with edge_gate, causing
-collateral node death that disconnected the I/O path. Nodes only die
-via the connectivity backstop (dead island purge) at prune time.
+sparsity=5e-5, edge_gate=1e-5, power=1e-5.
+**node_gate is 0.0** (deprecated — node gates are bypassed in `rhs()`,
+so their regularizer would be meaningless). capacitance is also 0.0
+(deprecated — with u_j always 1.0, it was a stage-constant penalty).
 
 **Phase C (retrain, epochs 70–100%).** At the B→C boundary, automatic
 pruning removes edges/nodes below the schedule's thresholds
@@ -645,8 +648,8 @@ four_phase:
 - `PHYS` — physical constants (x_max=3.0, C_eff=1.0, beta_softness=0.02, clip_current=0.05, clip_softness=0.02)
 - `OPTIM` — training hyperparameters (lr auto-computed as `3e-4 * batch_size/1024` = 3e-4 at 1024, wd=1e-4, epochs=800, batch_size=1024, reg_warmup_epochs=100, reg_anneal_epochs=50, scheduler_T_0=50, CosineAnnealingLR with T_max based on phase boundaries)
 - `TAU` — temperature annealing schedule (init=1.0, final=0.1, min=0.15, hardening_epoch_frac=0.1, final_pretrain=0.8 for two-phase pre-prune)
-- `LAMBDAS` — regularizer weights (sparsity=1e-3, rail=1.0, edge_gate=5e-4, node_gate=1e-4, power=1e-4, capacitance=1e-5, entropy=0.0)
-- `PRUNE` — pruning thresholds (edge_threshold=0.1, node_threshold=0.05, prune_nodes_by_gate=True; overridden by SCHEDULE_THREE_PHASE in phased mode)
+- `LAMBDAS` — regularizer weights (sparsity=1e-3, rail=1.0, edge_gate=5e-4, node_gate=0.0, power=1e-4, capacitance=0.0, entropy=0.0; node_gate and capacitance deprecated at 0.0)
+- `PRUNE` — pruning thresholds (edge_threshold=0.1, node_threshold=0.05, prune_nodes_by_gate=False; overridden by SCHEDULE_THREE_PHASE in phased mode)
 - `SCHEDULE_THREE_PHASE` — three-phase schedule config (frac_a=0.30, frac_b=0.40, frac_c=0.30; tau targets per phase; Phase B/C lambdas; warmup_frac_b; edge-only pruning)
 - `SCHEDULE_FOUR_PHASE` — four-phase schedule config (frac_a=0.25, frac_b1=0.20, frac_b2=0.25, frac_c=0.30; readiness-gated prune, teacher distillation, STE cell mode)
 - `SOLVER` — integration defaults (method=heun, t_span=10, num_steps=100)
@@ -759,9 +762,9 @@ C_eff · dxⱼ/dt = Σ_{e: dst(e)=j} I_e − Σ_{e: src(e)=j} I_e − leakⱼ ·
 | Sparsity | `Σ w[:, :Z_index]` (active non-Z cells) | 1e-3 |
 | Rail (ReLU²) | `mean(ReLU²(|x| - x_max))` over trajectory | 1.0 |
 | Edge gate | `Σ σ(z_e)` — open edge count | 5e-4 |
-| Node gate | `Σ σ(u_j)` — open node count | 1e-4 |
+| Node gate | `Σ σ(u_j)` — open node count **(deprecated, always 0.0)** | 0.0 |
 | Power | `Σ_e σ(z_e) · m_e · Σ_q p(L\|e,q) · gm_q` — static power proxy | 1e-4 |
-| Capacitance | `C_eff · Σ_j σ(u_j)` — node capacitance area proxy | 1e-5 |
+| Capacitance | `C_eff · Σ_j σ(u_j)` — node capacitance area proxy **(deprecated, always 0.0)** | 0.0 |
 | Entropy bonus | `−Σ w·log(w)` of logits/tau (off by default) | 0.0·tau |
 
 ### `train_script.py`

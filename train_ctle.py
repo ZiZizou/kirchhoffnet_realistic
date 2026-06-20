@@ -289,9 +289,9 @@ def make_ctle_preset(
         "lambdas": {
             "sparsity": 1e-5,
             "edge_gate": 5e-6,
-            "node_gate": 0.0,
+            "node_gate": 0.0,        # DEPRECATED (deprecate-node-gates)
             "power": 1e-5,
-            "capacitance": 1e-6,
+            "capacitance": 0.0,      # DEPRECATED (deprecate-node-gates)
             "rail": 0.1,
         },
         "tau_anneal": True,
@@ -1837,7 +1837,8 @@ def main() -> None:
     if args.prune:
         edge_thresh = float(SCHEDULE_FOUR_PHASE.get("prune_edge_threshold", 0.05))
         node_thresh = float(SCHEDULE_FOUR_PHASE.get("prune_node_threshold", 0.05))
-        prune_nodes_by_gate = bool(SCHEDULE_FOUR_PHASE.get("prune_nodes_by_gate", False))
+        # DEPRECATED (deprecate-node-gates): prune_nodes_by_gate is always False.
+        prune_nodes_by_gate = False
         pre_edges = sum(s.num_edges() for s in raw_net.core.stages)
         pre_nodes = sum(s.num_nodes for s in raw_net.core.stages)
         print(f"[prune] pre-prune: {pre_edges} edges, {pre_nodes} nodes "

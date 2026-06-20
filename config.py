@@ -275,7 +275,7 @@ _CELL_TYPE_CODE = {
 
 # Normalized physical limits (R7: not calibrated to real SI units).
 PHYS = {
-    "x_max": 1.0,
+    "x_max": 3.0,
     "C_eff": 1.0,
     "beta_softness": 0.02,
     "clip_current": 0.05,
@@ -323,18 +323,21 @@ TAU = {
 # (CP: complexity-regularized pruning decomposition. Replaces the single
 # merged "complexity" proxy with four per-component terms:
 #   edge_gate     : λ_E · Σ_e σ(z_logits)             (active edge count)
-#   node_gate     : λ_N · Σ_j σ(u_logits)             (active hidden node count)
+#   node_gate     : λ_N · Σ_j σ(u_logits)             (DEPRECATED: always 0)
 #   power         : λ_P · Σ_e z_e · m_e · Σ_q w_q·gm_q (static power proxy)
-#   capacitance   : λ_C · C_eff · Σ_j u_j             (capacitance area proxy)
+#   capacitance   : λ_C · C_eff · Σ_j u_j             (DEPRECATED: always 0)
 # RR-D: per-preset overrides live on each PRESET entry as a "lambdas" dict
-# and are merged over this global LAMBDAS by train_script.)
+# and are merged over this global LAMBDAS by train_script.
+# deprecate-node-gates: node_gate and capacitance lambdas are hardcoded to
+# 0.0 in every config — nodes are pruned by connectivity only, and the
+# C_eff·Σu proxy would be a constant per stage if node_mask were 1.0.
 LAMBDAS = {
     "sparsity": 1e-3,
     "rail": 0.0,
     "edge_gate": 5e-4,
-    "node_gate": 1e-4,
+    "node_gate": 0.0,       # DEPRECATED (deprecate-node-gates)
     "power": 1e-4,
-    "capacitance": 1e-5,
+    "capacitance": 0.0,     # DEPRECATED (deprecate-node-gates)
     "entropy": 0.0,
 }
 
@@ -342,14 +345,15 @@ LAMBDAS = {
 # (three-phase-schedule: updated to higher defaults — 0.01 was too forgiving
 # for the new gate-trained regime. 0.1 for edges, 0.05 for nodes gives a
 # usable Pareto frontier when gates have been pushed by Phase B regularizers.)
+# deprecate-node-gates: prune_nodes_by_gate is now hardcoded to False in
+# every config (PRUNE, SCHEDULE_*, presets). The flag is preserved on the
+# function signature of prune_stage / prune_network for backward compat
+# but has no effect; CLI flags --prune-nodes-by-gate / --no-prune-nodes-by-gate
+# are kept as deprecated no-ops.
 PRUNE = {
     "edge_threshold": 0.1,
     "node_threshold": 0.05,
-    # When True (legacy), nodes with σ(u_logits) <= node_threshold are pruned
-    # independently, which causes collateral edge removal. When False, no
-    # independent node pruning — nodes are only removed by the connectivity
-    # backstop (dead island purge). See spec/edge-only-prune.md.
-    "prune_nodes_by_gate": True,
+    "prune_nodes_by_gate": False,  # DEPRECATED (deprecate-node-gates): always False
 }
 
 # Three-phase training schedule (three-phase-schedule plan, refined by four-phase-redesign).
@@ -378,32 +382,32 @@ SCHEDULE_THREE_PHASE = {
     # Lambda warmup within Phase B: ramp from 0 to full over this fraction.
     "warmup_frac_b": 1.0 / 2.0,
     # Phase B target lambdas (Strategy 2: gate pruning first, tiny Z pressure).
-    # four-phase-redesign/1a: node_gate=0 (removed; node gate is too destructive
-    # when combined with edge_gate and active pruning in the same window).
+    # deprecate-node-gates: node_gate=0, capacitance=0 (both regularizers
+    # are no-ops; node pruning is connectivity-only).
     "lambdas_b": {
         "sparsity": 5e-5,
         "edge_gate": 1e-5,
-        "node_gate": 0.0,
+        "node_gate": 0.0,        # DEPRECATED (deprecate-node-gates)
         "power": 1e-5,
-        "capacitance": 1e-6,
+        "capacitance": 0.0,      # DEPRECATED (deprecate-node-gates)
     },
     # Phase C retrain lambdas: gate penalties off (irrelevant post-prune),
     # tiny sparsity for crisp cell family, rail unchanged.
     "lambdas_c": {
         "sparsity": 1e-5,
         "edge_gate": 0.0,
-        "node_gate": 0.0,
+        "node_gate": 0.0,        # DEPRECATED (deprecate-node-gates)
         "power": 0.0,
-        "capacitance": 0.0,
+        "capacitance": 0.0,      # DEPRECATED (deprecate-node-gates)
     },
     # Prune thresholds used at the Phase B->C boundary.
     # four-phase-redesign/1a: edge 0.1 -> 0.05 (gentler cut, retains more
     # edges so the retrain has material to work with).
     "prune_edge_threshold": 0.05,
     "prune_node_threshold": 0.05,
-    # four-phase-redesign/1a: True -> False (nodes only die via connectivity
-    # backstop; prevents the legacy "zap all low-u nodes" pathology).
-    "prune_nodes_by_gate": False,
+    # deprecate-node-gates: always False (node gates are bypassed; nodes
+    # only die via the connectivity backstop).
+    "prune_nodes_by_gate": False,  # DEPRECATED (deprecate-node-gates)
 }
 
 # Four-phase training schedule (four-phase-redesign/Phase 3a).
@@ -424,11 +428,12 @@ SCHEDULE_FOUR_PHASE = {
     "tau_b2_final": 0.4,       # Tau at end of B2 (readiness check here)
     "tau_c_init": 0.4,         # Tau at start of retrain
     "tau_c_final": 0.1,        # Tau at end of retrain
-    # Phase B1 lambdas: cell commitment only, NO edge/node gate.
+    # Phase B1 lambdas: cell commitment only, NO edge gate.
+    # deprecate-node-gates: node_gate/capacitance default to 0.0 via .get.
     "lambdas_b1": {
         "sparsity": 5e-5,
     },
-    # Phase B2 lambdas: sparsity + edge_gate. NO node_gate.
+    # Phase B2 lambdas: sparsity + edge_gate. No node_gate (DEPRECATED).
     "lambdas_b2": {
         "sparsity": 5e-5,
         "edge_gate": 1e-5,
@@ -453,7 +458,7 @@ SCHEDULE_FOUR_PHASE = {
     # or fallback).
     "prune_edge_threshold": 0.05,
     "prune_node_threshold": 0.05,
-    "prune_nodes_by_gate": False,  # edge-only: nodes only die via connectivity
+    "prune_nodes_by_gate": False,  # DEPRECATED (deprecate-node-gates)
 }
 
 # Fixed-step Heun solver
@@ -753,9 +758,9 @@ def make_smooth2d_grid_preset(
         "lambdas": {
             "sparsity": 1e-5,
             "edge_gate": 5e-6,
-            "node_gate": 1e-5,
+            "node_gate": 0.0,        # DEPRECATED (deprecate-node-gates)
             "power": 1e-5,
-            "capacitance": 1e-6,
+            "capacitance": 0.0,      # DEPRECATED (deprecate-node-gates)
             "rail": 0.1,
         },
         "tau_anneal": True,
@@ -844,9 +849,9 @@ def make_housing_grid_preset(
         "lambdas": {
             "sparsity": 1e-5,
             "edge_gate": 5e-6,
-            "node_gate": 1e-5,
+            "node_gate": 0.0,        # DEPRECATED (deprecate-node-gates)
             "power": 1e-5,
-            "capacitance": 1e-6,
+            "capacitance": 0.0,      # DEPRECATED (deprecate-node-gates)
             "rail": 0.1,
         },
         "tau_anneal": True,

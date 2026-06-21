@@ -41,6 +41,8 @@ _NODE_COLORS = {
 _CELL_COLORS = {
     "L": "tab:purple", "S": "tab:brown", "P": "tab:green", "Z": "lightgray",
     "O_weak": "tab:blue", "O_hard": "tab:red", "P0": "tab:green", "N0": "tab:orange", "D1": "tab:cyan",
+    "O_w11": "tab:blue", "O_h11": "tab:red", "O_h10": "tab:pink", "O_h01": "tab:olive",
+    "P1": "tab:green", "N1": "tab:orange",
 }
 _CELL_COLOR_DEFAULT = "tab:gray"
 

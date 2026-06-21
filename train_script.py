@@ -309,6 +309,7 @@ def _make_dynamic_preset(
     num_stages: int = 1,
     edge_repeats: int = 2,
     grid_size: int | None = None,
+    bidirectional: bool = False,
     write_mode_override: str | None = None,
     read_mode_override: str | None = None,
 ) -> dict:
@@ -326,6 +327,10 @@ def _make_dynamic_preset(
         edge_repeats: Parallel edges per hidden pair (default 2).
         grid_size: For 'grid' family; height/width. If None and family='grid',
             defaults to 5 (matches housing_grid default).
+        bidirectional: Emit two directed edges per hidden node pair (i->j
+            AND j->i). Doubles the hidden edge count and gives asymmetric
+            cells (P/rectifier) true bidirectional capability. Composes
+            multiplicatively with ``edge_repeats``.
         write_mode_override: If set, use this write_mode instead of
             family default. CLI --write-mode takes precedence.
         read_mode_override: If set, use this read_mode instead of family
@@ -349,7 +354,7 @@ def _make_dynamic_preset(
         hidden_kwargs = {
             "edge_prob": 1.0,
             "seed": 0,
-            "bidirectional": False,
+            "bidirectional": bidirectional,
         }
         eff_write_mode = (
             write_mode_override if write_mode_override is not None else "dense"
@@ -372,7 +377,7 @@ def _make_dynamic_preset(
             "height": grid_size,
             "width": grid_size,
             "kernel_size": 3,
-            "bidirectional": False,
+            "bidirectional": bidirectional,
         }
         eff_write_mode = (
             write_mode_override if write_mode_override is not None
@@ -922,8 +927,19 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
         help="Parallel edges per hidden node pair (default: 2, range 1-8). "
              "Each repeated edge gets independent logits/gate/multiplier. "
              "I/O and projection edges are NOT repeated. Composes "
-             "multiplicatively with --bidirectional (not exposed here, "
-             "see train_ctle.py).",
+             "multiplicatively with --bidirectional. Set to 1 for the "
+             "previous single-edge behavior.",
+    )
+    parser.add_argument(
+        "--bidirectional", dest="bidirectional", action="store_true", default=False,
+        help="Emit two directed edges per unique node pair in the hidden graph "
+             "(i->j AND j->i). Doubles the hidden edge count and gives "
+             "asymmetric cells (P/rectifier) true bidirectional capability. "
+             "Default: off (single edge per pair).",
+    )
+    parser.add_argument(
+        "--no-bidirectional", dest="bidirectional", action="store_false",
+        help="Disable dual edges per node pair (default).",
     )
     parser.add_argument(
         "--output", type=Path, default=Path("./output"),
@@ -1402,11 +1418,13 @@ def main():
         resolved_grid_size = args.grid_size if args.grid_size is not None else 7
         PRESETS["smooth2d_grid"] = make_smooth2d_grid_preset(
             grid_size=resolved_grid_size,
+            bidirectional=args.bidirectional,
         )
     elif args.problem == "housing_grid":
         resolved_grid_size = args.grid_size if args.grid_size is not None else 5
         PRESETS["housing_grid"] = make_housing_grid_preset(
             grid_size=resolved_grid_size,
+            bidirectional=args.bidirectional,
         )
     else:
         resolved_grid_size = args.grid_size
@@ -1429,6 +1447,7 @@ def main():
             num_stages=eff_num_stages,
             edge_repeats=eff_edge_repeats,
             grid_size=resolved_grid_size,
+            bidirectional=args.bidirectional,
             write_mode_override=args.write_mode,
             read_mode_override=args.read_mode,
         )
@@ -1437,6 +1456,7 @@ def main():
             f"[train] dynamic preset (hidden_family={args.hidden_family}): "
             f"num_hidden={eff_num_hidden} num_stages={eff_num_stages} "
             f"edge_repeats={eff_edge_repeats} "
+            f"bidirectional={args.bidirectional} "
             f"write_mode={new_preset['write_mode']} read_mode={new_preset['read_mode']}"
         )
     net = build_net_from_preset(
@@ -1466,6 +1486,21 @@ def main():
         f"write_idx={list(net.write_idx) if net.write_idx is not None else None} "
         f"read_idx={list(net.read_idx) if net.read_idx is not None else None}"
     )
+    if args.bidirectional or (args.edge_repeats is not None and args.edge_repeats > 1):
+        eff_er = args.edge_repeats if args.edge_repeats is not None else 2
+        mult = 2 if args.bidirectional else 1
+        mult *= eff_er
+        if args.bidirectional:
+            edges_per_stage = [s.num_edges() for s in net.core.stages]
+            print(
+                f"[train] bidirectional={args.bidirectional} "
+                f"edge_repeats={eff_er}: {edges_per_stage} edges per stage "
+                f"({mult}× single-edge baseline)"
+            )
+        else:
+            print(
+                f"[train] edge_repeats={eff_er}: ({mult}× single-edge baseline)"
+            )
     _save_config_snapshot(out_dir, args.problem, args, lambdas, net=net)
 
     effective_write_mode = (

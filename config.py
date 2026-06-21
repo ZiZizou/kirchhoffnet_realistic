@@ -333,12 +333,12 @@ TAU = {
 # C_eff·Σu proxy would be a constant per stage if node_mask were 1.0.
 LAMBDAS = {
     "sparsity": 1e-3,
-    "rail": 0.0,
+    "rail": 0.1,
     "edge_gate": 5e-4,
     "node_gate": 0.0,       # DEPRECATED (deprecate-node-gates)
     "power": 1e-4,
     "capacitance": 0.0,     # DEPRECATED (deprecate-node-gates)
-    "entropy": 0.0,
+    "entropy": 1e-4,
 }
 
 # Pruning thresholds for the overprovision-then-prune pipeline (CP-5).
@@ -374,10 +374,10 @@ SCHEDULE_THREE_PHASE = {
     "frac_b": 0.40,            # Phase B: compress (Strategy 2 gate penalties)
     "frac_c": 0.30,            # Phase C: retrain after prune
     # Tau targets per phase.
-    "tau_a": 1.0,              # Fixed tau during fit
-    "tau_b_init": 1.0,         # Tau at start of compress
-    "tau_b_final": 0.6,        # Tau at end of compress
-    "tau_c_init": 0.6,         # Tau at start of retrain
+    "tau_a": 0.8,              # Fixed tau during fit
+    "tau_b_init": 0.8,         # Tau at start of compress
+    "tau_b_final": 0.5,        # Tau at end of compress
+    "tau_c_init": 0.5,         # Tau at start of retrain
     "tau_c_final": 0.1,        # Tau at end of retrain
     # Lambda warmup within Phase B: ramp from 0 to full over this fraction.
     "warmup_frac_b": 1.0 / 2.0,
@@ -421,8 +421,8 @@ SCHEDULE_FOUR_PHASE = {
     "frac_b2": 0.2,           # Phase B2: edge pruning (readiness-gated)
     "frac_c": 0.3,            # Phase C: retrain compact model
     # Tau targets per phase.
-    "tau_a": 1.0,              # Fixed tau during free fit
-    "tau_b1_init": 1.0,        # Tau at start of B1
+    "tau_a": 0.8,              # Fixed tau during free fit
+    "tau_b1_init": 0.8,        # Tau at start of B1
     "tau_b1_final": 0.6,       # Tau at end of B1
     "tau_b2_init": 0.6,        # Tau at start of B2
     "tau_b2_final": 0.4,       # Tau at end of B2 (readiness check here)
@@ -432,11 +432,13 @@ SCHEDULE_FOUR_PHASE = {
     # deprecate-node-gates: node_gate/capacitance default to 0.0 via .get.
     "lambdas_b1": {
         "sparsity": 5e-5,
+        "power": 1e-4
     },
     # Phase B2 lambdas: sparsity + edge_gate. No node_gate (DEPRECATED).
     "lambdas_b2": {
         "sparsity": 5e-5,
         "edge_gate": 1e-5,
+        "power": 1e-5
     },
     # Phase C retrain lambdas: tiny sparsity for crisp cell family.
     "lambdas_c": {

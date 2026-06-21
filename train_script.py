@@ -1910,14 +1910,15 @@ def main():
         lr_str = f"{min(_lrs):.1e}..{max(_lrs):.1e}" if len(_lrs) > 1 else f"{_lrs[0]:.2e}"
         phase_tag = f" [{phase}]" if phase else ""
         if tqdm is not None:
-            desc = f"{ab_desc}  train={avg_train:.4f}  val={val_loss:.4f}"
-            if val_argmax_history is not None and len(val_argmax_history) > 0:
-                desc += f"  val_argmax={val_argmax_history[-1]:.4f}"
-            ab_iter.set_description_str(desc)
-            postfix_dict = dict(tau=f"{tau:.3f}", lr=lr_str)
-            if schedule_mode == "legacy":
-                postfix_dict["reg"] = f"{reg_scale:.2f}"
-            ab_iter.set_postfix(**postfix_dict)
+            print(
+                f"{ab_desc}  train={avg_train:.4f}  val={val_loss:.4f}"
+                + (f"  val_argmax={val_argmax_history[-1]:.4f}"
+                   if val_argmax_history is not None and len(val_argmax_history) > 0
+                   else "")
+                + f"  tau={tau:.3f}  lr={lr_str}"
+                + (f"  reg={reg_scale:.2f}" if schedule_mode == "legacy" else "")
+            )
+            ab_iter.set_description_str("")
         else:
             print_str = (
                 f"  epoch {epoch:4d}{phase_tag}  train={avg_train:.4f}  val={val_loss:.4f}"

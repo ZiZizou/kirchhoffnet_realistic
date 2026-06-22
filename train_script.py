@@ -30,7 +30,30 @@ import sys
 import copy
 import time
 import warnings
+import gc
 from pathlib import Path
+
+# retrain-oom-fix/REQ-3: reduce CUDA memory fragmentation by allowing
+# the caching allocator to expand segments rather than split. The error
+# message at the prune-to-retrain boundary explicitly recommends this.
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
+# retrain-oom-fix/REQ-6: torch.compile recompiles whenever a guard
+# fails (e.g. requires_grad mismatch between train/val). The default
+# limit is 8, which is hit quickly when validate() and compute_loss()
+# alternate each epoch. Raise to 32 so the cache doesn't churn and
+# leak compiled-graph memory across the 560+240-epoch training run.
+try:
+    import torch._dynamo
+    torch._dynamo.config.recompile_limit = 32
+except Exception:
+    pass
+try:
+    # Separate except for cache_size_limit — it may not exist in older
+    # PyTorch, and a failure here should not block recompile_limit.
+    torch._dynamo.config.cache_size_limit = 64
+except AttributeError:
+    pass
 
 import torch
 import torch.nn.functional as F
@@ -117,6 +140,30 @@ def _ensure_dir(path: Path) -> Path:
         path = path.with_name(f"{path.name}_{suffix}")
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _log_gpu_mem(label: str) -> None:
+    """retrain-oom-fix/REQ-4: log CUDA memory state at key transition points.
+
+    Reports PyTorch allocated/reserved, and the device's free/total
+    memory when CUDA is available. Pass to print() at any transition
+    (after Phase A+B, after DEQ diagnostics, after pruning, etc.) to
+    track memory pressure through the prune-to-retrain boundary.
+    """
+    if not torch.cuda.is_available():
+        return
+    try:
+        free_b, total_b = torch.cuda.mem_get_info()
+    except Exception:
+        free_b = total_b = 0
+    alloc_b = torch.cuda.memory_allocated()
+    reserved_b = torch.cuda.memory_reserved()
+    def _mb(x): return f"{x / 1024 / 1024:.1f} MiB"
+    print(
+        f"[mem] {label}: "
+        f"alloc={_mb(alloc_b)} reserved={_mb(reserved_b)} "
+        f"free={_mb(free_b)} total={_mb(total_b)}"
+    )
 
 
 def _resolve_lambdas(problem: str) -> dict:
@@ -1235,6 +1282,15 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
         help="Learning rate for the retrain phase (default: same as --lr).",
     )
     parser.add_argument(
+        "--retrain-batch-size", type=int, default=None,
+        help="retrain-oom-fix/REQ-5: batch size for the pruned-network "
+             "retrain phase (default: same as --batch-size). When GPU "
+             "memory is tight after Phase A+B, lowering this (e.g. 256) "
+             "can prevent the OOM at the prune-to-retrain transition. "
+             "The pruned model is created as a fresh nn.Module so it "
+             "duplicates the parameter tensor allocations.",
+    )
+    parser.add_argument(
         "--fresh-init", dest="fresh_init", action="store_true", default=False,
         help="Re-initialize the pruned network from scratch (skip warm "
              "start from pre-prune parameters). Default: warm-start.",
@@ -2130,8 +2186,13 @@ def main():
             print(print_str)
 
     # ---- DEQ diagnostics on the trained model (deq-core-prototype) ----
+    _log_gpu_mem("after_phase_ab")
     if getattr(args, "run_deq_diagnostics", False):
         _run_deq_diagnostics_report(net, device, ctx_factory, deq_cfg)
+
+    # retrain-oom-fix/REQ-4: log GPU memory after DEQ diagnostics so we
+    # can see the baseline pressure before pruning duplicates the model.
+    _log_gpu_mem("after_deq_diagnostics")
 
     # ---- End of Phase A+B (or A+B1+B2) ----
     if schedule_mode == "three_phase" and not stop_training:
@@ -2326,6 +2387,9 @@ def main():
             f"(edge_thresh={edge_thresh}, prune_nodes_by_gate={pnbg})"
         )
 
+        # retrain-oom-fix/REQ-4: log memory state right before pruning.
+        _log_gpu_mem("pre_prune")
+
         pruned_core, stage_remaps = prune_network(
             raw_net.core,
             edge_threshold=edge_thresh,
@@ -2413,6 +2477,34 @@ def main():
                 output_mapper_pruned = OutputMapper(node_dim=pruned_last_n, out_dim=out_dim)
                 pruned_read_idx = None
 
+        # retrain-oom-fix/REQ-1: free pre-prune model memory before
+        # creating pruned_net. The pruned_net duplicates every
+        # parameter tensor via fresh DifferentialStage objects, and
+        # even when 0 edges are pruned the new model coexists with
+        # raw_net on the GPU. Move raw_net to CPU and drop the
+        # original optimizer / scheduler / scaler / teacher; flush
+        # the allocator. Keep input_mapper_pruned /
+        # output_mapper_pruned / pruned_core alive (they were
+        # derived from raw_net and needed for the build below).
+        # NOTE: direct = None assignment is required here; exec("del ...")
+        # cannot modify enclosing function locals in CPython 3.
+        net = None
+        optimizer = None
+        scheduler = None
+        scaler = None
+        teacher = None
+        teacher_optim = None
+        if "raw_net" in locals() and raw_net is not None:
+            try:
+                raw_net.to("cpu")
+            except Exception:
+                pass
+            raw_net = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        _log_gpu_mem("pre_pruned_net_build")
+
         pruned_net = KirchhoffNetWithIO(
             input_mapper_pruned,
             pruned_core,
@@ -2425,6 +2517,26 @@ def main():
             read_idx=pruned_read_idx if effective_read_mode == "sparse" else None,
         )
         pruned_net.to(device)
+
+        # retrain-oom-fix/REQ-2: the shared cell_lib is the one compiled
+        # for raw_net (topology.py:788 sets new_lib=stage.cell_lib). The
+        # compiled cell_lib.forward was specialized for raw_net's
+        # parameters and tensor shapes; reset it to the uncompiled
+        # version so retrain doesn't hit stale cache and so any future
+        # recompilation is for pruned_net's actual shapes.
+        if compile_enabled and isinstance(device, str) and device.startswith("cuda"):
+            try:
+                for stage in pruned_net.core.stages:
+                    if hasattr(stage, "cell_lib") and not isinstance(
+                        stage.cell_lib, SimpleEdgeLibrary
+                    ):
+                        lib = stage.cell_lib
+                        if hasattr(lib.forward, "__wrapped__"):
+                            lib.forward = lib.forward.__wrapped__
+            except Exception as _e:
+                print(f"[prune] warning: failed to reset cell_lib compile: {_e}")
+
+        _log_gpu_mem("post_pruned_net_build")
 
         # For three_phase, Phase C retrain is always enabled and uses the remainder
         # of the epoch budget. For legacy, respect the --retrain flag.
@@ -2441,6 +2553,28 @@ def main():
                 f"(lr={c_lr}, warm_start={not args.fresh_init}, "
                 f"scheduler={args.use_scheduler})"
             )
+            # retrain-oom-fix/REQ-5: optionally use a smaller batch size
+            # for retrain. Build a separate loader (cheap; data is
+            # already on CPU) so we don't fight the training loader.
+            retrain_batch_size = (
+                args.retrain_batch_size if args.retrain_batch_size is not None
+                else batch_size
+            )
+            retrain_train_loader = train_loader
+            if retrain_batch_size != batch_size:
+                from torch.utils.data import DataLoader as _DL
+                _ds = train_loader.dataset
+                retrain_train_loader = _DL(
+                    _ds, batch_size=retrain_batch_size, shuffle=True,
+                    num_workers=train_loader.num_workers,
+                    pin_memory=train_loader.pin_memory,
+                    collate_fn=train_loader.collate_fn,
+                    drop_last=False,
+                )
+                print(
+                    f"[prune] retrain batch_size={retrain_batch_size} "
+                    f"(overridden from {batch_size})"
+                )
             retrain_optimizer = make_optimizer(
                 pruned_net, lr=c_lr,
                 stage_lr_scale=args.retrain_stage_lr_scale,
@@ -2481,6 +2615,11 @@ def main():
             best_state_pruned = None
             best_metric_name_c = "val"  # four-phase-redesign/Phase 1b
             ewop = 0
+            # retrain-oom-fix/REQ-4: log memory after pruned_net, optimizer,
+            # scaler are all set up; this is the snapshot right before the
+            # first retrain batch. If the OOM is going to fire, the print
+            # below shows how much headroom remained.
+            _log_gpu_mem("retrain_epoch_0_start")
             for repoch in range(c_epochs):
                 pruned_net.train()
                 if schedule_mode == "three_phase":
@@ -2520,7 +2659,7 @@ def main():
                 cell_mode_c = _resolve_cell_mode(args.cell_mode, "C", schedule_mode)
                 tot = 0.0
                 nb = 0
-                for batch in train_loader:
+                for batch in retrain_train_loader:
                     ctx = ctx_factory(batch[0].size(0), device=device)
                     retrain_optimizer.zero_grad()
                     u_b, tgt_b = batch

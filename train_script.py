@@ -163,6 +163,115 @@ def _resolve_cell_mode(cli_value: str, phase: str, schedule_mode: str) -> str:
     return "soft"
 
 
+def _build_deq_cfg(args) -> dict:
+    """Build the DEQ solver config dict from CLI overrides (deq-core-prototype).
+
+    Returns a dict keyed by the kwargs accepted by :func:`deq_solver.solve_equilibrium`.
+    Always includes the config-default DEQ dict, then overlays any explicit CLI
+    overrides. ``None``-valued CLI args are ignored (config default applies).
+    """
+    from config import DEQ
+    cfg = dict(DEQ)
+    if getattr(args, "deq_backend", None) is not None:
+        cfg["backend"] = args.deq_backend
+    if getattr(args, "deq_f_max_iter", None) is not None:
+        cfg["f_max_iter"] = int(args.deq_f_max_iter)
+    if getattr(args, "deq_f_tol", None) is not None:
+        cfg["f_tol"] = float(args.deq_f_tol)
+    if getattr(args, "deq_b_max_iter", None) is not None:
+        cfg["b_max_iter"] = int(args.deq_b_max_iter)
+    if getattr(args, "deq_step", None) is not None:
+        cfg["deq_step"] = float(args.deq_step)
+    if getattr(args, "leak_floor", None) is not None:
+        cfg["leak_floor"] = float(args.leak_floor)
+    return cfg
+
+
+def _run_deq_diagnostics_report(net, device, ctx_factory, deq_cfg) -> None:
+    """Print a one-shot DEQ diagnostics report for a trained model
+    (deq-core-prototype). Compares BPTT vs DEQ gradient norms on a single
+    batch, estimates Jacobian conditioning, and runs a multistart uniqueness
+    check on each stage.
+    """
+    import math as _math
+    from sim_context import SimContext
+    from deq_diagnostics import (
+        estimate_jacobian_cond,
+        gradient_norm_compare,
+        multistart_uniqueness,
+    )
+
+    raw = net.module if isinstance(net, torch.nn.DataParallel) else net
+    raw.eval()
+
+    print("\n[deq-diagnostics] building a sample batch")
+    train_loader = getattr(raw, "_train_loader", None)  # not always present
+    # Use a zero-input synthetic batch so we don't depend on data loaders.
+    first_stage = raw.core.stages[0] if hasattr(raw, "core") else raw.stages[0]
+    num_nodes = first_stage.num_nodes
+    num_inputs = max(2, raw.hid_count if hasattr(raw, "hid_count") else num_nodes)
+    u = torch.zeros(2, num_inputs, device=device) * 0.1
+    ctx = SimContext()
+    # Provide a one-shot drive at the write indices if persistent drive is on.
+    if getattr(raw, "enable_drive", False):
+        try:
+            drive_targets = []
+            for dm in raw.drive_mappers:
+                drive_targets.append(raw._make_full_drive(dm(u)))
+            drive_scales = raw.drive_scales
+        except Exception:
+            drive_targets = None
+            drive_scales = None
+    else:
+        drive_targets = None
+        drive_scales = None
+
+    print("[deq-diagnostics] gradient norm comparison (BPTT vs DEQ)")
+    try:
+        grad_res = gradient_norm_compare(
+            first_stage, torch.zeros(2, num_nodes, device=device),
+            ctx=ctx, tau=1.0, cell_mode="soft",
+            x_drive=None, drive_scale=0.0,
+            leak_floor=float(deq_cfg.get("leak_floor", 0.05)),
+            deq_cfg=deq_cfg,
+            bptt_t_span=0.3, bptt_num_steps=10,
+        )
+        for k, v in grad_res.items():
+            print(f"  {k}: {v:.3e}")
+    except Exception as e:
+        print(f"  [grad-norm compare] failed: {e}")
+
+    print("[deq-diagnostics] jacobian cond at equilibrium")
+    try:
+        x_eq, _ = first_stage.forward_equilibrium(
+            torch.zeros(2, num_nodes, device=device), ctx=ctx, tau=1.0,
+            cell_mode="soft", x_drive=None, drive_scale=0.0,
+            deq_cfg=deq_cfg,
+        )
+        cond = estimate_jacobian_cond(
+            first_stage, x_eq, ctx=ctx, tau=1.0, cell_mode="soft",
+            x_drive=None, drive_scale=0.0,
+            leak_floor=float(deq_cfg.get("leak_floor", 0.05)),
+        )
+        print(f"  cond(J) = {cond:.3e}" + (" (well-conditioned)" if cond < 100 else " (consider larger leak_floor)"))
+    except Exception as e:
+        print(f"  [jacobian cond] failed: {e}")
+
+    print("[deq-diagnostics] multistart uniqueness")
+    try:
+        ms = multistart_uniqueness(
+            first_stage, ctx=ctx, tau=1.0, cell_mode="soft",
+            x_drive=None, drive_scale=0.0,
+            leak_floor=float(deq_cfg.get("leak_floor", 0.05)),
+            deq_cfg=deq_cfg, starts=[-1.0, 0.0, 1.0, 5.0],
+            batch_shape=(2, num_nodes),
+        )
+        print(f"  max pairwise diff = {ms['max_pairwise_diff']:.3e}"
+              + (" (single equilibrium)" if ms['max_pairwise_diff'] < 1e-3 else " (multistability suspected)"))
+    except Exception as e:
+        print(f"  [multistart] failed: {e}")
+
+
 def _apply_ablation_set(args, schedule_mode: str) -> None:
     """Mutate ``args`` to apply a diagnostic ablation preset in place
     (four-phase-redesign/Phase 1c).
@@ -670,7 +779,8 @@ def make_data(problem: str, batch_size: int):
     raise ValueError(f"Unknown problem: {problem}")
 
 
-def validate(net, val_loader, task_fn, ctx_factory, device, cell_mode: str = "soft") -> float:
+def validate(net, val_loader, task_fn, ctx_factory, device, cell_mode: str = "soft",
+             solver: str = "heun", deq_cfg: dict | None = None) -> float:
     net.eval()
     total = 0.0
     n = 0
@@ -679,7 +789,8 @@ def validate(net, val_loader, task_fn, ctx_factory, device, cell_mode: str = "so
             u = u.to(device)
             target = target.to(device)
             ctx = ctx_factory(u.size(0), device=device)
-            out, _ = net(u, ctx=ctx, store_trajectory=False, cell_mode=cell_mode)
+            out, _ = net(u, ctx=ctx, store_trajectory=False, cell_mode=cell_mode,
+                         solver=solver, deq_cfg=deq_cfg)
             loss = task_fn(out, target)
             total += float(loss.item()) * u.size(0)
             n += u.size(0)
@@ -695,6 +806,8 @@ def validate_with_inverse(
     device,
     inverse_stats: dict | None,
     cell_mode: str = "soft",
+    solver: str = "heun",
+    deq_cfg: dict | None = None,
 ) -> dict:
     """Validation that also reports metrics in the original (denormalized) target units.
 
@@ -715,7 +828,8 @@ def validate_with_inverse(
             u = u.to(device)
             target = target.to(device)
             ctx = ctx_factory(u.size(0), device=device)
-            out, _ = net(u, ctx=ctx, store_trajectory=False, cell_mode=cell_mode)
+            out, _ = net(u, ctx=ctx, store_trajectory=False, cell_mode=cell_mode,
+                         solver=solver, deq_cfg=deq_cfg)
             loss = task_fn(out, target)
             total += float(loss.item()) * u.size(0)
             if inverse_stats is not None:
@@ -1182,6 +1296,51 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "straight-through soft gradients in the backward pass. "
              "'auto' uses 'soft' for Phase A and 'ste' for B/C (only "
              "meaningful with --schedule three_phase / four_phase).",
+    )
+
+    # --- Deep Equilibrium (DEQ) stagewise solver (deq-core-prototype) ---
+    parser.add_argument(
+        "--solver", choices=["heun", "deq"], default="heun",
+        dest="solver",
+        help="Stage solver (default: heun). 'deq' solves each stage's "
+             "fixed-point x* s.t. rhs(x*)=0 via torchdeq with implicit "
+             "gradients. DEQ enforces --cell-mode soft and applies the "
+             "minimum-leak floor (--leak-floor) so the fixed-point map is "
+             "contractive. Heun remains available for physical validation.",
+    )
+    parser.add_argument(
+        "--deq-backend", choices=["auto", "torchdeq", "fixed_point_iter"],
+        default="auto", dest="deq_backend",
+        help="DEQ solver backend (default: auto -> torchdeq if installed).",
+    )
+    parser.add_argument(
+        "--deq-f-max-iter", type=int, default=None, dest="deq_f_max_iter",
+        help="Max forward iterations for the DEQ fixed-point solver.",
+    )
+    parser.add_argument(
+        "--deq-f-tol", type=float, default=None, dest="deq_f_tol",
+        help="Relative residual tolerance for DEQ convergence.",
+    )
+    parser.add_argument(
+        "--deq-b-max-iter", type=int, default=None, dest="deq_b_max_iter",
+        help="Max backward (IFT) iterations.",
+    )
+    parser.add_argument(
+        "--deq-step", type=float, default=None, dest="deq_step",
+        help="Damped step size dt for Phi(x)=x+dt*rhs(x).",
+    )
+    parser.add_argument(
+        "--leak-floor", type=float, default=None, dest="leak_floor",
+        help="Minimum effective leak per node under DEQ (default: from "
+             "config DEQ). Keeps the fixed-point map contractive. Has no "
+             "effect on the Heun path beyond the explicit addend.",
+    )
+    parser.add_argument(
+        "--run-deq-diagnostics", action="store_true", default=False,
+        dest="run_deq_diagnostics",
+        help="Run DEQ diagnostics (gradient-norm compare, Jacobian cond, "
+             "multistart uniqueness) once after train/val and print the "
+             "report. Useful when prototyping --solver deq.",
     )
 
 
@@ -1687,6 +1846,11 @@ def main():
     # mapper-lr-control: freeze state for --freeze-mappers (four_phase only)
     mappers_frozen = False
 
+    # DEQ (deq-core-prototype): bind the active solver from CLI. Heun
+    # remains the default so existing runs are unaffected.
+    solver = getattr(args, "solver", "heun")
+    deq_cfg = _build_deq_cfg(args)
+
     for epoch in ab_iter:
         if stop_training:
             break
@@ -1762,6 +1926,11 @@ def main():
         # four-phase-redesign/Phase 2b: per-epoch cell selection mode.
         # 'auto' uses 'ste' for Phase B/C of phased schedules.
         cell_mode = _resolve_cell_mode(args.cell_mode, phase, schedule_mode)
+        # DEQ requires soft cell mode (forward_equilibrium enforces it).
+        if solver == "deq" and cell_mode != "soft":
+            print(f"[solver=deq] forcing cell_mode='soft' (was {cell_mode!r})")
+            cell_mode = "soft"
+        deq_cfg = _build_deq_cfg(args)
 
         total_loss = 0.0
         n_batches = 0
@@ -1782,6 +1951,7 @@ def main():
                 lambdas=effective_lambdas, tau=tau, return_parts=True,
                 amp=amp_enabled, amp_dtype=amp_dtype, reg_scale=reg_scale,
                 cell_mode=cell_mode,
+                solver=solver, deq_cfg=deq_cfg,
                 teacher=kd_teacher, lambda_kd=kd_lambda, teacher_tau=1.0,
                 teacher_cell_mode="soft",
             )
@@ -1805,10 +1975,12 @@ def main():
                 val_metrics = validate_with_inverse(
                     net, val_loader, task_fn, ctx_factory, device,
                     inverse_stats=inverse_stats, cell_mode=cell_mode,
+                    solver=solver, deq_cfg=deq_cfg,
                 )
                 val_loss = val_metrics["val"]
             else:
-                val_loss = validate(net, val_loader, task_fn, ctx_factory, device, cell_mode=cell_mode)
+                val_loss = validate(net, val_loader, task_fn, ctx_factory, device,
+                                    cell_mode=cell_mode, solver=solver, deq_cfg=deq_cfg)
                 val_metrics = None
             val_v_history.append(val_loss)
             if inverse_stats is not None and val_metrics is not None:
@@ -1927,6 +2099,10 @@ def main():
                 print_str += f"  val_argmax={val_argmax_history[-1]:.4f}"
             print_str += f"  tau={tau:.3f}  lr={lr_str}"
             print(print_str)
+
+    # ---- DEQ diagnostics on the trained model (deq-core-prototype) ----
+    if getattr(args, "run_deq_diagnostics", False):
+        _run_deq_diagnostics_report(net, device, ctx_factory, deq_cfg)
 
     # ---- End of Phase A+B (or A+B1+B2) ----
     if schedule_mode == "three_phase" and not stop_training:

@@ -7,6 +7,13 @@ Edge currents are computed by an IdealizedCellLibrary.
 Heun integration (predictor-corrector, 2nd order) is used for fixed-step
 BPTT. The stage returns both the final state and the full trajectory so
 that regularizers can be evaluated along the path.
+
+Deep Equilibrium (DEQ) forward path (deq-core-prototype plan): the stage
+exposes ``forward_equilibrium`` which solves ``rhs(x*)=0`` via the
+:mod:`deq_solver` adapter and returns implicit gradients. Selected by
+passing ``solver='deq'`` to ``forward``. The DEQ path enforces a soft-only
+``cell_mode`` and a minimum-leak floor to keep the fixed-point map
+contractive.
 """
 
 from __future__ import annotations
@@ -16,6 +23,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from config import (
+    DEQ,
     DRIVE,
     INIT,
     PHYS,
@@ -115,6 +123,12 @@ class DifferentialStage(nn.Module):
             self.raw_mult = nn.Parameter(torch.full((E,), float(INIT["raw_mult_init"])))
         self.raw_leak = nn.Parameter(torch.full((num_nodes,), float(INIT["raw_leak_init"])))
 
+        # Minimum effective leak (deq-core-prototype plan). Defaults to 0.0 so
+        # the Heun path is byte-for-byte unchanged. Under DEQ this is set to a
+        # positive value (config DEQ['leak_floor']) via :meth:`set_leak_floor`
+        # to keep the fixed-point map contractive (diagonal damping).
+        self.leak_floor = 0.0
+
         # Gate parameters for complexity-regularized pruning (CP-1, CP-2).
         # z_e = sigmoid(z_logits) is the edge gate: multiplies the edge current.
         # u_j = sigmoid(u_logits) is the node gate: gates the node voltage.
@@ -131,6 +145,26 @@ class DifferentialStage(nn.Module):
 
     def num_edges(self) -> int:
         return int(self.src.numel())
+
+    def set_leak_floor(self, leak_floor: float) -> None:
+        """Set the minimum effective leak per node.
+
+        Used by the DEQ solver path to enforce a positive diagonal damping so
+        the fixed-point map Phi(x)=x+dt*rhs(x) is contractive. Has no effect
+        on the Heun path beyond the explicit addend.
+        """
+        self.leak_floor = float(leak_floor)
+
+    def _effective_leak(self, num_nodes: int | None = None,
+                        leak_floor: float | None = None) -> torch.Tensor:
+        """Return the per-node effective leak (leak_floor + softplus(raw_leak))."""
+        if num_nodes is None:
+            num_nodes = self.num_nodes
+        lf = self.leak_floor if leak_floor is None else float(leak_floor)
+        base = F.softplus(self.raw_leak)
+        if lf == 0.0:
+            return base
+        return lf + base
 
     @property
     def is_simple_device(self) -> bool:
@@ -206,7 +240,7 @@ class DifferentialStage(nn.Module):
         acc.index_add_(1, self.src, -i_edge_f32)
         acc = acc.to(dtype=x.dtype)
 
-        leak = F.softplus(self.raw_leak).unsqueeze(0)  # [1, N]
+        leak = self._effective_leak().unsqueeze(0)  # [1, N]
         leak_term = leak * x
 
         clip = torch.sigmoid((x - self.x_max) / self.clip_softness)
@@ -236,16 +270,63 @@ class DifferentialStage(nn.Module):
         cell_mode: str = "soft",
         x_drive: torch.Tensor | None = None,
         drive_scale: float = 0.0,
+        solver: str = "heun",
+        deq_cfg: dict | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Integrate stage with fixed-step Heun. Returns (x_final, traj).
+        """Integrate stage with fixed-step Heun or solve to fixed point.
 
-        traj: [batch, num_nodes, num_steps+1] if store_trajectory else None.
+        Parameters
+        ----------
+        solver : str
+            ``"heun"`` (default) uses the 2nd-order Heun predictor-corrector
+            over ``num_steps``. ``"deq"`` solves ``rhs(x*) = 0`` via
+            :func:`deq_solver.solve_equilibrium` and returns implicit
+            gradients. The DEQ path requires ``cell_mode='soft'``.
+        deq_cfg : dict or None
+            Optional overrides for the DEQ solver. ``None`` uses defaults from
+            ``config.DEQ``. Recognized keys: ``backend``, ``f_solver``,
+            ``b_solver``, ``f_max_iter``, ``f_tol``, ``b_max_iter``,
+            ``anderson_m``, ``deq_step``, ``leak_floor``.
 
-        ``cell_mode`` (four-phase-redesign/Phase 2a): forwarded to
-        ``rhs`` to control cell selection. ``'soft'`` is the standard
-        mixture; ``'ste'`` uses one cell per edge in the forward pass
-        with straight-through soft gradients.
+        Returns
+        -------
+        x_final : torch.Tensor
+            Stage output state.
+        traj : torch.Tensor or None
+            ``[batch, num_nodes, num_steps+1]`` for the Heun path; ``None`` for
+            the DEQ path (no trajectory at equilibrium).
         """
+        if solver == "heun":
+            return self._forward_heun(
+                x0=x0, ctx=ctx, t_span=t_span, num_steps=num_steps, tau=tau,
+                store_trajectory=store_trajectory, cell_mode=cell_mode,
+                x_drive=x_drive, drive_scale=drive_scale,
+            )
+        if solver == "deq":
+            x_star, _info = self.forward_equilibrium(
+                x0=x0, ctx=ctx, tau=tau, cell_mode=cell_mode,
+                x_drive=x_drive, drive_scale=drive_scale,
+                deq_cfg=deq_cfg,
+            )
+            # Build a 1-timepoint synthetic trajectory [B, N, 1] so downstream
+            # regularizers (which expect a [B, N, T+1] traj) work without a
+            # special case. Only meaningful when store_trajectory=True.
+            traj = x_star.unsqueeze(-1) if store_trajectory else None
+            return x_star, traj
+        raise ValueError(f"DifferentialStage.forward: unknown solver={solver!r}")
+
+    def _forward_heun(
+        self,
+        x0: torch.Tensor,
+        ctx,
+        t_span: float | None,
+        num_steps: int | None,
+        tau: float | None,
+        store_trajectory: bool,
+        cell_mode: str,
+        x_drive: torch.Tensor | None,
+        drive_scale: float,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         t_span = float(t_span if t_span is not None else SOLVER["t_span"])
         num_steps = int(num_steps if num_steps is not None else SOLVER["num_steps"])
         tau = float(tau if tau is not None else 1.0)
@@ -266,6 +347,61 @@ class DifferentialStage(nn.Module):
 
         traj = torch.stack(traj_chunks, dim=2) if store_trajectory else None
         return x, traj
+
+    def forward_equilibrium(
+        self,
+        x0: torch.Tensor,
+        ctx,
+        tau: float | None = None,
+        cell_mode: str = "soft",
+        x_drive: torch.Tensor | None = None,
+        drive_scale: float = 0.0,
+        deq_cfg: dict | None = None,
+    ) -> tuple[torch.Tensor, dict]:
+        """Solve ``rhs(x*) = 0`` starting from ``x0`` (Deep Equilibrium).
+
+        The damped fixed-point map is ``Phi(x) = x + dt * rhs(x)`` where
+        ``dt = deq_cfg['deq_step']`` (defaulting to ``config.DEQ['deq_step']``).
+        Returns ``(x_star, info)``. The DEQ path enforces:
+
+        - ``cell_mode='soft'`` (raises ``ValueError`` otherwise). STE and
+          hard argmax break implicit differentiation.
+        - ``leak_floor >= 0`` applied via :meth:`set_leak_floor` so the
+          fixed-point map has positive diagonal damping (contractivity).
+        - Solve runs in fp32 with autocast disabled (AMP safety).
+        """
+        if cell_mode != "soft":
+            raise ValueError(
+                f"DifferentialStage.forward_equilibrium: cell_mode must be 'soft' "
+                f"under DEQ (got {cell_mode!r}). STE / hard argmax break implicit "
+                f"differentiation."
+            )
+
+        from deq_solver import solve_equilibrium
+
+        cfg = dict(DEQ)
+        if deq_cfg:
+            cfg.update(deq_cfg)
+        leak_floor = float(cfg.get("leak_floor", 0.0))
+        self.set_leak_floor(leak_floor)
+        dt = float(cfg.get("deq_step", 0.1))
+        tau = float(tau if tau is not None else 1.0)
+
+        def phi(x):
+            return x + dt * self.rhs(x, ctx=ctx, tau=tau, cell_mode="soft",
+                                    x_drive=x_drive, drive_scale=drive_scale)
+
+        x_star, info = solve_equilibrium(phi, x0, cfg)
+        # Cast to the stage's parameter dtype so AMP/GradScaler and downstream
+        # regularizers behave like the Heun path.
+        param_dtype = next(self.parameters()).dtype
+        if x_star.dtype != param_dtype:
+            x_star = x_star.to(dtype=param_dtype)
+        # Restore leak floor to 0.0 so subsequent Heun calls on this stage
+        # (e.g. physical validation after DEQ-based training) match the
+        # pre-DEQ path exactly.
+        self.set_leak_floor(0.0)
+        return x_star, info
 
     def edge_gates(self) -> torch.Tensor:
         """Return edge gate values z_e = σ(z_logits), shape [E]."""

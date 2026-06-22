@@ -867,6 +867,8 @@ def compute_loss(
     lambda_kd: float = 0.0,
     teacher_tau: float = 1.0,
     teacher_cell_mode: str = "soft",
+    solver: str = "heun",
+    deq_cfg: dict | None = None,
 ):
     """Compute total loss = task + regularizers + entropy bonus.
 
@@ -903,10 +905,12 @@ def compute_loss(
     with autocast_ctx:
         if isinstance(net, KirchhoffNetWithIO):
             out, trajs = net(x0, ctx=ctx, tau=tau, store_trajectory=True,
-                             cell_mode=cell_mode)
+                             cell_mode=cell_mode,
+                             solver=solver, deq_cfg=deq_cfg)
         else:
             out, trajs = net(x0, ctx=ctx, tau=tau, store_trajectory=True,
-                             cell_mode=cell_mode)
+                             cell_mode=cell_mode,
+                             solver=solver, deq_cfg=deq_cfg)
 
         loss_task = task_fn(out, target)
 

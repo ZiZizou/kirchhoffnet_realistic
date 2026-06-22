@@ -421,10 +421,10 @@ SCHEDULE_FOUR_PHASE = {
     "frac_b2": 0.2,           # Phase B2: edge pruning (readiness-gated)
     "frac_c": 0.3,            # Phase C: retrain compact model
     # Tau targets per phase.
-    "tau_a": 0.8,              # Fixed tau during free fit
-    "tau_b1_init": 0.8,        # Tau at start of B1
-    "tau_b1_final": 0.6,       # Tau at end of B1
-    "tau_b2_init": 0.6,        # Tau at start of B2
+    "tau_a": 0.6,              # Fixed tau during free fit
+    "tau_b1_init": 0.6,        # Tau at start of B1
+    "tau_b1_final": 0.5,       # Tau at end of B1
+    "tau_b2_init": 0.5,        # Tau at start of B2
     "tau_b2_final": 0.4,       # Tau at end of B2 (readiness check here)
     "tau_c_init": 0.4,         # Tau at start of retrain
     "tau_c_final": 0.1,        # Tau at end of retrain
@@ -468,6 +468,25 @@ SOLVER = {
     "method": "heun",
     "t_span": 5.0,
     "num_steps": 50,
+}
+
+# Deep Equilibrium (DEQ) stagewise fixed-point solver
+# (deq-core-prototype plan). Selected via --solver deq.
+# Defaults: Anderson forward + Anderson backward, with a small minimum-leak
+# floor so the fixed-point map Phi(x)=x+dt*rhs(x) is contractive (diagonal
+# damping dominates cross-coupling). The leak floor only takes effect under
+# DEQ; with --solver heun the stage uses leak_floor=0.0 and behaviour matches
+# the pre-DEQ path exactly.
+DEQ = {
+    "backend": "torchdeq",       # "torchdeq" | "fixed_point_iter"
+    "f_solver": "anderson",      # forward solver
+    "b_solver": "anderson",      # backward solver (implicit/IFT)
+    "f_max_iter": 30,
+    "f_tol": 1e-4,
+    "b_max_iter": 20,
+    "anderson_m": 5,
+    "deq_step": 0.1,             # damped-step size dt for Phi(x) = x + dt*rhs(x)
+    "leak_floor": 0.05,          # min effective leak per node under DEQ
 }
 
 # Initialization biases

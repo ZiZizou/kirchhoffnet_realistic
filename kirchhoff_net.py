@@ -81,6 +81,8 @@ class KirchhoffNet(nn.Module):
         cell_mode: str = "soft",
         drive_targets: list[torch.Tensor] | None = None,
         drive_scales: list[float] | None = None,
+        solver: str = "heun",
+        deq_cfg: dict | None = None,
     ):
         from sim_context import SimContext
 
@@ -109,6 +111,8 @@ class KirchhoffNet(nn.Module):
                 cell_mode=cell_mode,
                 x_drive=x_drive_i,
                 drive_scale=drive_scale_i,
+                solver=solver,
+                deq_cfg=deq_cfg,
             )
             if store_trajectory and traj is not None:
                 all_trajs.append(traj)
@@ -276,6 +280,8 @@ class KirchhoffNetWithIO(nn.Module):
         tau: float | None = None,
         store_trajectory: bool = False,
         cell_mode: str = "soft",
+        solver: str = "heun",
+        deq_cfg: dict | None = None,
     ):
         x0 = self.input_mapper(u)
         if x0.size(1) != self.hid_count:
@@ -305,6 +311,8 @@ class KirchhoffNetWithIO(nn.Module):
                 cell_mode=cell_mode,
                 drive_targets=drive_targets,
                 drive_scales=self.drive_scales if self.enable_drive else None,
+                solver=solver,
+                deq_cfg=deq_cfg,
             )
         if self.read_idx is not None:
             x_read = x_final
@@ -313,7 +321,7 @@ class KirchhoffNetWithIO(nn.Module):
             if x_read.size(1) != self.read_dim:
                 raise ValueError(
                     f"Final state has {x_final.size(1)} dims; read_slice gives "
-                    f"{x_read.size(1)} dims, expected {self.read_dim}"
+                    f"{x_read.size(1)} dims; expected {self.read_dim}"
                 )
         y = self.output_mapper(x_read)
         return y, trajs

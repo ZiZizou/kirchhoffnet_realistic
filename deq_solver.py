@@ -120,14 +120,29 @@ def _solve_torchdeq(phi, x0, cfg):
 
 
 def _solve_fixed_point_iter(phi, x0, cfg):
-    """Naive fixed-point iteration fallback (no implicit backward)."""
+    """Memory-friendlier fixed-point iteration fallback.
+
+    The fallback keeps gradients through the unrolled iterations, but wraps
+    each Phi evaluation in checkpointing so the solver does not retain the
+    full activation graph for every step. This is slower than a fused
+    implicit solver, but it avoids the OOM behavior seen when torchdeq is
+    unavailable and the model falls back to explicit unrolling.
+    """
     f_max_iter = int(cfg.get("f_max_iter", 30))
     f_tol = float(cfg.get("f_tol", 1e-4))
-    x = x0.to(dtype=torch.float32).clone()
+    use_checkpoint = bool(cfg.get("checkpoint_iter", True))
+    x = x0.to(dtype=torch.float32).clone().requires_grad_(True)
     nstep = 0
     rel_res = float("inf")
+    checkpoint = None
+    if use_checkpoint:
+        from torch.utils.checkpoint import checkpoint as _checkpoint
+        checkpoint = _checkpoint
     for nstep in range(1, f_max_iter + 1):
-        x_next = phi(x)
+        if checkpoint is None:
+            x_next = phi(x)
+        else:
+            x_next = checkpoint(phi, x, use_reentrant=False)
         diff = (x_next - x).flatten()
         denom = x.flatten().abs().clamp_min(1e-8)
         rel_res = float((diff.abs() / denom).max().item()) if denom.numel() > 0 else float("nan")
@@ -161,6 +176,7 @@ def solve_equilibrium(
           - backend: "torchdeq" | "fixed_point_iter" (default: auto)
           - deq_step: reserved (currently informational; stage-level caller
             applies the damping outside the solver)
+          - checkpoint_iter: bool (fixed_point_iter only; default True)
 
     Returns
     -------

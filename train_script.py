@@ -1003,6 +1003,27 @@ def _append_deq_validation_row(
         )
 
 
+def _append_deq_train_row(
+    path,
+    *,
+    epoch: int,
+    phase: str,
+    train_loss: float,
+    metrics: dict | None,
+) -> None:
+    if metrics is None:
+        return
+    _append_deq_validation_row(
+        path,
+        epoch=epoch,
+        phase=phase,
+        split="train",
+        train_loss=train_loss,
+        val_loss=train_loss,
+        metrics=metrics,
+    )
+
+
 def validate(net, val_loader, task_fn, ctx_factory, device, cell_mode: str = "soft",
              solver: str = "heun", deq_cfg: dict | None = None,
              collect_deq_metrics: bool = False):
@@ -2219,6 +2240,7 @@ def main():
     # remains the default so existing runs are unaffected.
     solver = getattr(args, "solver", "heun")
     deq_cfg = _build_deq_cfg(args)
+    deq_train_log_path = out_dir / "deq_training_history.txt" if solver == "deq" else None
     deq_val_log_path = out_dir / "deq_validation_history.txt" if solver == "deq" else None
 
     for epoch in ab_iter:
@@ -2304,6 +2326,12 @@ def main():
 
         total_loss = 0.0
         n_batches = 0
+        train_deq_weight = 0
+        train_deq_residual_sum = 0.0
+        train_deq_residual_max = 0.0
+        train_deq_nstep_sum = 0.0
+        train_deq_nstep_max = 0.0
+        train_deq_abs_state_max = 0.0
         for batch in train_loader:
             ctx = ctx_factory(batch[0].size(0), device=device)
             optimizer.zero_grad()
@@ -2337,8 +2365,35 @@ def main():
                 optimizer.step()
             total_loss += float((loss_task + loss_structural).item())
             n_batches += 1
+            if solver == "deq" and not isinstance(net, torch.nn.DataParallel):
+                batch_stats = _deq_batch_stats(raw_net, solver=solver, deq_cfg=deq_cfg)
+                if batch_stats is not None:
+                    bs = int(u.size(0))
+                    train_deq_weight += bs
+                    train_deq_residual_sum += batch_stats["residual_mean"] * bs
+                    train_deq_residual_max = max(train_deq_residual_max, batch_stats["residual_max"])
+                    train_deq_nstep_sum += batch_stats["nstep_mean"] * bs
+                    train_deq_nstep_max = max(train_deq_nstep_max, batch_stats["nstep_max"])
+                    train_deq_abs_state_max = max(train_deq_abs_state_max, batch_stats["max_abs_state"])
 
         avg_train = total_loss / max(1, n_batches)
+        train_deq_metrics = None
+        if solver == "deq" and train_deq_weight > 0:
+            train_deq_metrics = {
+                "residual_mean": train_deq_residual_sum / train_deq_weight,
+                "residual_max": train_deq_residual_max,
+                "nstep_mean": train_deq_nstep_sum / train_deq_weight,
+                "nstep_max": train_deq_nstep_max,
+                "max_abs_state": train_deq_abs_state_max,
+            }
+            if deq_train_log_path is not None:
+                _append_deq_train_row(
+                    deq_train_log_path,
+                    epoch=epoch,
+                    phase=phase,
+                    train_loss=avg_train,
+                    metrics=train_deq_metrics,
+                )
         do_validate = (epoch % args.validate_every == 0) or (epoch == ab_total - 1)
         if do_validate:
             val_deq_metrics = None
@@ -2432,8 +2487,6 @@ def main():
                         f"stability={ready_details['stability']:.4f}, "
                         f"improvement={ready_details['improvement_rate']:.6f}"
                     )
-            if val_deq_metrics is not None:
-                print(_format_deq_summary(val_deq_metrics))
         else:
             val_loss = val_history[-1] if val_history else avg_train
             if val_argmax_history is not None:
@@ -2441,6 +2494,11 @@ def main():
 
         history.append(avg_train)
         val_history.append(val_loss)
+
+        if train_deq_metrics is not None:
+            print(f"[deq-train] epoch {epoch:4d}  train={avg_train:.4f}" + _format_deq_summary(train_deq_metrics))
+        if val_deq_metrics is not None:
+            print(_format_deq_summary(val_deq_metrics))
 
         if do_validate:
             # four-phase-redesign/Phase 1b: For three_phase mode in Phase B,
@@ -2945,6 +3003,12 @@ def main():
             _log_gpu_mem("retrain_epoch_0_start")
             for repoch in range(c_epochs):
                 pruned_net.train()
+                retrain_deq_weight = 0
+                retrain_deq_residual_sum = 0.0
+                retrain_deq_residual_max = 0.0
+                retrain_deq_nstep_sum = 0.0
+                retrain_deq_nstep_max = 0.0
+                retrain_deq_abs_state_max = 0.0
                 if schedule_mode == "three_phase":
                     global_epoch = b_end + repoch
                     tau_r = three_phase_tau(global_epoch, epochs)
@@ -3006,6 +3070,16 @@ def main():
                         retrain_optimizer.step()
                     tot += float((loss_task + loss_structural).item())
                     nb += 1
+                    if solver == "deq" and not isinstance(pruned_net, torch.nn.DataParallel):
+                        batch_stats = _deq_batch_stats(pruned_net, solver=solver, deq_cfg=deq_cfg)
+                        if batch_stats is not None:
+                            bs = int(u_b.size(0))
+                            retrain_deq_weight += bs
+                            retrain_deq_residual_sum += batch_stats["residual_mean"] * bs
+                            retrain_deq_residual_max = max(retrain_deq_residual_max, batch_stats["residual_max"])
+                            retrain_deq_nstep_sum += batch_stats["nstep_mean"] * bs
+                            retrain_deq_nstep_max = max(retrain_deq_nstep_max, batch_stats["nstep_max"])
+                            retrain_deq_abs_state_max = max(retrain_deq_abs_state_max, batch_stats["max_abs_state"])
                 if retrain_scheduler is not None:
                     retrain_scheduler.step()
                 if grad_log_path is not None and repoch % args.grad_log_every == 0:
@@ -3015,6 +3089,23 @@ def main():
                     )
                 avg = tot / max(1, nb)
                 retrain_history.append(avg)
+                retrain_deq_metrics = None
+                if solver == "deq" and retrain_deq_weight > 0:
+                    retrain_deq_metrics = {
+                        "residual_mean": retrain_deq_residual_sum / retrain_deq_weight,
+                        "residual_max": retrain_deq_residual_max,
+                        "nstep_mean": retrain_deq_nstep_sum / retrain_deq_weight,
+                        "nstep_max": retrain_deq_nstep_max,
+                        "max_abs_state": retrain_deq_abs_state_max,
+                    }
+                    if retrain_deq_log_path is not None:
+                        _append_deq_train_row(
+                            retrain_deq_log_path,
+                            epoch=global_epoch,
+                            phase="C",
+                            train_loss=avg,
+                            metrics=retrain_deq_metrics,
+                        )
                 val_deq_metrics = None
                 if repoch % args.validate_every == 0 or repoch == c_epochs - 1:
                     if inverse_stats is not None:
@@ -3104,6 +3195,7 @@ def main():
                     f"train={avg:.4f}  "
                     f"val={retrain_val_history[-1]:.4f}  tau={tau_r:.3f}  "
                     f"lr={retrain_optimizer.param_groups[0]['lr']:.2e}"
+                    + (_format_deq_summary(retrain_deq_metrics) if retrain_deq_metrics is not None else "")
                     + (_format_deq_summary(val_deq_metrics) if val_deq_metrics is not None else "")
                 )
 

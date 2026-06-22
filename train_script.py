@@ -1303,7 +1303,7 @@ def _grad_norm_keys(norms):
     )
 
 
-def log_gradient_norms(grad_log_path, epoch, raw_net, *, retrain=False, optimizer=None):
+def log_gradient_norms(grad_log_path, epoch, raw_net, *, retrain=False, optimizer=None, norms=None):
     """Append one row of per-group L2 gradient norms to ``grad_log_path``.
 
     On the first call, also writes the header row.
@@ -1312,7 +1312,8 @@ def log_gradient_norms(grad_log_path, epoch, raw_net, *, retrain=False, optimize
     per-group learning rates as additional columns (``lr0``, ``lr1``, ...).
     """
     raw = raw_net.module if isinstance(raw_net, torch.nn.DataParallel) else raw_net
-    norms = collect_gradient_norms(raw)
+    if norms is None:
+        norms = collect_gradient_norms(raw)
     ordered_keys = _grad_norm_keys(norms)
 
     lr_keys = []
@@ -2326,6 +2327,8 @@ def main():
 
         total_loss = 0.0
         n_batches = 0
+        should_log_grads = grad_log_path is not None and epoch % args.grad_log_every == 0
+        epoch_grad_norms = None
         train_deq_weight = 0
         train_deq_residual_sum = 0.0
         train_deq_residual_max = 0.0
@@ -2357,11 +2360,15 @@ def main():
                 ( scaler.scale(loss_task) + scaler.scale(loss_structural) ).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=OPTIM["grad_clip_norm"])
+                if should_log_grads:
+                    epoch_grad_norms = collect_gradient_norms(raw_net)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 (loss_task + loss_structural).backward()
                 torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=OPTIM["grad_clip_norm"])
+                if should_log_grads:
+                    epoch_grad_norms = collect_gradient_norms(raw_net)
                 optimizer.step()
             total_loss += float((loss_task + loss_structural).item())
             n_batches += 1
@@ -2536,9 +2543,9 @@ def main():
         if scheduler is not None:
             scheduler.step()
 
-        if grad_log_path is not None and epoch % args.grad_log_every == 0:
+        if should_log_grads:
             raw = net.module if isinstance(net, torch.nn.DataParallel) else net
-            log_gradient_norms(grad_log_path, epoch, raw, optimizer=optimizer)
+            log_gradient_norms(grad_log_path, epoch, raw, optimizer=optimizer, norms=epoch_grad_norms)
 
         _lrs = [g["lr"] for g in optimizer.param_groups]
         lr_str = f"{min(_lrs):.1e}..{max(_lrs):.1e}" if len(_lrs) > 1 else f"{_lrs[0]:.2e}"
@@ -3046,6 +3053,8 @@ def main():
                 cell_mode_c = _resolve_cell_mode(args.cell_mode, "C", schedule_mode)
                 tot = 0.0
                 nb = 0
+                should_log_retrain_grads = grad_log_path is not None and repoch % args.grad_log_every == 0
+                retrain_epoch_grad_norms = None
                 for batch in retrain_train_loader:
                     ctx = ctx_factory(batch[0].size(0), device=device)
                     retrain_optimizer.zero_grad()
@@ -3062,11 +3071,15 @@ def main():
                         ( retrain_scaler.scale(loss_task) + retrain_scaler.scale(loss_structural) ).backward()
                         retrain_scaler.unscale_(retrain_optimizer)
                         torch.nn.utils.clip_grad_norm_(pruned_net.parameters(), max_norm=OPTIM["grad_clip_norm"])
+                        if should_log_retrain_grads:
+                            retrain_epoch_grad_norms = collect_gradient_norms(pruned_net)
                         retrain_scaler.step(retrain_optimizer)
                         retrain_scaler.update()
                     else:
                         (loss_task + loss_structural).backward()
                         torch.nn.utils.clip_grad_norm_(pruned_net.parameters(), max_norm=OPTIM["grad_clip_norm"])
+                        if should_log_retrain_grads:
+                            retrain_epoch_grad_norms = collect_gradient_norms(pruned_net)
                         retrain_optimizer.step()
                     tot += float((loss_task + loss_structural).item())
                     nb += 1
@@ -3082,10 +3095,10 @@ def main():
                             retrain_deq_abs_state_max = max(retrain_deq_abs_state_max, batch_stats["max_abs_state"])
                 if retrain_scheduler is not None:
                     retrain_scheduler.step()
-                if grad_log_path is not None and repoch % args.grad_log_every == 0:
+                if should_log_retrain_grads:
                     log_gradient_norms(
                         grad_log_path, repoch, pruned_net, retrain=True,
-                        optimizer=retrain_optimizer,
+                        optimizer=retrain_optimizer, norms=retrain_epoch_grad_norms,
                     )
                 avg = tot / max(1, nb)
                 retrain_history.append(avg)

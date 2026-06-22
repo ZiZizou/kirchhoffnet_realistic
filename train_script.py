@@ -1342,6 +1342,16 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "multistart uniqueness) once after train/val and print the "
              "report. Useful when prototyping --solver deq.",
     )
+    parser.add_argument(
+        "--persistent-drive", action="store_true", default=False,
+        dest="persistent_drive",
+        help="Enable persistent drive current in all stages. The drive "
+             "current I_drive = I_sat * tanh(g * (x_drive - x) / I_sat) "
+             "makes the fixed point x* input-dependent under DEQ. "
+             "Requires write_mode='fan_out' (the smooth2d_grid preset "
+             "already uses fan_out by default). Has no effect when "
+             "--solver heun.",
+    )
 
 
 # ----------------------------------------------------------------
@@ -1618,6 +1628,15 @@ def main():
             f"bidirectional={args.bidirectional} "
             f"write_mode={new_preset['write_mode']} read_mode={new_preset['read_mode']}"
         )
+    # Persistent drive: auto-force write_mode='fan_out' when enabled.
+    if args.persistent_drive:
+        if args.write_mode is not None and args.write_mode != "fan_out":
+            raise ValueError(
+                "--persistent-drive requires write_mode='fan_out' "
+                f"(got --write-mode {args.write_mode!r})"
+            )
+        if args.write_mode is None:
+            args.write_mode = "fan_out"
     net = build_net_from_preset(
         args.problem,
         cell_lib=cell_lib,
@@ -1625,6 +1644,7 @@ def main():
         read_mode=args.read_mode,
         write_idx=write_idx_arg,
         read_idx=read_idx_arg,
+        enable_drive=args.persistent_drive,
     )
     net.to(device)
     grid_label = (
@@ -1660,6 +1680,15 @@ def main():
             print(
                 f"[train] edge_repeats={eff_er}: ({mult}× single-edge baseline)"
             )
+    if args.solver == "deq" and not args.persistent_drive:
+        print(
+            "[train] WARNING: --solver deq without --persistent-drive: "
+            "the equilibrium x* has no input-dependent forcing term, "
+            "so the network can only fit a constant target. "
+            "Add --persistent-drive (requires write_mode='fan_out') "
+            "for input-dependent fixed points."
+        )
+
     _save_config_snapshot(out_dir, args.problem, args, lambdas, net=net)
 
     effective_write_mode = (

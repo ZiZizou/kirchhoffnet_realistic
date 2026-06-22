@@ -3,3 +3,7 @@ __pycache__
 network_visualization
 test_smoke.py
 different_configuration_output_logs.md
+implementation_notes_deq_gpt_54.md
+implementation_notes_deq_kimi.md
+kirchhoff_ode_inefficiency.md
+1

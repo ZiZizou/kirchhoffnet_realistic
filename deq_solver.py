@@ -77,8 +77,14 @@ def _solve_torchdeq(phi, x0, cfg):
     # internally and re-enters autograd for the IFT backward pass. We must NOT
     # wrap the deq() call in torch.no_grad() ourselves or the implicit-grad
     # graph breaks (the returned tensors lose their grad_fn).
+    #
+    # However, we DO disable autocast here so the solver (Anderson iteration
+    # + IFT backward) runs in fp32 regardless of the caller's autocast state.
+    # fp16 in the Anderson solver destabilises the fixed-point iteration and
+    # corrupts the IFT linear solve.
     x0_f32 = x0.to(dtype=torch.float32)
-    z_out_list, info = deq(phi, x0_f32)
+    with torch.autocast(device_type='cuda', enabled=False):
+        z_out_list, info = deq(phi, x0_f32)
 
     if isinstance(z_out_list, list):
         x_star = z_out_list[-1]

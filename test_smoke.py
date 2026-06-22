@@ -2483,20 +2483,21 @@ def main():
     test_deprecate_node_gates_warnings()         # DNG-1: deprecation warnings
 
     # Deep Equilibrium (DEQ) training mode tests (deq-core-prototype plan)
-    test_deq_config_defaults()                   # DEQ-12: config defaults
+    test_deq_config_defaults()                   # DEQ-13: config defaults
     test_deq_solver_imports_and_solves()         # DEQ-1:  solver adapter
     test_deq_solver_run_in_fp32()                # DEQ-2:  fp32 / AMP safety
-    test_deq_multistart_uniqueness_on_contractive()  # DEQ-11
-    test_deq_leak_floor_enforced()               # DEQ-8:  leak_floor safeguard
+    test_deq_multistart_uniqueness_on_contractive()  # DEQ-12
+    test_deq_leak_floor_enforced()               # DEQ-9:  leak_floor safeguard
     test_deq_equilibrium_rhs_residual_small()    # DEQ-3:  residual at equilibrium
     test_deq_equilibrium_matches_long_horizon_heun()  # DEQ-4: vs Heun rollout
     test_deq_implicit_backward_gradients_finite()    # DEQ-5: implicit grads
     test_deq_z_logits_grad_norm_at_least_bptt()  # DEQ-6:  DEQ vs BPTT
-    test_deq_ste_mode_rejected()                 # DEQ-7:  soft-only safeguard
-    test_deq_solver_kwarg_threads_through_kirchhoff_net()  # DEQ-9: wiring
-    test_deq_heun_regression_unchanged()         # DEQ-10: Heun regression
-    test_deq_diagnostics_jacobian_cond()         # DEQ-13: cond(J)
-    test_deq_diagnostics_grad_norm_compare()     # DEQ-14: grad norm compare
+    test_deq_input_dependence()                  # DEQ-7:  input-dependence w/ drive
+    test_deq_ste_mode_rejected()                 # DEQ-8:  soft-only safeguard
+    test_deq_solver_kwarg_threads_through_kirchhoff_net()  # DEQ-10: wiring
+    test_deq_heun_regression_unchanged()         # DEQ-11: Heun regression
+    test_deq_diagnostics_jacobian_cond()         # DEQ-14: cond(J)
+    test_deq_diagnostics_grad_norm_compare()     # DEQ-15: grad norm compare
 
     print()
     print("=" * 60)
@@ -5763,16 +5764,15 @@ def test_deq_equilibrium_rhs_residual_small():
     x_star, info = stage.forward_equilibrium(x0, ctx=ctx, tau=1.0,
                                              cell_mode="soft", x_drive=None,
                                              drive_scale=0.0, deq_cfg=deq_cfg)
-    # Measure the residual WHILE the stage still has the DEQ leak_floor set
-    # (forward_equilibrium restores it to 0.0 on return, so we re-apply
-    # before checking). The residual at x* should be small for a converged
-    # damped fixed point.
-    stage.set_leak_floor(float(deq_cfg["leak_floor"]))
+    # Measure the residual at the converged fixed point using the same
+    # leak_floor that was used during the DEQ solve (passed via kwarg to
+    # avoid mutating self.leak_floor, which is reset to 0.0 by
+    # forward_equilibrium after the solve).
     with torch.no_grad():
         r = stage.rhs(x_star, ctx=ctx, tau=1.0, cell_mode="soft",
-                      x_drive=None, drive_scale=0.0)
+                      x_drive=None, drive_scale=0.0,
+                      leak_floor=float(deq_cfg["leak_floor"]))
     res_norm = float(r.abs().max())
-    stage.set_leak_floor(0.0)
     check("x_star finite", torch.isfinite(x_star).all().item())
     check("max|rhs(x*)| < 1e-2", res_norm < 1e-2,
           f"max|rhs|={res_norm:.3e}")
@@ -5802,11 +5802,17 @@ def test_deq_equilibrium_matches_long_horizon_heun():
     x_deq, _ = stage.forward_equilibrium(x0, ctx=ctx, tau=1.0,
                                         cell_mode="soft", x_drive=None,
                                         drive_scale=0.0, deq_cfg=deq_cfg)
+    # Use the SAME leak_floor for the Heun comparison so both paths
+    # converge to the same dynamical system. forward_equilibrium resets
+    # self.leak_floor to 0.0 on return, so we set it explicitly here.
+    lf = float(deq_cfg["leak_floor"])
+    stage.set_leak_floor(lf)
     x_heun, _ = stage.forward(x0, ctx=ctx, t_span=50.0, num_steps=2000,
                               tau=1.0, store_trajectory=False,
                               cell_mode="soft", x_drive=None, drive_scale=0.0)
+    stage.set_leak_floor(0.0)
     diff = float((x_deq - x_heun).abs().max())
-    check("max|DEQ - long Heun| < 0.05", diff < 0.05,
+    check("max|DEQ - long Heun| < 0.05 (same leak_floor)", diff < 0.05,
           f"max diff={diff:.3e}")
 
 
@@ -5886,9 +5892,64 @@ def test_deq_z_logits_grad_norm_at_least_bptt():
           f"ratio={g_deq / max(g_heun, 1e-30):.3f}")
 
 
+def test_deq_input_dependence():
+    """DEQ with persistent drive produces input-dependent x*.
+
+    Without drive the fixed point is constant (parameters only). With
+    active drive the equilibrium differs for distinct x_drive inputs.
+    """
+    print("\nTest DEQ-7: DEQ input-dependence with persistent drive")
+    from cell_library import IdealizedCellLibrary
+    from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
+    from sim_context import SimContext
+
+    torch.manual_seed(0)
+    cell_lib = IdealizedCellLibrary()
+    hid = cluster_graph(3, edge_prob=0.5, seed=0)
+    builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
+    topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
+                         proj_pattern="all_to_all")
+    # Build stage with write_idx=[0] so drive is enabled.
+    stage, _, _ = topology_to_stage(topo, cell_lib=cell_lib, write_idx=[0])
+    stage.drive_isat = 0.5
+    stage.raw_drive_g.data.fill_(0.5)
+
+    ctx = SimContext()
+    deq_cfg = {"f_max_iter": 60, "f_tol": 1e-6, "deq_step": 0.1,
+               "leak_floor": 0.05}
+    x0 = torch.zeros(1, 3)
+
+    # Two different x_drive inputs.
+    x_drive_a = torch.tensor([[1.0, 0.0, 0.0]])
+    x_drive_b = torch.tensor([[-1.0, 0.0, 0.0]])
+
+    x_a, _ = stage.forward_equilibrium(x0, ctx=ctx, tau=1.0, cell_mode="soft",
+                                        x_drive=x_drive_a, drive_scale=1.0,
+                                        deq_cfg=deq_cfg)
+    x_b, _ = stage.forward_equilibrium(x0, ctx=ctx, tau=1.0, cell_mode="soft",
+                                        x_drive=x_drive_b, drive_scale=1.0,
+                                        deq_cfg=deq_cfg)
+    diff = float((x_a - x_b).abs().max())
+    check("x* differs for different x_drive (drive active)",
+          diff > 1e-4,
+          f"max|x_a - x_b| = {diff:.6e}")
+
+    # Without drive (drive_scale=0) the equilibrium should be the same.
+    x_a0, _ = stage.forward_equilibrium(x0, ctx=ctx, tau=1.0, cell_mode="soft",
+                                         x_drive=x_drive_a, drive_scale=0.0,
+                                         deq_cfg=deq_cfg)
+    x_b0, _ = stage.forward_equilibrium(x0, ctx=ctx, tau=1.0, cell_mode="soft",
+                                         x_drive=x_drive_b, drive_scale=0.0,
+                                         deq_cfg=deq_cfg)
+    diff0 = float((x_a0 - x_b0).abs().max())
+    check("x* identical for different x_drive (drive_scale=0)",
+          diff0 < 1e-6,
+          f"max|x_a0 - x_b0| = {diff0:.6e}")
+
+
 def test_deq_ste_mode_rejected():
     """forward_equilibrium rejects cell_mode='ste' (soft-only safeguard)."""
-    print("\nTest DEQ-7: forward_equilibrium rejects STE cell mode")
+    print("\nTest DEQ-8: forward_equilibrium rejects STE cell mode")
     from cell_library import IdealizedCellLibrary
     from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
     from sim_context import SimContext
@@ -5916,7 +5977,7 @@ def test_deq_ste_mode_rejected():
 
 def test_deq_leak_floor_enforced():
     """leak_floor=0.0 leaves Heun path unchanged (regression); >0 keeps diagonal damping."""
-    print("\nTest DEQ-8: leak_floor=0.0 matches default Heun; leak_floor>0 increases leak")
+    print("\nTest DEQ-9: leak_floor=0.0 matches default Heun; leak_floor>0 increases leak")
     from cell_library import IdealizedCellLibrary
     from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
     from sim_context import SimContext
@@ -5942,7 +6003,7 @@ def test_deq_leak_floor_enforced():
 
 def test_deq_solver_kwarg_threads_through_kirchhoff_net():
     """KirchhoffNet.forward accepts solver='heun' and 'deq' and dispatches correctly."""
-    print("\nTest DEQ-9: solver kwarg threads through KirchhoffNet / WithIO")
+    print("\nTest DEQ-10: solver kwarg threads through KirchhoffNet / WithIO")
     from cell_library import IdealizedCellLibrary
     from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
     from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
@@ -5980,7 +6041,7 @@ def test_deq_solver_kwarg_threads_through_kirchhoff_net():
 
 def test_deq_heun_regression_unchanged():
     """With solver='heun' (default), behavior must be unchanged from pre-DEQ path."""
-    print("\nTest DEQ-10: Heun path unchanged with solver='heun'")
+    print("\nTest DEQ-11: Heun path unchanged with solver='heun'")
     from cell_library import IdealizedCellLibrary
     from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
     from kirchhoff_net import KirchhoffNet
@@ -6009,7 +6070,7 @@ def test_deq_heun_regression_unchanged():
 
 def test_deq_multistart_uniqueness_on_contractive():
     """Multistart: solving from several x0 should give the same x* on contractive Phi."""
-    print("\nTest DEQ-11: multistart uniqueness on contractive fixed point")
+    print("\nTest DEQ-12: multistart uniqueness on contractive fixed point")
     from deq_solver import solve_equilibrium
 
     def phi(x):
@@ -6032,7 +6093,7 @@ def test_deq_multistart_uniqueness_on_contractive():
 
 def test_deq_config_defaults():
     """DEQ config dict exists in config.py with expected keys and defaults."""
-    print("\nTest DEQ-12: config.DEQ has expected defaults")
+    print("\nTest DEQ-13: config.DEQ has expected defaults")
     import config
     check("config has DEQ dict", hasattr(config, "DEQ"))
     if not hasattr(config, "DEQ"):
@@ -6048,7 +6109,7 @@ def test_deq_config_defaults():
 
 def test_deq_diagnostics_jacobian_cond():
     """deq_diagnostics.estimate_jacobian_cond returns a finite cond on a tiny stage."""
-    print("\nTest DEQ-13: deq_diagnostics.jacobian_cond finite")
+    print("\nTest DEQ-14: deq_diagnostics.jacobian_cond finite")
     from cell_library import IdealizedCellLibrary
     from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
     from sim_context import SimContext
@@ -6074,7 +6135,7 @@ def test_deq_diagnostics_jacobian_cond():
 
 def test_deq_diagnostics_grad_norm_compare():
     """deq_diagnostics.gradient_norm_compare returns finite z_logits & logits norms."""
-    print("\nTest DEQ-14: deq_diagnostics.gradient_norm_compare returns finite norms")
+    print("\nTest DEQ-15: deq_diagnostics.gradient_norm_compare returns finite norms")
     from cell_library import IdealizedCellLibrary
     from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
     from sim_context import SimContext

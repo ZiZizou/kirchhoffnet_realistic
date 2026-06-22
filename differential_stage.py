@@ -185,7 +185,8 @@ class DifferentialStage(nn.Module):
         return out.to(dtype=x.dtype)
 
     def rhs(self, x: torch.Tensor, ctx, tau: float = 1.0, cell_mode: str = "soft",
-            x_drive: torch.Tensor | None = None, drive_scale: float = 0.0) -> torch.Tensor:
+            x_drive: torch.Tensor | None = None, drive_scale: float = 0.0,
+            leak_floor: float | None = None) -> torch.Tensor:
         """Compute dx/dt at state x. x: [batch, num_nodes].
 
         Gate application (CP-2):
@@ -240,7 +241,7 @@ class DifferentialStage(nn.Module):
         acc.index_add_(1, self.src, -i_edge_f32)
         acc = acc.to(dtype=x.dtype)
 
-        leak = self._effective_leak().unsqueeze(0)  # [1, N]
+        leak = self._effective_leak(leak_floor=leak_floor).unsqueeze(0)  # [1, N]
         leak_term = leak * x
 
         clip = torch.sigmoid((x - self.x_max) / self.clip_softness)
@@ -368,7 +369,10 @@ class DifferentialStage(nn.Module):
           hard argmax break implicit differentiation.
         - ``leak_floor >= 0`` applied via :meth:`set_leak_floor` so the
           fixed-point map has positive diagonal damping (contractivity).
-        - Solve runs in fp32 with autocast disabled (AMP safety).
+        - The ``leak_floor`` value is captured by the ``phi`` closure so the
+          backward pass (re-evaluated by torchdeq's IFT) uses the same
+          leak_floor as the forward solve.
+        - Solver runs in fp32; autocast is disabled by the solver adapter.
         """
         if cell_mode != "soft":
             raise ValueError(
@@ -382,14 +386,15 @@ class DifferentialStage(nn.Module):
         cfg = dict(DEQ)
         if deq_cfg:
             cfg.update(deq_cfg)
-        leak_floor = float(cfg.get("leak_floor", 0.0))
-        self.set_leak_floor(leak_floor)
+        lf = float(cfg.get("leak_floor", 0.0))
+        self.set_leak_floor(lf)
         dt = float(cfg.get("deq_step", 0.1))
         tau = float(tau if tau is not None else 1.0)
 
         def phi(x):
             return x + dt * self.rhs(x, ctx=ctx, tau=tau, cell_mode="soft",
-                                    x_drive=x_drive, drive_scale=drive_scale)
+                                    x_drive=x_drive, drive_scale=drive_scale,
+                                    leak_floor=lf)
 
         x_star, info = solve_equilibrium(phi, x0, cfg)
         # Cast to the stage's parameter dtype so AMP/GradScaler and downstream

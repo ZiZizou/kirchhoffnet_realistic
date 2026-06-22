@@ -826,11 +826,196 @@ def make_data(problem: str, batch_size: int):
     raise ValueError(f"Unknown problem: {problem}")
 
 
+def _unwrap_raw_net(net):
+    return net.module if isinstance(net, torch.nn.DataParallel) else net
+
+
+def _deq_batch_stats(raw_net, *, solver: str, deq_cfg: dict | None) -> dict | None:
+    """Compute cached DEQ residual stats for the most recent forward pass."""
+    core = raw_net.core if hasattr(raw_net, "core") else raw_net
+    stage_outputs = getattr(core, "last_stage_outputs", None) or []
+    stage_infos = getattr(core, "last_stage_infos", None) or []
+    stage_ctxs = getattr(core, "last_stage_ctxs", None) or []
+    drive_targets = getattr(core, "last_drive_targets", None) or []
+    drive_scales = getattr(core, "last_drive_scales", None) or []
+    stages = getattr(core, "stages", None) or []
+    if solver != "deq" or not stage_outputs or not stages:
+        return None
+
+    abs_residual_means = []
+    abs_residual_maxes = []
+    nsteps = []
+    max_abs_state = 0.0
+    for i, stage in enumerate(stages):
+        if i >= len(stage_outputs):
+            break
+        info = stage_infos[i] if i < len(stage_infos) else {}
+        if not info:
+            continue
+        x_stage = stage_outputs[i]
+        stage_ctx = stage_ctxs[i] if i < len(stage_ctxs) else None
+        x_drive = drive_targets[i] if i < len(drive_targets) else None
+        drive_scale = float(drive_scales[i]) if i < len(drive_scales) else 0.0
+        tau_i = float(info.get("tau", 1.0))
+        cell_mode_i = info.get("cell_mode", "soft")
+        leak_floor = float(info.get("leak_floor", 0.0))
+        deq_step = float(info.get("deq_step", (deq_cfg or {}).get("deq_step", 0.1)))
+
+        with torch.no_grad():
+            rhs = stage.rhs(
+                x_stage,
+                ctx=stage_ctx,
+                tau=tau_i,
+                cell_mode=cell_mode_i,
+                x_drive=x_drive,
+                drive_scale=drive_scale,
+                leak_floor=leak_floor,
+            )
+        residual = deq_step * rhs
+        abs_residual = residual.abs()
+        abs_residual_means.append(float(abs_residual.mean().item()))
+        abs_residual_maxes.append(float(abs_residual.max().item()))
+        max_abs_state = max(max_abs_state, float(x_stage.abs().max().item()))
+
+        nstep = info.get("nstep", 0)
+        if torch.is_tensor(nstep):
+            nstep = int(nstep.flatten()[0].item())
+        else:
+            nstep = int(nstep)
+        nsteps.append(nstep)
+
+    if not abs_residual_means:
+        return None
+
+    return {
+        "residual_mean": float(sum(abs_residual_means) / len(abs_residual_means)),
+        "residual_max": float(max(abs_residual_maxes)),
+        "nstep_mean": float(sum(nsteps) / len(nsteps)) if nsteps else 0.0,
+        "nstep_max": float(max(nsteps)) if nsteps else 0.0,
+        "max_abs_state": float(max_abs_state),
+    }
+
+
+def _deq_gradient_probe(
+    net,
+    u: torch.Tensor,
+    target: torch.Tensor,
+    ctx,
+    task_fn,
+    *,
+    cell_mode: str,
+    solver: str,
+    deq_cfg: dict | None,
+) -> dict | None:
+    """Run one gradient probe batch and summarize mapper / gate norms."""
+    if solver != "deq":
+        return None
+    raw_net = _unwrap_raw_net(net)
+    probe_net = raw_net if isinstance(net, torch.nn.DataParallel) else net
+    raw_net.zero_grad(set_to_none=True)
+    out, _ = probe_net(
+        u,
+        ctx=ctx,
+        tau=1.0,
+        store_trajectory=False,
+        cell_mode=cell_mode,
+        solver=solver,
+        deq_cfg=deq_cfg,
+    )
+    loss = task_fn(out, target)
+    loss.backward()
+    norms = collect_gradient_norms(raw_net)
+    batch_stats = _deq_batch_stats(raw_net, solver=solver, deq_cfg=deq_cfg)
+    raw_net.zero_grad(set_to_none=True)
+
+    stage_logits_sq = 0.0
+    z_logits_sq = 0.0
+    for key, val in norms.items():
+        if val is None:
+            continue
+        if key.endswith("_logits") and not key.endswith("_z_logits"):
+            stage_logits_sq += float(val) ** 2
+        elif key.endswith("_z_logits"):
+            z_logits_sq += float(val) ** 2
+    mapper_sq = 0.0
+    if norms.get("in_mapper") is not None:
+        mapper_sq += float(norms["in_mapper"]) ** 2
+    if norms.get("out_mapper") is not None:
+        mapper_sq += float(norms["out_mapper"]) ** 2
+
+    return {
+        "mapper_grad_norm": float(mapper_sq ** 0.5),
+        "stage_logits_grad_norm": float(stage_logits_sq ** 0.5),
+        "z_logits_grad_norm": float(z_logits_sq ** 0.5),
+        "probe_loss": float(loss.item()),
+        **(batch_stats or {}),
+    }
+
+
+def _format_deq_summary(metrics: dict | None) -> str:
+    if not metrics:
+        return ""
+    parts = [
+        f"res={metrics.get('residual_mean', float('nan')):.2e}/{metrics.get('residual_max', float('nan')):.2e}",
+        f"nstep={metrics.get('nstep_mean', float('nan')):.1f}/{metrics.get('nstep_max', float('nan')):.0f}",
+        f"|x|_max={metrics.get('max_abs_state', float('nan')):.2e}",
+    ]
+    if "mapper_grad_norm" in metrics:
+        parts.append(
+            f"grad={metrics.get('mapper_grad_norm', float('nan')):.2e}/"
+            f"{metrics.get('stage_logits_grad_norm', float('nan')):.2e}/"
+            f"{metrics.get('z_logits_grad_norm', float('nan')):.2e}"
+        )
+    return "  DEQ[" + " ".join(parts) + "]"
+
+
+def _append_deq_validation_row(
+    path,
+    *,
+    epoch: int,
+    phase: str,
+    split: str,
+    train_loss: float,
+    val_loss: float,
+    metrics: dict | None,
+) -> None:
+    if metrics is None:
+        return
+    new_file = not path.exists()
+    with open(path, "a") as f:
+        if new_file:
+            f.write(
+                "epoch\tphase\tsplit\ttrain\tval\tresidual_mean\tresidual_max\t"
+                "nstep_mean\tnstep_max\tmax_abs_state\tmapper_grad_norm\t"
+                "stage_logits_grad_norm\tz_logits_grad_norm\tprobe_loss\n"
+            )
+        f.write(
+            f"{epoch}\t{phase}\t{split}\t{train_loss:.6f}\t{val_loss:.6f}\t"
+            f"{metrics.get('residual_mean', float('nan')):.6e}\t"
+            f"{metrics.get('residual_max', float('nan')):.6e}\t"
+            f"{metrics.get('nstep_mean', float('nan')):.6f}\t"
+            f"{metrics.get('nstep_max', float('nan')):.6f}\t"
+            f"{metrics.get('max_abs_state', float('nan')):.6e}\t"
+            f"{metrics.get('mapper_grad_norm', float('nan')):.6e}\t"
+            f"{metrics.get('stage_logits_grad_norm', float('nan')):.6e}\t"
+            f"{metrics.get('z_logits_grad_norm', float('nan')):.6e}\t"
+            f"{metrics.get('probe_loss', float('nan')):.6f}\n"
+        )
+
+
 def validate(net, val_loader, task_fn, ctx_factory, device, cell_mode: str = "soft",
-             solver: str = "heun", deq_cfg: dict | None = None) -> float:
+             solver: str = "heun", deq_cfg: dict | None = None,
+             collect_deq_metrics: bool = False):
     net.eval()
+    use_cached_deq_stats = collect_deq_metrics and solver == "deq" and not isinstance(net, torch.nn.DataParallel)
     total = 0.0
     n = 0
+    deq_sum_residual = 0.0
+    deq_max_residual = 0.0
+    deq_sum_nstep = 0.0
+    deq_max_nstep = 0.0
+    deq_max_abs_state = 0.0
+    first_batch = None
     with torch.no_grad():
         for u, target in val_loader:
             u = u.to(device)
@@ -841,8 +1026,48 @@ def validate(net, val_loader, task_fn, ctx_factory, device, cell_mode: str = "so
             loss = task_fn(out, target)
             total += float(loss.item()) * u.size(0)
             n += u.size(0)
+            if use_cached_deq_stats:
+                raw = _unwrap_raw_net(net)
+                batch_stats = _deq_batch_stats(raw, solver=solver, deq_cfg=deq_cfg)
+                if batch_stats is not None:
+                    deq_sum_residual += batch_stats["residual_mean"] * u.size(0)
+                    deq_max_residual = max(deq_max_residual, batch_stats["residual_max"])
+                    deq_sum_nstep += batch_stats["nstep_mean"] * u.size(0)
+                    deq_max_nstep = max(deq_max_nstep, batch_stats["nstep_max"])
+                    deq_max_abs_state = max(deq_max_abs_state, batch_stats["max_abs_state"])
+            if first_batch is None:
+                first_batch = (u.detach(), target.detach(), ctx)
     net.train()
-    return total / max(1, n)
+    val_loss = total / max(1, n)
+    if not collect_deq_metrics or solver != "deq":
+        return val_loss
+
+    probe_metrics = None
+    if first_batch is not None:
+        probe_metrics = _deq_gradient_probe(
+            net,
+            first_batch[0],
+            first_batch[1],
+            first_batch[2],
+            task_fn,
+            cell_mode=cell_mode,
+            solver=solver,
+            deq_cfg=deq_cfg,
+        )
+    deq_metrics = {
+        "residual_mean": deq_sum_residual / max(1, n),
+        "residual_max": deq_max_residual,
+        "nstep_mean": deq_sum_nstep / max(1, n),
+        "nstep_max": deq_max_nstep,
+        "max_abs_state": deq_max_abs_state,
+    }
+    if probe_metrics is not None:
+        for key, value in probe_metrics.items():
+            if key in ("mapper_grad_norm", "stage_logits_grad_norm", "z_logits_grad_norm", "probe_loss"):
+                deq_metrics[key] = value
+            elif key not in deq_metrics or deq_metrics[key] == 0.0:
+                deq_metrics[key] = value
+    return val_loss, deq_metrics
 
 
 def validate_with_inverse(
@@ -855,6 +1080,7 @@ def validate_with_inverse(
     cell_mode: str = "soft",
     solver: str = "heun",
     deq_cfg: dict | None = None,
+    collect_deq_metrics: bool = False,
 ) -> dict:
     """Validation that also reports metrics in the original (denormalized) target units.
 
@@ -866,10 +1092,17 @@ def validate_with_inverse(
     reported as NaN (no denormalization available).
     """
     net.eval()
+    use_cached_deq_stats = collect_deq_metrics and solver == "deq" and not isinstance(net, torch.nn.DataParallel)
     total = 0.0
     n = 0
     se_sum = 0.0
     ae_sum = 0.0
+    deq_sum_residual = 0.0
+    deq_max_residual = 0.0
+    deq_sum_nstep = 0.0
+    deq_max_nstep = 0.0
+    deq_max_abs_state = 0.0
+    first_batch = None
     with torch.no_grad():
         for u, target in val_loader:
             u = u.to(device)
@@ -885,6 +1118,17 @@ def validate_with_inverse(
                 ae_sum += float((pred_orig - targ_orig).abs().sum().item())
                 se_sum += float(((pred_orig - targ_orig) ** 2).sum().item())
             n += u.size(0)
+            if use_cached_deq_stats:
+                raw = _unwrap_raw_net(net)
+                batch_stats = _deq_batch_stats(raw, solver=solver, deq_cfg=deq_cfg)
+                if batch_stats is not None:
+                    deq_sum_residual += batch_stats["residual_mean"] * u.size(0)
+                    deq_max_residual = max(deq_max_residual, batch_stats["residual_max"])
+                    deq_sum_nstep += batch_stats["nstep_mean"] * u.size(0)
+                    deq_max_nstep = max(deq_max_nstep, batch_stats["nstep_max"])
+                    deq_max_abs_state = max(deq_max_abs_state, batch_stats["max_abs_state"])
+            if first_batch is None:
+                first_batch = (u.detach(), target.detach(), ctx)
     net.train()
     out_dict = {"val": total / max(1, n)}
     if inverse_stats is not None and n > 0:
@@ -893,14 +1137,54 @@ def validate_with_inverse(
     else:
         out_dict["mae_orig"] = float("nan")
         out_dict["rmse_orig"] = float("nan")
+    if collect_deq_metrics and solver == "deq":
+        probe_metrics = None
+        if first_batch is not None:
+            probe_metrics = _deq_gradient_probe(
+                net,
+                first_batch[0],
+                first_batch[1],
+                first_batch[2],
+                task_fn,
+                cell_mode=cell_mode,
+                solver=solver,
+                deq_cfg=deq_cfg,
+            )
+        out_dict["deq"] = {
+            "residual_mean": deq_sum_residual / max(1, n),
+            "residual_max": deq_max_residual,
+            "nstep_mean": deq_sum_nstep / max(1, n),
+            "nstep_max": deq_max_nstep,
+            "max_abs_state": deq_max_abs_state,
+        }
+        if probe_metrics is not None:
+            for key, value in probe_metrics.items():
+                if key in ("mapper_grad_norm", "stage_logits_grad_norm", "z_logits_grad_norm", "probe_loss"):
+                    out_dict["deq"][key] = value
+                elif key not in out_dict["deq"] or out_dict["deq"][key] == 0.0:
+                    out_dict["deq"][key] = value
     return out_dict
 
 
-def collect_predictions(net, inputs, ctx_factory, device) -> torch.Tensor:
+def collect_predictions(
+    net,
+    inputs,
+    ctx_factory,
+    device,
+    *,
+    solver: str = "heun",
+    deq_cfg: dict | None = None,
+) -> torch.Tensor:
     net.eval()
     with torch.no_grad():
         ctx = ctx_factory(inputs.size(0), device=device)
-        out, _ = net(inputs, ctx=ctx, store_trajectory=True)
+        out, _ = net(
+            inputs,
+            ctx=ctx,
+            store_trajectory=True,
+            solver=solver,
+            deq_cfg=deq_cfg,
+        )
     net.train()
     return out
 
@@ -1935,6 +2219,7 @@ def main():
     # remains the default so existing runs are unaffected.
     solver = getattr(args, "solver", "heun")
     deq_cfg = _build_deq_cfg(args)
+    deq_val_log_path = out_dir / "deq_validation_history.txt" if solver == "deq" else None
 
     for epoch in ab_iter:
         if stop_training:
@@ -2056,23 +2341,55 @@ def main():
         avg_train = total_loss / max(1, n_batches)
         do_validate = (epoch % args.validate_every == 0) or (epoch == ab_total - 1)
         if do_validate:
+            val_deq_metrics = None
             if inverse_stats is not None:
-                val_metrics = validate_with_inverse(
-                    net, val_loader, task_fn, ctx_factory, device,
-                    inverse_stats=inverse_stats, cell_mode=cell_mode,
-                    solver=solver, deq_cfg=deq_cfg,
-                )
+                if solver == "deq":
+                    val_metrics = validate_with_inverse(
+                        net, val_loader, task_fn, ctx_factory, device,
+                        inverse_stats=inverse_stats, cell_mode=cell_mode,
+                        solver=solver, deq_cfg=deq_cfg,
+                        collect_deq_metrics=True,
+                    )
+                    val_deq_metrics = val_metrics.pop("deq", None)
+                else:
+                    val_metrics = validate_with_inverse(
+                        net, val_loader, task_fn, ctx_factory, device,
+                        inverse_stats=inverse_stats, cell_mode=cell_mode,
+                        solver=solver, deq_cfg=deq_cfg,
+                    )
                 val_loss = val_metrics["val"]
             else:
-                val_loss = validate(net, val_loader, task_fn, ctx_factory, device,
-                                    cell_mode=cell_mode, solver=solver, deq_cfg=deq_cfg)
+                if solver == "deq":
+                    val_loss, val_deq_metrics = validate(
+                        net, val_loader, task_fn, ctx_factory, device,
+                        cell_mode=cell_mode, solver=solver, deq_cfg=deq_cfg,
+                        collect_deq_metrics=True,
+                    )
+                else:
+                    val_loss = validate(
+                        net, val_loader, task_fn, ctx_factory, device,
+                        cell_mode=cell_mode, solver=solver, deq_cfg=deq_cfg,
+                    )
                 val_metrics = None
             val_v_history.append(val_loss)
             if inverse_stats is not None and val_metrics is not None:
                 val_orig_history.append(val_metrics)
+            if deq_val_log_path is not None and val_deq_metrics is not None:
+                _append_deq_validation_row(
+                    deq_val_log_path,
+                    epoch=epoch,
+                    phase=phase,
+                    split="val",
+                    train_loss=avg_train,
+                    val_loss=val_loss,
+                    metrics=val_deq_metrics,
+                )
             # Argmax validation for phased schedules
             if val_argmax_history is not None:
-                val_arg = validate_argmax(net, val_loader, task_fn, ctx_factory, device)
+                val_arg = validate_argmax(
+                    net, val_loader, task_fn, ctx_factory, device,
+                    solver=solver, deq_cfg=deq_cfg,
+                )
                 val_argmax_history.append(val_arg)
                 val_argmax_v_history.append(val_arg)
             if solid_log_path is not None and phase in ("A", "B", "B1", "B2"):
@@ -2115,6 +2432,8 @@ def main():
                         f"stability={ready_details['stability']:.4f}, "
                         f"improvement={ready_details['improvement_rate']:.6f}"
                     )
+            if val_deq_metrics is not None:
+                print(_format_deq_summary(val_deq_metrics))
         else:
             val_loss = val_history[-1] if val_history else avg_train
             if val_argmax_history is not None:
@@ -2317,7 +2636,10 @@ def main():
     u_val, y_val = val_batch[0][:64].to(device), val_batch[1][:64].to(device)
     ctx = ctx_factory(u_val.size(0), device=device)
     with torch.no_grad():
-        out, trajs = net(u_val, ctx=ctx, store_trajectory=True)
+        out, trajs = net(
+            u_val, ctx=ctx, store_trajectory=True,
+            solver=solver, deq_cfg=deq_cfg,
+        )
     if isinstance(trajs, list) and trajs:
         plot_trajectories(
             trajs[0], stage_idx=0,
@@ -2610,6 +2932,7 @@ def main():
             retrain_val_history = []
             retrain_val_argmax = [] if val_argmax_history is not None else None
             retrain_orig_history = [] if inverse_stats is not None else None
+            retrain_deq_log_path = deq_val_log_path
             best_val_pruned = float("inf")
             best_epoch_pruned = -1
             best_state_pruned = None
@@ -2692,22 +3015,53 @@ def main():
                     )
                 avg = tot / max(1, nb)
                 retrain_history.append(avg)
+                val_deq_metrics = None
                 if repoch % args.validate_every == 0 or repoch == c_epochs - 1:
                     if inverse_stats is not None:
-                        val_metrics_c = validate_with_inverse(
-                            pruned_net, val_loader, task_fn, ctx_factory, device,
-                            inverse_stats=inverse_stats, cell_mode=cell_mode_c,
-                        )
+                        if solver == "deq":
+                            val_metrics_c = validate_with_inverse(
+                                pruned_net, val_loader, task_fn, ctx_factory, device,
+                                inverse_stats=inverse_stats, cell_mode=cell_mode_c,
+                                solver=solver, deq_cfg=deq_cfg,
+                                collect_deq_metrics=True,
+                            )
+                            val_deq_metrics = val_metrics_c.pop("deq", None)
+                        else:
+                            val_metrics_c = validate_with_inverse(
+                                pruned_net, val_loader, task_fn, ctx_factory, device,
+                                inverse_stats=inverse_stats, cell_mode=cell_mode_c,
+                                solver=solver, deq_cfg=deq_cfg,
+                            )
                         val = val_metrics_c["val"]
                     else:
                         val_metrics_c = None
-                        val = validate(pruned_net, val_loader, task_fn, ctx_factory, device, cell_mode=cell_mode_c)
+                        if solver == "deq":
+                            val, val_deq_metrics = validate(
+                                pruned_net, val_loader, task_fn, ctx_factory, device,
+                                cell_mode=cell_mode_c, solver=solver, deq_cfg=deq_cfg,
+                                collect_deq_metrics=True,
+                            )
+                        else:
+                            val = validate(pruned_net, val_loader, task_fn, ctx_factory, device, cell_mode=cell_mode_c)
                     if retrain_val_argmax is not None:
-                        val_arg = validate_argmax(pruned_net, val_loader, task_fn, ctx_factory, device)
+                        val_arg = validate_argmax(
+                            pruned_net, val_loader, task_fn, ctx_factory, device,
+                            solver=solver, deq_cfg=deq_cfg,
+                        )
                         retrain_val_argmax.append(val_arg)
                     retrain_val_history.append(val)
                     if retrain_orig_history is not None and val_metrics_c is not None:
                         retrain_orig_history.append(val_metrics_c)
+                    if retrain_deq_log_path is not None and val_deq_metrics is not None:
+                        _append_deq_validation_row(
+                            retrain_deq_log_path,
+                            epoch=global_epoch,
+                            phase="C",
+                            split="retrain",
+                            train_loss=avg,
+                            val_loss=val,
+                            metrics=val_deq_metrics,
+                        )
                     # four-phase-redesign/Phase 1b: Phase C is post-prune, the
                     # deployable model IS the hard-cell (argmax) version, so
                     # use val_argmax for checkpoint selection.
@@ -2750,6 +3104,7 @@ def main():
                     f"train={avg:.4f}  "
                     f"val={retrain_val_history[-1]:.4f}  tau={tau_r:.3f}  "
                     f"lr={retrain_optimizer.param_groups[0]['lr']:.2e}"
+                    + (_format_deq_summary(val_deq_metrics) if val_deq_metrics is not None else "")
                 )
 
             if best_state_pruned is not None:
@@ -2815,7 +3170,13 @@ def main():
 
             # Pruned output fit.
             with torch.no_grad():
-                out_pruned, _ = pruned_net(u_val, ctx=ctx_factory(u_val.size(0), device=device), store_trajectory=False)
+                out_pruned, _ = pruned_net(
+                    u_val,
+                    ctx=ctx_factory(u_val.size(0), device=device),
+                    store_trajectory=False,
+                    solver=solver,
+                    deq_cfg=deq_cfg,
+                )
             plot_output_fit(
                 out_pruned, y_val, loss_name=PRESETS[args.problem]["loss"],
                 save_path=str(out_dir / "output_fit_pruned.png"),

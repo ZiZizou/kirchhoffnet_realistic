@@ -161,8 +161,14 @@ def multistart_uniqueness(
     cfg = dict(deq_cfg or {})
     cfg.setdefault("leak_floor", leak_floor)
     finals = []
+    stage_param = next(stage.parameters())
     for v in starts:
-        x0 = torch.full(batch_shape, float(v))
+        x0 = torch.full(
+            batch_shape,
+            float(v),
+            device=stage_param.device,
+            dtype=stage_param.dtype,
+        )
         x_star, _ = stage.forward_equilibrium(
             x0=x0, ctx=ctx, tau=tau, cell_mode="soft",
             x_drive=x_drive, drive_scale=drive_scale, deq_cfg=cfg,

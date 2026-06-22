@@ -817,6 +817,8 @@ def validate_argmax(
     device,
     *,
     argmax_tau: float = 0.001,
+    solver: str = "heun",
+    deq_cfg: dict | None = None,
 ) -> float:
     """Validation loss with effectively-argmax cell selection (τ→0).
 
@@ -842,7 +844,14 @@ def validate_argmax(
             u = u.to(device)
             target = target.to(device)
             ctx = ctx_factory(u.size(0), device=device)
-            out, _ = net(u, ctx=ctx, tau=argmax_tau, store_trajectory=False)
+            out, _ = net(
+                u,
+                ctx=ctx,
+                tau=argmax_tau,
+                store_trajectory=False,
+                solver=solver,
+                deq_cfg=deq_cfg,
+            )
             loss = task_fn(out, target)
             total += float(loss.item()) * u.size(0)
             n += u.size(0)

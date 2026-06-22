@@ -88,6 +88,9 @@ class KirchhoffNet(nn.Module):
 
         x = x0
         all_trajs = []
+        stage_outputs = []
+        stage_infos = []
+        stage_ctxs = []
         for i, stage in enumerate(self.stages):
             tau_i = 1.0 if tau is None else tau
             stage_ctx = ctx
@@ -97,7 +100,7 @@ class KirchhoffNet(nn.Module):
                 stage_ctx = SimContext(
                     temp_c=ctx.temp_c,
                     global_gain_shift=ctx.global_gain_shift,
-                    edge_mismatch=ctx.edge_mismatch[start:end],
+                edge_mismatch=ctx.edge_mismatch[start:end],
                 )
             x_drive_i = None if drive_targets is None else drive_targets[i]
             drive_scale_i = 0.0 if drive_scales is None else drive_scales[i]
@@ -114,10 +117,19 @@ class KirchhoffNet(nn.Module):
                 solver=solver,
                 deq_cfg=deq_cfg,
             )
+            stage_outputs.append(x.detach())
+            stage_infos.append(dict(getattr(stage, "last_deq_info", {}) or {}))
+            stage_ctxs.append(stage_ctx)
             if store_trajectory and traj is not None:
                 all_trajs.append(traj)
             if i < len(self.transfers):
                 x = self.transfers[i](x)
+        self.last_stage_outputs = stage_outputs
+        self.last_stage_infos = stage_infos
+        self.last_stage_ctxs = stage_ctxs
+        self.last_drive_targets = drive_targets
+        self.last_drive_scales = list(drive_scales) if drive_scales is not None else None
+        self.last_solver = solver
         return x, all_trajs if store_trajectory else None
 
     def parameter_breakdown(self) -> dict:

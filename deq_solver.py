@@ -90,9 +90,10 @@ def _solve_torchdeq(phi, x0, cfg):
         x_star = z_out_list[-1]
     else:
         x_star = z_out_list
-    # Cast to fp32 explicitly so AMP-safe behaviour is preserved regardless
-    # of x0's input dtype. Callers should cast to their preferred dtype.
-    x_star = x_star.to(dtype=torch.float32)
+    # Preserve the caller's dtype at the API boundary. The solver itself runs
+    # in fp32 for stability, but downstream callers expect the same dtype they
+    # provided for x0.
+    x_star = x_star.to(dtype=x0.dtype)
 
     def _get(key, default):
         if isinstance(info, dict):

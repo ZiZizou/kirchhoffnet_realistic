@@ -298,6 +298,7 @@ class DifferentialStage(nn.Module):
             the DEQ path (no trajectory at equilibrium).
         """
         if solver == "heun":
+            self.last_deq_info = None
             return self._forward_heun(
                 x0=x0, ctx=ctx, t_span=t_span, num_steps=num_steps, tau=tau,
                 store_trajectory=store_trajectory, cell_mode=cell_mode,
@@ -309,6 +310,7 @@ class DifferentialStage(nn.Module):
                 x_drive=x_drive, drive_scale=drive_scale,
                 deq_cfg=deq_cfg,
             )
+            self.last_deq_info = dict(_info)
             # Build a 1-timepoint synthetic trajectory [B, N, 1] so downstream
             # regularizers (which expect a [B, N, T+1] traj) work without a
             # special case. Only meaningful when store_trajectory=True.
@@ -387,26 +389,35 @@ class DifferentialStage(nn.Module):
         if deq_cfg:
             cfg.update(deq_cfg)
         lf = float(cfg.get("leak_floor", 0.0))
-        self.set_leak_floor(lf)
         dt = float(cfg.get("deq_step", 0.1))
         tau = float(tau if tau is not None else 1.0)
 
-        def phi(x):
-            return x + dt * self.rhs(x, ctx=ctx, tau=tau, cell_mode="soft",
-                                    x_drive=x_drive, drive_scale=drive_scale,
-                                    leak_floor=lf)
+        self.set_leak_floor(lf)
+        try:
+            def phi(x):
+                return x + dt * self.rhs(x, ctx=ctx, tau=tau, cell_mode="soft",
+                                        x_drive=x_drive, drive_scale=drive_scale,
+                                        leak_floor=lf)
 
-        x_star, info = solve_equilibrium(phi, x0, cfg)
-        # Cast to the stage's parameter dtype so AMP/GradScaler and downstream
-        # regularizers behave like the Heun path.
-        param_dtype = next(self.parameters()).dtype
-        if x_star.dtype != param_dtype:
-            x_star = x_star.to(dtype=param_dtype)
-        # Restore leak floor to 0.0 so subsequent Heun calls on this stage
-        # (e.g. physical validation after DEQ-based training) match the
-        # pre-DEQ path exactly.
-        self.set_leak_floor(0.0)
-        return x_star, info
+            x_star, info = solve_equilibrium(phi, x0, cfg)
+            self.last_deq_info = {
+                "nstep": info.get("nstep"),
+                "rel_residual": info.get("rel_residual"),
+                "deq_step": dt,
+                "leak_floor": lf,
+                "tau": tau,
+                "cell_mode": "soft",
+            }
+            # Cast to the stage's parameter dtype so AMP/GradScaler and downstream
+            # regularizers behave like the Heun path.
+            param_dtype = next(self.parameters()).dtype
+            if x_star.dtype != param_dtype:
+                x_star = x_star.to(dtype=param_dtype)
+            return x_star, info
+        finally:
+            # Restore leak floor to 0.0 even if the solver fails so later
+            # Heun/validation calls do not inherit DEQ damping by accident.
+            self.set_leak_floor(0.0)
 
     def edge_gates(self) -> torch.Tensor:
         """Return edge gate values z_e = σ(z_logits), shape [E]."""

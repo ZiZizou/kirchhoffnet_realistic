@@ -332,11 +332,11 @@ TAU = {
 # 0.0 in every config — nodes are pruned by connectivity only, and the
 # C_eff·Σu proxy would be a constant per stage if node_mask were 1.0.
 LAMBDAS = {
-    "sparsity": 1e-3,
+    "sparsity": 1e-6,
     "rail": 0.1,
     "edge_gate": 0,
     "node_gate": 0.0,       # DEPRECATED (deprecate-node-gates)
-    "power": 1e-4,
+    "power": 1e-6,
     "capacitance": 0.0,     # DEPRECATED (deprecate-node-gates)
     "entropy": 1e-4,
 }
@@ -351,7 +351,7 @@ LAMBDAS = {
 # but has no effect; CLI flags --prune-nodes-by-gate / --no-prune-nodes-by-gate
 # are kept as deprecated no-ops.
 PRUNE = {
-    "edge_threshold": 0.1,
+    "edge_threshold": 0.001,
     "node_threshold": 0.05,
     "prune_nodes_by_gate": False,  # DEPRECATED (deprecate-node-gates): always False
 }
@@ -370,14 +370,14 @@ PRUNE = {
 #     used in concert with edge_gate; remove the regularizer from B entirely)
 SCHEDULE_THREE_PHASE = {
     # Fraction of total epochs allocated to each phase.
-    "frac_a": 0.30,            # Phase A: fit (no structure pressure)
+    "frac_a": 0.15,            # Phase A: fit (no structure pressure)
     "frac_b": 0.40,            # Phase B: compress (Strategy 2 gate penalties)
-    "frac_c": 0.30,            # Phase C: retrain after prune
+    "frac_c": 0.45,            # Phase C: retrain after prune
     # Tau targets per phase.
     "tau_a": 0.8,              # Fixed tau during fit
     "tau_b_init": 0.8,         # Tau at start of compress
-    "tau_b_final": 0.5,        # Tau at end of compress
-    "tau_c_init": 0.5,         # Tau at start of retrain
+    "tau_b_final": 0.4,        # Tau at end of compress
+    "tau_c_init": 0.4,         # Tau at start of retrain
     "tau_c_final": 0.1,        # Tau at end of retrain
     # Lambda warmup within Phase B: ramp from 0 to full over this fraction.
     "warmup_frac_b": 1.0 / 2.0,
@@ -385,16 +385,16 @@ SCHEDULE_THREE_PHASE = {
     # deprecate-node-gates: node_gate=0, capacitance=0 (both regularizers
     # are no-ops; node pruning is connectivity-only).
     "lambdas_b": {
-        "sparsity": 5e-5,
+        "sparsity": 1e-6,
         "edge_gate": 0,
         "node_gate": 0.0,        # DEPRECATED (deprecate-node-gates)
-        "power": 1e-5,
+        "power": 1e-6,
         "capacitance": 0.0,      # DEPRECATED (deprecate-node-gates)
     },
     # Phase C retrain lambdas: gate penalties off (irrelevant post-prune),
     # tiny sparsity for crisp cell family, rail unchanged.
     "lambdas_c": {
-        "sparsity": 1e-5,
+        "sparsity": 1e-8,
         "edge_gate": 0.0,
         "node_gate": 0.0,        # DEPRECATED (deprecate-node-gates)
         "power": 0.0,
@@ -403,8 +403,8 @@ SCHEDULE_THREE_PHASE = {
     # Prune thresholds used at the Phase B->C boundary.
     # four-phase-redesign/1a: edge 0.1 -> 0.05 (gentler cut, retains more
     # edges so the retrain has material to work with).
-    "prune_edge_threshold": 0.009,
-    "prune_node_threshold": 0.009,
+    "prune_edge_threshold": 0.001,
+    "prune_node_threshold": 0.001,
     # deprecate-node-gates: always False (node gates are bypassed; nodes
     # only die via the connectivity backstop).
     "prune_nodes_by_gate": False,  # DEPRECATED (deprecate-node-gates)
@@ -458,8 +458,8 @@ SCHEDULE_FOUR_PHASE = {
     "readiness_window": 10,            # number of recent readings for stability checks
     # Prune thresholds (used at the B2->C boundary, whether readiness-gated
     # or fallback).
-    "prune_edge_threshold": 0.05,
-    "prune_node_threshold": 0.05,
+    "prune_edge_threshold": 0.01,
+    "prune_node_threshold": 0.01,
     "prune_nodes_by_gate": False,  # DEPRECATED (deprecate-node-gates)
 }
 
@@ -504,9 +504,9 @@ DEQ = {
 DEGREE_BUDGET = {
     "enabled": False,           # master switch; --budget CLI enables
     "frac_start": 1.0,          # initial budget fraction (1.0 = no restriction)
-    "frac_end": 0.75,           # final budget fraction (75% retention at prune)
+    "frac_end": 0.8,           # final budget fraction (75% retention at prune)
     "temperature_start": 1.0,   # initial softmax temperature
-    "temperature_end": 0.1,     # final temperature (sharper competition)
+    "temperature_end": 0.2,     # final temperature (sharper competition)
     "axis": "dst",              # "dst" | "src" | "both"
     "anneal_frac": 0.8,         # fraction of total epochs over which to anneal
 }
@@ -799,10 +799,10 @@ def make_smooth2d_grid_preset(
         "read_idx": read_idx,
         "schedule": "three_phase",
         "lambdas": {
-            "sparsity": 1e-5,
+            "sparsity": 1e-6,
             "edge_gate": 0,
             "node_gate": 0.0,        # DEPRECATED (deprecate-node-gates)
-            "power": 1e-5,
+            "power": 1e-6,
             "capacitance": 0.0,      # DEPRECATED (deprecate-node-gates)
             "rail": 0.1,
         },

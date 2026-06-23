@@ -814,7 +814,17 @@ def prune_stage(
             else:
                 new_stage.logits.data.copy_(stage.logits.data[edge_idx_old].cpu())
                 new_stage.raw_mult.data.copy_(stage.raw_mult.data[edge_idx_old].cpu())
-            new_stage.z_logits.data.copy_(stage.z_logits.data[edge_idx_old].cpu())
+            old_z_logits = stage.z_logits.data[edge_idx_old].cpu()
+            if _budget_enabled:
+                # Rescale z_logits so that σ(z_new) = σ(z_old) * budget_gate_old.
+                # This folds the budget attenuation into the surviving edge
+                # gates so that when budget is disabled at Phase C start the
+                # effective edge mask is identical to the budget-on regime.
+                _bg_surv = _bg[edge_idx_old]
+                combined = torch.sigmoid(old_z_logits) * _bg_surv
+                combined = torch.clamp(combined, min=1e-6, max=1.0 - 1e-6)
+                old_z_logits = torch.logit(combined)
+            new_stage.z_logits.data.copy_(old_z_logits)
         with torch.no_grad():
             new_stage.raw_leak.data.copy_(stage.raw_leak.data[node_idx_old].cpu())
             new_stage.u_logits.data.copy_(stage.u_logits.data[node_idx_old].cpu())

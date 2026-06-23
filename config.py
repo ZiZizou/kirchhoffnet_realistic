@@ -489,6 +489,24 @@ DEQ = {
     "leak_floor": 0.05,          # min effective leak per node under DEQ
 }
 
+# Degree budget / top-k competition (degree-budget-topk plan).
+# Each destination (or source) node keeps at most k incoming edges open
+# via temperature-scaled softmax renormalization of z_logits scores.
+# Budget k and temperature T are annealed from permissive to restrictive
+# over anneal_frac of training. The budget gate is LAYERED on top of the
+# sigmoid gate: edge_gate = sigmoid(z_logits) * budget_gate.
+# CLI override via --budget, --budget-k-start, --budget-k-end,
+# --budget-temp-start, --budget-temp-end, --budget-axis.
+DEGREE_BUDGET = {
+    "enabled": False,           # master switch; --budget CLI enables
+    "k_start": 8,               # initial budget per destination
+    "k_end": 2,                 # final budget (annealed to)
+    "temperature_start": 1.0,   # initial softmax temperature
+    "temperature_end": 0.1,     # final temperature (sharper competition)
+    "axis": "dst",              # "dst" | "src" | "both"
+    "anneal_frac": 0.8,         # fraction of total epochs over which to anneal
+}
+
 # Initialization biases
 # (fix-z-death: logits_z_bias=0.0 (was 1.0) gives all four cells equal
 # P=0.25 probability at init. Previously Z started at ~42% and, combined

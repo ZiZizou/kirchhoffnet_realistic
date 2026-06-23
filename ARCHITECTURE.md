@@ -211,12 +211,35 @@ This folds both the Z-cell probability (gm_Z ≈ 0 ⇒ no current) and the edge 
 
 **SimpleEdgeLibrary handling.** Stages using `SimpleEdgeLibrary` have no Z cell — the effective score is just `σ(z_logits)`.
 
+### 2.9 Degree budget / top-k competition (degree-budget-topk plan)
+
+The independent per-edge sigmoid gate (`σ(z_logits)`) cannot break symmetry among redundant edges — 11 edges to the same destination can all sit at gate=0.5 forever. The degree budget adds **explicit competition** via temperature-scaled softmax renormalization:
+
+```
+budget_gate[j] = softmax(z_logits[incoming_to_j] / T) * k
+edge_gate = σ(z_logits) * budget_gate   (layered: independent × competitive)
+```
+
+Each destination node j keeps at most k incoming edges open. Temperature T and budget k are **annealed** from permissive (high k, high T) to restrictive (low k, low T) over the first `anneal_frac` of training. Three axis modes:
+
+| `--budget-axis` | Competition | Budget per |
+|----------------|-------------|------------|
+| `dst` (default) | Incoming edges per destination | Destination |
+| `src` | Outgoing edges per source | Source |
+| `both` | Both directions (product of masks) | Source & Destination |
+
+The budget is fully differentiable (C∞ softmax) → compatible with DEQ implicit differentiation. Config via `config.DEGREE_BUDGET`, CLI via `--budget` and related flags.
+
 Key functions in `topology.py`:
 - `prune_stage(stage, edge_threshold, ...)` — returns `(new_stage, node_remap)`. Handles persistent drive, SimpleEdgeLibrary.
 - `prune_network(core, ...)` — applies `prune_stage` to every stage, reinitializes `StageTransfer` modules, protects driven nodes, returns `(new_core, stage_remaps)`
 
 The `train_script.py` CLI exposes:
 - `--prune` — enable pruning after training
+- `--budget` — enable degree budget top-k competition
+- `--budget-k-start`, `--budget-k-end` — budget annealing range
+- `--budget-temp-start`, `--budget-temp-end` — temperature annealing range
+- `--budget-axis` — competition axis (dst / src / both)
 - `--retrain` / `--no-retrain` — retrain pruned network (default: retrain)
 - `--prune-edge-threshold` — override edge gate threshold
 - `--prune-node-threshold` — override node gate threshold
@@ -1162,6 +1185,10 @@ INIT = {"logits_z_bias": 0.0, "raw_mult_init": 0.0, "raw_leak_init": -3.0,
 # Persistent drive
 DRIVE = {"drive_isat": 0.5, "raw_drive_g_init": -1.0, "drive_scales": [1.0, 0.5, 0.25]}
 
+# Degree budget (top-k edge competition; k and temperature annealed over train_frac of epochs)
+DEGREE_BUDGET = {"enabled": False, "k_start": 8, "k_end": 2, "temp_start": 1.0,
+                 "temp_end": 0.1, "axis": "dst", "anneal_frac": 0.8}
+
 # Variation injection (R6.3: off by default at training time; temp_c deprecated)
 VARIATION = {"temp_c_default": 27.0, "temp_c_choices": [0.0, 27.0, 75.0],
              "global_gain_shift_std": 0.05, "edge_mismatch_std": 0.05}
@@ -1204,7 +1231,7 @@ Run with:
   kirchhoff_redesign/ideal/test_smoke.py
 ```
 
-Tests cover: config loading, SimContext, topology primitives (line/ring/grid/cluster/empty), StageTransfer, Heun convergence, gradient flow, loss finiteness, sparsity push, tau annealing, round-trip sinx, removed presets, housing preset, I/O filtering, topology validation, visualization, solver subsystem, honest I/O split, no-proj fallback, mapper-only ablation, weighted power/area, active presets stage count, tau monotonic, CLI flags, normalized units, apply_ablation, sparse I/O defaults/validation/select/gradients/CLI, complexity proxy, reg schedule curve, smooth2d_grid sparsity override, tau anneal option/override/backward compat, preset lambda overrides, Z-bias elimination, gate initialization, gate application in rhs, per-component regularizers, prune_stage, parameter transfer, all-removed raises, prune_network, topology degree validation, joint Z+gate pruning, prune_network remap, prune I/O transfer, protected write targets, min_read_nodes guard, smooth2d preset, smooth2d_grid preset, MLP benchmark, FanOutInputMapper, optimizer LR auto-scaling, patience default, scheduler config, tau smooth hardening, retrain warmup bounds, fresh init default, retrain LR CLI, loss history, gradient logging, three-phase schedule (TP-1–9), housing_grid preset/data, stage LR scaling, rail loss ReLU², retrain LR scale.
+Tests cover: config loading, SimContext, topology primitives (line/ring/grid/cluster/empty), StageTransfer, Heun convergence, gradient flow, loss finiteness, sparsity push, tau annealing, round-trip sinx, removed presets, housing preset, I/O filtering, topology validation, visualization, solver subsystem, honest I/O split, no-proj fallback, mapper-only ablation, weighted power/area, active presets stage count, tau monotonic, CLI flags, normalized units, apply_ablation, sparse I/O defaults/validation/select/gradients/CLI, complexity proxy, reg schedule curve, smooth2d_grid sparsity override, tau anneal option/override/backward compat, preset lambda overrides, Z-bias elimination, gate initialization, gate application in rhs, per-component regularizers, prune_stage, parameter transfer, all-removed raises, prune_network, topology degree validation, joint Z+gate pruning, prune_network remap, prune I/O transfer, protected write targets, min_read_nodes guard, smooth2d preset, smooth2d_grid preset, MLP benchmark, FanOutInputMapper, optimizer LR auto-scaling, patience default, scheduler config, tau smooth hardening, retrain warmup bounds, fresh init default, retrain LR CLI, loss history, gradient logging, three-phase schedule (TP-1–9), housing_grid preset/data, stage LR scaling, rail loss ReLU², retrain LR scale, degree budget (BUD-1–10).
 
 **DEQ tests (DEQ-1–15):** 15 DEQ-specific tests at the end of `test_smoke.py`:
 
@@ -1226,6 +1253,21 @@ Tests cover: config loading, SimContext, topology primitives (line/ring/grid/clu
 | `test_deq_diagnostics_jacobian_cond` | DEQ-14 | `estimate_jacobian_cond` returns finite cond on tiny stage |
 | `test_deq_diagnostics_grad_norm_compare` | DEQ-15 | `gradient_norm_compare` returns finite norms |
 
+**Budget tests (BUD-1–10):** Degree budget / top-k softmax competition tests:
+
+| Test | ID | What it verifies |
+|------|----|-----------------|
+| `test_budget_gate_basic` | BUD-1 | Budget gate per-destination, sums to ≤ k, values in [0, 1] |
+| `test_budget_gate_differentiable` | BUD-2 | Budget gate is differentiable through z_logits |
+| `test_budget_k_gte_indegree_noop` | BUD-3 | k ≥ in-degree → budget gate is all-ones |
+| `test_budget_temperature_limits` | BUD-4 | T→0 gives argmax (hard); T→∞ gives uniform budget |
+| `test_budget_axis_src` | BUD-5 | Per-source competition (outgoing edges) |
+| `test_budget_axis_both` | BUD-6 | axis=both equals product of src-mask and dst-mask |
+| `test_budget_deq_forward` | BUD-7 | DEQ forward with budget produces finite x* that differs from no-budget |
+| `test_budget_annealing_schedule` | BUD-8 | `budget_k_for_epoch` and `budget_temperature_for_epoch` linear anneal |
+| `test_budget_disabled_byte_identical` | BUD-9 | rhs() output byte-identical to pre-budget when budget_k=0 |
+| `test_budget_simple_edge_library_compat` | BUD-10 | Budget works on SimpleEdgeLibrary stages (logits=None) |
+
 ---
 
 ## 11. File Map
@@ -1234,7 +1276,8 @@ Tests cover: config loading, SimContext, topology primitives (line/ring/grid/clu
 kirchhoff_redesign/ideal/
 ├── __init__.py                    # Package docstring
 ├── config.py                      # All tunable constants + presets (legacy/v15/v2 libraries,
-│                                  #   three-phase and four-phase schedules, DRIVE config)
+│                                  #   three-phase and four-phase schedules, DRIVE config,
+│                                  #   DEGREE_BUDGET config)
 ├── cell_library.py                # IdealizedCellLibrary (formula dispatch: standard/pos_rect/
 │                                  #   neg_rect/dead_zone; legacy/v15/v2 libraries; cell_mode)
 │                                  #   SimpleEdgeLibrary (relu/tanh), make_cell_library factory
@@ -1244,7 +1287,8 @@ kirchhoff_redesign/ideal/
 │                                  #   edge-only mode, SimpleEdgeLibrary, persistent drive)
 ├── differential_stage.py          # DifferentialStage (COO graph + Heun ODE + DEQ equilibrium
 │                                  #   solve + gates + compile + persistent drive + cell_mode
-│                                  #   + float32 KCL + leak_floor contractivity)
+│                                  #   + float32 KCL + leak_floor contractivity + degree budget
+│                                  #   top-k competition)
 ├── sim_context.py                 # SimContext (PVT + mismatch dataclass, temp_c deprecated)
 ├── stage_transfer.py              # StageTransfer (truncation/zero-padding)
 ├── io_mapper.py                   # InputMapper, RobustInputMapper, SparseInputMapper,
@@ -1259,14 +1303,15 @@ kirchhoff_redesign/ideal/
 │                                  #   three-phase + four-phase schedules, solidification
 │                                  #   metrics, argmax validation, readiness-based prune
 │                                  #   trigger, teacher distillation, stage-LR scaling,
-│                                  #   mapper LR scaling, training loop (solver/deq_cfg
-│                                  #   threading)
+│                                  #   mapper LR scaling, budget k/temperature annealing,
+│                                  #   training loop (solver/deq_cfg threading)
 ├── train_script.py                # CLI training entry point (5 problems; dynamic topology
 │                                  #   overrides; prune/retrain; three-phase + four-phase;
 │                                  #   grid-size CLI; ablation-set; cell-mode; cell-library;
 │                                  #   bidirectional; edge-repeats; persistent-drive;
 │                                  #   mapper-lr-control; freeze-mappers; AMP/compile/DP;
-│                                  #   gradient logging; per-dim diagnostics;
+│                                  #   gradient logging; per-dim diagnostics; degree budget
+│                                  #   (--budget, --budget-k-*, --budget-temp-*, --budget-axis);
 │                                  #   DEQ solver: --solver deq, --deq-backend,
 │                                  #   --deq-f-max-iter, --deq-step, --leak-floor,
 │                                  #   --run-deq-diagnostics)

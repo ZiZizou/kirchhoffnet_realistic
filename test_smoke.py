@@ -2499,6 +2499,17 @@ def main():
     test_deq_diagnostics_jacobian_cond()         # DEQ-14: cond(J)
     test_deq_diagnostics_grad_norm_compare()     # DEQ-15: grad norm compare
 
+    test_budget_gate_basic()                     # BUD-1: budget gate basics
+    test_budget_gate_differentiable()            # BUD-2: differentiable
+    test_budget_k_gte_indegree_noop()            # BUD-3: k >= in-degree no-op
+    test_budget_temperature_limits()             # BUD-4: T->0 / T->inf
+    test_budget_axis_src()                       # BUD-5: axis=src
+    test_budget_axis_both()                      # BUD-6: axis=both
+    test_budget_deq_forward()                    # BUD-7: DEQ w/ budget
+    test_budget_annealing_schedule()             # BUD-8: annealing schedule
+    test_budget_disabled_byte_identical()        # BUD-9: budget disabled = no-op
+    test_budget_simple_edge_library_compat()     # BUD-10: SimpleEdgeLibrary
+
     print()
     print("=" * 60)
     print(f"Smoke test results: {passed} passed, {failed} failed")
@@ -6161,6 +6172,288 @@ def test_deq_diagnostics_grad_norm_compare():
     for k, v in res.items():
         check(f"{k} finite and >= 0", math.isfinite(v) and v >= 0,
               f"{k}={v}")
+
+
+# =============================================================================
+# Degree budget / top-k competition (degree-budget-topk plan)
+# =============================================================================
+
+def _make_budget_stage(num_nodes=5, src=None, dst=None):
+    """Helper: build a small DifferentialStage with 5 nodes and 15 edges
+    (3 incoming edges per destination) for budget tests.
+    """
+    from cell_library import IdealizedCellLibrary
+    from differential_stage import DifferentialStage
+    if src is None or dst is None:
+        # 5 nodes, 3 incoming edges per destination (uniform coverage)
+        src = [1, 3, 4, 0, 2, 4, 0, 1, 3, 1, 2, 4, 0, 2, 3]
+        dst = [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4]
+    cell_lib = IdealizedCellLibrary()
+    return DifferentialStage(num_nodes=num_nodes, src=src, dst=dst, cell_lib=cell_lib)
+
+
+def test_budget_gate_basic():
+    """BUD-1: budget gate per-destination, sum per group <= k, in [0, 1]."""
+    print("\nTest BUD-1: budget gate basic properties")
+    stage = _make_budget_stage()
+    with torch.no_grad():
+        stage.z_logits.data = torch.tensor(
+            [3.0, 1.0, 0.0, 2.0, 1.5, 0.5, 2.5, 0.8, -0.5, 1.2, 0.3, 2.2, 1.8, 0.6, -1.0]
+        )
+
+    stage.set_budget(k=2, temperature=1.0)
+    gate = stage._compute_budget_gate()
+
+    # Shape
+    check("gate shape is [E]", gate.shape == (15,))
+    # Range
+    check("gate in [0, 1]",
+          bool((gate >= 0.0).all().item() and (gate <= 1.0).all().item()),
+          f"min={gate.min().item():.4f} max={gate.max().item():.4f}")
+    # Per-destination sum <= k
+    for j in range(5):
+        idx = (stage.dst == j).nonzero(as_tuple=False).squeeze(-1)
+        s = gate[idx].sum().item()
+        check(f"dst={j} group sum <= k=2", s <= 2.0 + 1e-5,
+              f"got {s:.4f}")
+
+
+def test_budget_gate_differentiable():
+    """BUD-2: budget gate is differentiable through z_logits."""
+    print("\nTest BUD-2: budget gate differentiable")
+    stage = _make_budget_stage()
+    with torch.no_grad():
+        stage.z_logits.data = torch.tensor(
+            [3.0, 1.0, 0.0, 2.0, 1.5, 0.5, 2.5, 0.8, -0.5, 1.2, 0.3, 2.2, 1.8, 0.6, -1.0]
+        )
+    stage.set_budget(k=2, temperature=1.0)
+    gate = stage._compute_budget_gate()
+    check("gate.requires_grad is True", gate.requires_grad is True)
+    loss = gate.sum()
+    loss.backward()
+    check("z_logits.grad is finite", torch.isfinite(stage.z_logits.grad).all().item())
+    check("z_logits.grad has nonzero entries",
+          (stage.z_logits.grad.abs() > 0).any().item(),
+          f"all grad = {[round(g, 4) for g in stage.z_logits.grad.tolist()]}")
+
+
+def test_budget_k_gte_indegree_noop():
+    """BUD-3: when k >= in-degree, budget gate is all-ones (no constraint)."""
+    print("\nTest BUD-3: k >= in-degree is no-op")
+    stage = _make_budget_stage()  # 3 incoming edges per destination
+    with torch.no_grad():
+        stage.z_logits.data = torch.tensor(
+            [3.0, 1.0, 0.0, 2.0, 1.5, 0.5, 2.5, 0.8, -0.5, 1.2, 0.3, 2.2, 1.8, 0.6, -1.0]
+        )
+    # k=3 >= in-degree(3) -> no-op
+    stage.set_budget(k=3, temperature=1.0)
+    gate = stage._compute_budget_gate()
+    check("k=3 >= in-degree -> all ones",
+          torch.allclose(gate, torch.ones_like(gate), atol=1e-6),
+          f"max diff from ones = {(gate - 1.0).abs().max().item():.4e}")
+
+    # k=10 >> in-degree -> no-op
+    stage.set_budget(k=10, temperature=1.0)
+    gate = stage._compute_budget_gate()
+    check("k=10 >> in-degree -> all ones",
+          torch.allclose(gate, torch.ones_like(gate), atol=1e-6))
+
+
+def test_budget_temperature_limits():
+    """BUD-4: T->inf gives uniform budget; T->0 gives argmax (top-k hard)."""
+    print("\nTest BUD-4: temperature limits")
+    stage = _make_budget_stage()
+    with torch.no_grad():
+        stage.z_logits.data = torch.tensor(
+            [3.0, 1.0, 0.0, 2.0, 1.5, 0.5, 2.5, 0.8, -0.5, 1.2, 0.3, 2.2, 1.8, 0.6, -1.0]
+        )
+
+    # T -> 0: argmax per group
+    stage.set_budget(k=1, temperature=0.001)
+    gate = stage._compute_budget_gate()
+    # For each destination, the highest-z edge should be 1.0, others 0.0
+    for j in range(5):
+        idx = (stage.dst == j).nonzero(as_tuple=False).squeeze(-1)
+        z = stage.z_logits[idx]
+        max_pos = idx[int(z.argmax().item())]
+        check(f"dst={j} argmax edge gets 1.0 at T~0",
+              abs(gate[max_pos].item() - 1.0) < 1e-3,
+              f"got {gate[max_pos].item():.4f}")
+        others = [i.item() for i in idx if i.item() != max_pos.item()]
+        for o in others:
+            check(f"dst={j} non-argmax edge at T~0: ~0.0",
+                  gate[o].item() < 0.1,
+                  f"got {gate[o].item():.4f}")
+
+    # T -> inf: uniform
+    stage.set_budget(k=2, temperature=1000.0)
+    gate = stage._compute_budget_gate()
+    for j in range(5):
+        idx = (stage.dst == j).nonzero(as_tuple=False).squeeze(-1)
+        n = len(idx)
+        if n <= 2:
+            continue
+        vals = [gate[i].item() for i in idx]
+        spread = max(vals) - min(vals)
+        check(f"dst={j} uniform at T~inf: spread < 0.1",
+              spread < 0.1,
+              f"spread = {spread:.4f}")
+
+
+def test_budget_axis_src():
+    """BUD-5: budget axis='src' competes on outgoing edges per source."""
+    print("\nTest BUD-5: axis=src")
+    stage = _make_budget_stage()
+    with torch.no_grad():
+        stage.z_logits.data = torch.tensor(
+            [3.0, 1.0, 0.0, 2.0, 1.5, 0.5, 2.5, 0.8, -0.5, 1.2, 0.3, 2.2, 1.8, 0.6, -1.0]
+        )
+    stage.set_budget(k=2, temperature=1.0)
+    stage.budget_axis = "src"
+    gate = stage._compute_budget_gate()
+    # Each source should have group sum <= k=2
+    for s in range(5):
+        idx = (stage.src == s).nonzero(as_tuple=False).squeeze(-1)
+        if len(idx) == 0:
+            continue
+        s_sum = gate[idx].sum().item()
+        check(f"src={s} group sum <= k=2", s_sum <= 2.0 + 1e-5,
+              f"got {s_sum:.4f}")
+
+
+def test_budget_axis_both():
+    """BUD-6: budget axis='both' is product of src-mask and dst-mask."""
+    print("\nTest BUD-6: axis=both")
+    stage = _make_budget_stage()
+    with torch.no_grad():
+        stage.z_logits.data = torch.tensor(
+            [3.0, 1.0, 0.0, 2.0, 1.5, 0.5, 2.5, 0.8, -0.5, 1.2, 0.3, 2.2, 1.8, 0.6, -1.0]
+        )
+    # Get dst-only mask
+    stage.set_budget(k=2, temperature=1.0)
+    stage.budget_axis = "dst"
+    gate_dst = stage._compute_budget_gate()
+    # Get src-only mask
+    stage.budget_axis = "src"
+    gate_src = stage._compute_budget_gate()
+    # Get both mask
+    stage.budget_axis = "both"
+    gate_both = stage._compute_budget_gate()
+    expected = gate_dst * gate_src
+    check("axis=both equals dst*src",
+          torch.allclose(gate_both, expected, atol=1e-6),
+          f"max diff = {(gate_both - expected).abs().max().item():.4e}")
+
+
+def test_budget_deq_forward():
+    """BUD-7: DEQ forward with budget enabled returns finite x*."""
+    print("\nTest BUD-7: DEQ forward with budget")
+    stage = _make_budget_stage()
+    with torch.no_grad():
+        stage.z_logits.data = torch.tensor(
+            [3.0, 1.0, 0.0, 2.0, 1.5, 0.5, 2.5, 0.8, -0.5, 1.2, 0.3, 2.2, 1.8, 0.6, -1.0]
+        )
+    stage.set_budget(k=2, temperature=1.0)
+    from sim_context import SimContext
+    ctx = SimContext()
+    x0 = torch.zeros(2, 5)
+    x_star, _info = stage.forward_equilibrium(
+        x0=x0, ctx=ctx, tau=1.0, cell_mode="soft",
+        x_drive=None, drive_scale=0.0,
+        deq_cfg={"f_max_iter": 30, "f_tol": 1e-5, "deq_step": 0.1, "leak_floor": 0.05},
+    )
+    check("x_star is finite", torch.isfinite(x_star).all().item())
+    check("x_star shape matches", x_star.shape == (2, 5))
+
+    # Compare against no-budget: should differ (budget changes dynamics)
+    stage.set_budget(k=0, temperature=1.0)
+    x_star_nb, _ = stage.forward_equilibrium(
+        x0=x0, ctx=ctx, tau=1.0, cell_mode="soft",
+        x_drive=None, drive_scale=0.0,
+        deq_cfg={"f_max_iter": 30, "f_tol": 1e-5, "deq_step": 0.1, "leak_floor": 0.05},
+    )
+    diff = (x_star - x_star_nb).abs().max().item()
+    check("budget-enabled x* differs from no-budget",
+          diff > 1e-4,
+          f"max diff = {diff:.4e}")
+
+
+def test_budget_annealing_schedule():
+    """BUD-8: budget_k_for_epoch and budget_temperature_for_epoch linear anneal."""
+    print("\nTest BUD-8: annealing schedule")
+    from train import budget_k_for_epoch, budget_temperature_for_epoch
+    # k anneal: 8 -> 2 over 80% of 100 epochs
+    check("k(0) = k_start", budget_k_for_epoch(0, 100, 8, 2, 0.8) == 8)
+    check("k(40) ~ 5 (midpoint)", budget_k_for_epoch(40, 100, 8, 2, 0.8) == 5,
+          f"got {budget_k_for_epoch(40, 100, 8, 2, 0.8)}")
+    check("k(79) = k_end (last anneal epoch)",
+          budget_k_for_epoch(79, 100, 8, 2, 0.8) == 2)
+    check("k(80) = k_end (post-anneal freeze)",
+          budget_k_for_epoch(80, 100, 8, 2, 0.8) == 2)
+    check("k(99) = k_end", budget_k_for_epoch(99, 100, 8, 2, 0.8) == 2)
+
+    # Temperature anneal: 1.0 -> 0.1
+    check("T(0) = temp_start",
+          abs(budget_temperature_for_epoch(0, 100, 1.0, 0.1, 0.8) - 1.0) < 1e-6)
+    # At epoch 40 with 80 anneal epochs: alpha = 40/79 ≈ 0.5063
+    # T = 0.5063 * (0.1 - 1.0) + 1.0 = 0.5443
+    check("T(40) ≈ 0.5443 (midpoint of anneal)",
+          abs(budget_temperature_for_epoch(40, 100, 1.0, 0.1, 0.8) - 0.5443) < 1e-3,
+          f"got {budget_temperature_for_epoch(40, 100, 1.0, 0.1, 0.8):.4f}")
+    check("T(79) = temp_end",
+          abs(budget_temperature_for_epoch(79, 100, 1.0, 0.1, 0.8) - 0.1) < 1e-6)
+    check("T(99) = temp_end",
+          abs(budget_temperature_for_epoch(99, 100, 1.0, 0.1, 0.8) - 0.1) < 1e-6)
+    check("T(0) > 0 (always positive)",
+          budget_temperature_for_epoch(0, 100, 1.0, 0.0, 0.8) > 0)
+
+
+def test_budget_disabled_byte_identical():
+    """BUD-9: rhs() output is byte-identical to pre-budget when budget_k=0."""
+    print("\nTest BUD-9: budget disabled = no change to rhs")
+    stage = _make_budget_stage()
+    with torch.no_grad():
+        stage.z_logits.data = torch.tensor(
+            [3.0, 1.0, 0.0, 2.0, 1.5, 0.5, 2.5, 0.8, -0.5, 1.2, 0.3, 2.2, 1.8, 0.6, -1.0]
+        )
+    from sim_context import SimContext
+    ctx = SimContext()
+    x = torch.randn(2, 5)
+    # Default (budget_enabled=False, budget_k=0)
+    out1 = stage.rhs(x, ctx=ctx, tau=1.0, cell_mode="soft")
+    # Explicitly disabled
+    stage.set_budget(0, 1.0)
+    out2 = stage.rhs(x, ctx=ctx, tau=1.0, cell_mode="soft")
+    check("default rhs == disabled-budget rhs",
+          torch.allclose(out1, out2, atol=1e-7),
+          f"max diff = {(out1 - out2).abs().max().item():.4e}")
+
+
+def test_budget_simple_edge_library_compat():
+    """BUD-10: budget works on SimpleEdgeLibrary stages (logits=None)."""
+    print("\nTest BUD-10: SimpleEdgeLibrary compat")
+    from cell_library import SimpleEdgeLibrary
+    from differential_stage import DifferentialStage
+    cell_lib = SimpleEdgeLibrary(num_edges=15, mode="tanh")
+    src = [1, 3, 4, 0, 2, 4, 0, 1, 3, 1, 2, 4, 0, 2, 3]
+    dst = [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4]
+    stage = DifferentialStage(num_nodes=5, src=src, dst=dst, cell_lib=cell_lib)
+    with torch.no_grad():
+        stage.z_logits.data = torch.tensor(
+            [3.0, 1.0, 0.0, 2.0, 1.5, 0.5, 2.5, 0.8, -0.5, 1.2, 0.3, 2.2, 1.8, 0.6, -1.0]
+        )
+    stage.set_budget(k=2, temperature=1.0)
+    gate = stage._compute_budget_gate()
+    check("SimpleEdgeLibrary: gate shape [E]", gate.shape == (15,))
+    check("SimpleEdgeLibrary: gate in [0, 1]",
+          bool((gate >= 0.0).all().item() and (gate <= 1.0).all().item()))
+    # Forward should work without errors
+    from sim_context import SimContext
+    ctx = SimContext()
+    x = torch.randn(2, 5)
+    out = stage.rhs(x, ctx=ctx, tau=1.0, cell_mode="soft")
+    check("SimpleEdgeLibrary rhs with budget is finite",
+          torch.isfinite(out).all().item())
 
 
 if __name__ == "__main__":

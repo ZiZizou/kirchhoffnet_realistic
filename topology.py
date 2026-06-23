@@ -643,6 +643,13 @@ def prune_stage(
     from differential_stage import DifferentialStage
 
     z = stage.edge_gates().detach().cpu()
+    # When budget was enabled during training, combine sigmoid * budget gate
+    # as the effective edge mask. Budget-losers with still-positive sigmoid
+    # should not survive pruning — their effective contribution is ≈ 0.
+    _budget_enabled = getattr(stage, 'budget_enabled', False)
+    if _budget_enabled:
+        _bg = stage._compute_budget_gate().detach().cpu()
+        z = z * _bg
     if getattr(stage.cell_lib, 'has_z_cell', True):
         w_logits = stage.logits.detach().cpu()
         p_z = torch.softmax(w_logits, dim=-1)[:, stage.cell_lib.z_index]  # [E]

@@ -60,6 +60,8 @@ __all__ = [
     "make_optimizer",
     "apply_ablation",
     "train_epoch",
+    "budget_k_for_epoch",
+    "budget_temperature_for_epoch",
 ]
 
 
@@ -1177,6 +1179,82 @@ def tau_for_epoch(
     span = max(1, hardening_end - hardening_start)
     progress = (epoch - hardening_start) / span
     return tau_base + (tau_final - tau_base) * progress
+
+
+# ---------- degree-budget annealing (degree-budget-topk plan) ----------
+
+def budget_k_for_epoch(
+    epoch: int,
+    total_epochs: int,
+    k_start: int = 8,
+    k_end: int = 2,
+    anneal_frac: float = 0.8,
+) -> int:
+    """Linearly anneal the degree-budget ``k`` from ``k_start`` to ``k_end``.
+
+    Annealing is spread over the first ``anneal_frac`` of ``total_epochs``.
+    Beyond that, the value is clamped to ``k_end`` (more restrictive).
+
+    The budget is always rounded to an integer >= 1 (k=0 would disable
+    the budget entirely, which is reserved for the no-budget path).
+
+    Args:
+        epoch: Current epoch index (0-based).
+        total_epochs: Total number of training epochs (the annealing
+            denominator).
+        k_start: Initial budget per destination (permissive, large).
+        k_end: Final budget (restrictive, small). Should be >= 1.
+        anneal_frac: Fraction of ``total_epochs`` over which to anneal.
+            Default 0.8 (i.e. the last 20% of training freezes at k_end).
+
+    Returns:
+        Integer budget ``k`` for this epoch, in ``[max(1, k_end), k_start]``.
+    """
+    if total_epochs <= 0:
+        return max(1, k_end)
+    max_anneal_epochs = max(1, int(total_epochs * anneal_frac))
+    if epoch >= max_anneal_epochs:
+        return max(1, k_end)
+    denom = max(1, max_anneal_epochs - 1)
+    alpha = epoch / denom
+    k = round((1.0 - alpha) * k_start + alpha * k_end)
+    return max(1, int(k))
+
+
+def budget_temperature_for_epoch(
+    epoch: int,
+    total_epochs: int,
+    temp_start: float = 1.0,
+    temp_end: float = 0.1,
+    anneal_frac: float = 0.8,
+) -> float:
+    """Linearly anneal the degree-budget softmax temperature.
+
+    Annealing is spread over the first ``anneal_frac`` of ``total_epochs``.
+    Beyond that, the value is clamped to ``temp_end`` (sharper competition).
+
+    Smaller temperature → sharper softmax → closer to hard top-k. Larger
+    temperature → softer → more uniform sharing of the budget.
+
+    Args:
+        epoch: Current epoch index (0-based).
+        total_epochs: Total number of training epochs.
+        temp_start: Initial temperature (typically 1.0, soft).
+        temp_end: Final temperature (typically 0.1, sharp).
+        anneal_frac: Fraction of ``total_epochs`` over which to anneal.
+
+    Returns:
+        Float temperature for this epoch, clamped to be > 0.
+    """
+    if total_epochs <= 0:
+        return max(1e-6, temp_end)
+    max_anneal_epochs = max(1, int(total_epochs * anneal_frac))
+    if epoch >= max_anneal_epochs:
+        return max(1e-6, temp_end)
+    denom = max(1, max_anneal_epochs - 1)
+    alpha = epoch / denom
+    T = (1.0 - alpha) * temp_start + alpha * temp_end
+    return max(1e-6, T)
 
 
 # ---------- optimizer ----------

@@ -393,6 +393,8 @@ def _apply_ablation_set(args, schedule_mode: str) -> None:
         _set_if_unset("retrain_stage_lr_scale", 1.0)
         _set_if_unset("mapper_lr_scale", 1.0)
         _set_if_unset("retrain_mapper_lr_scale", 1.0)
+        _set_if_unset("struct_lr_scale", 1.0)
+        _set_if_unset("dyn_lr_scale", 1.0)
         _set_if_unset("freeze_mappers", False)
         print(
             "[ablation-set=edge-only] node-gate pruning permanently disabled "
@@ -639,6 +641,8 @@ def _save_config_snapshot(out_dir: Path, problem: str, args, lambdas: dict,
             f.write(f"  proj_count: {net.proj_count}\n")
             f.write(f"  stage_lr_scale: {args.stage_lr_scale}\n")
             f.write(f"  mapper_lr_scale: {args.mapper_lr_scale}\n")
+            f.write(f"  struct_lr_scale: {args.struct_lr_scale}\n")
+            f.write(f"  dyn_lr_scale: {args.dyn_lr_scale}\n")
             f.write(f"  retrain_stage_lr_scale: {args.retrain_stage_lr_scale}\n")
             f.write(f"  retrain_mapper_lr_scale: {args.retrain_mapper_lr_scale}\n")
             f.write(f"  freeze_mappers: {args.freeze_mappers}\n")
@@ -1298,6 +1302,51 @@ def collect_gradient_norms(raw_net):
     return out
 
 
+def compute_update_norms(
+    snapshots: dict[str, torch.Tensor],
+    net: torch.nn.Module,
+) -> dict[str, dict[str, float]]:
+    """Compute per-group param/update/relative norms from saved snapshots.
+
+    Classifies parameters into mapper/struct/dyn/other bins matching the
+    logic in ``make_optimizer`` (see :ref:`lr-param-groups`).
+
+    Returns a nested dict: ``{"mapper": {"param_norm": ..., "update_norm": ..., "rel_update": ...},
+    "struct": ..., "dyn": ..., "other": ...}``.
+    """
+    raw = net.module if isinstance(net, torch.nn.DataParallel) else net
+    groups: dict[str, dict[str, float]] = {
+        "mapper": {"param_sq": 0.0, "update_sq": 0.0},
+        "struct": {"param_sq": 0.0, "update_sq": 0.0},
+        "dyn": {"param_sq": 0.0, "update_sq": 0.0},
+        "other": {"param_sq": 0.0, "update_sq": 0.0},
+    }
+
+    for name, p in raw.named_parameters():
+        if name not in snapshots:
+            continue
+        delta = p.data - snapshots[name]
+        if "input_mapper" in name or "output_mapper" in name:
+            g = "mapper"
+        # NOTE: .z_logits MUST be checked before .logits (z_logits also ends with .logits)
+        elif name.endswith(".z_logits") or name.endswith(".logits") or name.endswith(".raw_mult"):
+            g = "struct"
+        elif name.endswith(".raw_leak") or name.endswith(".raw_drive_g"):
+            g = "dyn"
+        else:
+            g = "other"
+        groups[g]["param_sq"] += float(p.data.pow(2).sum().item())
+        groups[g]["update_sq"] += float(delta.pow(2).sum().item())
+
+    result: dict[str, dict[str, float]] = {}
+    for gname, data in groups.items():
+        pn = data["param_sq"] ** 0.5
+        un = data["update_sq"] ** 0.5
+        rel = un / (pn + 1e-12) if pn > 0 else 0.0
+        result[gname] = {"param_norm": pn, "update_norm": un, "rel_update": rel}
+    return result
+
+
 def _grad_norm_keys(norms):
     """Deterministic key ordering for gradient norm output (shared by header and data rows)."""
     return sorted(
@@ -1338,6 +1387,37 @@ def log_gradient_norms(grad_log_path, epoch, raw_net, *, retrain=False, optimize
             row_parts.append(f"{g['lr']:.6e}")
     with open(grad_log_path, "a") as f:
         f.write("\t".join(row_parts) + "\n")
+
+
+def log_update_norms(
+    path: Path,
+    epoch: int,
+    update_norms: dict[str, dict[str, float]],
+    phase: str = "",
+    *,
+    retrain: bool = False,
+) -> None:
+    """Append one row of per-group param/update/relative norms to ``path``.
+
+    Columns: ``epoch``, ``phase``, then for each group (mapper, struct, dyn, other):
+    ``{group}_param``, ``{group}_update``, ``{group}_rel``.
+    """
+    group_order = ["mapper", "struct", "dyn", "other"]
+    if not path.exists():
+        cols = ["epoch", "phase"]
+        for g in group_order:
+            cols += [f"{g}_param", f"{g}_update", f"{g}_rel"]
+        with open(path, "w") as f:
+            f.write("\t".join(cols) + "\n")
+    prefix = "retrain_" if retrain else ""
+    parts = [f"{prefix}{epoch}", phase]
+    for g in group_order:
+        d = update_norms.get(g, {"param_norm": 0.0, "update_norm": 0.0, "rel_update": 0.0})
+        parts.append(f"{d['param_norm']:.6e}")
+        parts.append(f"{d['update_norm']:.6e}")
+        parts.append(f"{d['rel_update']:.6e}")
+    with open(path, "a") as f:
+        f.write("\t".join(parts) + "\n")
 
 
 def make_static_ctx_factory():
@@ -1440,17 +1520,32 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "if you want geometric scaling during retrain.",
     )
     parser.add_argument(
-        "--mapper-lr-scale", type=float, default=1.0,
+        "--mapper-lr-scale", type=float, default=0.1,
         help="LR multiplier for I/O mapper params (input_mapper + output_mapper). "
-             "Default 1.0 (no change). Use <1.0 (e.g. 0.1) to slow mapper learning "
-             "when mapper gradient norms dominate core by ~300x. Composes with "
-             "--stage-lr-scale.",
+             "Default 0.1 (slow mapper learning). Use 1.0 to match base LR. "
+             "When mapper gradient norms dominate core by ~300x, lowering this "
+             "forces more residual error to be explained by the core.",
     )
     parser.add_argument(
-        "--retrain-mapper-lr-scale", type=float, default=1.0,
-        help="Mapper LR scale for the pruned-network retrain optimizer "
-             "(default: 1.0). Mirrors --mapper-lr-scale if you want to slow "
-             "mapper learning during retrain.",
+        "--retrain-mapper-lr-scale", type=float, default=0.1,
+        help="Mapper LR scale for retrain (default: 0.1). "
+             "Mirrors --mapper-lr-scale if you want to slow mapper learning "
+             "during retrain.",
+    )
+    parser.add_argument(
+        "--struct-lr-scale", type=float, default=2.0,
+        help="LR multiplier for structural core params (z_logits, cell logits, "
+             "raw_mult). Default 2.0 (modest boost). These combinatorial-ish "
+             "parameters often need help in DEQ mode. When != 1.0, uses flat "
+             "global groups and ignores --stage-lr-scale.",
+    )
+    parser.add_argument(
+        "--dyn-lr-scale", type=float, default=1.0,
+        help="LR multiplier for sensitive dynamical params (raw_leak, "
+             "raw_drive_g). Default 1.0 (base LR). These affect the Jacobian "
+             "and fixed-point conditioning, so boosting aggressively can "
+             "destabilize DEQ solves. When != 1.0, uses flat global groups "
+             "and ignores --stage-lr-scale.",
     )
     parser.add_argument(
         "--freeze-mappers", dest="freeze_mappers", action="store_true", default=False,
@@ -2202,12 +2297,16 @@ def main():
         net, lr=lr,
         stage_lr_scale=args.stage_lr_scale,
         mapper_lr_scale=args.mapper_lr_scale,
+        struct_lr_scale=args.struct_lr_scale,
+        dyn_lr_scale=args.dyn_lr_scale,
     )
-    if args.stage_lr_scale != 1.0 or args.mapper_lr_scale != 1.0:
+    if any(abs(s - 1.0) > 1e-6 for s in [args.stage_lr_scale, args.mapper_lr_scale,
+                                          args.struct_lr_scale, args.dyn_lr_scale]):
         lr_strs = [f"{g['lr']:.1e}" for g in optimizer.param_groups]
         print(
-            f"[train] stage_lr_scale={args.stage_lr_scale}, "
-            f"mapper_lr_scale={args.mapper_lr_scale}: per-group LRs = {lr_strs}"
+            f"[train] scales: stage={args.stage_lr_scale}, mapper={args.mapper_lr_scale}, "
+            f"struct={args.struct_lr_scale}, dyn={args.dyn_lr_scale}: "
+            f"per-group LRs = {lr_strs}"
         )
     if args.use_scheduler:
         if schedule_mode == "three_phase":
@@ -2253,6 +2352,7 @@ def main():
         tqdm = None
 
     grad_log_path = out_dir / "grad_norms.txt" if args.grad_log else None
+    update_norms_path = out_dir / "update_norms.txt" if args.grad_log else None
     solid_log_path = out_dir / "solidification_metrics.txt" if schedule_mode in ("three_phase", "four_phase") else None
 
     # ---------- Determine effective training scope ----------
@@ -2433,6 +2533,10 @@ def main():
         n_batches = 0
         should_log_grads = grad_log_path is not None and epoch % args.grad_log_every == 0
         epoch_grad_norms = None
+        param_snapshots: dict[str, torch.Tensor] | None = None
+        if should_log_grads:
+            raw_net_snapshot = net.module if isinstance(net, torch.nn.DataParallel) else net
+            param_snapshots = {name: p.data.detach().clone() for name, p in raw_net_snapshot.named_parameters()}
         train_deq_weight = 0
         train_deq_residual_sum = 0.0
         train_deq_residual_max = 0.0
@@ -2650,6 +2754,10 @@ def main():
         if should_log_grads:
             raw = net.module if isinstance(net, torch.nn.DataParallel) else net
             log_gradient_norms(grad_log_path, epoch, raw, optimizer=optimizer, norms=epoch_grad_norms)
+            if param_snapshots is not None and update_norms_path is not None:
+                update_norms = compute_update_norms(param_snapshots, net)
+                log_update_norms(update_norms_path, epoch, update_norms, phase=phase)
+                param_snapshots = None  # free snapshot memory
 
         _lrs = [g["lr"] for g in optimizer.param_groups]
         lr_str = f"{min(_lrs):.1e}..{max(_lrs):.1e}" if len(_lrs) > 1 else f"{_lrs[0]:.2e}"
@@ -3070,12 +3178,16 @@ def main():
                 pruned_net, lr=c_lr,
                 stage_lr_scale=args.retrain_stage_lr_scale,
                 mapper_lr_scale=args.retrain_mapper_lr_scale,
+                struct_lr_scale=args.struct_lr_scale,
+                dyn_lr_scale=args.dyn_lr_scale,
             )
-            if args.retrain_stage_lr_scale != 1.0 or args.retrain_mapper_lr_scale != 1.0:
+            if max(abs(args.retrain_stage_lr_scale - 1.0), abs(args.retrain_mapper_lr_scale - 1.0),
+                   abs(args.struct_lr_scale - 1.0), abs(args.dyn_lr_scale - 1.0)) > 1e-6:
                 lr_strs = [f"{g['lr']:.1e}" for g in retrain_optimizer.param_groups]
                 print(
-                    f"[prune] retrain stage_lr_scale={args.retrain_stage_lr_scale}, "
-                    f"retrain_mapper_lr_scale={args.retrain_mapper_lr_scale}: "
+                    f"[prune] retrain scales: stage={args.retrain_stage_lr_scale}, "
+                    f"mapper={args.retrain_mapper_lr_scale}, "
+                    f"struct={args.struct_lr_scale}, dyn={args.dyn_lr_scale}: "
                     f"per-group LRs = {lr_strs}"
                 )
             if args.use_scheduler:
@@ -3167,6 +3279,10 @@ def main():
                 nb = 0
                 should_log_retrain_grads = grad_log_path is not None and repoch % args.grad_log_every == 0
                 retrain_epoch_grad_norms = None
+                retrain_param_snapshots: dict[str, torch.Tensor] | None = None
+                if should_log_retrain_grads:
+                    retrain_raw = pruned_net.module if isinstance(pruned_net, torch.nn.DataParallel) else pruned_net
+                    retrain_param_snapshots = {name: p.data.detach().clone() for name, p in retrain_raw.named_parameters()}
                 for batch in retrain_train_loader:
                     ctx = ctx_factory(batch[0].size(0), device=device)
                     retrain_optimizer.zero_grad()
@@ -3212,6 +3328,10 @@ def main():
                         grad_log_path, repoch, pruned_net, retrain=True,
                         optimizer=retrain_optimizer, norms=retrain_epoch_grad_norms,
                     )
+                    if retrain_param_snapshots is not None and update_norms_path is not None:
+                        retrain_update_norms = compute_update_norms(retrain_param_snapshots, pruned_net)
+                        log_update_norms(update_norms_path, repoch, retrain_update_norms, phase="C", retrain=True)
+                        retrain_param_snapshots = None
                 avg = tot / max(1, nb)
                 retrain_history.append(avg)
                 retrain_deq_metrics = None

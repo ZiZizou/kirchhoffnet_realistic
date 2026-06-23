@@ -1149,8 +1149,20 @@ def main() -> None:
         help="Per-stage geometric LR multiplier (default: 1.0).",
     )
     parser.add_argument(
-        "--mapper-lr-scale", type=float, default=1.0,
-        help="LR multiplier for I/O mapper params (default: 1.0).",
+        "--mapper-lr-scale", type=float, default=0.1,
+        help="LR multiplier for I/O mapper params (default: 0.1).",
+    )
+    parser.add_argument(
+        "--struct-lr-scale", type=float, default=2.0,
+        help="LR multiplier for structural core params (z_logits, logits, "
+             "raw_mult). Default 2.0. When != 1.0 uses flat groups and "
+             "ignores --stage-lr-scale.",
+    )
+    parser.add_argument(
+        "--dyn-lr-scale", type=float, default=1.0,
+        help="LR multiplier for sensitive dynamical params (raw_leak, "
+             "raw_drive_g). Default 1.0. When != 1.0 uses flat groups and "
+             "ignores --stage-lr-scale.",
     )
     parser.add_argument(
         "--compile", dest="compile", action="store_true", default=None,
@@ -1487,6 +1499,8 @@ def main() -> None:
         f.write(f"batch_size: {batch_size}\n")
         f.write(f"stage_lr_scale: {args.stage_lr_scale}\n")
         f.write(f"mapper_lr_scale: {args.mapper_lr_scale}\n")
+        f.write(f"struct_lr_scale: {args.struct_lr_scale}\n")
+        f.write(f"dyn_lr_scale: {args.dyn_lr_scale}\n")
         f.write(f"write_mode: {_effective_write_mode}\n")
         f.write(f"compile: {compile_enabled}\n")
         f.write(f"parallel: {parallel_enabled}\n")
@@ -1559,6 +1573,8 @@ def main() -> None:
         weight_decay=args.weight_decay,
         stage_lr_scale=args.stage_lr_scale,
         mapper_lr_scale=args.mapper_lr_scale,
+        struct_lr_scale=args.struct_lr_scale,
+        dyn_lr_scale=args.dyn_lr_scale,
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max(1, ab_total), eta_min=float(OPTIM["scheduler_eta_min"]),
@@ -1912,6 +1928,8 @@ def main() -> None:
             pruned_net, lr=retrain_lr,
             weight_decay=args.weight_decay,
             stage_lr_scale=1.0, mapper_lr_scale=1.0,
+            struct_lr_scale=args.struct_lr_scale,
+            dyn_lr_scale=args.dyn_lr_scale,
         )
         retrain_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             retrain_optimizer, T_max=max(1, c_total),

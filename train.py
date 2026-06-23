@@ -19,6 +19,7 @@ value, ``[W+A, ∞)`` → full value (RR-A + CP).
 from __future__ import annotations
 
 import math
+import warnings
 
 import torch
 import torch.nn.functional as F
@@ -1265,6 +1266,8 @@ def make_optimizer(
     weight_decay: float | None = None,
     stage_lr_scale: float = 1.0,
     mapper_lr_scale: float = 1.0,
+    struct_lr_scale: float = 1.0,
+    dyn_lr_scale: float = 1.0,
 ):
     """Build the AdamW optimizer.
 
@@ -1284,72 +1287,116 @@ def make_optimizer(
 
             Example with ``stage_lr_scale=10`` and 3 stages:
               stage 0 → lr × 100, stage 1 → lr × 10, stage 2 → lr × 1
+
+            Ignored when ``struct_lr_scale != 1.0`` or ``dyn_lr_scale != 1.0``
+            (flat grouping active).
         mapper_lr_scale: Multiplier on base LR for the I/O mapper parameter
             group (input_mapper + output_mapper). When ``1.0`` (default) and
-            ``stage_lr_scale == 1.0``, falls back to a single param group.
+            all other scales == 1.0, falls back to a single param group.
             When ``<1.0``, mappers learn more slowly — useful when mapper
-            gradient norms dominate core by ~300×. Composes with
-            ``stage_lr_scale`` so both controls can be active simultaneously.
+            gradient norms dominate core by ~300×.
+        struct_lr_scale: Multiplier on base LR for structural core params
+            (``z_logits``, ``logits``, ``raw_mult``). Default 1.0 (no
+            change). Use >1.0 (e.g. 2.0) to boost learning of gates and
+            cell assignments. When != 1.0, uses flat global groups and
+            ignores ``stage_lr_scale``.
+        dyn_lr_scale: Multiplier on base LR for sensitive dynamical params
+            (``raw_leak``, ``raw_drive_g``). Default 1.0 (no change). Use
+            <1.0 to protect solver stability. When != 1.0, uses flat global
+            groups and ignores ``stage_lr_scale``.
     """
     if lr is None:
         lr = OPTIM["lr"]
     if weight_decay is None:
         weight_decay = OPTIM["weight_decay"]
-    if stage_lr_scale <= 0.0:
-        raise ValueError(
-            f"stage_lr_scale must be positive, got {stage_lr_scale}"
-        )
-    if mapper_lr_scale <= 0.0:
-        raise ValueError(
-            f"mapper_lr_scale must be positive, got {mapper_lr_scale}"
-        )
+    for name, sc in [
+        ("stage_lr_scale", stage_lr_scale),
+        ("mapper_lr_scale", mapper_lr_scale),
+        ("struct_lr_scale", struct_lr_scale),
+        ("dyn_lr_scale", dyn_lr_scale),
+    ]:
+        if sc <= 0.0:
+            raise ValueError(f"{name} must be positive, got {sc}")
 
-    if stage_lr_scale == 1.0 and mapper_lr_scale == 1.0:
+    if (
+        stage_lr_scale == 1.0
+        and mapper_lr_scale == 1.0
+        and struct_lr_scale == 1.0
+        and dyn_lr_scale == 1.0
+    ):
         return torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=weight_decay)
 
     raw = net.module if isinstance(net, torch.nn.DataParallel) else net
-    stage_params: dict[int, list[torch.nn.Parameter]] = {}
-    mapper_params: list[torch.nn.Parameter] = []
-    other_params: list[torch.nn.Parameter] = []
-
-    core = getattr(raw, "core", raw)
-    stages = getattr(core, "stages", None)
-    num_stages = len(stages) if stages is not None else 0
-    if stage_lr_scale > 1.0 and num_stages <= 1:
-        import warnings
-        warnings.warn(
-            f"stage_lr_scale={stage_lr_scale} has no effect with "
-            f"{num_stages} stage(s); all parameters will use base LR."
-        )
-
-    for name, p in raw.named_parameters():
-        if ".stages." in name:
-            try:
-                idx = int(name.split(".stages.")[1].split(".")[0])
-            except (ValueError, IndexError):
-                other_params.append(p)
-                continue
-            stage_params.setdefault(idx, []).append(p)
-        elif "input_mapper" in name or "output_mapper" in name:
-            mapper_params.append(p)
-        else:
-            other_params.append(p)
-
     groups: list[dict] = []
-    if stage_lr_scale == 1.0:
-        core_params = other_params
-        for stage_list in stage_params.values():
-            core_params.extend(stage_list)
-        if core_params:
-            groups.append({"params": core_params, "lr": lr})
-    else:
-        for i in sorted(stage_params.keys()):
-            stage_lr = lr * (stage_lr_scale ** (num_stages - 1 - i))
-            groups.append({"params": stage_params[i], "lr": stage_lr})
+
+    if struct_lr_scale != 1.0 or dyn_lr_scale != 1.0:
+        if stage_lr_scale != 1.0:
+            warnings.warn(
+                f"stage_lr_scale={stage_lr_scale} ignored because "
+                f"struct/dyn LR scales are active (flat grouping)."
+            )
+        struct_params: list[torch.nn.Parameter] = []
+        dyn_params: list[torch.nn.Parameter] = []
+        mapper_params: list[torch.nn.Parameter] = []
+        other_params: list[torch.nn.Parameter] = []
+        for name, p in raw.named_parameters():
+            if "input_mapper" in name or "output_mapper" in name:
+                mapper_params.append(p)
+            # NOTE: .z_logits MUST be checked before .logits (z_logits also ends with .logits)
+            elif name.endswith(".z_logits") or name.endswith(".logits") or name.endswith(".raw_mult"):
+                struct_params.append(p)
+            elif name.endswith(".raw_leak") or name.endswith(".raw_drive_g"):
+                dyn_params.append(p)
+            else:
+                other_params.append(p)
         if other_params:
             groups.append({"params": other_params, "lr": lr})
-    if mapper_params:
-        groups.append({"params": mapper_params, "lr": lr * mapper_lr_scale})
+        if mapper_params:
+            groups.append({"params": mapper_params, "lr": lr * mapper_lr_scale})
+        if struct_params:
+            groups.append({"params": struct_params, "lr": lr * struct_lr_scale})
+        if dyn_params:
+            groups.append({"params": dyn_params, "lr": lr * dyn_lr_scale})
+    else:
+        core = getattr(raw, "core", raw)
+        stages = getattr(core, "stages", None)
+        num_stages = len(stages) if stages is not None else 0
+        if stage_lr_scale > 1.0 and num_stages <= 1:
+            warnings.warn(
+                f"stage_lr_scale={stage_lr_scale} has no effect with "
+                f"{num_stages} stage(s); all parameters will use base LR."
+            )
+
+        stage_params: dict[int, list[torch.nn.Parameter]] = {}
+        mapper_params: list[torch.nn.Parameter] = []
+        other_params: list[torch.nn.Parameter] = []
+        for name, p in raw.named_parameters():
+            if ".stages." in name:
+                try:
+                    idx = int(name.split(".stages.")[1].split(".")[0])
+                except (ValueError, IndexError):
+                    other_params.append(p)
+                    continue
+                stage_params.setdefault(idx, []).append(p)
+            elif "input_mapper" in name or "output_mapper" in name:
+                mapper_params.append(p)
+            else:
+                other_params.append(p)
+
+        if stage_lr_scale == 1.0:
+            core_params = other_params
+            for stage_list in stage_params.values():
+                core_params.extend(stage_list)
+            if core_params:
+                groups.append({"params": core_params, "lr": lr})
+        else:
+            for i in sorted(stage_params.keys()):
+                stage_lr = lr * (stage_lr_scale ** (num_stages - 1 - i))
+                groups.append({"params": stage_params[i], "lr": stage_lr})
+            if other_params:
+                groups.append({"params": other_params, "lr": lr})
+        if mapper_params:
+            groups.append({"params": mapper_params, "lr": lr * mapper_lr_scale})
 
     return torch.optim.AdamW(groups, lr=lr, weight_decay=weight_decay)
 

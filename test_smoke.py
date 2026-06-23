@@ -2443,6 +2443,19 @@ def main():
     test_mapper_unfreeze_epoch_midpoint()         # MLR-7: midpoint
     test_freeze_mappers_requires_grad_toggle()    # MLR-8: requires_grad toggle
 
+    # LR param group tests (lr-param-groups plan)
+    test_lrp_struct_dyn_groups_created()          # LRP-1
+    test_lrp_correct_param_membership()           # LRP-2
+    test_lrp_backward_compat()                    # LRP-3
+    test_lrp_validation_positive()                # LRP-4
+    test_lrp_composition_with_mapper()            # LRP-5
+    test_lrp_stage_lr_scale_ignored()             # LRP-6
+    test_lrp_empty_group_handling()               # LRP-6b
+    test_lrp_cli_flags_parsed()                   # LRP-7
+    test_lrp_compute_update_norms()               # LRP-8
+    test_lrp_old_mapper_default_backward_compat() # LRP-9
+    test_lrp_mapper_lr_scale_new_default()        # LRP-10
+
     # Bidirectional topology tests (bidirectional-edges plan, spec order)
     test_bidir_line_graph_doubles_edges()         # BIDI-1: line primitive
     test_bidir_ring_graph_doubles_edges()         # BIDI-2: ring primitive
@@ -4762,7 +4775,7 @@ def test_freeze_mappers_cli_flag_parsed():
     )
     result = subprocess.run(
         [sys.executable, "-c", script],
-        cwd="kirchhoff_redesign/ideal",
+        cwd=THIS_DIR,
         capture_output=True, text=True, timeout=60,
     )
     check("MLR-4: subprocess returns 0", result.returncode == 0,
@@ -4793,13 +4806,13 @@ def test_mapper_lr_scale_cli_flag_parsed():
     )
     result = subprocess.run(
         [sys.executable, "-c", script],
-        cwd="kirchhoff_redesign/ideal",
+        cwd=THIS_DIR,
         capture_output=True, text=True, timeout=60,
     )
     check("MLR-5: subprocess returns 0", result.returncode == 0,
           f"stderr: {result.stderr}")
-    check("MLR-5: default mapper_lr_scale is 1.0",
-          "default: 1.0" in result.stdout,
+    check("MLR-5: default mapper_lr_scale is 0.1 (new default)",
+          "default: 0.1" in result.stdout,
           f"stdout: {result.stdout}")
     check("MLR-5: --mapper-lr-scale 0.1 parsed",
           "set: 0.1" in result.stdout,
@@ -4824,6 +4837,344 @@ def test_mapper_unfreeze_epoch_midpoint():
         check(f"MLR-7: midpoint == floor(mean) for {total} epochs",
               midpoint == int(arithmetic_mean),
               f"midpoint={midpoint}, floor(mean)={int(arithmetic_mean)}")
+
+
+# ---- LR param groups tests (lr-param-groups plan) ----
+
+def test_lrp_struct_dyn_groups_created():
+    """LRP-1: struct_lr_scale and dyn_lr_scale create separate param groups."""
+    print("\nTest LRP-1: struct/dyn LR groups created")
+    from train import make_optimizer
+    from topology import build_net_from_preset
+    from cell_library import make_default_library
+
+    cell_lib = make_default_library()
+    net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
+    base_lr = 1e-3
+    optim = make_optimizer(
+        net, lr=base_lr,
+        stage_lr_scale=1.0, mapper_lr_scale=0.1,
+        struct_lr_scale=2.0, dyn_lr_scale=0.5,
+    )
+    check("LRP-1: 4 param groups (other + mapper + struct + dyn)",
+          len(optim.param_groups) == 4,
+          f"got {len(optim.param_groups)} groups, expected 4")
+
+    lrs = sorted([g["lr"] for g in optim.param_groups])
+    expected = sorted([base_lr, base_lr * 0.1, base_lr * 2.0, base_lr * 0.5])
+    check("LRP-1: correct LRs in groups",
+          all(abs(a - b) < 1e-12 for a, b in zip(lrs, expected)),
+          f"expected {expected}, got {lrs}")
+
+
+def test_lrp_correct_param_membership():
+    """LRP-2: verify params land in correct groups by name."""
+    print("\nTest LRP-2: correct param membership per group")
+    from train import make_optimizer
+    from topology import build_net_from_preset
+    from cell_library import make_default_library
+
+    cell_lib = make_default_library()
+    net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
+    base_lr = 1e-3
+    optim = make_optimizer(
+        net, lr=base_lr,
+        stage_lr_scale=1.0, mapper_lr_scale=0.1,
+        struct_lr_scale=2.0, dyn_lr_scale=0.5,
+    )
+
+    # Find groups by unique LR
+    groups_by_lr = {g["lr"]: g for g in optim.param_groups}
+    param_to_group = {}
+    for n, p_in_net in net.named_parameters():
+        for gidx, g in enumerate(optim.param_groups):
+            if any(p_in_net is pp for pp in g["params"]):
+                param_to_group[n] = g["lr"]
+                break
+
+    struct_params = [
+        n for n, lr_val in param_to_group.items()
+        if abs(lr_val - base_lr * 2.0) < 1e-12
+    ]
+    dyn_params = [
+        n for n, lr_val in param_to_group.items()
+        if abs(lr_val - base_lr * 0.5) < 1e-12
+    ]
+    mapper_params = [
+        n for n, lr_val in param_to_group.items()
+        if abs(lr_val - base_lr * 0.1) < 1e-12
+    ]
+    other_params = [
+        n for n, lr_val in param_to_group.items()
+        if abs(lr_val - base_lr) < 1e-12
+    ]
+
+    check("LRP-2: struct group has z_logits params",
+          any("z_logits" in n for n in struct_params),
+          f"struct_params={struct_params}")
+    check("LRP-2: struct group has logits params",
+          any(n.endswith(".logits") for n in struct_params),
+          f"struct_params={struct_params}")
+    check("LRP-2: struct group has raw_mult params",
+          any("raw_mult" in n for n in struct_params),
+          f"struct_params={struct_params}")
+    check("LRP-2: dyn group has raw_leak params",
+          any("raw_leak" in n for n in dyn_params),
+          f"dyn_params={dyn_params}")
+    # raw_drive_g is optional — only present with persistent drive.
+    has_drive = any("raw_drive_g" in n for n, _ in net.named_parameters())
+    if has_drive:
+        check("LRP-2: dyn group has raw_drive_g params",
+              any("raw_drive_g" in n for n in dyn_params),
+              f"dyn_params={dyn_params}")
+    check("LRP-2: mapper group has input_mapper params",
+          any("input_mapper" in n for n in mapper_params),
+          f"mapper_params={mapper_params}")
+    check("LRP-2: mapper group has output_mapper params",
+          any("output_mapper" in n for n in mapper_params),
+          f"mapper_params={mapper_params}")
+    check("LRP-2: no struct params in other group",
+          not any("z_logits" in n or n.endswith(".logits") or "raw_mult" in n
+                  for n in other_params),
+          f"other_params unexpectedly has leaked struct params: {other_params}")
+    check("LRP-2: no dyn params in other group",
+          not any("raw_leak" in n or "raw_drive_g" in n
+                  for n in other_params),
+          f"other_params unexpectedly has leaked dyn params: {other_params}")
+
+
+def test_lrp_backward_compat():
+    """LRP-3: all scales=1.0 preserves single-group optimizer."""
+    print("\nTest LRP-3: backward compat with all scales=1.0")
+    from train import make_optimizer
+    from topology import build_net_from_preset
+    from cell_library import make_default_library
+
+    cell_lib = make_default_library()
+    net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
+    optim = make_optimizer(
+        net, lr=1e-3,
+        stage_lr_scale=1.0, mapper_lr_scale=1.0,
+        struct_lr_scale=1.0, dyn_lr_scale=1.0,
+    )
+    check("LRP-3: single param group when all scales=1.0",
+          len(optim.param_groups) == 1,
+          f"got {len(optim.param_groups)} groups")
+
+
+def test_lrp_validation_positive():
+    """LRP-4: struct_lr_scale and dyn_lr_scale must be positive."""
+    print("\nTest LRP-4: validation of positive struct/dyn scales")
+    from train import make_optimizer
+    from topology import build_net_from_preset
+    from cell_library import make_default_library
+
+    cell_lib = make_default_library()
+    net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
+
+    for val, name in [(0.0, "zero"), (-0.1, "negative")]:
+        n_trials = 0
+        for scale_name, scale_val in [("struct_lr_scale", val), ("dyn_lr_scale", val)]:
+            try:
+                make_optimizer(
+                    net, lr=1e-3,
+                    mapper_lr_scale=1.0,
+                    **{scale_name: scale_val},
+                )
+            except ValueError:
+                n_trials += 1
+        check(f"LRP-4: {name} struct/dyn scale raises ValueError (got {n_trials}/2)",
+              n_trials == 2)
+
+
+def test_lrp_composition_with_mapper():
+    """LRP-5: mapper_lr_scale and struct_lr_scale compose correctly."""
+    print("\nTest LRP-5: mapper + struct LR scales composition")
+    from train import make_optimizer
+    from topology import build_net_from_preset
+    from cell_library import make_default_library
+
+    cell_lib = make_default_library()
+    net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
+    base_lr = 1e-3
+    optim = make_optimizer(
+        net, lr=base_lr,
+        mapper_lr_scale=0.1, struct_lr_scale=3.0, dyn_lr_scale=1.0,
+    )
+    lrs = [g["lr"] for g in optim.param_groups]
+    check("LRP-5: contains mapper LR = 0.1*base",
+          base_lr * 0.1 in lrs,
+          f"LRs={lrs}")
+    check("LRP-5: contains struct LR = 3.0*base",
+          base_lr * 3.0 in lrs,
+          f"LRs={lrs}")
+    check("LRP-5: contains base LR group",
+          base_lr in lrs,
+          f"LRs={lrs}")
+
+
+def test_lrp_stage_lr_scale_ignored():
+    """LRP-6: stage_lr_scale ignored when struct/dyn active."""
+    print("\nTest LRP-6: stage_lr_scale is ignored when struct/dyn != 1.0")
+    from train import make_optimizer
+    from topology import build_net_from_preset
+    from cell_library import make_default_library
+    import io
+    import warnings
+
+    cell_lib = make_default_library()
+    net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
+    base_lr = 1e-3
+
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        optim = make_optimizer(
+            net, lr=base_lr,
+            stage_lr_scale=10.0,      # should be ignored
+            mapper_lr_scale=0.1,
+            struct_lr_scale=2.0,
+            dyn_lr_scale=0.5,
+        )
+    has_warning = any("stage_lr_scale" in str(wm.message).lower() for wm in w)
+    check("LRP-6: warning issued about stage_lr_scale ignored",
+          has_warning,
+          f"warnings: {[str(x.message) for x in w]}")
+
+    lrs = [g["lr"] for g in optim.param_groups]
+    expected_lrs = [base_lr, base_lr * 0.1, base_lr * 2.0, base_lr * 0.5]
+    # None of the groups should have stage_lr_scale multiplied in
+    for expected in expected_lrs:
+        check(f"LRP-6: group with LR {expected} exists",
+              any(abs(lr - expected) < 1e-12 for lr in lrs),
+              f"LRs={lrs}")
+
+
+def test_lrp_empty_group_handling():
+    """LRP-6b: groups with no params are simply absent (not an error)."""
+    print("\nTest LRP-6b: empty groups are omitted from optimizer")
+    from train import make_optimizer
+    from topology import build_net_from_preset
+    from cell_library import make_default_library
+
+    cell_lib = make_default_library()
+    net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
+    # dyn_lr_scale=1.0 creates no dyn group; struct=2.0 creates struct group
+    optim = make_optimizer(net, lr=1e-3, struct_lr_scale=2.0, dyn_lr_scale=1.0)
+    check("LRP-6b: optimizer created without error",
+          isinstance(optim, torch.optim.Optimizer))
+    # When dyn_lr_scale=1.0 is passed explicitly, make_optimizer sees
+    # struct=2.0 != 1.0 so flat grouping kicks in. No dyn group needed.
+    check("LRP-6b: has groups (struct active)",
+          len(optim.param_groups) >= 2)
+
+
+def test_lrp_cli_flags_parsed():
+    """LRP-7: --struct-lr-scale and --dyn-lr-scale CLI flags parse correctly."""
+    print("\nTest LRP-7: CLI flags for struct/dyn LR scales")
+    import subprocess
+    import sys
+    result = subprocess.run(
+        [
+            sys.executable, "-c",
+            "import sys; sys.path.insert(0, '.'); "
+            "from train_script import _add_argparse_args; "
+            "import argparse; "
+            "p = argparse.ArgumentParser(); "
+            "_add_argparse_args(p); "
+            "args = p.parse_args(['--problem', 'sinx', '--struct-lr-scale', '3.0', '--dyn-lr-scale', '0.5']); "
+            "print('struct:', args.struct_lr_scale); "
+            "print('dyn:', args.dyn_lr_scale)",
+        ],
+        cwd=THIS_DIR,
+        capture_output=True, text=True, timeout=60,
+    )
+    check("LRP-7: subprocess returns 0", result.returncode == 0,
+          f"stderr: {result.stderr}")
+    check("LRP-7: --struct-lr-scale 3.0 parsed",
+          "struct: 3.0" in result.stdout,
+          f"stdout: {result.stdout}")
+    check("LRP-7: --dyn-lr-scale 0.5 parsed",
+          "dyn: 0.5" in result.stdout,
+          f"stdout: {result.stdout}")
+
+
+def test_lrp_compute_update_norms():
+    """LRP-8: compute_update_norms returns expected keys and values."""
+    print("\nTest LRP-8: compute_update_norms output")
+    from train_script import compute_update_norms
+    from topology import build_net_from_preset
+    from cell_library import make_default_library
+
+    cell_lib = make_default_library()
+    net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
+
+    snapshots = {name: p.data.detach().clone() for name, p in net.named_parameters()}
+    # Before any training, update norms should be ~zero
+    norms = compute_update_norms(snapshots, net)
+
+    check("LRP-8: has mapper key", "mapper" in norms)
+    check("LRP-8: has struct key", "struct" in norms)
+    check("LRP-8: has dyn key", "dyn" in norms)
+    check("LRP-8: has other key", "other" in norms)
+
+    for gname in ("mapper", "struct", "dyn", "other"):
+        d = norms[gname]
+        for key in ("param_norm", "update_norm", "rel_update"):
+            check(f"LRP-8: {gname} has {key}", key in d,
+                  f"keys={list(d.keys())}")
+        check(f"LRP-8: {gname} update_norm ~ 0 (no training)",
+              d["update_norm"] < 1e-12,
+              f"{gname} update_norm={d['update_norm']}")
+
+
+def test_lrp_old_mapper_default_backward_compat():
+    """LRP-9: old default (mapper=1.0, struct=1.0, dyn=1.0) gives single group."""
+    print("\nTest LRP-9: old explicit defaults produce single group")
+    from train import make_optimizer
+    from topology import build_net_from_preset
+    from cell_library import make_default_library
+
+    cell_lib = make_default_library()
+    net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
+    optim = make_optimizer(
+        net, lr=1e-3,
+        mapper_lr_scale=1.0,
+        struct_lr_scale=1.0,
+        dyn_lr_scale=1.0,
+    )
+    check("LRP-9: single group", len(optim.param_groups) == 1)
+
+
+def test_lrp_mapper_lr_scale_new_default():
+    """LRP-10: mapper_lr_scale defaults to 0.1."""
+    print("\nTest LRP-10: mapper_lr_scale new default (0.1)")
+    import subprocess
+    import sys
+    result = subprocess.run(
+        [
+            sys.executable, "-c",
+            "import sys; sys.path.insert(0, '.'); "
+            "from train_script import _add_argparse_args; "
+            "import argparse; p = argparse.ArgumentParser(); "
+            "_add_argparse_args(p); "
+            "args = p.parse_args(['--problem', 'sinx']); "
+            "print('default:', args.mapper_lr_scale); "
+            "print('struct:', args.struct_lr_scale); "
+            "print('dyn:', args.dyn_lr_scale)",
+        ],
+        cwd=THIS_DIR,
+        capture_output=True, text=True, timeout=60,
+    )
+    output = result.stdout
+    check("LRP-10: mapper_lr_scale default is 0.1",
+          "default: 0.1" in output,
+          f"stdout: {output}")
+    check("LRP-10: struct_lr_scale default is 2.0",
+          "struct: 2.0" in output,
+          f"stdout: {output}")
+    check("LRP-10: dyn_lr_scale default is 1.0",
+          "dyn: 1.0" in output,
+          f"stdout: {output}")
 
 
 def test_freeze_mappers_requires_grad_toggle():

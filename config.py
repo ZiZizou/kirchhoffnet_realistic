@@ -334,7 +334,7 @@ TAU = {
 LAMBDAS = {
     "sparsity": 1e-3,
     "rail": 0.1,
-    "edge_gate": 5e-4,
+    "edge_gate": 0,
     "node_gate": 0.0,       # DEPRECATED (deprecate-node-gates)
     "power": 1e-4,
     "capacitance": 0.0,     # DEPRECATED (deprecate-node-gates)
@@ -386,7 +386,7 @@ SCHEDULE_THREE_PHASE = {
     # are no-ops; node pruning is connectivity-only).
     "lambdas_b": {
         "sparsity": 5e-5,
-        "edge_gate": 1e-5,
+        "edge_gate": 0,
         "node_gate": 0.0,        # DEPRECATED (deprecate-node-gates)
         "power": 1e-5,
         "capacitance": 0.0,      # DEPRECATED (deprecate-node-gates)
@@ -437,7 +437,7 @@ SCHEDULE_FOUR_PHASE = {
     # Phase B2 lambdas: sparsity + edge_gate. No node_gate (DEPRECATED).
     "lambdas_b2": {
         "sparsity": 5e-5,
-        "edge_gate": 1e-5,
+        "edge_gate": 0,
         "power": 1e-5
     },
     # Phase C retrain lambdas: tiny sparsity for crisp cell family.
@@ -500,7 +500,7 @@ DEQ = {
 DEGREE_BUDGET = {
     "enabled": False,           # master switch; --budget CLI enables
     "k_start": 8,               # initial budget per destination
-    "k_end": 2,                 # final budget (annealed to)
+    "k_end": 4,                 # final budget (annealed to)
     "temperature_start": 1.0,   # initial softmax temperature
     "temperature_end": 0.1,     # final temperature (sharper competition)
     "axis": "dst",              # "dst" | "src" | "both"
@@ -796,7 +796,7 @@ def make_smooth2d_grid_preset(
         "schedule": "three_phase",
         "lambdas": {
             "sparsity": 1e-5,
-            "edge_gate": 5e-6,
+            "edge_gate": 0,
             "node_gate": 0.0,        # DEPRECATED (deprecate-node-gates)
             "power": 1e-5,
             "capacitance": 0.0,      # DEPRECATED (deprecate-node-gates)
@@ -887,7 +887,7 @@ def make_housing_grid_preset(
         "schedule": "three_phase",
         "lambdas": {
             "sparsity": 1e-5,
-            "edge_gate": 5e-6,
+            "edge_gate": 0,
             "node_gate": 0.0,        # DEPRECATED (deprecate-node-gates)
             "power": 1e-5,
             "capacitance": 0.0,      # DEPRECATED (deprecate-node-gates)

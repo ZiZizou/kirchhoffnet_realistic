@@ -3232,7 +3232,8 @@ def main():
                 # fewer edges, so competition is naturally tighter).
                 if budget_enabled:
                     for _stage in pruned_net.core.stages:
-                        _stage.set_budget(budget_k_end, budget_temp_end)
+                        # Disable it for phase C retrain; the compact network is already pruned.
+                        _stage.set_budget(0, budget_temp_end)
                         _stage.budget_axis = budget_axis
                 retrain_deq_weight = 0
                 retrain_deq_residual_sum = 0.0

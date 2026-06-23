@@ -251,7 +251,7 @@ class DifferentialStage(nn.Module):
         Fully vectorized via scatter operations (no Python loop) for
         performance under torch.compile and large graphs.
         """
-        n_groups = int(group.max().item()) + 1
+        n_groups = self.num_nodes  # group is always self.src/self.dst, max = N-1
         logits = scores.float() / T
 
         # Per-group max for numerical stability (like F.softmax internally)

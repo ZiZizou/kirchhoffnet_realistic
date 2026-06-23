@@ -99,7 +99,7 @@ from train import (
     prune_readiness_check,
     compute_solidification_metrics,
     validate_argmax,
-    budget_k_for_epoch,
+    budget_frac_for_epoch,
     budget_temperature_for_epoch,
 )
 from io_mapper import (
@@ -1813,26 +1813,26 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "--solver heun.",
     )
 
-    # --- Degree budget / top-k edge competition (degree-budget-topk plan) ---
+    # --- Degree budget / fraction edge competition (degree-budget-topk plan) ---
     parser.add_argument(
         "--budget", action="store_true", default=False,
         dest="budget",
-        help="Enable degree-budget top-k edge competition. Each "
-             "destination (or source) node keeps at most k edges open via "
-             "temperature-scaled softmax renormalization of z_logits. "
+        help="Enable degree-budget edge competition. Each destination "
+             "(or source) node keeps a fraction of its incoming edges open "
+             "via temperature-scaled softmax renormalization of z_logits. "
              "Replaces the L1 edge_gate pressure with explicit competition.",
     )
     parser.add_argument(
-        "--budget-k-start", type=int, default=None,
-        dest="budget_k_start",
-        help="Initial budget k per destination (permissive, large). "
-             "Default: 8.",
+        "--budget-frac-start", type=float, default=None,
+        dest="budget_frac_start",
+        help="Initial budget fraction per group (permissive, 1.0 = no "
+             "restriction). Default: 1.0.",
     )
     parser.add_argument(
-        "--budget-k-end", type=int, default=None,
-        dest="budget_k_end",
-        help="Final budget k per destination (restrictive, small). "
-             "Default: 2.",
+        "--budget-frac-end", type=float, default=None,
+        dest="budget_frac_end",
+        help="Final budget fraction per group (restrictive, 0.0 = disables "
+             "budget, 0.75 = keep 75% of edges). Default: 0.75.",
     )
     parser.add_argument(
         "--budget-temp-start", type=float, default=None,
@@ -1842,7 +1842,7 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--budget-temp-end", type=float, default=None,
         dest="budget_temp_end",
-        help="Final softmax temperature (sharp, approaches hard top-k). "
+        help="Final softmax temperature (sharp, approaches hard top-k_eff). "
              "Default: 0.1.",
     )
     parser.add_argument(
@@ -2067,18 +2067,18 @@ def main():
             f"[train] WARNING: --freeze-mappers ignored for schedule_mode={schedule_mode} "
             f"(only supported for four_phase)"
         )
-    # Degree budget / top-k competition (degree-budget-topk plan).
+    # Degree budget / fraction competition (degree-budget-topk plan).
     # Resolve effective config: CLI override > config default.
     budget_enabled = bool(getattr(args, "budget", False)) or bool(
         DEGREE_BUDGET.get("enabled", False)
     )
-    budget_k_start = int(
-        args.budget_k_start if args.budget_k_start is not None
-        else DEGREE_BUDGET["k_start"]
+    budget_frac_start = float(
+        args.budget_frac_start if args.budget_frac_start is not None
+        else DEGREE_BUDGET["frac_start"]
     )
-    budget_k_end = int(
-        args.budget_k_end if args.budget_k_end is not None
-        else DEGREE_BUDGET["k_end"]
+    budget_frac_end = float(
+        args.budget_frac_end if args.budget_frac_end is not None
+        else DEGREE_BUDGET["frac_end"]
     )
     budget_temp_start = float(
         args.budget_temp_start if args.budget_temp_start is not None
@@ -2094,15 +2094,21 @@ def main():
     )
     budget_anneal_frac = float(DEGREE_BUDGET["anneal_frac"])
     if budget_enabled:
-        if budget_k_end < 1:
+        if not (0.0 <= budget_frac_end <= 1.0):
             print(
-                f"[train] WARNING: budget_k_end={budget_k_end} must be >= 1, "
-                f"clamping to 1"
+                f"[train] WARNING: budget_frac_end={budget_frac_end} must be in [0,1], "
+                f"clamping to [0,1]"
             )
-            budget_k_end = 1
+            budget_frac_end = max(0.0, min(1.0, budget_frac_end))
+        if not (0.0 <= budget_frac_start <= 1.0):
+            print(
+                f"[train] WARNING: budget_frac_start={budget_frac_start} must be in [0,1], "
+                f"clamping to [0,1]"
+            )
+            budget_frac_start = max(0.0, min(1.0, budget_frac_start))
         print(
             f"[train] budget=enabled axis={budget_axis} "
-            f"k: {budget_k_start}->{budget_k_end} "
+            f"frac: {budget_frac_start:.2f}->{budget_frac_end:.2f} "
             f"temp: {budget_temp_start:.2f}->{budget_temp_end:.2f} "
             f"anneal_frac={budget_anneal_frac}"
         )
@@ -2437,20 +2443,20 @@ def main():
             break
         net.train()
 
-        # Degree budget / top-k competition (degree-budget-topk plan).
-        # Recompute k and temperature for this epoch and push to all
+        # Degree budget / fraction competition (degree-budget-topk plan).
+        # Recompute frac and temperature for this epoch and push to all
         # stages. Done once per epoch (global schedule), the per-batch
         # budget gate is recomputed inside rhs() from the stage's current
-        # budget_k / budget_temperature.
+        # budget_frac / budget_temperature.
         if budget_enabled:
-            _b_k = budget_k_for_epoch(
-                epoch, ab_total, budget_k_start, budget_k_end, budget_anneal_frac,
+            _b_frac = budget_frac_for_epoch(
+                epoch, ab_total, budget_frac_start, budget_frac_end, budget_anneal_frac,
             )
             _b_T = budget_temperature_for_epoch(
                 epoch, ab_total, budget_temp_start, budget_temp_end, budget_anneal_frac,
             )
             for _stage in raw_net.core.stages:
-                _stage.set_budget(_b_k, _b_T)
+                _stage.set_budget_frac(_b_frac, _b_T)
                 _stage.budget_axis = budget_axis
 
         if schedule_mode == "four_phase":
@@ -3227,13 +3233,12 @@ def main():
             for repoch in range(c_epochs):
                 pruned_net.train()
                 # Degree budget (degree-budget-topk plan): in Phase C the
-                # budget is held at its final restrictive values (no
-                # further annealing — the compact network already has
-                # fewer edges, so competition is naturally tighter).
+                # budget is disabled (frac=0.0) — the compact network is
+                # already pruned, so per-edge competition has no work.
                 if budget_enabled:
                     for _stage in pruned_net.core.stages:
                         # Disable it for phase C retrain; the compact network is already pruned.
-                        _stage.set_budget(0, budget_temp_end)
+                        _stage.set_budget_frac(0.0, budget_temp_end)
                         _stage.budget_axis = budget_axis
                 retrain_deq_weight = 0
                 retrain_deq_residual_sum = 0.0

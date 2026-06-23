@@ -18,6 +18,8 @@ contractive.
 
 from __future__ import annotations
 
+import warnings
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -144,11 +146,12 @@ class DifferentialStage(nn.Module):
         self.u_logits = nn.Parameter(torch.full((num_nodes,), u_init))
 
         # Degree budget / top-k competition (degree-budget-topk plan).
-        # Each destination (or source) keeps at most ``budget_k`` edges open
-        # via temperature-scaled softmax renormalization of z_logits scores.
-        # budget_k=0 disables the budget entirely (byte-identical rhs).
+        # Each destination (or source) keeps a fraction ``budget_frac`` of
+        # its incoming edges open via temperature-scaled softmax
+        # renormalization of z_logits scores (per-group k_eff).
+        # budget_frac=0 disables the budget entirely (byte-identical rhs).
         # budget_axis: "dst" (per-destination), "src" (per-source), "both".
-        self.budget_k: int = 0
+        self.budget_frac: float = 0.0
         self.budget_temperature: float = 1.0
         self.budget_axis: str = "dst"
         self.budget_enabled: bool = False
@@ -165,14 +168,27 @@ class DifferentialStage(nn.Module):
         """
         self.leak_floor = float(leak_floor)
 
-    def set_budget(self, k: int, temperature: float) -> None:
-        """Set the degree-budget parameters for this stage.
+    def set_budget_frac(self, frac: float, temperature: float) -> None:
+        """Set the degree-budget fraction for this stage.
 
-        Each destination (or source) node keeps at most ``k`` incoming edges
-        open via temperature-scaled softmax renormalization of z_logits
-        scores. ``k=0`` disables the budget entirely (no overhead in
-        ``rhs``). ``temperature`` controls sharpness of competition
-        (smaller = sharper, approaches hard top-k).
+        Each destination (or source) node keeps a fraction ``frac`` of its
+        incoming edges open via temperature-scaled softmax renormalization of
+        z_logits scores. The effective per-group budget is computed as
+        ``k_eff = max(1, round(count * frac))`` where ``count`` is the
+        number of incident edges for that group.
+
+        - ``frac <= 0`` disables the budget entirely (no overhead in
+          ``rhs``). Used in Phase C retrain.
+        - ``frac >= 1.0`` means no restriction (every group keeps all its
+          incident edges; budget_gate = 1.0).
+        - ``0 < frac < 1`` activates per-group competition proportional to
+          each group's size — nodes with many incoming edges (e.g. proj
+          nodes with 25) keep the same fraction as nodes with few (e.g.
+          edge hidden with 4), unlike the prior absolute-``k`` mechanism
+          which over-pruned high-degree nodes.
+
+        ``temperature`` controls sharpness of competition (smaller = sharper,
+        approaches hard top-``k_eff``).
 
         The budget gate is layered on top of the existing sigmoid gate:
         ``edge_gate = sigmoid(z_logits) * budget_gate``.
@@ -180,9 +196,14 @@ class DifferentialStage(nn.Module):
         Called once per epoch by the training loop. Captured by attribute
         (not closure) so DEQ IFT re-evaluates with the same values.
         """
-        self.budget_k = int(k)
+        self.budget_frac = float(frac)
         self.budget_temperature = float(temperature)
-        self.budget_enabled = (self.budget_k > 0)
+        self.budget_enabled = (self.budget_frac > 0.0)
+        if self.budget_frac < 0.0 or self.budget_frac > 1.0:
+            warnings.warn(
+                f"set_budget_frac: frac={self.budget_frac} is outside [0, 1]. "
+                f"frac<0 disables budget; frac>1 is a no-op (all ones).",
+            )
 
     def _effective_leak(self, num_nodes: int | None = None,
                         leak_floor: float | None = None) -> torch.Tensor:
@@ -200,9 +221,13 @@ class DifferentialStage(nn.Module):
 
         For each group node (destination by default), gather the indices of
         incident edges and apply temperature-scaled softmax over their
-        z_logits scores, then scale to a total budget of ``budget_k`` and
-        clamp each edge's share to [0, 1]. Groups with fewer incident edges
-        than ``budget_k`` receive an all-ones mask (no competition needed).
+        z_logits scores. The effective per-group budget is
+        ``k_eff = max(1, round(count * frac))`` (a fraction of the group's
+        actual incident edge count), so every node type receives a uniform
+        proportion of its incoming connections regardless of absolute
+        degree. The softmax is scaled to a total budget of ``k_eff`` and
+        clamped per-edge to [0, 1]. Groups with ``count <= k_eff`` incident
+        edges receive an all-ones mask (no competition needed).
 
         Fully differentiable (C-infinity) so it is compatible with DEQ
         implicit differentiation. No STE, no hard threshold.
@@ -213,13 +238,13 @@ class DifferentialStage(nn.Module):
         are multiplied. Empty groups (no edges) produce a 1.0 contribution
         that does not affect the product.
         """
-        if not self.budget_enabled or self.budget_k <= 0:
+        if not self.budget_enabled or self.budget_frac <= 0.0:
             return torch.ones(
                 self.z_logits.shape, device=self.z_logits.device,
                 dtype=self.z_logits.dtype,
             )
         scores = self.z_logits
-        k = float(self.budget_k)
+        frac = float(self.budget_frac)
         T = float(self.budget_temperature)
         if T <= 0.0:
             T = 1e-6  # avoid div-by-zero; effectively hard
@@ -229,10 +254,10 @@ class DifferentialStage(nn.Module):
         )
 
         if self.budget_axis in ("dst", "both"):
-            gate = gate * self._budget_group_mask(scores, self.dst, k, T)
+            gate = gate * self._budget_group_mask(scores, self.dst, frac, T)
 
         if self.budget_axis in ("src", "both"):
-            gate = gate * self._budget_group_mask(scores, self.src, k, T)
+            gate = gate * self._budget_group_mask(scores, self.src, frac, T)
 
         return gate
 
@@ -240,13 +265,15 @@ class DifferentialStage(nn.Module):
         self,
         scores: torch.Tensor,
         group: torch.Tensor,
-        k: float,
+        frac: float,
         T: float,
     ) -> torch.Tensor:
         """Build a [E] gate for a single axis (dst or src).
 
-        For each unique group value, compute softmax(scores[idx] / T) * k
-        and clamp to [0, 1]. Groups with n <= k incident edges are all 1.0.
+        For each unique group value, compute the per-group effective budget
+        ``k_eff = max(1, round(count * frac))`` and the per-edge gate
+        ``clamp(softmax(scores / T) * k_eff, max=1.0)``. Groups with
+        ``count <= k_eff`` incident edges are all 1.0 (no competition).
 
         Fully vectorized via scatter operations (no Python loop) for
         performance under torch.compile and large graphs.
@@ -283,10 +310,19 @@ class DifferentialStage(nn.Module):
             torch.ones_like(group, dtype=torch.long),
         )
 
-        needs_budget = count[group].float() > k
+        # Per-group effective budget: max(1, round(count * frac))
+        # frac is in [0, 1] so count*frac is in [0, count].
+        # max(1, ...) ensures isolated single-edge groups still get a
+        # competitive budget of 1 even when frac=0.
+        k_per_group = torch.clamp(
+            (count.float() * frac).round(), min=1.0,
+        ).long()
+        k_eff = k_per_group[group].float()  # [E]
+
+        needs_budget = count[group].float() > k_eff
         gate = torch.where(
             needs_budget,
-            torch.clamp(softmaxed * k, max=1.0),
+            torch.clamp(softmaxed * k_eff, max=1.0),
             torch.ones_like(softmaxed),
         )
         return gate
@@ -355,7 +391,7 @@ class DifferentialStage(nn.Module):
         # Degree budget / top-k competition (degree-budget-topk plan).
         # Budget gate is layered on top of the sigmoid gate: independent
         # per-edge gate * competitive per-destination (or per-source) mask.
-        # When budget is disabled (budget_k=0) the budget gate is all-ones
+        # When budget is disabled (budget_frac=0) the budget gate is all-ones
         # and this multiplication is a no-op.
         if self.budget_enabled:
             budget_gate = self._compute_budget_gate()  # [E]

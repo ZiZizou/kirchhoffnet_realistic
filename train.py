@@ -61,7 +61,7 @@ __all__ = [
     "make_optimizer",
     "apply_ablation",
     "train_epoch",
-    "budget_k_for_epoch",
+    "budget_frac_for_epoch",
     "budget_temperature_for_epoch",
 ]
 
@@ -1184,42 +1184,57 @@ def tau_for_epoch(
 
 # ---------- degree-budget annealing (degree-budget-topk plan) ----------
 
-def budget_k_for_epoch(
+def budget_frac_for_epoch(
     epoch: int,
     total_epochs: int,
-    k_start: int = 8,
-    k_end: int = 2,
+    frac_start: float = 1.0,
+    frac_end: float = 0.75,
     anneal_frac: float = 0.8,
-) -> int:
-    """Linearly anneal the degree-budget ``k`` from ``k_start`` to ``k_end``.
+) -> float:
+    """Linearly anneal the degree-budget fraction from ``frac_start`` to ``frac_end``.
 
-    Annealing is spread over the first ``anneal_frac`` of ``total_epochs``.
-    Beyond that, the value is clamped to ``k_end`` (more restrictive).
+    The fraction is the proportion of each node's incoming edges that the
+    budget keeps open (via per-group softmax renormalization). ``frac=1.0``
+    means no restriction (every group keeps all incident edges);
+    ``frac=0.0`` disables the budget entirely. Annealing is spread over
+    the first ``anneal_frac`` of ``total_epochs``; beyond that the value
+    is clamped to ``frac_end``.
 
-    The budget is always rounded to an integer >= 1 (k=0 would disable
-    the budget entirely, which is reserved for the no-budget path).
+    This is a continuous float, unlike the previous integer-``k`` annealing
+    that over-pruned high-degree nodes. Each group independently computes
+    ``k_eff = max(1, round(count * frac))`` at the call site
+    (``DifferentialStage._budget_group_mask``), so all node types get a
+    uniform proportion of their incoming connections.
 
     Args:
         epoch: Current epoch index (0-based).
         total_epochs: Total number of training epochs (the annealing
             denominator).
-        k_start: Initial budget per destination (permissive, large).
-        k_end: Final budget (restrictive, small). Should be >= 1.
+        frac_start: Initial budget fraction (permissive). Default 1.0
+            (no restriction at the start of training).
+        frac_end: Final budget fraction (restrictive). Default 0.75
+            (75% retention at the prune point).
         anneal_frac: Fraction of ``total_epochs`` over which to anneal.
-            Default 0.8 (i.e. the last 20% of training freezes at k_end).
+            Default 0.8 (i.e. the last 20% of training freezes at frac_end).
 
     Returns:
-        Integer budget ``k`` for this epoch, in ``[max(1, k_end), k_start]``.
+        Float budget fraction for this epoch, in ``[frac_end, frac_start]``.
+        Negative outputs are clamped to 0.0.
     """
+    if frac_start < frac_end:
+        warnings.warn(
+            f"budget_frac_for_epoch: frac_start={frac_start} < frac_end={frac_end}, "
+            f"annealing will become more permissive over time (likely a bug)"
+        )
     if total_epochs <= 0:
-        return max(1, k_end)
+        return max(0.0, float(frac_end))
     max_anneal_epochs = max(1, int(total_epochs * anneal_frac))
     if epoch >= max_anneal_epochs:
-        return max(1, k_end)
+        return max(0.0, float(frac_end))
     denom = max(1, max_anneal_epochs - 1)
     alpha = epoch / denom
-    k = round((1.0 - alpha) * k_start + alpha * k_end)
-    return max(1, int(k))
+    frac = (1.0 - alpha) * float(frac_start) + alpha * float(frac_end)
+    return max(0.0, frac)
 
 
 def budget_temperature_for_epoch(

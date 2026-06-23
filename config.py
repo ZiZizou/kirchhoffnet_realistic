@@ -403,8 +403,8 @@ SCHEDULE_THREE_PHASE = {
     # Prune thresholds used at the Phase B->C boundary.
     # four-phase-redesign/1a: edge 0.1 -> 0.05 (gentler cut, retains more
     # edges so the retrain has material to work with).
-    "prune_edge_threshold": 0.05,
-    "prune_node_threshold": 0.05,
+    "prune_edge_threshold": 0.009,
+    "prune_node_threshold": 0.009,
     # deprecate-node-gates: always False (node gates are bypassed; nodes
     # only die via the connectivity backstop).
     "prune_nodes_by_gate": False,  # DEPRECATED (deprecate-node-gates)
@@ -466,8 +466,8 @@ SCHEDULE_FOUR_PHASE = {
 # Fixed-step Heun solver
 SOLVER = {
     "method": "heun",
-    "t_span": 5.0,
-    "num_steps": 50,
+    "t_span": 7.0,
+    "num_steps": 70,
 }
 
 # Deep Equilibrium (DEQ) stagewise fixed-point solver
@@ -489,18 +489,22 @@ DEQ = {
     "leak_floor": 0.05,          # min effective leak per node under DEQ
 }
 
-# Degree budget / top-k competition (degree-budget-topk plan).
-# Each destination (or source) node keeps at most k incoming edges open
-# via temperature-scaled softmax renormalization of z_logits scores.
-# Budget k and temperature T are annealed from permissive to restrictive
-# over anneal_frac of training. The budget gate is LAYERED on top of the
-# sigmoid gate: edge_gate = sigmoid(z_logits) * budget_gate.
-# CLI override via --budget, --budget-k-start, --budget-k-end,
+# Degree budget / fraction competition (degree-budget-topk plan).
+# Each destination (or source) node keeps a fraction of its incoming
+# edges open via temperature-scaled softmax renormalization of z_logits
+# scores. The effective per-group budget is
+#   k_eff = max(1, round(count * frac))
+# so every node type (interior hidden, edge hidden, proj, etc.) receives a
+# uniform proportion of its incoming connections regardless of absolute
+# degree. Budget frac and temperature T are annealed from permissive to
+# restrictive over anneal_frac of training. The budget gate is LAYERED on
+# top of the sigmoid gate: edge_gate = sigmoid(z_logits) * budget_gate.
+# CLI override via --budget, --budget-frac-start, --budget-frac-end,
 # --budget-temp-start, --budget-temp-end, --budget-axis.
 DEGREE_BUDGET = {
     "enabled": False,           # master switch; --budget CLI enables
-    "k_start": 8,               # initial budget per destination
-    "k_end": 4,                 # final budget (annealed to)
+    "frac_start": 1.0,          # initial budget fraction (1.0 = no restriction)
+    "frac_end": 0.75,           # final budget fraction (75% retention at prune)
     "temperature_start": 1.0,   # initial softmax temperature
     "temperature_end": 0.1,     # final temperature (sharper competition)
     "axis": "dst",              # "dst" | "src" | "both"

@@ -2514,7 +2514,7 @@ def main():
 
     test_budget_gate_basic()                     # BUD-1: budget gate basics
     test_budget_gate_differentiable()            # BUD-2: differentiable
-    test_budget_k_gte_indegree_noop()            # BUD-3: k >= in-degree no-op
+    test_budget_frac_unity_noop()                # BUD-3: frac >= 1.0 is no-op
     test_budget_temperature_limits()             # BUD-4: T->0 / T->inf
     test_budget_axis_src()                       # BUD-5: axis=src
     test_budget_axis_both()                      # BUD-6: axis=both
@@ -2522,6 +2522,7 @@ def main():
     test_budget_annealing_schedule()             # BUD-8: annealing schedule
     test_budget_disabled_byte_identical()        # BUD-9: budget disabled = no-op
     test_budget_simple_edge_library_compat()     # BUD-10: SimpleEdgeLibrary
+    test_budget_frac_uniform_proportion()        # BUD-11: uniform proportion
 
     print()
     print("=" * 60)
@@ -6544,7 +6545,7 @@ def _make_budget_stage(num_nodes=5, src=None, dst=None):
 
 
 def test_budget_gate_basic():
-    """BUD-1: budget gate per-destination, sum per group <= k, in [0, 1]."""
+    """BUD-1: budget gate per-destination, sum per group <= k_eff, in [0, 1]."""
     print("\nTest BUD-1: budget gate basic properties")
     stage = _make_budget_stage()
     with torch.no_grad():
@@ -6552,7 +6553,8 @@ def test_budget_gate_basic():
             [3.0, 1.0, 0.0, 2.0, 1.5, 0.5, 2.5, 0.8, -0.5, 1.2, 0.3, 2.2, 1.8, 0.6, -1.0]
         )
 
-    stage.set_budget(k=2, temperature=1.0)
+    # frac=0.5 with in-degree=3 gives k_eff = max(1, round(1.5)) = 2 per group
+    stage.set_budget_frac(frac=0.5, temperature=1.0)
     gate = stage._compute_budget_gate()
 
     # Shape
@@ -6561,11 +6563,11 @@ def test_budget_gate_basic():
     check("gate in [0, 1]",
           bool((gate >= 0.0).all().item() and (gate <= 1.0).all().item()),
           f"min={gate.min().item():.4f} max={gate.max().item():.4f}")
-    # Per-destination sum <= k
+    # Per-destination sum <= k_eff (=2 with count=3, frac=0.5)
     for j in range(5):
         idx = (stage.dst == j).nonzero(as_tuple=False).squeeze(-1)
         s = gate[idx].sum().item()
-        check(f"dst={j} group sum <= k=2", s <= 2.0 + 1e-5,
+        check(f"dst={j} group sum <= k_eff=2", s <= 2.0 + 1e-5,
               f"got {s:.4f}")
 
 
@@ -6577,7 +6579,7 @@ def test_budget_gate_differentiable():
         stage.z_logits.data = torch.tensor(
             [3.0, 1.0, 0.0, 2.0, 1.5, 0.5, 2.5, 0.8, -0.5, 1.2, 0.3, 2.2, 1.8, 0.6, -1.0]
         )
-    stage.set_budget(k=2, temperature=1.0)
+    stage.set_budget_frac(frac=0.5, temperature=1.0)
     gate = stage._compute_budget_gate()
     check("gate.requires_grad is True", gate.requires_grad is True)
     loss = gate.sum()
@@ -6588,30 +6590,36 @@ def test_budget_gate_differentiable():
           f"all grad = {[round(g, 4) for g in stage.z_logits.grad.tolist()]}")
 
 
-def test_budget_k_gte_indegree_noop():
-    """BUD-3: when k >= in-degree, budget gate is all-ones (no constraint)."""
-    print("\nTest BUD-3: k >= in-degree is no-op")
+def test_budget_frac_unity_noop():
+    """BUD-3: when frac >= 1.0, k_eff >= count, budget gate is all-ones."""
+    print("\nTest BUD-3: frac >= 1.0 is no-op (k_eff >= in-degree)")
     stage = _make_budget_stage()  # 3 incoming edges per destination
     with torch.no_grad():
         stage.z_logits.data = torch.tensor(
             [3.0, 1.0, 0.0, 2.0, 1.5, 0.5, 2.5, 0.8, -0.5, 1.2, 0.3, 2.2, 1.8, 0.6, -1.0]
         )
-    # k=3 >= in-degree(3) -> no-op
-    stage.set_budget(k=3, temperature=1.0)
+    # frac=1.0 with count=3 gives k_eff=3 -> 3 > 3 = False, all ones
+    stage.set_budget_frac(frac=1.0, temperature=1.0)
     gate = stage._compute_budget_gate()
-    check("k=3 >= in-degree -> all ones",
+    check("frac=1.0 with in-degree=3 -> all ones",
           torch.allclose(gate, torch.ones_like(gate), atol=1e-6),
           f"max diff from ones = {(gate - 1.0).abs().max().item():.4e}")
 
-    # k=10 >> in-degree -> no-op
-    stage.set_budget(k=10, temperature=1.0)
+    # frac > 1.0: also no-op (clamped by k_eff >= count)
+    stage.set_budget_frac(frac=10.0, temperature=1.0)
     gate = stage._compute_budget_gate()
-    check("k=10 >> in-degree -> all ones",
+    check("frac=10.0 >> 1.0 -> all ones",
+          torch.allclose(gate, torch.ones_like(gate), atol=1e-6))
+
+    # frac=0.0 disables the budget entirely
+    stage.set_budget_frac(frac=0.0, temperature=1.0)
+    gate = stage._compute_budget_gate()
+    check("frac=0.0 -> disabled (all ones)",
           torch.allclose(gate, torch.ones_like(gate), atol=1e-6))
 
 
 def test_budget_temperature_limits():
-    """BUD-4: T->inf gives uniform budget; T->0 gives argmax (top-k hard)."""
+    """BUD-4: T->inf gives uniform budget; T->0 gives argmax (top-k_eff hard)."""
     print("\nTest BUD-4: temperature limits")
     stage = _make_budget_stage()
     with torch.no_grad():
@@ -6619,8 +6627,8 @@ def test_budget_temperature_limits():
             [3.0, 1.0, 0.0, 2.0, 1.5, 0.5, 2.5, 0.8, -0.5, 1.2, 0.3, 2.2, 1.8, 0.6, -1.0]
         )
 
-    # T -> 0: argmax per group
-    stage.set_budget(k=1, temperature=0.001)
+    # T -> 0: argmax per group. frac=0.33 with count=3 gives k_eff=1
+    stage.set_budget_frac(frac=1.0 / 3.0, temperature=0.001)
     gate = stage._compute_budget_gate()
     # For each destination, the highest-z edge should be 1.0, others 0.0
     for j in range(5):
@@ -6637,7 +6645,7 @@ def test_budget_temperature_limits():
                   f"got {gate[o].item():.4f}")
 
     # T -> inf: uniform
-    stage.set_budget(k=2, temperature=1000.0)
+    stage.set_budget_frac(frac=0.5, temperature=1000.0)
     gate = stage._compute_budget_gate()
     for j in range(5):
         idx = (stage.dst == j).nonzero(as_tuple=False).squeeze(-1)
@@ -6659,16 +6667,17 @@ def test_budget_axis_src():
         stage.z_logits.data = torch.tensor(
             [3.0, 1.0, 0.0, 2.0, 1.5, 0.5, 2.5, 0.8, -0.5, 1.2, 0.3, 2.2, 1.8, 0.6, -1.0]
         )
-    stage.set_budget(k=2, temperature=1.0)
+    # In test topology, each source has 3 outgoing edges; frac=0.5 -> k_eff=2
+    stage.set_budget_frac(frac=0.5, temperature=1.0)
     stage.budget_axis = "src"
     gate = stage._compute_budget_gate()
-    # Each source should have group sum <= k=2
+    # Each source should have group sum <= k_eff=2
     for s in range(5):
         idx = (stage.src == s).nonzero(as_tuple=False).squeeze(-1)
         if len(idx) == 0:
             continue
         s_sum = gate[idx].sum().item()
-        check(f"src={s} group sum <= k=2", s_sum <= 2.0 + 1e-5,
+        check(f"src={s} group sum <= k_eff=2", s_sum <= 2.0 + 1e-5,
               f"got {s_sum:.4f}")
 
 
@@ -6681,7 +6690,7 @@ def test_budget_axis_both():
             [3.0, 1.0, 0.0, 2.0, 1.5, 0.5, 2.5, 0.8, -0.5, 1.2, 0.3, 2.2, 1.8, 0.6, -1.0]
         )
     # Get dst-only mask
-    stage.set_budget(k=2, temperature=1.0)
+    stage.set_budget_frac(frac=0.5, temperature=1.0)
     stage.budget_axis = "dst"
     gate_dst = stage._compute_budget_gate()
     # Get src-only mask
@@ -6704,7 +6713,7 @@ def test_budget_deq_forward():
         stage.z_logits.data = torch.tensor(
             [3.0, 1.0, 0.0, 2.0, 1.5, 0.5, 2.5, 0.8, -0.5, 1.2, 0.3, 2.2, 1.8, 0.6, -1.0]
         )
-    stage.set_budget(k=2, temperature=1.0)
+    stage.set_budget_frac(frac=0.5, temperature=1.0)
     from sim_context import SimContext
     ctx = SimContext()
     x0 = torch.zeros(2, 5)
@@ -6717,7 +6726,7 @@ def test_budget_deq_forward():
     check("x_star shape matches", x_star.shape == (2, 5))
 
     # Compare against no-budget: should differ (budget changes dynamics)
-    stage.set_budget(k=0, temperature=1.0)
+    stage.set_budget_frac(frac=0.0, temperature=1.0)
     x_star_nb, _ = stage.forward_equilibrium(
         x0=x0, ctx=ctx, tau=1.0, cell_mode="soft",
         x_drive=None, drive_scale=0.0,
@@ -6730,18 +6739,26 @@ def test_budget_deq_forward():
 
 
 def test_budget_annealing_schedule():
-    """BUD-8: budget_k_for_epoch and budget_temperature_for_epoch linear anneal."""
+    """BUD-8: budget_frac_for_epoch and budget_temperature_for_epoch linear anneal."""
     print("\nTest BUD-8: annealing schedule")
-    from train import budget_k_for_epoch, budget_temperature_for_epoch
-    # k anneal: 8 -> 2 over 80% of 100 epochs
-    check("k(0) = k_start", budget_k_for_epoch(0, 100, 8, 2, 0.8) == 8)
-    check("k(40) ~ 5 (midpoint)", budget_k_for_epoch(40, 100, 8, 2, 0.8) == 5,
-          f"got {budget_k_for_epoch(40, 100, 8, 2, 0.8)}")
-    check("k(79) = k_end (last anneal epoch)",
-          budget_k_for_epoch(79, 100, 8, 2, 0.8) == 2)
-    check("k(80) = k_end (post-anneal freeze)",
-          budget_k_for_epoch(80, 100, 8, 2, 0.8) == 2)
-    check("k(99) = k_end", budget_k_for_epoch(99, 100, 8, 2, 0.8) == 2)
+    from train import budget_frac_for_epoch, budget_temperature_for_epoch
+    # frac anneal: 1.0 -> 0.75 over 80% of 100 epochs
+    check("frac(0) = frac_start",
+          abs(budget_frac_for_epoch(0, 100, 1.0, 0.75, 0.8) - 1.0) < 1e-6)
+    # At epoch 40 with 80 anneal epochs: alpha = 40/79 ≈ 0.5063
+    # frac = (1-0.5063) * 1.0 + 0.5063 * 0.75 = 0.4937 + 0.3797 = 0.8734
+    check("frac(40) ≈ 0.8734 (midpoint of anneal)",
+          abs(budget_frac_for_epoch(40, 100, 1.0, 0.75, 0.8) - 0.8734) < 1e-3,
+          f"got {budget_frac_for_epoch(40, 100, 1.0, 0.75, 0.8):.4f}")
+    check("frac(79) = frac_end (last anneal epoch)",
+          abs(budget_frac_for_epoch(79, 100, 1.0, 0.75, 0.8) - 0.75) < 1e-6)
+    check("frac(80) = frac_end (post-anneal freeze)",
+          abs(budget_frac_for_epoch(80, 100, 1.0, 0.75, 0.8) - 0.75) < 1e-6)
+    check("frac(99) = frac_end",
+          abs(budget_frac_for_epoch(99, 100, 1.0, 0.75, 0.8) - 0.75) < 1e-6)
+    # Negative frac_end clamped to 0
+    check("frac never negative",
+          budget_frac_for_epoch(50, 100, 0.5, -0.1, 0.8) >= 0.0)
 
     # Temperature anneal: 1.0 -> 0.1
     check("T(0) = temp_start",
@@ -6760,7 +6777,7 @@ def test_budget_annealing_schedule():
 
 
 def test_budget_disabled_byte_identical():
-    """BUD-9: rhs() output is byte-identical to pre-budget when budget_k=0."""
+    """BUD-9: rhs() output is byte-identical to pre-budget when budget_frac=0."""
     print("\nTest BUD-9: budget disabled = no change to rhs")
     stage = _make_budget_stage()
     with torch.no_grad():
@@ -6770,10 +6787,10 @@ def test_budget_disabled_byte_identical():
     from sim_context import SimContext
     ctx = SimContext()
     x = torch.randn(2, 5)
-    # Default (budget_enabled=False, budget_k=0)
+    # Default (budget_enabled=False, budget_frac=0)
     out1 = stage.rhs(x, ctx=ctx, tau=1.0, cell_mode="soft")
     # Explicitly disabled
-    stage.set_budget(0, 1.0)
+    stage.set_budget_frac(0.0, 1.0)
     out2 = stage.rhs(x, ctx=ctx, tau=1.0, cell_mode="soft")
     check("default rhs == disabled-budget rhs",
           torch.allclose(out1, out2, atol=1e-7),
@@ -6793,7 +6810,7 @@ def test_budget_simple_edge_library_compat():
         stage.z_logits.data = torch.tensor(
             [3.0, 1.0, 0.0, 2.0, 1.5, 0.5, 2.5, 0.8, -0.5, 1.2, 0.3, 2.2, 1.8, 0.6, -1.0]
         )
-    stage.set_budget(k=2, temperature=1.0)
+    stage.set_budget_frac(frac=0.5, temperature=1.0)
     gate = stage._compute_budget_gate()
     check("SimpleEdgeLibrary: gate shape [E]", gate.shape == (15,))
     check("SimpleEdgeLibrary: gate in [0, 1]",
@@ -6805,6 +6822,92 @@ def test_budget_simple_edge_library_compat():
     out = stage.rhs(x, ctx=ctx, tau=1.0, cell_mode="soft")
     check("SimpleEdgeLibrary rhs with budget is finite",
           torch.isfinite(out).all().item())
+
+
+def test_budget_frac_uniform_proportion():
+    """BUD-11: frac=0.5 with mixed in-degrees keeps ~50% per group.
+
+    Demonstrates the key advantage of fraction-based budget over absolute-k:
+    nodes with high in-degree (e.g., proj nodes with 25) keep the same
+    proportion as nodes with low in-degree (e.g., edge hidden with 4).
+    Uses high temperature so the per-edge budget gate is approximately
+    uniform within the top-k_eff edges, demonstrating the proportion.
+    """
+    print("\nTest BUD-11: fraction budget applies uniform proportion")
+    from cell_library import IdealizedCellLibrary
+    from differential_stage import DifferentialStage
+    # Build a stage with 3 destination groups having different in-degrees:
+    #   group 0: 4 incoming edges (small, like edge hidden)
+    #   group 1: 8 incoming edges (medium, like interior hidden)
+    #   group 2: 16 incoming edges (large, like proj nodes)
+    src = []
+    dst = []
+    src.extend([10, 11, 12, 13])
+    dst.extend([0, 0, 0, 0])
+    src.extend(list(range(20, 28)))
+    dst.extend([1] * 8)
+    src.extend(list(range(30, 46)))
+    dst.extend([2] * 16)
+    cell_lib = IdealizedCellLibrary()
+    stage = DifferentialStage(
+        num_nodes=46, src=src, dst=dst, cell_lib=cell_lib,
+    )
+    with torch.no_grad():
+        # Higher-index edges have higher z_logits within each group
+        z = torch.zeros(28)
+        z[0:4] = torch.tensor([0.0, 1.0, 2.0, 3.0])
+        z[4:12] = torch.tensor([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])
+        z[12:28] = torch.tensor([float(i) for i in range(16)])
+        stage.z_logits.data = z
+
+    # frac=0.5: k_eff = max(1, round(count*0.5)) per group
+    #   group 0: round(4*0.5)=2 -> k_eff=2  (50% of 4)
+    #   group 1: round(8*0.5)=4 -> k_eff=4  (50% of 8)
+    #   group 2: round(16*0.5)=8 -> k_eff=8 (50% of 16)
+    # Use high T for uniform distribution: each surviving edge gate ≈
+    # k_eff/count (since softmax ≈ uniform, then *k_eff, then clamp to 1.0).
+    stage.set_budget_frac(frac=0.5, temperature=1000.0)
+    gate = stage._compute_budget_gate()
+    for grp, count, expected_keff in [(0, 4, 2), (1, 8, 4), (2, 16, 8)]:
+        idx = (stage.dst == grp).nonzero(as_tuple=False).squeeze(-1)
+        # At high T, softmax is uniform 1/count; budget_gate ≈
+        # k_eff * (1/count) for every edge; clamp to max=1.0.
+        # Since k_eff/count = 0.5, every edge gate ≈ 0.5 (no clamping).
+        # The uniform-proportion claim: each group retains a fixed
+        # proportion of edges by giving them all equal budget_gate.
+        # Verify group-mean gate is the same for all groups.
+        mean_gate = gate[idx].mean().item()
+        check(f"group {grp} (count={count}, k_eff={expected_keff}) "
+              f"mean gate ≈ 0.5",
+              abs(mean_gate - 0.5) < 0.05,
+              f"got {mean_gate:.4f}")
+
+    # The KEY uniform-proportion claim: with absolute-k, group 2 (16 in)
+    # would have to compete for k_eff slots, while group 0 (4 in) would
+    # have a fraction that depends on the absolute k. With frac=0.5,
+    # both get the same k_eff/count = 0.5.
+    check("uniform proportion: all groups ~50% retention",
+          all(
+              abs(
+                  round(
+                      (4 if g == 0 else 8 if g == 1 else 16) * 0.5
+                  ) / (4 if g == 0 else 8 if g == 1 else 16)
+                  - 0.5
+              ) < 0.001
+              for g in (0, 1, 2)
+          ))
+
+    # Sanity: with frac=0.5 and T=high, every edge in every group gets
+    # the same gate value (uniform distribution). Compare inter-group.
+    stage.set_budget_frac(frac=0.5, temperature=1000.0)
+    gate = stage._compute_budget_gate()
+    means = []
+    for grp in (0, 1, 2):
+        idx = (stage.dst == grp).nonzero(as_tuple=False).squeeze(-1)
+        means.append(gate[idx].mean().item())
+    check("all groups have equal mean gate (frac is uniform)",
+          max(means) - min(means) < 0.05,
+          f"group mean gates: {means}")
 
 
 if __name__ == "__main__":

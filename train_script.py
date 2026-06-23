@@ -36,7 +36,15 @@ from pathlib import Path
 # retrain-oom-fix/REQ-3: reduce CUDA memory fragmentation by allowing
 # the caching allocator to expand segments rather than split. The error
 # message at the prune-to-retrain boundary explicitly recommends this.
-os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+# Merge with any pre-existing PYTORCH_ALLOC_CONF (e.g. Kaggle's runtime
+# may already set one) so this is always active.
+_existing_alloc = os.environ.get("PYTORCH_ALLOC_CONF", "")
+if "expandable_segments" not in _existing_alloc:
+    os.environ["PYTORCH_ALLOC_CONF"] = (
+        f"{_existing_alloc},expandable_segments:True" if _existing_alloc
+        else "expandable_segments:True"
+    )
+del _existing_alloc
 
 # retrain-oom-fix/REQ-6: torch.compile recompiles whenever a guard
 # fails (e.g. requires_grad mismatch between train/val). The default
@@ -1686,13 +1694,14 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
         help="Learning rate for the retrain phase (default: same as --lr).",
     )
     parser.add_argument(
-        "--retrain-batch-size", type=int, default=None,
+        "--retrain-batch-size", type=int, default=2048,
         help="retrain-oom-fix/REQ-5: batch size for the pruned-network "
-             "retrain phase (default: same as --batch-size). When GPU "
-             "memory is tight after Phase A+B, lowering this (e.g. 256) "
-             "can prevent the OOM at the prune-to-retrain transition. "
-             "The pruned model is created as a fresh nn.Module so it "
-             "duplicates the parameter tensor allocations.",
+             "retrain phase (default: 2048, half the default training "
+             "batch size of 4096). Lower this when GPU memory is tight "
+             "after Phase A+B to prevent the OOM at the prune-to-retrain "
+             "transition. Set to 0 to use the same batch size as "
+             "--batch-size. The pruned model is created as a fresh "
+             "nn.Module so it duplicates the parameter tensor allocations.",
     )
     parser.add_argument(
         "--fresh-init", dest="fresh_init", action="store_true", default=False,
@@ -3161,10 +3170,13 @@ def main():
             # retrain-oom-fix/REQ-5: optionally use a smaller batch size
             # for retrain. Build a separate loader (cheap; data is
             # already on CPU) so we don't fight the training loader.
-            retrain_batch_size = (
-                args.retrain_batch_size if args.retrain_batch_size is not None
-                else batch_size
-            )
+            # Default is 2048 (half the default 4096) to keep retrain
+            # memory in budget after Phase A+B. Setting --retrain-batch-size
+            # 0 falls back to the training batch_size.
+            if args.retrain_batch_size is None or args.retrain_batch_size <= 0:
+                retrain_batch_size = batch_size
+            else:
+                retrain_batch_size = args.retrain_batch_size
             retrain_train_loader = train_loader
             if retrain_batch_size != batch_size:
                 from torch.utils.data import DataLoader as _DL

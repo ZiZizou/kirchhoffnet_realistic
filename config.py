@@ -285,7 +285,7 @@ PHYS = {
 # Training hyperparameters
 _BASE_BATCH_SIZE = 1024
 _BASE_LR = 3e-4
-_FINAL_BATCH_SIZE = 2048
+_FINAL_BATCH_SIZE = 4096
 OPTIM = {
     # LR auto-scales linearly with batch size (Goyal et al., 2017):
     # lr_new = base_lr * (batch_size / base_batch_size)

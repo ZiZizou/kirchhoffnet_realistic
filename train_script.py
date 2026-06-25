@@ -462,13 +462,87 @@ def _validate_hidden_family_args(args) -> None:
             raise ValueError(
                 "--grid-size is not compatible with --hidden-family=cluster "
                 "(cluster has no spatial grid; --num-hidden controls size)."
-            )
+             )
     elif hf == "grid":
         if nh is not None:
             print(
                 f"[train] note: --num-hidden={nh} is ignored for grid family; "
                 f"use --grid-size N (default per problem)"
             )
+
+
+def _build_grid_write_fan_out(num_inputs: int, grid_size: int | None) -> dict:
+    """Build a grid-family write_fan_out map with no duplicate targets.
+
+    Each input gets a unique hidden grid node as a write target. Targets
+    are unique across inputs (FanOutInputMapper rejects duplicates).
+    We avoid the grid's center column to keep write->read >1 hop when
+    the preset's read_idx is the center column (e.g. housing_grid,
+    smooth2d_grid). For 2 inputs we use the spatial left/right column
+    pattern from ``make_smooth2d_grid_preset``; for more inputs we
+    sweep through outer columns left-to-right, picking a unique row
+    per input so all targets are distinct. If outer columns are
+    exhausted, we fall back to the center column (sacrificing the >1
+    hop guarantee rather than failing).
+    """
+    if grid_size is None or grid_size < 2:
+        grid_size = 2
+    total_nodes = grid_size * grid_size
+    if num_inputs > total_nodes:
+        raise ValueError(
+            f"Cannot build write_fan_out: num_inputs={num_inputs} exceeds "
+            f"grid size {grid_size}x{grid_size}={total_nodes} (need one "
+            f"unique target per input)"
+        )
+    center_col = grid_size // 2
+    outer_cols = [c for c in range(grid_size) if c != center_col]
+    if num_inputs == 2 and grid_size >= 4:
+        # Mirror make_smooth2d_grid_preset's spatial pattern.
+        col_for_input = [0, grid_size - 1]
+    else:
+        col_for_input = [outer_cols[i % len(outer_cols)] for i in range(num_inputs)]
+    fan_out: dict[int, list[int]] = {}
+    used: set[int] = set()
+    center_used = False
+    for i in range(num_inputs):
+        col = col_for_input[i]
+        for r in range(grid_size):
+            node = r * grid_size + col
+            if node not in used:
+                fan_out[i] = [node]
+                used.add(node)
+                break
+        else:
+            # Outer column exhausted; fall back to center column.
+            if not center_used and center_col != col_for_input[0]:
+                # Place this input in the center column's first unused row.
+                for r in range(grid_size):
+                    node = r * grid_size + center_col
+                    if node not in used:
+                        fan_out[i] = [node]
+                        used.add(node)
+                        center_used = True
+                        break
+                else:
+                    raise RuntimeError(
+                        "Internal error: no unused grid node found "
+                        f"(num_inputs={num_inputs}, grid_size={grid_size})"
+                    )
+            else:
+                # All outer + center column slots used; scan all nodes.
+                found = False
+                for node in range(total_nodes):
+                    if node not in used:
+                        fan_out[i] = [node]
+                        used.add(node)
+                        found = True
+                        break
+                if not found:
+                    raise RuntimeError(
+                        "Internal error: no unused grid node found "
+                        f"(num_inputs={num_inputs}, grid_size={grid_size})"
+                    )
+    return fan_out
 
 
 def _make_dynamic_preset(
@@ -582,6 +656,18 @@ def _make_dynamic_preset(
     new_preset["write_mode"] = eff_write_mode
     new_preset["read_idx"] = read_idx
     new_preset["read_mode"] = eff_read_mode
+    # Grid-family fan_out generation: when write_mode='fan_out', every
+    # write target list must be present (build_net_from_config requires it).
+    # When the base preset already has write_fan_out (e.g. smooth2d_grid),
+    # keep it. Otherwise generate a deterministic fan-out mapping that
+    # distributes inputs across the grid without duplicate target nodes
+    # (FanOutInputMapper requires each hidden node to be written by at
+    # most one input).
+    if hidden_family == "grid" and eff_write_mode == "fan_out":
+        if "write_fan_out" not in new_preset or new_preset["write_fan_out"] is None:
+            new_preset["write_fan_out"] = _build_grid_write_fan_out(
+                num_inputs=num_inputs, grid_size=grid_size,
+            )
     # Remove schedule/lambdas overrides if present so dynamic topology uses
     # the global defaults from LAMBDAS. Per-problem schedules (e.g. housing's
     # default 'three_phase') are still preserved by the explicit
@@ -2197,6 +2283,29 @@ def main():
             )
         if args.write_mode is None:
             args.write_mode = "fan_out"
+        # Ensure write_fan_out exists in the active preset. Some base
+        # presets (e.g. housing_grid) declare write_mode='dense' and
+        # therefore omit write_fan_out. --persistent-drive forces
+        # write_mode='fan_out', so generate a deterministic fan-out
+        # mapping consistent with the grid-family convention used by
+        # _make_dynamic_preset and make_smooth2d_grid_preset.
+        active_preset = PRESETS.get(args.problem)
+        if active_preset is None:
+            raise ValueError(
+                f"--persistent-drive: unknown problem {args.problem!r}"
+            )
+        if not active_preset.get("write_fan_out"):
+            if resolved_grid_size is None:
+                raise ValueError(
+                    f"--persistent-drive requires a grid-family topology with "
+                    f"a known grid size (problem={args.problem!r}, "
+                    f"grid_size=None). Use --hidden-family grid --grid-size N."
+                )
+            num_inputs = int(active_preset["stages"][0]["num_inputs"])
+            active_preset["write_fan_out"] = _build_grid_write_fan_out(
+                num_inputs=num_inputs, grid_size=resolved_grid_size,
+            )
+            active_preset["write_mode"] = "fan_out"
     net = build_net_from_preset(
         args.problem,
         cell_lib=cell_lib,

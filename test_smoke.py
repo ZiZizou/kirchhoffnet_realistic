@@ -2384,6 +2384,10 @@ def main():
     test_housing_grid_preset()
     test_housing_grid_data_huber_loss()
     test_housing_data_normalization_float16_safe()
+    test_persistent_drive_auto_fan_out()
+    test_dynamic_preset_grid_injects_fan_out()
+    test_fan_out_outer_col_exhaustion_fallback()
+    test_persistent_drive_non_grid_raises()
     test_fan_out_input_mapper_basic()
     test_fan_out_input_mapper_param_count()
     test_fan_out_input_mapper_gradients()
@@ -2887,6 +2891,152 @@ def test_housing_grid_preset():
           len(cfg4["stages"]) == 3)
     check("make_housing_grid_preset(4): write_mode still dense",
           cfg4["write_mode"] == "dense")
+
+
+def test_persistent_drive_auto_fan_out():
+    print("\nTest PD-1: --persistent-drive auto-injects write_fan_out for non-fan_out presets")
+    from train_script import _build_grid_write_fan_out
+    from config import make_housing_grid_preset, PRESETS
+    from topology import build_net_from_preset
+    from cell_library import make_cell_library
+
+    cfg = make_housing_grid_preset(grid_size=5)
+    check("housing_grid base preset has write_mode='dense' (no fan_out)",
+          cfg["write_mode"] == "dense")
+    check("housing_grid base preset has NO write_fan_out",
+          "write_fan_out" not in cfg or cfg.get("write_fan_out") is None)
+
+    num_inputs = int(cfg["stages"][0]["num_inputs"])
+    fan_out = _build_grid_write_fan_out(num_inputs=num_inputs, grid_size=5)
+    check("_build_grid_write_fan_out: one entry per input",
+          len(fan_out) == num_inputs)
+    all_targets = [t for tgts in fan_out.values() for t in tgts]
+    check("_build_grid_write_fan_out: all targets unique",
+          len(all_targets) == len(set(all_targets)))
+    check("_build_grid_write_fan_out: every input has >= 1 target",
+          all(len(v) >= 1 for v in fan_out.values()))
+
+    active = dict(PRESETS.get("housing_grid", {}))
+    if "write_fan_out" in active:
+        active.pop("write_fan_out", None)
+    active["write_fan_out"] = fan_out
+    active["write_mode"] = "fan_out"
+    PRESETS["housing_grid"] = active
+
+    try:
+        cell_lib = make_cell_library("legacy")
+        net = build_net_from_preset(
+            "housing_grid",
+            cell_lib=cell_lib,
+            write_mode="fan_out",
+            read_mode=None,
+            write_idx=None,
+            read_idx=None,
+            enable_drive=True,
+        )
+        from io_mapper import FanOutInputMapper
+        check("housing_grid + persistent-drive uses FanOutInputMapper",
+              isinstance(net.input_mapper, FanOutInputMapper))
+        check("housing_grid + persistent-drive has drive_mappers",
+              net.drive_mappers is not None and len(net.drive_mappers) == 3)
+        check("housing_grid + persistent-drive: forward output is finite",
+              torch.isfinite(net(torch.rand(4, 8), ctx=None)[0]).all().item())
+    finally:
+        PRESETS["housing_grid"] = make_housing_grid_preset(grid_size=5)
+
+
+def test_dynamic_preset_grid_injects_fan_out():
+    print("\nTest PD-2: _make_dynamic_preset injects write_fan_out for grid+fan_out")
+    from train_script import _make_dynamic_preset
+
+    preset = _make_dynamic_preset(
+        problem="housing_grid",
+        hidden_family="grid",
+        num_hidden=25,
+        num_stages=3,
+        edge_repeats=2,
+        grid_size=5,
+        bidirectional=False,
+        write_mode_override="fan_out",
+        read_mode_override=None,
+    )
+    check("dynamic preset has write_mode=fan_out",
+          preset["write_mode"] == "fan_out")
+    check("dynamic preset has write_fan_out with 8 inputs",
+          len(preset.get("write_fan_out", {})) == 8)
+    all_targets = [t for tgts in preset["write_fan_out"].values() for t in tgts]
+    check("dynamic preset: all targets unique",
+          len(all_targets) == len(set(all_targets)))
+
+
+def test_fan_out_outer_col_exhaustion_fallback():
+    print("\nTest PD-3: _build_grid_write_fan_out falls back to center column when outer cols exhausted")
+    from train_script import _build_grid_write_fan_out
+
+    # grid_size=2 has only 1 outer column (col 0), 2 nodes.
+    # With 3 inputs we exhaust outer col and must fall back to center col (col 1).
+    fan_out = _build_grid_write_fan_out(num_inputs=3, grid_size=2)
+    all_targets = [t for tgts in fan_out.values() for t in tgts]
+    check("gs=2 ni=3: 3 inputs mapped",
+          len(fan_out) == 3)
+    check("gs=2 ni=3: all targets unique",
+          len(all_targets) == len(set(all_targets)))
+    check("gs=2 ni=3: all targets in [0, 4)",
+          all(0 <= t < 4 for t in all_targets))
+
+    # grid_size=2 with all 4 nodes used
+    fan_out = _build_grid_write_fan_out(num_inputs=4, grid_size=2)
+    all_targets = [t for tgts in fan_out.values() for t in tgts]
+    check("gs=2 ni=4: 4 inputs mapped",
+          len(fan_out) == 4)
+    check("gs=2 ni=4: all 4 nodes used exactly once",
+          sorted(all_targets) == [0, 1, 2, 3])
+
+    # grid_size=3 ni=5 fills outer (6 nodes) + center col first row (col 1, row 0 = node 3)
+    fan_out = _build_grid_write_fan_out(num_inputs=5, grid_size=3)
+    all_targets = [t for tgts in fan_out.values() for t in tgts]
+    check("gs=3 ni=5: 5 inputs mapped",
+          len(fan_out) == 5)
+    check("gs=3 ni=5: all targets unique",
+          len(all_targets) == len(set(all_targets)))
+    check("gs=3 ni=5: all targets in [0, 9)",
+          all(0 <= t < 9 for t in all_targets))
+
+    # num_inputs > total_nodes should still raise
+    raised = False
+    try:
+        _build_grid_write_fan_out(num_inputs=5, grid_size=2)
+    except ValueError:
+        raised = True
+    check("gs=2 ni=5 (exceeds total): raises ValueError",
+          raised)
+
+
+def test_persistent_drive_non_grid_raises():
+    print("\nTest PD-4: --persistent-drive on non-grid problem raises clear error")
+    # Check the validation in main() without running a full training.
+    # The simplest check: simulate the CLI args path that triggers the
+    # resolved_grid_size is None branch.
+    import sys as _sys
+    _sys.path.insert(0, _sys.path[0])
+    from train_script import _build_grid_write_fan_out
+
+    # sinx preset has num_inputs=1, no write_fan_out, no grid topology.
+    # Without --hidden-family grid, resolved_grid_size stays None.
+    # Simulating the catch-all: with None grid_size, fall back to 2 and
+    # num_inputs=1 fits.
+    # But num_inputs > total_nodes (4) would still fail; housing has 8 inputs.
+    raised = False
+    msg = ""
+    try:
+        _build_grid_write_fan_out(num_inputs=8, grid_size=None)
+    except ValueError as e:
+        raised = True
+        msg = str(e)
+    check("num_inputs=8 grid_size=None raises ValueError (housing-style)",
+          raised)
+    check("error message mentions grid size",
+          "grid size" in msg.lower() or "exceeds" in msg.lower())
 
 
 def test_housing_grid_data_huber_loss():

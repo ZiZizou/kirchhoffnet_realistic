@@ -149,6 +149,8 @@ def make_ctle_preset(
     cluster_seed: int | None = None,
     q75_input: bool = False,
     edge_repeats: int = 2,
+    nodes_per_target: int = 0,
+    readout_offset: int = 0,
 ) -> dict:
     """Build a 4-spec → 7-logit CTLE KirchhoffNet preset for a given family.
 
@@ -172,6 +174,13 @@ def make_ctle_preset(
     8 (teacher's scale_input(): log10 + StandardScaler/Q75 expansion).
     Caller must apply the same scaling to training inputs.
 
+    When ``nodes_per_target > 0``, group the 7 regression targets into per-target
+    readout windows of ``nodes_per_target`` consecutive state nodes each. The
+    network auto-sizes so ``grid_size**2`` (grid) or ``num_hidden`` (cluster)
+    accommodates ``nodes_per_target * 7 + readout_offset`` state nodes. In
+    this mode ``num_proj`` is forced to 0 (no projection nodes; heads read
+    directly from hidden state) and ``--prune`` must be disabled at the CLI.
+
     Args:
         family: 'grid' or 'cluster'.
         grid_size: Square grid side length (grid family).
@@ -187,16 +196,38 @@ def make_ctle_preset(
             range 1-8). Composes multiplicatively with ``bidirectional``. Each
             repeated edge gets independent cell-type logits, gate, and
             multiplier. I/O and projection edges are NOT repeated.
+        nodes_per_target: If > 0, enable grouped per-target readout with this
+            many state nodes per target. Auto-sizes the network.
+        readout_offset: Starting state index for the first target's window
+            (only used when ``nodes_per_target > 0``).
     """
     if edge_repeats < 1 or edge_repeats > 8:
         raise ValueError(f"edge_repeats must be in [1, 8], got {edge_repeats}")
+    if nodes_per_target < 0:
+        raise ValueError(f"nodes_per_target must be >= 0, got {nodes_per_target}")
+    if readout_offset < 0:
+        raise ValueError(f"readout_offset must be >= 0, got {readout_offset}")
     n_stages = max(1, num_stages)
 
+    grouped = nodes_per_target > 0
+    required_state_dim = (
+        readout_offset + nodes_per_target * len(PARAM_COLS) if grouped else 0
+    )
+
     if family == "grid":
+        if grouped:
+            # Auto-size: find smallest grid_size whose square >= required.
+            import math as _math
+            grid_size = max(grid_size, _math.ceil(_math.sqrt(required_state_dim)))
+            num_proj = 0
+            print(f"[make_ctle_preset] grouped readout: nodes_per_target={nodes_per_target}, "
+                  f"offset={readout_offset} -> grid_size auto-sized to {grid_size} "
+                  f"({grid_size ** 2} hidden >= {required_state_dim} required), "
+                  f"num_proj forced to 0")
         if num_proj is None:
             num_proj = 7
         n_hidden = grid_size * grid_size
-        if num_hidden is not None and num_hidden != n_hidden:
+        if num_hidden is not None and num_hidden != n_hidden and not grouped:
             print(f"[make_ctle_preset] note: grid mode ignores num_hidden={num_hidden}; "
                   f"using grid_size**2={n_hidden}")
         if q75_input:
@@ -217,32 +248,52 @@ def make_ctle_preset(
             "t_span": SOLVER["t_span"] / n_stages,
             "num_steps": round(SOLVER["num_steps"] / n_stages),
         }
-        eff_write = write_mode if write_mode is not None else "fan_out"
-
-        # Fan-out write: each of 4 inputs writes to 2 corner grid nodes.
-        top_rows = [0, 1]
-        bot_rows = [grid_size - 2, grid_size - 1]
-        fan_out = {
-            0: [r * grid_size + 0 for r in top_rows],
-            1: [r * grid_size + (grid_size - 1) for r in top_rows],
-            2: [r * grid_size + 0 for r in bot_rows],
-            3: [r * grid_size + (grid_size - 1) for r in bot_rows],
-        }
-        center_col = grid_size // 2
-        center_nodes = [r * grid_size + center_col for r in range(grid_size)]
-        read_idx = center_nodes + list(range(n_hidden, n_hidden + num_proj))
+        if grouped:
+            # GroupedOutputMapper reads directly from hidden state; no projection
+            # nodes, no center-column selection.
+            eff_write = write_mode if write_mode is not None else "fan_out"
+            top_rows = [0, 1]
+            bot_rows = [grid_size - 2, grid_size - 1]
+            fan_out = {
+                0: [r * grid_size + 0 for r in top_rows],
+                1: [r * grid_size + (grid_size - 1) for r in top_rows],
+                2: [r * grid_size + 0 for r in bot_rows],
+                3: [r * grid_size + (grid_size - 1) for r in bot_rows],
+            }
+            read_idx = None  # GroupedOutputMapper handles its own windowing.
+        else:
+            eff_write = write_mode if write_mode is not None else "fan_out"
+            top_rows = [0, 1]
+            bot_rows = [grid_size - 2, grid_size - 1]
+            fan_out = {
+                0: [r * grid_size + 0 for r in top_rows],
+                1: [r * grid_size + (grid_size - 1) for r in top_rows],
+                2: [r * grid_size + 0 for r in bot_rows],
+                3: [r * grid_size + (grid_size - 1) for r in bot_rows],
+            }
+            center_col = grid_size // 2
+            center_nodes = [r * grid_size + center_col for r in range(grid_size)]
+            read_idx = center_nodes + list(range(n_hidden, n_hidden + num_proj))
 
     elif family == "cluster":
-        if num_hidden is None:
-            raise ValueError(
-                "make_ctle_preset(family='cluster') requires num_hidden to be set. "
-                "Pass --num-hidden N on the CLI or num_hidden=N to the factory."
-            )
-        if num_hidden < 2:
-            raise ValueError(f"num_hidden must be >= 2 for cluster family (got {num_hidden})")
-        if num_proj is not None and num_proj != 0:
-            print(f"[make_ctle_preset] note: cluster mode forces num_proj=0 "
-                  f"(was {num_proj}); all hidden nodes are already fully connected.")
+        if grouped:
+            if num_hidden is None:
+                num_hidden = 0  # will be overwritten below
+            num_proj = 0
+            num_hidden = required_state_dim
+            print(f"[make_ctle_preset] grouped readout: nodes_per_target={nodes_per_target}, "
+                  f"offset={readout_offset} -> num_hidden auto-sized to {num_hidden}")
+        else:
+            if num_hidden is None:
+                raise ValueError(
+                    "make_ctle_preset(family='cluster') requires num_hidden to be set. "
+                    "Pass --num-hidden N on the CLI or num_hidden=N to the factory."
+                )
+            if num_hidden < 2:
+                raise ValueError(f"num_hidden must be >= 2 for cluster family (got {num_hidden})")
+            if num_proj is not None and num_proj != 0:
+                print(f"[make_ctle_preset] note: cluster mode forces num_proj=0 "
+                      f"(was {num_proj}); all hidden nodes are already fully connected.")
         n_hidden = int(num_hidden)
         num_proj = 0
         n_inputs = 8 if q75_input else 4
@@ -271,8 +322,9 @@ def make_ctle_preset(
             eff_write = "dense"
         else:
             eff_write = write_mode if write_mode is not None else "dense"
-        # Fully connected: read every hidden node.
-        read_idx = list(range(n_hidden))
+        # Grouped: read_idx=None (mapper handles windowing).
+        # Non-grouped: read every hidden node.
+        read_idx = None if grouped else list(range(n_hidden))
         fan_out = None
 
     else:
@@ -298,6 +350,11 @@ def make_ctle_preset(
     }
     if eff_write == "fan_out" and fan_out is not None:
         preset["write_fan_out"] = fan_out
+    if grouped:
+        preset["grouped_readout"] = {
+            "nodes_per_target": nodes_per_target,
+            "offset": readout_offset,
+        }
     return preset
 
 
@@ -309,6 +366,8 @@ def make_ctle_grid_preset(
     bidirectional: bool = False,
     q75_input: bool = False,
     edge_repeats: int = 2,
+    nodes_per_target: int = 0,
+    readout_offset: int = 0,
 ) -> dict:
     """Backward-compatible thin wrapper for the grid CTLE preset.
 
@@ -324,6 +383,8 @@ def make_ctle_grid_preset(
         bidirectional=bidirectional,
         q75_input=q75_input,
         edge_repeats=edge_repeats,
+        nodes_per_target=nodes_per_target,
+        readout_offset=readout_offset,
     )
 
 
@@ -1245,6 +1306,21 @@ def main() -> None:
         help="Use raw 4-dim spec inputs (default).",
     )
     parser.add_argument(
+        "--nodes-per-target", type=int, default=0, dest="nodes_per_target",
+        help="If > 0, each of the 7 regression targets reads from this many "
+             "consecutive state nodes via an independent Linear head. Auto-sizes "
+             "the network (grid: smallest grid_size with grid_size**2 >= "
+             "nodes_per_target*7 + readout_offset; cluster: num_hidden = "
+             "nodes_per_target*7 + readout_offset). Replaces the monolithic "
+             "OutputMapper with a GroupedOutputMapper. 0 = use default "
+             "OutputMapper (default). Forces --num_proj=0 and disables --prune.",
+    )
+    parser.add_argument(
+        "--readout-offset", type=int, default=0, dest="readout_offset",
+        help="Starting state index for the first target's readout window "
+             "(only used with --nodes-per-target > 0). Default: 0.",
+    )
+    parser.add_argument(
         "--weight-decay", type=float, default=None, dest="weight_decay",
         help=f"AdamW weight decay (default: {OPTIM.get('weight_decay', 0.0)}). "
              "Pass 1e-4 to match distill_ctle_kirchhoff.py.",
@@ -1266,13 +1342,19 @@ def main() -> None:
 
     # ---- early validation: cluster requires num_hidden ----
     if args.hidden_family == "cluster":
-        if args.num_hidden is None:
+        if args.nodes_per_target > 0:
+            # Grouped mode auto-sizes num_hidden; explicit value is ignored.
+            if args.num_hidden is not None:
+                print(f"[train_ctle] note: --num-hidden is ignored when "
+                      f"--nodes-per-target > 0 (auto-sized to "
+                      f"{args.nodes_per_target}*7+{args.readout_offset})")
+        elif args.num_hidden is None:
             raise ValueError(
                 "--num-hidden is required when --hidden-family=cluster. "
                 "Pass an integer (e.g. --num-hidden 25) to specify the number "
                 "of hidden nodes per stage."
             )
-        if args.num_hidden < 2:
+        if args.num_hidden is not None and args.num_hidden < 2:
             raise ValueError(
                 f"--num-hidden must be >= 2 for cluster family (got {args.num_hidden})"
             )
@@ -1322,6 +1404,7 @@ def main() -> None:
           f"grid_size={args.grid_size} num_hidden={args.num_hidden} "
           f"num_stages={args.num_stages} "
           f"q75_input={args.q75_input} "
+          f"nodes_per_target={args.nodes_per_target} readout_offset={args.readout_offset} "
           f"weight_decay={args.weight_decay if args.weight_decay is not None else OPTIM['weight_decay']} "
           f"grad_clip={args.grad_clip if args.grad_clip is not None else OPTIM['grad_clip_norm']} "
           f"compile={compile_enabled} parallel={parallel_enabled} "
@@ -1386,6 +1469,8 @@ def main() -> None:
         cluster_seed=args.cluster_seed,
         q75_input=args.q75_input,
         edge_repeats=args.edge_repeats,
+        nodes_per_target=args.nodes_per_target,
+        readout_offset=args.readout_offset,
     )
     net: KirchhoffNetWithIO = build_net_from_config(
         preset, cell_lib=cell_lib, enable_drive=args.persistent_drive,
@@ -1395,6 +1480,14 @@ def main() -> None:
     in_mapper_name = type(net.input_mapper).__name__
     out_mapper_name = type(net.output_mapper).__name__
     _in_dim = 8 if args.q75_input else 4
+    if args.nodes_per_target > 0:
+        readout_mode_str = (
+            f"GroupedOutputMapper(nodes_per_target={args.nodes_per_target}, "
+            f"offset={args.readout_offset})"
+        )
+    else:
+        readout_mode_str = "OutputMapper (default)"
+    print(f"[train_ctle] readout mode: {readout_mode_str}")
     print(f"[train_ctle] built KirchhoffNet: in_dim={_in_dim} out_dim=7 "
           f"hid={net.hid_count} proj={net.proj_count} stages={len(net.core.stages)} "
           f"input_mapper={in_mapper_name} output_mapper={out_mapper_name} "
@@ -1420,6 +1513,12 @@ def main() -> None:
     # Cluster-specific guards must fire before the generic fan_out check below,
     # because cluster always uses dense write mode — the generic check would
     # raise a confusing ValueError instead of a graceful warning.
+
+    if args.prune and args.nodes_per_target > 0:
+        print(f"[train_ctle] WARNING: --prune is not supported with --nodes-per-target > 0 "
+              f"(grouped readout uses GroupedOutputMapper, incompatible with "
+              f"_transfer_output_mapper's OutputMapper-only path). Disabling --prune.")
+        args.prune = False
 
     if args.prune and args.hidden_family == "cluster":
         print(f"[train_ctle] WARNING: --prune is not supported with --hidden-family=cluster "
@@ -1511,6 +1610,9 @@ def main() -> None:
         f.write(f"prune: {args.prune}\n")
         f.write(f"normalize_targets: {args.normalize_targets}\n")
         f.write(f"q75_input: {args.q75_input}\n")
+        f.write(f"nodes_per_target: {args.nodes_per_target}\n")
+        f.write(f"readout_offset: {args.readout_offset}\n")
+        f.write(f"grouped_readout: {args.nodes_per_target > 0}\n")
         f.write(f"weight_decay: {args.weight_decay if args.weight_decay is not None else OPTIM['weight_decay']}\n")
         f.write(f"grad_clip: {args.grad_clip if args.grad_clip is not None else OPTIM['grad_clip_norm']}\n")
         f.write(f"\nLAMBDAS (effective):\n")

@@ -41,6 +41,7 @@ __all__ = [
     "SparseInputMapper",
     "FanOutInputMapper",
     "OutputMapper",
+    "GroupedOutputMapper",
 ]
 
 
@@ -311,3 +312,76 @@ class OutputMapper(nn.Module):
             )
         gathered = x_final.index_select(-1, self._read_index.to(x_final.device))
         return self.proj(gathered)
+
+
+class GroupedOutputMapper(nn.Module):
+    """Per-target Linear heads reading from disjoint state-node windows.
+
+    Replaces the monolithic ``Linear(read_dim, num_targets)`` OutputMapper with
+    ``num_targets`` independent ``Linear(nodes_per_target, 1)`` layers. Target
+    ``i`` reads from ``state[..., offset + i*nodes_per_target :
+                              offset + (i+1)*nodes_per_target]``.
+
+    Unlike ``OutputMapper``, this mapper ignores any ``read_idx`` list passed
+    to ``KirchhoffNetWithIO`` — it does its own contiguous slicing on the full
+    state vector. The caller's full state must be at least
+    ``offset + num_targets * nodes_per_target`` wide; the caller should set
+    ``read_idx = list(range(node_dim))`` on ``KirchhoffNetWithIO`` so the full
+    state is forwarded.
+    """
+
+    def __init__(
+        self,
+        nodes_per_target: int,
+        num_targets: int,
+        node_dim: int,
+        offset: int = 0,
+    ) -> None:
+        super().__init__()
+        if nodes_per_target <= 0:
+            raise ValueError(
+                f"GroupedOutputMapper: nodes_per_target must be > 0, got {nodes_per_target}"
+            )
+        if num_targets <= 0:
+            raise ValueError(
+                f"GroupedOutputMapper: num_targets must be > 0, got {num_targets}"
+            )
+        if offset < 0:
+            raise ValueError(
+                f"GroupedOutputMapper: offset must be >= 0, got {offset}"
+            )
+        self.nodes_per_target = int(nodes_per_target)
+        self.num_targets = int(num_targets)
+        self.offset = int(offset)
+        self.node_dim = int(node_dim)
+        required = self.offset + self.num_targets * self.nodes_per_target
+        if self.node_dim < required:
+            raise ValueError(
+                f"GroupedOutputMapper: node_dim must be >= offset + num_targets * "
+                f"nodes_per_target = {required} (got node_dim={self.node_dim}, "
+                f"offset={self.offset}, num_targets={self.num_targets}, "
+                f"nodes_per_target={self.nodes_per_target})"
+            )
+        self.heads = nn.ModuleList([
+            nn.Linear(self.nodes_per_target, 1, bias=True) for _ in range(self.num_targets)
+        ])
+        for head in self.heads:
+            nn.init.xavier_uniform_(head.weight)
+            if head.bias is not None:
+                with torch.no_grad():
+                    head.bias.zero_()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        end = self.offset + self.num_targets * self.nodes_per_target
+        if x.size(-1) < end:
+            raise RuntimeError(
+                f"GroupedOutputMapper needs state dim >= {end} "
+                f"(offset={self.offset}, num_targets={self.num_targets}, "
+                f"nodes_per_target={self.nodes_per_target}); got {x.size(-1)}. "
+                f"Increase --num-hidden/--grid-size."
+            )
+        out = []
+        for i, head in enumerate(self.heads):
+            start = self.offset + i * self.nodes_per_target
+            out.append(head(x[..., start:start + self.nodes_per_target]))
+        return torch.cat(out, dim=-1)

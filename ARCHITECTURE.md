@@ -758,7 +758,10 @@ Outputs per run: `loss_history.txt`, `loss_curve.png`, `model.pt`, `config_snaps
 **MLP baselines** — MLPRegressor(2→H→1) for smooth2d Franke task, benchmark comparison.
 
 ### `mlp_benchmark_housing.py`
-**Housing MLP baseline** — MLPRegressor(8→H→1) for California Housing task. Matches the `housing_grid` KirchhoffNet in parameter count (~2000) and training hyperparameters (AdamW, Huber loss, CosineAnnealingWarmRestarts). Outputs loss history, curve, model, and final metrics in original USD × 100k units.
+**Housing MLP baseline** — MLPRegressor(8→H→1) for California Housing task. Matches the `housing_grid` KirchhoffNet in parameter count (~2000) and training hyperparameters (AdamW, Huber loss, CosineAnnealingWarmRestarts). The number of linear layers is configurable via `--num-layers` (default 2, must be >= 2): the architecture is `Linear(in, h) -> Act -> [Linear(h, h) -> Act] x (num_layers-2) -> Linear(h, out)`. Outputs loss history, curve, model, and final metrics in original USD × 100k units.
+
+### `xgb_benchmark_housing.py`
+**Housing XGBoost baseline** — SOTA gradient-boosted tree baseline for California Housing task, matching the `mlp_benchmark_housing.py` data pipeline and metric format. Reuses the same `_load_california_housing_data` and `_make_data_split` (seed=42) for identical train/val splits, but uses RAW (unscaled) features AND raw targets in USD × 100k units: tree models are invariant to monotonic feature transforms, and the MLP's min-max feature scaling combined with standardized targets actively hurts XGBoost performance (we measured val RMSE 1.02 with min-max+standardized vs 0.45 with raw+raw on the same split). SOTA hyperparams: n_estimators=1000, max_depth=6, learning_rate=0.05, subsample=0.8, colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=1.0, min_child_weight=5, gamma=0.1, tree_method=hist, early_stopping_rounds=30. Huber loss is reported in standardized space (denormalized from raw predictions) for direct comparability with the MLP/KirchhoffNet. Outputs the same artifact set as `mlp_benchmark_housing.py` (loss_history.txt, loss_curve.png, model.json, config_snapshot.txt, output_fit.png, final_metrics.txt) plus MAE/RMSE in original units.
 
 ### `train_ctle.py`
 **CTLE inverse design distillation** — Trains a 3-stage KirchhoffNet student (4 inputs → 7 CTLE logits) via 4-phase knowledge distillation from a pre-trained `RegimeAwareMoE` teacher (loaded from `dagger_student_moe.pt`). Supports both `grid` and `cluster` hidden families, `--q75-input` for 8-dim Q75-scaled features, `--persistent-drive`, `--bidirectional`, `--edge-repeats`, per-dim diagnostics with logging/plotting, readiness-gated pruning, and physical-domain evaluation at the end. Not a standard preset — invoked directly via `python train_ctle.py --teacher-path ...`.
@@ -1318,6 +1321,9 @@ kirchhoff_redesign/ideal/
 ├── test_smoke.py                  # Smoke test suite
 ├── mlp_benchmark.py               # MLPRegressor baseline for smooth2d Franke task
 ├── mlp_benchmark_housing.py       # MLPRegressor baseline for California Housing task
+│                                  #   (--num-layers N for configurable depth; default 2)
+├── xgb_benchmark_housing.py       # SOTA XGBoost baseline for California Housing task
+│                                  #   (raw features, raw targets, SOTA hyperparams)
 ├── train_ctle.py                  # CTLE inverse design: 4-phase KD from RegimeAwareMoE
 │                                  #   teacher; grid + cluster families; per-dim diagnostics;
 │                                  #   persistent drive; q75-input; gradient logging

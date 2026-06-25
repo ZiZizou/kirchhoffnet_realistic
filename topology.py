@@ -1074,6 +1074,7 @@ def build_net_from_config(
         OutputMapper,
         SparseInputMapper,
         FanOutInputMapper,
+        GroupedOutputMapper,
     )
     from stage_transfer import StageTransfer
 
@@ -1182,7 +1183,32 @@ def build_net_from_config(
             for _ in range(len(stages_cfg))
         ]
 
-    if read_mode == "sparse":
+    grouped_cfg = cfg.get("grouped_readout")
+    if grouped_cfg is not None:
+        nodes_per_target = int(grouped_cfg.get("nodes_per_target", 0))
+        readout_offset = int(grouped_cfg.get("offset", 0))
+        if nodes_per_target <= 0:
+            raise ValueError(
+                f"grouped_readout: nodes_per_target must be > 0, got {nodes_per_target}"
+            )
+        required = readout_offset + out_dim * nodes_per_target
+        if final_state_dim < required:
+            raise ValueError(
+                f"grouped_readout needs final_state_dim >= {required} "
+                f"(offset={readout_offset}, out_dim={out_dim}, "
+                f"nodes_per_target={nodes_per_target}); got final_state_dim={final_state_dim}. "
+                f"Increase --num-hidden/--grid-size."
+            )
+        output_mapper = GroupedOutputMapper(
+            nodes_per_target=nodes_per_target,
+            num_targets=out_dim,
+            node_dim=final_state_dim,
+            offset=readout_offset,
+        )
+        # Pass full state through KirchhoffNetWithIO; the mapper does its
+        # own contiguous windowing.
+        read_idx_arg = list(range(final_state_dim))
+    elif read_mode == "sparse":
         preset_read_idx = cfg.get("read_idx")
         if preset_read_idx is None:
             if len(last_hid) > 0:
@@ -1228,7 +1254,10 @@ def build_net_from_config(
     # write_idx_arg and read_idx_arg are in pre-compact (user-facing)
     # coordinates, but the stage's src/dst are in compact (post-remap)
     # coordinates. Remap via first_id_map before calling validate.
-    if write_idx_arg is not None and read_idx_arg is not None:
+    # Skip when grouped readout is active: read_idx covers all state nodes and
+    # the >1-hop write→read constraint cannot be satisfied across the whole
+    # state. GroupedOutputMapper handles its own node selection.
+    if grouped_cfg is None and write_idx_arg is not None and read_idx_arg is not None:
         all_read_are_proj = all(r >= n_first_hid for r in read_idx_arg)
         if not all_read_are_proj:
             hidden_read_idx = [r for r in read_idx_arg if r < n_first_hid]

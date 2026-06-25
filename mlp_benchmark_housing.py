@@ -7,8 +7,14 @@ The housing_grid (5x5 grid, 3 stages, 3 proj) has roughly 2000 learnable
 parameters. A 2-layer MLP with hidden_dim=200 gives 2001 params
 (8*200 + 200 + 200*1 + 1), providing a comparable-capacity baseline.
 
+The number of linear layers is configurable via ``--num-layers`` (default 2,
+which matches the original 2-layer model). The architecture is:
+  Linear(in_dim, hidden_dim) -> Act -> [Linear(hidden_dim, hidden_dim) -> Act] x (num_layers-2) -> Linear(hidden_dim, out_dim)
+With num_layers=2 the middle block is empty (no hidden layers), preserving
+the original behavior exactly.
+
 CLI:
-    mlp_benchmark_housing.py [--hidden-dim 200] [--epochs 800]
+    mlp_benchmark_housing.py [--hidden-dim 200] [--num-layers 2] [--epochs 800]
                              [--lr 6e-4] [--output OUTPUT] [--device DEVICE]
 
 Outputs to --output:
@@ -46,14 +52,36 @@ _ACTIVATIONS = {
 }
 
 
+_ACTIVATION_MODULES = {
+    "relu": nn.ReLU(),
+    "tanh": nn.Tanh(),
+}
+
+
 class MLPRegressor(nn.Module):
-    """2-layer feedforward regressor: Linear -> Act -> Linear.
+    """N-layer feedforward regressor.
 
-    Input: (B, 8)  — 8 California-housing features
-    Output: (B, 1) — median house value (standardized)
+    Input: (B, in_dim)
+    Output: (B, out_dim)
 
-    Default hidden_dim=200 gives ~2001 params, comparable to the
-    housing_grid KirchhoffNet (3-stage, 5x5 grid, ~2000 params).
+    Default sizes target ~2001 learnable parameters to match the
+    housing_grid KirchhoffNet (3-stage, 5x5 grid, ~2000 params):
+    in_dim=8, hidden_dim=200, out_dim=1, num_layers=2 → 8*200 + 200 + 200*1 + 1 = 2001.
+
+    Architecture: num_layers linear layers with activation between them.
+      - First layer: in_dim -> hidden_dim
+      - Hidden layers (num_layers - 2 of them): hidden_dim -> hidden_dim
+      - Final layer: hidden_dim -> out_dim
+      - No activation after the final layer (regression head)
+
+    Parameter count formula:
+      params = in_dim * hidden_dim + hidden_dim
+            + (num_layers - 2) * (hidden_dim * hidden_dim + hidden_dim)
+            + hidden_dim * out_dim + out_dim
+    For num_layers=2, the middle term is zero (no hidden layers).
+
+    Activation is selectable via the ``activation`` argument (one of
+    ``"relu"``, ``"tanh"``).
     """
 
     def __init__(
@@ -61,6 +89,7 @@ class MLPRegressor(nn.Module):
         in_dim: int = 8,
         hidden_dim: int = 200,
         out_dim: int = 1,
+        num_layers: int = 2,
         activation: str = "relu",
     ) -> None:
         super().__init__()
@@ -69,16 +98,34 @@ class MLPRegressor(nn.Module):
                 f"MLPRegressor: activation must be one of {sorted(_ACTIVATIONS)}, "
                 f"got {activation!r}"
             )
+        if num_layers < 2:
+            raise ValueError(
+                f"MLPRegressor: num_layers must be >= 2, got {num_layers}"
+            )
         self.in_dim = int(in_dim)
         self.hidden_dim = int(hidden_dim)
         self.out_dim = int(out_dim)
+        self.num_layers = int(num_layers)
         self.activation = activation
-        self.fc1 = nn.Linear(in_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, out_dim)
+        act_module = _ACTIVATION_MODULES[activation]
+
+        layers = []
+        layers.append(nn.Linear(in_dim, hidden_dim))
+        layers.append(act_module)
+        for _ in range(num_layers - 2):
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(act_module)
+        layers.append(nn.Linear(hidden_dim, out_dim))
+
+        self.layers = nn.ModuleList(layers)
+        self.fc1 = layers[0]
+        self.fc2 = layers[-1]
 
     def forward(self, u: torch.Tensor) -> torch.Tensor:
-        h = _ACTIVATIONS[self.activation](self.fc1(u))
-        return self.fc2(h)
+        h = u
+        for layer in self.layers:
+            h = layer(h)
+        return h
 
 
 def count_parameters(net: nn.Module) -> int:
@@ -172,10 +219,12 @@ def plot_loss_curve(history, val_history, save_path, title):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train a 2-layer MLP on the California Housing regression task."
+        description="Train an N-layer MLP on the California Housing regression task."
     )
     parser.add_argument("--hidden-dim", type=int, default=200,
                         help="Hidden layer width (default: 200 -> ~2001 params)")
+    parser.add_argument("--num-layers", type=int, default=2,
+                        help="Number of linear layers in MLP, must be >= 2 (default: 2)")
     parser.add_argument("--epochs", type=int, default=None,
                         help=f"Number of training epochs (default: {OPTIM['epochs']})")
     parser.add_argument("--lr", type=float, default=None,
@@ -212,7 +261,13 @@ def main():
     out_dir = args.output.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    net = MLPRegressor(in_dim=8, hidden_dim=args.hidden_dim, out_dim=1, activation=args.activation)
+    net = MLPRegressor(
+        in_dim=8,
+        hidden_dim=args.hidden_dim,
+        out_dim=1,
+        num_layers=args.num_layers,
+        activation=args.activation,
+    )
     n_params = count_parameters(net)
     net.to(device)
 
@@ -226,16 +281,19 @@ def main():
     )
 
     print(
-        f"[mlp_housing] hidden_dim={args.hidden_dim} params={n_params} "
-        f"activation={args.activation} "
+        f"[mlp_housing] hidden_dim={args.hidden_dim} num_layers={args.num_layers} "
+        f"params={n_params} activation={args.activation} "
         f"epochs={epochs} lr={lr} weight_decay={weight_decay} "
         f"batch_size={batch_size} grad_clip_norm={grad_clip_norm} device={device} "
         f"output={out_dir}"
     )
 
     with open(out_dir / "config_snapshot.txt", "w") as f:
-        f.write(f"model: MLPRegressor(8 -> {args.hidden_dim} -> 1, activation={args.activation})\n")
+        f.write(f"model: MLPRegressor(8 -> {args.hidden_dim} -> 1, "
+                f"num_layers={args.num_layers}, activation={args.activation})\n")
         f.write(f"param_count: {n_params}\n")
+        f.write(f"num_layers: {args.num_layers}\n")
+        f.write(f"hidden_dim: {args.hidden_dim}\n")
         f.write(f"activation: {args.activation}\n")
         f.write(f"epochs: {epochs}\n")
         f.write(f"lr: {lr}\n")
@@ -336,7 +394,7 @@ def main():
     plot_loss_curve(
         history, val_history,
         save_path=str(out_dir / "loss_curve.png"),
-        title=f"MLP (hidden={args.hidden_dim}, {args.activation}, {n_params} params) — CA Housing",
+        title=f"MLP (hidden={args.hidden_dim}, layers={args.num_layers}, {args.activation}, {n_params} params) — CA Housing",
     )
 
     val_batch = next(iter(val_loader))
@@ -348,7 +406,7 @@ def main():
     plot_output_fit(
         out, y_val,
         save_path=str(out_dir / "output_fit.png"),
-        title=f"MLP (hidden={args.hidden_dim}, {args.activation}) — CA Housing output fit",
+        title=f"MLP (hidden={args.hidden_dim}, layers={args.num_layers}, {args.activation}) — CA Housing output fit",
     )
 
     full_val_loss = validate(net, val_loader, task_fn, device)

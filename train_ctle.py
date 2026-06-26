@@ -349,14 +349,6 @@ def make_ctle_preset(
         "write_mode": eff_write,
         "read_idx": read_idx,
         "schedule": "four_phase",
-        "lambdas": {
-            "sparsity": 1e-5,
-            "edge_gate": 5e-6,
-            "node_gate": 0.0,        # DEPRECATED (deprecate-node-gates)
-            "power": 1e-5,
-            "capacitance": 0.0,      # DEPRECATED (deprecate-node-gates)
-            "rail": 0.1,
-        },
         "tau_anneal": True,
     }
     if eff_write == "fan_out" and fan_out is not None:
@@ -1561,6 +1553,12 @@ def main() -> None:
         readout_offset=args.readout_offset,
     )
 
+    # Inject base lambdas from the config module-level LAMBDAS dict
+    # (single source of truth for base regularizer weights). Schedule-specific
+    # overrides (lambdas_b, lambdas_c, etc.) are applied per-epoch by
+    # three_phase_lambdas / four_phase_lambdas during training.
+    preset["lambdas"] = dict(LAMBDAS)
+
     # ---- resolve schedule mode (CLI override > preset default > 'four_phase') ----
     schedule_mode = _resolve_schedule(preset, args.schedule)
     print(f"[train_ctle] schedule_mode={schedule_mode}")
@@ -1604,12 +1602,24 @@ def main() -> None:
             f"temp: {budget_temp_start:.2f}->{budget_temp_end:.2f} "
             f"anneal_frac={budget_anneal_frac}"
         )
-        edge_gate_lambda = float(preset["lambdas"].get("edge_gate", 0.0))
-        if edge_gate_lambda > 0.0:
+        # Check base lambdas and schedule-specific overrides for edge_gate.
+        # With LAMBDAS as base (edge_gate=0) this typically won't fire;
+        # the schedule check catches any non-zero edge_gate in the schedule
+        # dict's lambdas_b / lambdas_b1 / lambdas_b2 (the phases where
+        # budget competition is active).
+        _base_edge = float(preset["lambdas"].get("edge_gate", 0.0))
+        _sched_edge = 0.0
+        if schedule_mode == "three_phase":
+            _sched_edge = float(SCHEDULE_THREE_PHASE.get("lambdas_b", {}).get("edge_gate", 0.0))
+        elif schedule_mode == "four_phase":
+            _sched_edge = float(SCHEDULE_FOUR_PHASE.get("lambdas_b1", {}).get("edge_gate", 0.0))
+            _sched_edge += float(SCHEDULE_FOUR_PHASE.get("lambdas_b2", {}).get("edge_gate", 0.0))
+        if _base_edge > 0.0 or _sched_edge > 0.0:
             print(
-                f"[train_ctle] WARNING: budget enabled but edge_gate lambda={edge_gate_lambda} > 0. "
+                f"[train_ctle] WARNING: budget enabled but edge_gate may be active "
+                f"(base={_base_edge}, schedule_phases={_sched_edge}). "
                 f"The edge_gate regularizer (L1 on sigma(z_logits)) may fight the budget. "
-                f"Consider setting edge_gate to 0 in the preset's lambdas override."
+                f"Consider setting edge_gate to 0 in all lambda sources."
             )
     net: KirchhoffNetWithIO = build_net_from_config(
         preset, cell_lib=cell_lib, enable_drive=args.persistent_drive,

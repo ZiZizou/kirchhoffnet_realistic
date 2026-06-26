@@ -44,9 +44,12 @@ from torch.utils.data import DataLoader, TensorDataset
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config import (
+    DEGREE_BUDGET,
     LAMBDAS,
     OPTIM,
+    PRUNE,
     SCHEDULE_FOUR_PHASE,
+    SCHEDULE_THREE_PHASE,
     SOLVER,
     TAU,
 )
@@ -55,6 +58,8 @@ from io_mapper import FanOutInputMapper, SparseInputMapper
 from kirchhoff_net import KirchhoffNetWithIO
 from topology import build_net_from_config, prune_network
 from train import (
+    budget_frac_for_epoch,
+    budget_temperature_for_epoch,
     compute_loss,
     compute_solidification_metrics,
     four_phase_boundaries,
@@ -62,8 +67,14 @@ from train import (
     four_phase_lambdas,
     four_phase_tau,
     make_optimizer,
+    phase_boundaries,
+    phase_for_epoch,
     phase_for_epoch_four,
     prune_readiness_check,
+    reg_schedule,
+    tau_for_epoch,
+    three_phase_lambdas,
+    three_phase_tau,
     validate_argmax,
 )
 
@@ -1049,16 +1060,46 @@ def log_gradient_norms(grad_log_path, epoch, raw_net, *, retrain=False, optimize
 # STE inline via train.compute_loss(cell_mode='ste') which already exists).
 # =============================================================================
 
-def resolve_cell_mode(cli_value: str, phase: str) -> str:
-    """Resolve the cell selection mode for the current epoch.
+def resolve_cell_mode(cli_value: str, phase: str, schedule_mode: str = "four_phase") -> str:
+    """Resolve the cell selection mode for the current epoch
+    (four-phase-redesign/Phase 2b).
 
-    'soft' uses softmax-weighted mixture of cells per edge.
-    'ste' uses one cell per edge in forward + straight-through soft grads.
-    'auto' returns 'ste' for phases B1, B2, C; 'soft' for phase A.
+    Behavior:
+    - ``cli_value == 'soft'`` or ``'ste'``: honor the explicit override.
+    - ``cli_value == 'auto'`` (default): use ``'ste'`` for compressed
+      phases (B/B1/B2/C under a phased schedule) and ``'soft'`` for the
+      free-fit Phase A. Outside of a phased schedule, always ``'soft'``.
+
+    Args:
+        cli_value: The CLI value of ``--cell-mode`` ('soft', 'ste', or 'auto').
+        phase: Active phase name ('A', 'B', 'B1', 'B2', 'C', or '').
+        schedule_mode: 'legacy', 'three_phase', or 'four_phase'.
+
+    Returns:
+        Resolved cell_mode: 'soft' or 'ste'.
     """
     if cli_value in ("soft", "ste"):
         return cli_value
-    return "ste" if phase in ("B1", "B2", "C") else "soft"
+    if schedule_mode in ("three_phase", "four_phase") and phase in ("B", "C", "B1", "B2"):
+        return "ste"
+    return "soft"
+
+
+# =============================================================================
+# Schedule resolver (mirrors train_script._resolve_schedule).
+# =============================================================================
+
+def _resolve_schedule(preset: dict, cli_value: str | None) -> str:
+    """Resolve the active schedule mode (three-phase-schedule, four-phase-redesign).
+
+    Precedence: explicit CLI flag > preset['schedule'] > 'four_phase' (CTLE default).
+    """
+    if cli_value is not None:
+        return cli_value
+    preset_val = preset.get("schedule")
+    if preset_val in ("legacy", "three_phase", "four_phase"):
+        return preset_val
+    return "four_phase"
 
 
 # =============================================================================
@@ -1323,12 +1364,59 @@ def main() -> None:
     parser.add_argument(
         "--weight-decay", type=float, default=None, dest="weight_decay",
         help=f"AdamW weight decay (default: {OPTIM.get('weight_decay', 0.0)}). "
-             "Pass 1e-4 to match distill_ctle_kirchhoff.py.",
+             f"Pass 1e-4 to match distill_ctle_kirchhoff.py.",
     )
     parser.add_argument(
         "--grad-clip", type=float, default=None, dest="grad_clip",
         help=f"Max gradient norm for clipping (default: {OPTIM.get('grad_clip_norm', 0.0)}). "
-             "Pass 1.0 to match distill_ctle_kirchhoff.py. 0 or negative = no clipping.",
+             f"Pass 1.0 to match distill_ctle_kirchhoff.py. 0 or negative = no clipping.",
+    )
+    parser.add_argument(
+        "--schedule", choices=["legacy", "three_phase", "four_phase"], default=None,
+        help="Training schedule mode (default: from preset['schedule'], "
+             "fallback 'four_phase'). 'three_phase' uses the fit-compress-prune "
+             "pipeline (Phase A: fit, Phase B: compress via gate penalties, "
+             "Phase C: auto-prune + retrain). 'four_phase' splits B into B1 "
+             "(cell commitment) and B2 (edge pruning, readiness-gated) and "
+             "adds KD-anchored retrain. 'legacy' uses reg_schedule warmup "
+             "with no phased lambdas/tau.",
+    )
+    parser.add_argument(
+        "--budget", action="store_true", default=False,
+        dest="budget",
+        help="Enable degree-budget edge competition. Each destination "
+             "(or source) node keeps a fraction of its incoming edges open "
+             "via temperature-scaled softmax renormalization of z_logits. "
+             "Replaces the L1 edge_gate pressure with explicit competition.",
+    )
+    parser.add_argument(
+        "--budget-frac-start", type=float, default=None,
+        dest="budget_frac_start",
+        help="Initial budget fraction per group (permissive, 1.0 = no "
+             "restriction). Default: 1.0.",
+    )
+    parser.add_argument(
+        "--budget-frac-end", type=float, default=None,
+        dest="budget_frac_end",
+        help="Final budget fraction per group (restrictive, 0.0 = disables "
+             "budget, 0.75 = keep 75% of edges). Default: 0.75.",
+    )
+    parser.add_argument(
+        "--budget-temp-start", type=float, default=None,
+        dest="budget_temp_start",
+        help="Initial softmax temperature (soft). Default: 1.0.",
+    )
+    parser.add_argument(
+        "--budget-temp-end", type=float, default=None,
+        dest="budget_temp_end",
+        help="Final softmax temperature (sharp, approaches hard top-k_eff). "
+             "Default: 0.1.",
+    )
+    parser.add_argument(
+        "--budget-axis", choices=["dst", "src", "both"], default=None,
+        dest="budget_axis",
+        help="Competition axis: 'dst' (per-destination, default), 'src' "
+             "(per-source), or 'both' (multiplicative).",
     )
     args = parser.parse_args()
 
@@ -1472,6 +1560,57 @@ def main() -> None:
         nodes_per_target=args.nodes_per_target,
         readout_offset=args.readout_offset,
     )
+
+    # ---- resolve schedule mode (CLI override > preset default > 'four_phase') ----
+    schedule_mode = _resolve_schedule(preset, args.schedule)
+    print(f"[train_ctle] schedule_mode={schedule_mode}")
+
+    # ---- resolve degree-budget config (degree-budget-topk plan) ----
+    # CLI override > DEGREE_BUDGET defaults. --budget enables the master switch.
+    budget_enabled = bool(args.budget) or bool(DEGREE_BUDGET.get("enabled", False))
+    budget_frac_start = float(
+        args.budget_frac_start if args.budget_frac_start is not None
+        else DEGREE_BUDGET["frac_start"]
+    )
+    budget_frac_end = float(
+        args.budget_frac_end if args.budget_frac_end is not None
+        else DEGREE_BUDGET["frac_end"]
+    )
+    budget_temp_start = float(
+        args.budget_temp_start if args.budget_temp_start is not None
+        else DEGREE_BUDGET["temperature_start"]
+    )
+    budget_temp_end = float(
+        args.budget_temp_end if args.budget_temp_end is not None
+        else DEGREE_BUDGET["temperature_end"]
+    )
+    budget_axis = (
+        args.budget_axis if args.budget_axis is not None
+        else DEGREE_BUDGET["axis"]
+    )
+    budget_anneal_frac = float(DEGREE_BUDGET["anneal_frac"])
+    if budget_enabled:
+        if not (0.0 <= budget_frac_end <= 1.0):
+            print(f"[train_ctle] WARNING: budget_frac_end={budget_frac_end} must be in [0,1], "
+                  f"clamping to [0,1]")
+            budget_frac_end = max(0.0, min(1.0, budget_frac_end))
+        if not (0.0 <= budget_frac_start <= 1.0):
+            print(f"[train_ctle] WARNING: budget_frac_start={budget_frac_start} must be in [0,1], "
+                  f"clamping to [0,1]")
+            budget_frac_start = max(0.0, min(1.0, budget_frac_start))
+        print(
+            f"[train_ctle] budget=enabled axis={budget_axis} "
+            f"frac: {budget_frac_start:.2f}->{budget_frac_end:.2f} "
+            f"temp: {budget_temp_start:.2f}->{budget_temp_end:.2f} "
+            f"anneal_frac={budget_anneal_frac}"
+        )
+        edge_gate_lambda = float(preset["lambdas"].get("edge_gate", 0.0))
+        if edge_gate_lambda > 0.0:
+            print(
+                f"[train_ctle] WARNING: budget enabled but edge_gate lambda={edge_gate_lambda} > 0. "
+                f"The edge_gate regularizer (L1 on sigma(z_logits)) may fight the budget. "
+                f"Consider setting edge_gate to 0 in the preset's lambdas override."
+            )
     net: KirchhoffNetWithIO = build_net_from_config(
         preset, cell_lib=cell_lib, enable_drive=args.persistent_drive,
     )
@@ -1618,9 +1757,19 @@ def main() -> None:
         f.write(f"\nLAMBDAS (effective):\n")
         for k, v in preset["lambdas"].items():
             f.write(f"  {k}: {v}\n")
-        f.write(f"\nSCHEDULE_FOUR_PHASE fractions: {SCHEDULE_FOUR_PHASE['frac_a']}/"
-                f"{SCHEDULE_FOUR_PHASE['frac_b1']}/{SCHEDULE_FOUR_PHASE['frac_b2']}/"
-                f"{SCHEDULE_FOUR_PHASE['frac_c']}\n")
+        f.write(f"\nSCHEDULE_MODE: {schedule_mode}\n")
+        if schedule_mode == "four_phase":
+            f.write(f"SCHEDULE_FOUR_PHASE fractions: {SCHEDULE_FOUR_PHASE['frac_a']}/"
+                    f"{SCHEDULE_FOUR_PHASE['frac_b1']}/{SCHEDULE_FOUR_PHASE['frac_b2']}/"
+                    f"{SCHEDULE_FOUR_PHASE['frac_c']}\n")
+        elif schedule_mode == "three_phase":
+            f.write(f"SCHEDULE_THREE_PHASE fractions: {SCHEDULE_THREE_PHASE['frac_a']}/"
+                    f"{SCHEDULE_THREE_PHASE['frac_b']}/{SCHEDULE_THREE_PHASE['frac_c']}\n")
+        f.write(f"budget_enabled: {budget_enabled}\n")
+        if budget_enabled:
+            f.write(f"budget: frac {budget_frac_start}->{budget_frac_end}, "
+                    f"temp {budget_temp_start}->{budget_temp_end}, axis={budget_axis}, "
+                    f"anneal_frac={budget_anneal_frac}\n")
 
     # ---- generate dataset ----
     print(f"[train_ctle] generating {args.n_train + args.n_val} synthetic spec samples "
@@ -1659,11 +1808,30 @@ def main() -> None:
         )
 
     # ---- schedule boundaries ----
-    a_end, b1_end, b2_end, c_end = four_phase_boundaries(epochs)
-    print(f"[train_ctle] four_phase schedule: A=[0,{a_end}) B1=[{a_end},{b1_end}) "
-          f"B2=[{b1_end},{b2_end}) C=[{b2_end},{c_end})")
-    ab_total = b2_end
-    c_total = max(1, epochs - b2_end)
+    # Branch on schedule_mode to support three_phase and legacy in addition
+    # to the default four_phase. For three_phase, ab_total=b_end (no B1/B2
+    # split, no readiness gating); for legacy, ab_total=epochs and retrain
+    # only runs if --prune is explicitly set.
+    if schedule_mode == "four_phase":
+        a_end, b1_end, b2_end, c_end = four_phase_boundaries(epochs)
+        print(f"[train_ctle] four_phase schedule: A=[0,{a_end}) B1=[{a_end},{b1_end}) "
+              f"B2=[{b1_end},{b2_end}) C=[{b2_end},{c_end})")
+        ab_total = b2_end
+        c_total = max(1, epochs - b2_end)
+        needs_prune = True
+    elif schedule_mode == "three_phase":
+        a_end, b_end, _ = phase_boundaries(epochs)
+        print(f"[train_ctle] three_phase schedule: A=[0,{a_end}) B=[{a_end},{b_end}) "
+              f"C=[{b_end},{epochs})")
+        ab_total = b_end
+        c_total = max(1, epochs - b_end)
+        needs_prune = True
+    else:  # legacy
+        print(f"[train_ctle] legacy schedule: single-phase over {epochs} epochs")
+        a_end = b1_end = b2_end = b_end = epochs
+        ab_total = epochs
+        c_total = 0
+        needs_prune = args.prune
     if args.retrain_epochs is not None:
         c_total = args.retrain_epochs
 
@@ -1720,23 +1888,59 @@ def main() -> None:
         torch.amp.GradScaler("cuda", enabled=amp_enabled and amp_dtype == torch.float16)
     )
 
-    # ---- Phase A + B1 + B2 training loop ----
-    print("[train_ctle] starting 4-phase training loop")
+    # ---- Phase A + (B1 + B2 | B) training loop ----
+    if schedule_mode == "four_phase":
+        loop_desc = "train_ctle [A+B1+B2]"
+    elif schedule_mode == "three_phase":
+        loop_desc = "train_ctle [A+B]"
+    else:
+        loop_desc = "train_ctle [legacy]"
+    print(f"[train_ctle] starting {schedule_mode} training loop ({loop_desc})")
     for epoch in range(ab_total):
         if stop_training:
             break
         net.train()
-        tau = four_phase_tau(epoch, epochs)
-        phase = phase_for_epoch_four(epoch, epochs)
-        eff_lambdas = four_phase_lambdas(epoch, epochs, preset["lambdas"])
-        cell_mode = resolve_cell_mode(args.cell_mode, phase)
 
-        # Stop early if readiness triggered (handled at validate step, but
-        # we also break here if the flag was set in a previous iteration).
-        if phase == "B2" and readiness_prune_fired:
-            print(f"[four_phase] readiness pruning triggered at epoch {epoch} "
-                  f"(B2 cut short, was scheduled for {b2_end})")
-            break
+        # Degree budget / fraction competition (degree-budget-topk plan).
+        # Recompute frac and temperature for this epoch and push to all
+        # stages. Done once per epoch (global schedule); the per-batch
+        # budget gate is recomputed inside rhs() from each stage's
+        # current budget_frac / budget_temperature.
+        if budget_enabled:
+            _b_frac = budget_frac_for_epoch(
+                epoch, ab_total, budget_frac_start, budget_frac_end, budget_anneal_frac,
+            )
+            _b_T = budget_temperature_for_epoch(
+                epoch, ab_total, budget_temp_start, budget_temp_end, budget_anneal_frac,
+            )
+            for _stage in raw_net.core.stages:
+                _stage.set_budget_frac(_b_frac, _b_T)
+                _stage.budget_axis = budget_axis
+
+        # Schedule-aware tau / phase / lambdas dispatch.
+        if schedule_mode == "four_phase":
+            tau = four_phase_tau(epoch, epochs)
+            phase = phase_for_epoch_four(epoch, epochs)
+            eff_lambdas = four_phase_lambdas(epoch, epochs, preset["lambdas"])
+            reg_scale = 1.0  # four_phase_lambdas already includes warmup
+            # Stop early if readiness triggered (handled at validate step,
+            # but we also break here if the flag was set in a previous
+            # iteration).
+            if phase == "B2" and readiness_prune_fired:
+                print(f"[four_phase] readiness pruning triggered at epoch {epoch} "
+                      f"(B2 cut short, was scheduled for {b2_end})")
+                break
+        elif schedule_mode == "three_phase":
+            tau = three_phase_tau(epoch, epochs)
+            phase = phase_for_epoch(epoch, epochs)
+            eff_lambdas = three_phase_lambdas(epoch, epochs, preset["lambdas"])
+            reg_scale = 1.0  # three_phase_lambdas already includes warmup
+        else:  # legacy
+            tau = tau_for_epoch(epoch, total_epochs=epochs)
+            phase = ""
+            reg_scale = reg_schedule(epoch)
+            eff_lambdas = dict(preset["lambdas"])
+        cell_mode = resolve_cell_mode(args.cell_mode, phase, schedule_mode)
 
         # ---- one epoch ----
         total_loss = 0.0
@@ -1755,7 +1959,7 @@ def main() -> None:
             loss_task, loss_structural, _ = compute_loss(
                 net, u_b, tgt_b, ctx=None, task_fn=task_fn,
                 lambdas=eff_lambdas, tau=tau, return_parts=True,
-                amp=amp_enabled, amp_dtype=amp_dtype, reg_scale=1.0,
+                amp=amp_enabled, amp_dtype=amp_dtype, reg_scale=reg_scale,
                 cell_mode=cell_mode,
                 teacher=kd_teacher, lambda_kd=kd_lambda, teacher_tau=1.0,
                 teacher_cell_mode="soft",
@@ -1795,7 +1999,10 @@ def main() -> None:
             val_argmax_history.append(val_arg)
             val_argmax_v_history.append(val_arg)
 
-            if phase in ("A", "B1", "B2"):
+            if (
+                (schedule_mode == "three_phase" and phase in ("A", "B"))
+                or (schedule_mode == "four_phase" and phase in ("A", "B1", "B2"))
+            ):
                 metrics = compute_solidification_metrics(raw_net, tau=tau)
                 _log_solidification(solid_log_path, epoch, metrics)
                 solid_metrics_history.append(metrics)
@@ -1836,7 +2043,10 @@ def main() -> None:
 
         # ---- checkpointing (use argmax val for B1/B2; soft for A) ----
         if do_validate:
-            use_argmax_ckpt = phase in ("B1", "B2") and val_argmax_history and len(val_argmax_history) > 0
+            use_argmax_ckpt = (
+                (schedule_mode == "three_phase" and phase == "B")
+                or (schedule_mode == "four_phase" and phase in ("B1", "B2"))
+            ) and val_argmax_history and len(val_argmax_history) > 0
             if use_argmax_ckpt:
                 sel_metric = float(val_argmax_history[-1])
                 sel_name = "val_argmax"
@@ -1869,12 +2079,24 @@ def main() -> None:
             f"tau={tau:.3f}  lr={optimizer.param_groups[0]['lr']:.2e}{worst_str}"
         )
 
-    # ---- end of Phase A+B1+B2 ----
-    if not stop_training and not readiness_prune_fired:
-        readiness_prune_fired = True
-        readiness_prune_epoch = b2_end
-        print(f"[train_ctle] A+B1+B2 complete, no readiness trigger — "
-              f"fallback prune at epoch {b2_end}")
+    # ---- end of overcomplete phase(s) ----
+    if schedule_mode == "four_phase":
+        if not stop_training and not readiness_prune_fired:
+            readiness_prune_fired = True
+            readiness_prune_epoch = b2_end
+            print(f"[train_ctle] A+B1+B2 complete, no readiness trigger — "
+                  f"fallback prune at epoch {b2_end}")
+    elif schedule_mode == "three_phase":
+        # three_phase always prunes at B->C (no readiness gating).
+        if not stop_training:
+            print(f"[train_ctle] A+B complete at epoch {b_end}, "
+                  f"pruning at B->C boundary")
+    else:  # legacy
+        # legacy only prunes when --prune is explicitly set.
+        needs_prune = bool(args.prune)
+        if needs_prune and not stop_training:
+            print(f"[train_ctle] legacy schedule complete at epoch {epochs}, "
+                  f"pruning (--prune was set)")
 
     # ---- restore best pre-prune state ----
     if best_state is not None:
@@ -1887,7 +2109,12 @@ def main() -> None:
     with loss_history_path.open("w") as f:
         f.write("epoch\ttrain\tval\tval_argmax\tphase\n")
         for i, (t, v) in enumerate(zip(history, val_history)):
-            p = phase_for_epoch_four(i, epochs)
+            if schedule_mode == "four_phase":
+                p = phase_for_epoch_four(i, epochs)
+            elif schedule_mode == "three_phase":
+                p = phase_for_epoch(i, epochs)
+            else:
+                p = "A"
             va = val_argmax_history[i] if i < len(val_argmax_history) else float("nan")
             f.write(f"{i}\t{t:.6e}\t{v:.6e}\t{va:.6e}\t{p}\n")
 
@@ -1899,7 +2126,7 @@ def main() -> None:
         ax.plot(val_argmax_history, label="val (argmax)", color="C2", linestyle="--")
     ax.set_xlabel("epoch")
     ax.set_ylabel("MSE (logit space)")
-    ax.set_title(f"{topo_label} (KD from MLP) — 4-phase training (total {epochs} epochs)")
+    ax.set_title(f"{topo_label} (KD from MLP) — {schedule_mode} training (total {epochs} epochs)")
     ax.legend()
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
@@ -1911,7 +2138,7 @@ def main() -> None:
         _plot_per_dim_diagnostics(
             per_dim_history, out_dir / "per_dim_stats.png",
             norm_label="(normalized)" if args.normalize_targets else "(logit space)",
-            suptitle=f"Per-dimension diagnostics ({topo_label}) — A+B1+B2",
+            suptitle=f"Per-dimension diagnostics ({topo_label}) — {loop_desc}",
         )
 
     # output fit (logit space)
@@ -1952,9 +2179,16 @@ def main() -> None:
     print(f"[train_ctle] saved pre-prune model to {out_dir / 'model.pt'}")
 
     # ---- pruning + retrain (Phase C) ----
-    if args.prune:
-        edge_thresh = float(SCHEDULE_FOUR_PHASE.get("prune_edge_threshold", 0.05))
-        node_thresh = float(SCHEDULE_FOUR_PHASE.get("prune_node_threshold", 0.05))
+    if needs_prune:
+        if schedule_mode == "four_phase":
+            edge_thresh = float(SCHEDULE_FOUR_PHASE.get("prune_edge_threshold", 0.05))
+            node_thresh = float(SCHEDULE_FOUR_PHASE.get("prune_node_threshold", 0.05))
+        elif schedule_mode == "three_phase":
+            edge_thresh = float(SCHEDULE_THREE_PHASE.get("prune_edge_threshold", 0.1))
+            node_thresh = float(SCHEDULE_THREE_PHASE.get("prune_node_threshold", 0.05))
+        else:  # legacy
+            edge_thresh = float(PRUNE["edge_threshold"])
+            node_thresh = float(PRUNE["node_threshold"])
         # DEPRECATED (deprecate-node-gates): prune_nodes_by_gate is always False.
         prune_nodes_by_gate = False
         pre_edges = sum(s.num_edges() for s in raw_net.core.stages)
@@ -2050,10 +2284,32 @@ def main() -> None:
         ewop_p = 0
         for repoch in range(c_total):
             pruned_net.train()
-            global_epoch = b2_end + repoch
-            tau_r = four_phase_tau(global_epoch, epochs)
-            eff_c_lambdas = four_phase_lambdas(global_epoch, epochs, preset["lambdas"])
-            cell_mode_c = resolve_cell_mode(args.cell_mode, "C")
+            # Degree budget (degree-budget-topk plan): in Phase C the
+            # budget is disabled (frac=0.0) — the compact network is
+            # already pruned, so per-edge competition has no work.
+            if budget_enabled:
+                for _stage in pruned_net.core.stages:
+                    _stage.set_budget_frac(0.0, budget_temp_end)
+                    _stage.budget_axis = budget_axis
+            # Schedule-aware Phase C retrain: schedule's tau/lambdas at the
+            # appropriate global epoch so the retrain picks up where the
+            # overcomplete training left off.
+            if schedule_mode == "four_phase":
+                global_epoch = b2_end + repoch
+                tau_r = four_phase_tau(global_epoch, epochs)
+                eff_c_lambdas = four_phase_lambdas(global_epoch, epochs, preset["lambdas"])
+                reg_scale_r = 1.0
+            elif schedule_mode == "three_phase":
+                global_epoch = b_end + repoch
+                tau_r = three_phase_tau(global_epoch, epochs)
+                eff_c_lambdas = three_phase_lambdas(global_epoch, epochs, preset["lambdas"])
+                reg_scale_r = 1.0
+            else:  # legacy
+                global_epoch = repoch
+                tau_r = tau_for_epoch(repoch, total_epochs=c_total)
+                eff_c_lambdas = dict(preset["lambdas"])
+                reg_scale_r = reg_schedule(repoch)
+            cell_mode_c = resolve_cell_mode(args.cell_mode, "C", schedule_mode)
 
             tot = 0.0
             nb = 0
@@ -2064,7 +2320,7 @@ def main() -> None:
                 loss_task, loss_structural, _ = compute_loss(
                     pruned_net, u_b, tgt_b, ctx=None, task_fn=task_fn,
                     lambdas=eff_c_lambdas, tau=tau_r, return_parts=True,
-                    amp=amp_enabled, amp_dtype=amp_dtype, reg_scale=1.0,
+                    amp=amp_enabled, amp_dtype=amp_dtype, reg_scale=reg_scale_r,
                     cell_mode=cell_mode_c,
                 )
                 if retrain_scaler is not None and retrain_scaler._enabled:

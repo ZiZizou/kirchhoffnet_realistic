@@ -41,6 +41,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config import OPTIM
 from train_script import make_data_housing_grid, denormalize_targets
+from analog_noise import (
+    AnalogMLPWrapper,
+    NoiseConfig,
+    evaluate_clean,
+    evaluate_with_noise,
+)
 
 
 __all__ = ["MLPRegressor", "count_parameters"]
@@ -247,6 +253,28 @@ def main():
                         help="Output directory (default: ./output/mlp_housing)")
     parser.add_argument("--device", default=None,
                         help="Device 'cpu' or 'cuda' (default: auto-detect)")
+    parser.add_argument("--noise", action="store_true",
+                        help="Enable realistic hardware noise "
+                             "(quantization + circuit noise) on the trained "
+                             "model and report Monte Carlo evaluation stats.")
+    parser.add_argument("--noise-aware", action="store_true",
+                        help="Train under analog noise so the MLP becomes "
+                             "robust to it. Implies --noise for final eval.")
+    parser.add_argument("--quant-bits", type=int, choices=[4, 6], default=4,
+                        help="Bit-width for weight and ADC/DAC quantization "
+                             "(default: 4). Used when --noise is set.")
+    parser.add_argument("--noise-std", type=float, default=0.05,
+                        help="Standard deviation of additive Gaussian "
+                             "circuit noise on weights and activations "
+                             "(default: 0.05). Used when --noise is set.")
+    parser.add_argument("--mc-trials", type=int, default=20,
+                        help="Number of Monte Carlo trials for noisy "
+                             "evaluation (default: 20).")
+    parser.add_argument("--adc-full-range", type=float, default=3.0,
+                        help="Symmetric full-scale range for ADC/DAC "
+                             "quantization (default: 3.0).")
+    parser.add_argument("--noise-seed", type=int, default=0,
+                        help="Seed for noise sampling (default: 0).")
     args = parser.parse_args()
 
     epochs = args.epochs if args.epochs is not None else int(OPTIM["epochs"])
@@ -270,6 +298,17 @@ def main():
     )
     n_params = count_parameters(net)
     net.to(device)
+
+    noise_cfg = NoiseConfig(
+        quant_bits=args.quant_bits if args.noise or args.noise_aware else None,
+        noise_std=args.noise_std if args.noise or args.noise_aware else 0.0,
+        mc_trials=args.mc_trials,
+        seed=args.noise_seed,
+    )
+    train_wrapper: AnalogMLPWrapper | None = None
+    if args.noise_aware:
+        train_wrapper = AnalogMLPWrapper(net, noise_cfg, adc_full_range=args.adc_full_range)
+        train_wrapper.to(device)
 
     train_loader, val_loader, task_fn, inverse_stats = make_data_housing_grid(batch_size=batch_size)
     optimizer = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=weight_decay)
@@ -331,7 +370,10 @@ def main():
             u = u.to(device)
             target = target.to(device)
             optimizer.zero_grad()
-            out = net(u)
+            if train_wrapper is not None:
+                out = train_wrapper(u)
+            else:
+                out = net(u)
             loss = task_fn(out, target)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=grad_clip_norm)
@@ -425,6 +467,55 @@ def main():
         f.write(f"final_rmse_orig: {final_rmse:.6f}\n")
         f.write(f"epochs_run: {len(history)}\n")
         f.write(f"elapsed_seconds: {elapsed:.2f}\n")
+
+    if args.noise or args.noise_aware:
+        print(
+            f"[mlp_housing] running MC noise eval: quant_bits={args.quant_bits} "
+            f"noise_std={args.noise_std} trials={args.mc_trials} "
+            f"adc_full_range={args.adc_full_range} seed={args.noise_seed}"
+        )
+        eval_cfg = NoiseConfig(
+            quant_bits=args.quant_bits,
+            noise_std=args.noise_std,
+            mc_trials=args.mc_trials,
+            seed=args.noise_seed,
+        )
+        eval_wrapper = AnalogMLPWrapper(
+            net, eval_cfg, adc_full_range=args.adc_full_range,
+        )
+        eval_wrapper.to(device)
+        clean_loss = evaluate_clean(
+            eval_wrapper, val_loader, task_fn, device,
+        )
+        noise_result = evaluate_with_noise(
+            eval_wrapper, val_loader, task_fn, eval_cfg, device,
+        )
+        noise_result.clean_loss = clean_loss
+        print(
+            f"[mlp_housing] noise eval: clean={clean_loss:.6f} "
+            f"noisy_mean={noise_result.mean:.6f} "
+            f"noisy_std={noise_result.std:.6f} "
+            f"p90={noise_result.p90:.6f} p95={noise_result.p95:.6f}"
+        )
+        with open(out_dir / "noise_metrics.txt", "w") as f:
+            f.write(f"quant_bits: {args.quant_bits}\n")
+            f.write(f"noise_std: {args.noise_std}\n")
+            f.write(f"mc_trials: {args.mc_trials}\n")
+            f.write(f"adc_full_range: {args.adc_full_range}\n")
+            f.write(f"noise_seed: {args.noise_seed}\n")
+            f.write(f"noise_aware_training: {bool(args.noise_aware)}\n")
+            f.write(f"clean_val_huber: {clean_loss:.6f}\n")
+            f.write(f"noisy_mean: {noise_result.mean:.6f}\n")
+            f.write(f"noisy_std: {noise_result.std:.6f}\n")
+            f.write(f"noisy_p50: {noise_result.p50:.6f}\n")
+            f.write(f"noisy_p90: {noise_result.p90:.6f}\n")
+            f.write(f"noisy_p95: {noise_result.p95:.6f}\n")
+            f.write(f"noisy_best: {noise_result.best:.6f}\n")
+            f.write(f"noisy_worst: {noise_result.worst:.6f}\n")
+            f.write(f"degradation_mean: {noise_result.mean - clean_loss:.6f}\n")
+            f.write("per_trial_losses:\n")
+            for i, l in enumerate(noise_result.losses):
+                f.write(f"  trial_{i:03d}: {l:.6f}\n")
 
     print(f"[mlp_housing] artifacts in {out_dir}")
 

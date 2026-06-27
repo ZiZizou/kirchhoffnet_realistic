@@ -555,8 +555,16 @@ INIT = {
 VARIATION = {
     "temp_c_default": 27.0,
     "temp_c_choices": [0.0, 27.0, 75.0],
+    # Legacy-library variation is sampled in the log domain so positive
+    # physical parameters remain positive after perturbation:
+    #   gm   -> gm   * exp(delta_gm)
+    #   isat -> isat * exp(delta_isat)
+    #
+    # edge_mismatch_std is the legacy name for per-edge/per-cell gm log-std.
     "global_gain_shift_std": 0.05,
     "edge_mismatch_std": 0.05,
+    "global_isat_shift_std": 0.02,
+    "edge_isat_mismatch_std": 0.03,
 }
 
 

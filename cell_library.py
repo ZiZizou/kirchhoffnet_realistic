@@ -154,18 +154,39 @@ class IdealizedCellLibrary(nn.Module):
         mult = mult.unsqueeze(0).unsqueeze(-1)  # [1, E, 1]
 
         gm = self.gm.view(1, 1, Q)  # [1, 1, Q]
-        isat = self.isat.view(1, 1, Q).clamp_min(1e-6)  # [1, 1, Q]
+        isat = self.isat.view(1, 1, Q)  # [1, 1, Q]
         gleak = self.gleak.view(1, 1, Q)  # [1, 1, Q]
         bias = self.bias.view(1, 1, Q)  # [1, 1, Q]
 
         if ctx is not None and ctx.edge_mismatch is not None:
             em = ctx.edge_mismatch
-            if em.device != gm.device:
-                em = em.to(gm.device)
+            if em.device != gm.device or em.dtype != gm.dtype:
+                em = em.to(device=gm.device, dtype=gm.dtype)
             gm = gm * torch.exp(em).unsqueeze(0)  # [1, E, Q]
         if ctx is not None and getattr(ctx, "global_gain_shift", 0.0) != 0.0:
-            shift = torch.tensor(ctx.global_gain_shift, dtype=gm.dtype, device=gm.device)
+            shift = torch.tensor(
+                ctx.global_gain_shift,
+                dtype=gm.dtype,
+                device=gm.device,
+            )
             gm = gm * torch.exp(shift)
+        if (
+            ctx is not None
+            and getattr(ctx, "edge_isat_mismatch", None) is not None
+        ):
+            em_i = ctx.edge_isat_mismatch
+            if em_i.device != isat.device or em_i.dtype != isat.dtype:
+                em_i = em_i.to(device=isat.device, dtype=isat.dtype)
+            isat = isat * torch.exp(em_i).unsqueeze(0)  # [1, E, Q]
+        if ctx is not None and getattr(ctx, "global_isat_shift", 0.0) != 0.0:
+            shift_i = torch.tensor(
+                ctx.global_isat_shift,
+                dtype=isat.dtype,
+                device=isat.device,
+            )
+            isat = isat * torch.exp(shift_i)
+
+        isat = isat.clamp_min(1e-6)
 
         # Preactivation: v2 uses per-cell src_gain/dst_gain mix; legacy/v15
         # use a single rho destination gain. v2 cells have gleak=0 and bias=0

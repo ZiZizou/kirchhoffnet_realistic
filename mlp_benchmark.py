@@ -39,6 +39,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config import OPTIM
 from train_script import make_data_smooth2d
+from analog_noise import (
+    AnalogMLPWrapper,
+    NoiseConfig,
+    NoiseBenchmarkResult,
+    evaluate_clean,
+    evaluate_with_noise,
+)
 
 
 __all__ = ["MLPRegressor", "count_parameters"]
@@ -49,15 +56,25 @@ _ACTIVATIONS = {
     "tanh": torch.tanh,
 }
 
+_ACTIVATION_MODULES = {
+    "relu": nn.ReLU(),
+    "tanh": nn.Tanh(),
+}
+
 
 class MLPRegressor(nn.Module):
-    """2-layer feedforward regressor: Linear -> Act -> Linear.
+    """N-layer feedforward regressor: Linear -> Act -> [Linear -> Act] x (N-2) -> Linear.
 
     Input: (B, in_dim)
     Output: (B, out_dim)
 
     Default sizes target ~400 learnable parameters to match the smooth2d
-    KirchhoffNet: in_dim=2, hidden_dim=100, out_dim=1 -> 2*100 + 100 + 100*1 + 1 = 401.
+    KirchhoffNet: in_dim=2, hidden_dim=100, out_dim=1, num_layers=2
+    -> 2*100 + 100 + 100*1 + 1 = 401.
+
+    For num_layers=2, the middle block is empty (2-layer MLP), preserving
+    the original behavior. For num_layers > 2, additional hidden layers
+    Linear(hidden_dim, hidden_dim) are inserted.
 
     Activation is selectable via the ``activation`` argument (one of
     ``"relu"``, ``"tanh"``). Parameter count is identical across activations;
@@ -69,6 +86,7 @@ class MLPRegressor(nn.Module):
         in_dim: int = 2,
         hidden_dim: int = 100,
         out_dim: int = 1,
+        num_layers: int = 2,
         activation: str = "relu",
     ) -> None:
         super().__init__()
@@ -77,16 +95,34 @@ class MLPRegressor(nn.Module):
                 f"MLPRegressor: activation must be one of {sorted(_ACTIVATIONS)}, "
                 f"got {activation!r}"
             )
+        if num_layers < 2:
+            raise ValueError(
+                f"MLPRegressor: num_layers must be >= 2, got {num_layers}"
+            )
         self.in_dim = int(in_dim)
         self.hidden_dim = int(hidden_dim)
         self.out_dim = int(out_dim)
+        self.num_layers = int(num_layers)
         self.activation = activation
-        self.fc1 = nn.Linear(in_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, out_dim)
+        act_module = _ACTIVATION_MODULES[activation]
+
+        layers = []
+        layers.append(nn.Linear(in_dim, hidden_dim))
+        layers.append(act_module)
+        for _ in range(num_layers - 2):
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(act_module)
+        layers.append(nn.Linear(hidden_dim, out_dim))
+
+        self.layers = nn.ModuleList(layers)
+        self.fc1 = layers[0]
+        self.fc2 = layers[-1]
 
     def forward(self, u: torch.Tensor) -> torch.Tensor:
-        h = _ACTIVATIONS[self.activation](self.fc1(u))
-        return self.fc2(h)
+        h = u
+        for layer in self.layers:
+            h = layer(h)
+        return h
 
 
 def count_parameters(net: nn.Module) -> int:
@@ -164,7 +200,9 @@ def main():
         description="Train a minimal MLP on the Franke (smooth2d) regression task."
     )
     parser.add_argument("--hidden-dim", type=int, default=100,
-                        help="Hidden layer width (default: 100 -> ~401 params)")
+                        help="Hidden layer width (default: 100)")
+    parser.add_argument("--num-layers", type=int, default=2,
+                        help="Number of linear layers (default: 2)")
     parser.add_argument("--epochs", type=int, default=2000,
                         help=f"Number of training epochs (default: 2000)")
     parser.add_argument("--lr", type=float, default=None,
@@ -187,6 +225,28 @@ def main():
                         help="Output directory (default: ./output/mlp_smooth2d)")
     parser.add_argument("--device", default=None,
                         help="Device 'cpu' or 'cuda' (default: auto-detect)")
+    parser.add_argument("--noise", action="store_true",
+                        help="Enable realistic hardware noise "
+                             "(quantization + circuit noise) on the trained "
+                             "model and report Monte Carlo evaluation stats.")
+    parser.add_argument("--noise-aware", action="store_true",
+                        help="Train under analog noise so the MLP becomes "
+                             "robust to it. Implies --noise for final eval.")
+    parser.add_argument("--quant-bits", type=int, choices=[4, 6], default=4,
+                        help="Bit-width for weight and ADC/DAC quantization "
+                             "(default: 4). Used when --noise is set.")
+    parser.add_argument("--noise-std", type=float, default=0.05,
+                        help="Standard deviation of additive Gaussian "
+                             "circuit noise on weights and activations "
+                             "(default: 0.05). Used when --noise is set.")
+    parser.add_argument("--mc-trials", type=int, default=20,
+                        help="Number of Monte Carlo trials for noisy "
+                             "evaluation (default: 20).")
+    parser.add_argument("--adc-full-range", type=float, default=3.0,
+                        help="Symmetric full-scale range for ADC/DAC "
+                             "quantization (default: 3.0).")
+    parser.add_argument("--noise-seed", type=int, default=0,
+                        help="Seed for noise sampling (default: 0).")
     args = parser.parse_args()
 
     lr = args.lr if args.lr is not None else float(OPTIM["lr"])
@@ -200,15 +260,27 @@ def main():
     out_dir = args.output.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    net = MLPRegressor(in_dim=2, hidden_dim=args.hidden_dim, out_dim=1, activation=args.activation)
+    net = MLPRegressor(in_dim=2, hidden_dim=args.hidden_dim, out_dim=1,
+                       num_layers=args.num_layers, activation=args.activation)
     n_params = count_parameters(net)
     net.to(device)
+
+    noise_cfg = NoiseConfig(
+        quant_bits=args.quant_bits if args.noise or args.noise_aware else None,
+        noise_std=args.noise_std if args.noise or args.noise_aware else 0.0,
+        mc_trials=args.mc_trials,
+        seed=args.noise_seed,
+    )
+    train_wrapper: AnalogMLPWrapper | None = None
+    if args.noise_aware:
+        train_wrapper = AnalogMLPWrapper(net, noise_cfg, adc_full_range=args.adc_full_range)
+        train_wrapper.to(device)
 
     train_loader, val_loader, task_fn = make_data_smooth2d(batch_size=batch_size)
     optimizer = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=weight_decay)
 
     print(
-        f"[mlp] hidden_dim={args.hidden_dim} params={n_params} "
+        f"[mlp] hidden_dim={args.hidden_dim} num_layers={args.num_layers} params={n_params} "
         f"activation={args.activation} "
         f"epochs={args.epochs} lr={lr} weight_decay={weight_decay} "
         f"batch_size={batch_size} grad_clip_norm={grad_clip_norm} device={device} "
@@ -216,8 +288,9 @@ def main():
     )
 
     with open(out_dir / "config_snapshot.txt", "w") as f:
-        f.write(f"model: MLPRegressor(2 -> {args.hidden_dim} -> 1, activation={args.activation})\n")
+        f.write(f"model: MLPRegressor(2 -> {args.hidden_dim} x {args.num_layers} -> 1, activation={args.activation})\n")
         f.write(f"param_count: {n_params}\n")
+        f.write(f"num_layers: {args.num_layers}\n")
         f.write(f"activation: {args.activation}\n")
         f.write(f"epochs: {args.epochs}\n")
         f.write(f"lr: {lr}\n")
@@ -250,7 +323,10 @@ def main():
             u = u.to(device)
             target = target.to(device)
             optimizer.zero_grad()
-            out = net(u)
+            if train_wrapper is not None:
+                out = train_wrapper(u)
+            else:
+                out = net(u)
             loss = task_fn(out, target)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=grad_clip_norm)
@@ -330,6 +406,55 @@ def main():
         f.write(f"final_val_mse: {full_val_loss:.6f}\n")
         f.write(f"epochs_run: {len(history)}\n")
         f.write(f"elapsed_seconds: {elapsed:.2f}\n")
+
+    if args.noise or args.noise_aware:
+        print(
+            f"[mlp] running MC noise eval: quant_bits={args.quant_bits} "
+            f"noise_std={args.noise_std} trials={args.mc_trials} "
+            f"adc_full_range={args.adc_full_range} seed={args.noise_seed}"
+        )
+        eval_cfg = NoiseConfig(
+            quant_bits=args.quant_bits,
+            noise_std=args.noise_std,
+            mc_trials=args.mc_trials,
+            seed=args.noise_seed,
+        )
+        eval_wrapper = AnalogMLPWrapper(
+            net, eval_cfg, adc_full_range=args.adc_full_range,
+        )
+        eval_wrapper.to(device)
+        clean_loss = evaluate_clean(
+            eval_wrapper, val_loader, task_fn, device,
+        )
+        noise_result = evaluate_with_noise(
+            eval_wrapper, val_loader, task_fn, eval_cfg, device,
+        )
+        noise_result.clean_loss = clean_loss
+        print(
+            f"[mlp] noise eval: clean={clean_loss:.6f} "
+            f"noisy_mean={noise_result.mean:.6f} "
+            f"noisy_std={noise_result.std:.6f} "
+            f"p90={noise_result.p90:.6f} p95={noise_result.p95:.6f}"
+        )
+        with open(out_dir / "noise_metrics.txt", "w") as f:
+            f.write(f"quant_bits: {args.quant_bits}\n")
+            f.write(f"noise_std: {args.noise_std}\n")
+            f.write(f"mc_trials: {args.mc_trials}\n")
+            f.write(f"adc_full_range: {args.adc_full_range}\n")
+            f.write(f"noise_seed: {args.noise_seed}\n")
+            f.write(f"noise_aware_training: {bool(args.noise_aware)}\n")
+            f.write(f"clean_val_mse: {clean_loss:.6f}\n")
+            f.write(f"noisy_mean: {noise_result.mean:.6f}\n")
+            f.write(f"noisy_std: {noise_result.std:.6f}\n")
+            f.write(f"noisy_p50: {noise_result.p50:.6f}\n")
+            f.write(f"noisy_p90: {noise_result.p90:.6f}\n")
+            f.write(f"noisy_p95: {noise_result.p95:.6f}\n")
+            f.write(f"noisy_best: {noise_result.best:.6f}\n")
+            f.write(f"noisy_worst: {noise_result.worst:.6f}\n")
+            f.write(f"degradation_mean: {noise_result.mean - clean_loss:.6f}\n")
+            f.write("per_trial_losses:\n")
+            for i, l in enumerate(noise_result.losses):
+                f.write(f"  trial_{i:03d}: {l:.6f}\n")
 
     print(f"[mlp] artifacts in {out_dir}")
 

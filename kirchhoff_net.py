@@ -84,8 +84,6 @@ class KirchhoffNet(nn.Module):
         solver: str = "heun",
         deq_cfg: dict | None = None,
     ):
-        from sim_context import SimContext
-
         x = x0
         all_trajs = []
         stage_outputs = []
@@ -93,15 +91,12 @@ class KirchhoffNet(nn.Module):
         stage_ctxs = []
         for i, stage in enumerate(self.stages):
             tau_i = 1.0 if tau is None else tau
-            stage_ctx = ctx
-            if ctx is not None and ctx.edge_mismatch is not None:
+            if ctx is None:
+                stage_ctx = None
+            else:
                 start = self._edge_offsets[i]
                 end = self._edge_offsets[i + 1]
-                stage_ctx = SimContext(
-                    temp_c=ctx.temp_c,
-                    global_gain_shift=ctx.global_gain_shift,
-                edge_mismatch=ctx.edge_mismatch[start:end],
-                )
+                stage_ctx = ctx.slice_edges(start, end)
             x_drive_i = None if drive_targets is None else drive_targets[i]
             drive_scale_i = 0.0 if drive_scales is None else drive_scales[i]
             x, traj = stage(

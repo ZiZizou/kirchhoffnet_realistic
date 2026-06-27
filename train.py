@@ -1540,6 +1540,8 @@ def default_ctx_factory(net: KirchhoffNetWithIO):
             **{
                 "gain_shift_std": VARIATION["global_gain_shift_std"],
                 "mismatch_std": VARIATION["edge_mismatch_std"],
+                "global_isat_shift_std": VARIATION.get("global_isat_shift_std", 0.0),
+                "isat_mismatch_std": VARIATION.get("edge_isat_mismatch_std", 0.0),
             },
         )
     return _factory

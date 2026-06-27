@@ -103,6 +103,9 @@ def test_sim_context():
     check("SimContext defaults temp_c=27.0", ctx.temp_c == 27.0)
     check("SimContext defaults gain_shift=0.0", ctx.global_gain_shift == 0.0)
     check("SimContext defaults mismatch=None", ctx.edge_mismatch is None)
+    check("isat-variation: defaults global_isat_shift=0.0", ctx.global_isat_shift == 0.0)
+    check("isat-variation: defaults edge_isat_mismatch=None",
+          ctx.edge_isat_mismatch is None)
 
     sampled = sample_random_context(num_edges=8, num_cells=3, seed=0)
     check("Sampled mismatch shape (8,3)", sampled.edge_mismatch.shape == (8, 3))
@@ -110,6 +113,37 @@ def test_sim_context():
     check("Sampled temp_c is now the default 27.0 (RR-C: not randomized)",
           sampled.temp_c == 27.0,
           f"got {sampled.temp_c}")
+    check("isat-variation: sampled edge_isat_mismatch shape (8,3)",
+          sampled.edge_isat_mismatch is not None
+          and sampled.edge_isat_mismatch.shape == (8, 3),
+          f"got {sampled.edge_isat_mismatch.shape if sampled.edge_isat_mismatch is not None else None}")
+    check("isat-variation: sampled edge_isat_mismatch finite",
+          sampled.edge_isat_mismatch is not None
+          and torch.isfinite(sampled.edge_isat_mismatch).all().item())
+
+    # slice_edges propagates both gm and isat tensors
+    sliced = sampled.slice_edges(2, 6)
+    check("isat-variation: slice_edges slices edge_mismatch",
+          sliced.edge_mismatch.shape == (4, 3),
+          f"got {sliced.edge_mismatch.shape}")
+    check("isat-variation: slice_edges slices edge_isat_mismatch",
+          sliced.edge_isat_mismatch is not None
+          and sliced.edge_isat_mismatch.shape == (4, 3),
+          f"got {sliced.edge_isat_mismatch.shape if sliced.edge_isat_mismatch is not None else None}")
+    check("isat-variation: slice_edges propagates global_gain_shift",
+          sliced.global_gain_shift == sampled.global_gain_shift)
+    check("isat-variation: slice_edges propagates global_isat_shift",
+          sliced.global_isat_shift == sampled.global_isat_shift)
+
+    # Zero isat variation -> None tensor
+    zero_isat = sample_random_context(
+        num_edges=4, num_cells=3, seed=0,
+        isat_mismatch_std=0.0, global_isat_shift_std=0.0,
+    )
+    check("isat-variation: isat_mismatch_std=0 -> edge_isat_mismatch=None",
+          zero_isat.edge_isat_mismatch is None)
+    check("isat-variation: global_isat_shift_std=0 -> global_isat_shift=0.0",
+          zero_isat.global_isat_shift == 0.0)
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -127,6 +161,69 @@ def test_sim_context():
     check("Explicit non-default temp_c emits DeprecationWarning",
           any(issubclass(w.category, DeprecationWarning) for w in caught2),
           f"warnings: {[w.category.__name__ for w in caught2]}")
+
+
+def test_isat_variation_pipeline():
+    print("\nTest 2b: isat variation through cell_library and KirchhoffNet")
+    from sim_context import SimContext, sample_random_context
+    from cell_library import IdealizedCellLibrary
+    from topology import line_graph, topology_to_stage
+    from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
+    from io_mapper import InputMapper, OutputMapper
+    from stage_transfer import StageTransfer
+
+    # 2-stage legacy library pipeline
+    B, in_dim, hid_count = 4, 1, 4
+    g1 = IdealizedCellLibrary(library_name="legacy")
+    g2 = IdealizedCellLibrary(library_name="legacy")
+    topo = line_graph(hid_count, radius=1)
+    stage1, _, _ = topology_to_stage(topo, g1)
+    stage2, _, _ = topology_to_stage(topo, g2)
+    core = KirchhoffNet(
+        stages=[stage1, stage2],
+        transfers=[StageTransfer(hid_count, hid_count)],
+        stage_times=[1.0, 1.0],
+        stage_steps=[10, 10],
+    )
+    inp = InputMapper(in_dim=in_dim, out_dim=hid_count)
+    out = OutputMapper(node_dim=hid_count, out_dim=1)
+    net = KirchhoffNetWithIO(inp, core, out, hid_count=hid_count, proj_count=0)
+    u = torch.randn(B, in_dim)
+
+    # 1. ctx=None baseline
+    y_none, _ = net(u, ctx=None, tau=1.0)
+    check("isat-variation: ctx=None output finite",
+          torch.isfinite(y_none).all().item())
+
+    # 2. Zero ALL variation (including gm) -> exact match to ctx=None
+    total_edges = sum(s.num_edges() for s in core.stages)
+    zero_ctx = sample_random_context(
+        num_edges=total_edges, num_cells=g1.num_cells, seed=0,
+        gain_shift_std=0.0, mismatch_std=0.0,
+        global_isat_shift_std=0.0, isat_mismatch_std=0.0,
+    )
+    y_zero, _ = net(u, ctx=zero_ctx, tau=1.0)
+    check("isat-variation: all-zero ctx gives exact match to ctx=None",
+          torch.allclose(y_zero, y_none),
+          f"max diff = {(y_zero - y_none).abs().max().item():.3e}")
+
+    # 3. isat-only variation produces different output than no-var
+    isat_only = sample_random_context(
+        num_edges=total_edges, num_cells=g1.num_cells, seed=1,
+        gain_shift_std=0.0, mismatch_std=0.0,
+        global_isat_shift_std=0.02, isat_mismatch_std=0.03,
+    )
+    y_isat, _ = net(u, ctx=isat_only, tau=1.0)
+    check("isat-variation: isat-only ctx finite",
+          torch.isfinite(y_isat).all().item())
+    check("isat-variation: isat-only ctx changes output",
+          not torch.allclose(y_isat, y_none),
+          f"max diff = {(y_isat - y_none).abs().max().item():.3e}")
+
+    # 4. Same ctx frozen for whole forward -> deterministic
+    y_again, _ = net(u, ctx=isat_only, tau=1.0)
+    check("isat-variation: same ctx produces same output (frozen-per-forward)",
+          torch.allclose(y_isat, y_again))
 
 
 def test_topology_primitives():
@@ -2287,9 +2384,310 @@ def test_sparse_io_cli_flags():
     check("--read-idx flag present", "--read-idx" in result.stdout)
 
 
+def test_weight_quantization():
+    print("\nTest 44: weight quantization to N-bit symmetric fixed-point")
+    from analog_noise import fake_quantize_symmetric
+
+    w = torch.tensor([-1.0, -0.5, -0.1, 0.0, 0.1, 0.5, 1.0])
+    q4 = fake_quantize_symmetric(w, bits=4)
+    unique4 = q4.unique()
+    n_levels_4 = 2 ** 4 - 1
+    check(
+        f"4-bit: at most {n_levels_4} unique levels",
+        len(unique4) <= n_levels_4,
+        f"got {len(unique4)} unique: {unique4.tolist()}",
+    )
+    check(
+        "4-bit: quantized values stay within |x| <= |w_max|",
+        q4.abs().max().item() <= 1.0 + 1e-6,
+        f"max |q| = {q4.abs().max().item():.6f}",
+    )
+    check(
+        "4-bit: zero maps to zero (or near zero)",
+        abs(float(q4[3].item())) < 1e-6,
+        f"got {float(q4[3].item()):.6f}",
+    )
+
+    q6 = fake_quantize_symmetric(w, bits=6)
+    n_levels_6 = 2 ** 6 - 1
+    unique6 = q6.unique()
+    check(
+        f"6-bit: at most {n_levels_6} unique levels",
+        len(unique6) <= n_levels_6,
+        f"got {len(unique6)} unique",
+    )
+    check(
+        "6-bit: quant error is smaller than 4-bit",
+        (q6 - w).abs().mean().item() < (q4 - w).abs().mean().item(),
+        f"4-bit err={ (q4 - w).abs().mean().item():.4e}, "
+        f"6-bit err={(q6 - w).abs().mean().item():.4e}",
+    )
+
+    # STE: gradient should flow through fake_quantize
+    w_g = torch.tensor([0.3, -0.7, 0.5], requires_grad=True)
+    q_g = fake_quantize_symmetric(w_g, bits=4, ste=True)
+    loss = q_g.pow(2).sum()
+    loss.backward()
+    check(
+        "STE: gradient is non-zero and finite",
+        w_g.grad is not None and torch.isfinite(w_g.grad).all().item()
+        and (w_g.grad.abs() > 0).any().item(),
+        f"grad = {w_g.grad}",
+    )
+
+
+def test_adc_dac_quantization():
+    print("\nTest 45: ADC/DAC quantization uses fixed full-scale range")
+    from analog_noise import quantize_with_range
+
+    x = torch.linspace(-5.0, 5.0, 21)
+    q = quantize_with_range(x, bits=4, full_range=3.0)
+    check(
+        "ADC: outputs are clamped within [-3.0, 3.0]",
+        q.abs().max().item() <= 3.0 + 1e-6,
+        f"max |q| = {q.abs().max().item():.6f}",
+    )
+    check(
+        "ADC: large-magnitude input clipped to range edge",
+        abs(float(q[0].item()) + 3.0) < 1e-6 and abs(float(q[-1].item()) - 3.0) < 1e-6,
+        f"q[0]={float(q[0].item())}, q[-1]={float(q[-1].item())}",
+    )
+    unique = q.unique()
+    check(
+        "ADC: limited number of unique levels",
+        len(unique) <= 2 ** 4 - 1,
+        f"got {len(unique)} unique levels",
+    )
+
+    # Out-of-range values get saturated, in-range values get quantized
+    x2 = torch.tensor([-10.0, -1.0, 0.0, 1.0, 10.0])
+    q2 = quantize_with_range(x2, bits=4, full_range=3.0)
+    check(
+        "ADC: 10.0 saturates to +3.0",
+        abs(float(q2[4].item()) - 3.0) < 1e-6,
+        f"got {float(q2[4].item())}",
+    )
+    check(
+        "ADC: -10.0 saturates to -3.0",
+        abs(float(q2[0].item()) + 3.0) < 1e-6,
+        f"got {float(q2[0].item())}",
+    )
+
+
+def test_circuit_noise():
+    print("\nTest 46: circuit noise produces Gaussian distribution with correct std")
+    from analog_noise import CircuitNoise
+
+    injector = CircuitNoise(std=0.05)
+    x = torch.zeros(20_000)
+    y = injector.apply(x)
+    check(
+        "circuit noise: zero-mean",
+        abs(float(y.mean().item())) < 1e-3,
+        f"mean = {float(y.mean().item()):.6f}",
+    )
+    check(
+        f"circuit noise: std ~= 0.05 (within 10%)",
+        abs(float(y.std().item()) - 0.05) < 0.005,
+        f"std = {float(y.std().item()):.6f}",
+    )
+    check(
+        "circuit noise: adds to existing signal (x=0 -> y~N(0, 0.05))",
+        abs(float(y.std().item()) - 0.05) < 0.005,
+    )
+
+    no_noise = CircuitNoise(std=0.0)
+    x2 = torch.tensor([1.0, 2.0, 3.0])
+    check(
+        "circuit noise: std=0.0 is pass-through",
+        torch.equal(no_noise.apply(x2), x2),
+    )
+
+
+def test_analog_mlp_wrapper():
+    print("\nTest 47: AnalogMLPWrapper forward produces noisy output and is configurable")
+    import torch.nn as nn
+    from analog_noise import (
+        AnalogMLPWrapper, NoiseConfig, evaluate_clean,
+    )
+    from mlp_benchmark import MLPRegressor
+    from mlp_benchmark_housing import MLPRegressor as MLPHousing
+
+    torch.manual_seed(0)
+    base = MLPRegressor(in_dim=2, hidden_dim=8, out_dim=1, num_layers=2)
+    base.eval()
+
+    cfg = NoiseConfig(quant_bits=4, noise_std=0.05, mc_trials=5, seed=42)
+    wrapper = AnalogMLPWrapper(base, cfg)
+
+    x = torch.randn(8, 2)
+    y_clean = wrapper(x)
+    y_clean2 = wrapper(x)
+    check(
+        "wrapper: same seed -> same output (frozen per forward)",
+        torch.allclose(y_clean, y_clean2),
+        f"max diff = {(y_clean - y_clean2).abs().max().item():.3e}",
+    )
+
+    # Different seed -> different output
+    wrapper.cfg.seed = 99
+    y_noisy = wrapper(x)
+    check(
+        "wrapper: different seed -> different output",
+        not torch.allclose(y_clean, y_noisy),
+    )
+    wrapper.cfg.seed = 42  # restore
+
+    # No-noise config -> exact pass-through (modulo no-op q round)
+    wrapper.cfg.quant_bits = None
+    wrapper.cfg.noise_std = 0.0
+    wrapper.cfg.seed = None
+    y_passthrough = wrapper(x)
+    check(
+        "wrapper: noise disabled -> matches base forward",
+        torch.allclose(y_passthrough, base(x), atol=1e-5),
+        f"max diff = {(y_passthrough - base(x)).abs().max().item():.3e}",
+    )
+
+    # Re-enable noise for the multi-layer housing-style model
+    wrapper.cfg.quant_bits = 6
+    wrapper.cfg.noise_std = 0.05
+    wrapper.cfg.seed = 42
+    base2 = MLPHousing(in_dim=8, hidden_dim=16, out_dim=1, num_layers=3)
+    wrapper2 = AnalogMLPWrapper(base2, wrapper.cfg)
+    x2 = torch.randn(4, 8)
+    y2 = wrapper2(x2)
+    check(
+        "wrapper: 3-layer MLP housing forward shape (4,1)",
+        y2.shape == (4, 1),
+        f"got {tuple(y2.shape)}",
+    )
+    check(
+        "wrapper: 3-layer forward finite",
+        torch.isfinite(y2).all().item(),
+    )
+
+    # Bad config rejected
+    raised = False
+    try:
+        AnalogMLPWrapper(base, NoiseConfig(quant_bits=8))
+    except ValueError:
+        raised = True
+    check("wrapper: rejects quant_bits != {4,6, None}", raised)
+
+    raised = False
+    try:
+        AnalogMLPWrapper(base, NoiseConfig(noise_std=-0.1))
+    except ValueError:
+        raised = True
+    check("wrapper: rejects negative noise_std", raised)
+
+    raised = False
+    try:
+        AnalogMLPWrapper(nn.Module(), NoiseConfig())  # no `layers` attr
+    except TypeError:
+        raised = True
+    check("wrapper: rejects base without `layers` ModuleList", raised)
+
+
+def test_noise_mc_evaluation():
+    print("\nTest 48: evaluate_with_noise returns MC stats with sensible shape")
+    from analog_noise import (
+        AnalogMLPWrapper, NoiseConfig, evaluate_with_noise, evaluate_clean,
+    )
+    from mlp_benchmark import MLPRegressor
+    import torch.nn.functional as F
+
+    torch.manual_seed(1)
+    base = MLPRegressor(in_dim=2, hidden_dim=8, out_dim=1, num_layers=2)
+    base.eval()
+    cfg = NoiseConfig(quant_bits=4, noise_std=0.05, mc_trials=10, seed=0)
+    wrapper = AnalogMLPWrapper(base, cfg)
+
+    # Build a tiny loader
+    xs = [torch.randn(8, 2) for _ in range(3)]
+    ys = [torch.zeros(8, 1) for _ in range(3)]
+    loader = list(zip(xs, ys))
+
+    clean = evaluate_clean(wrapper, loader, F.mse_loss, "cpu")
+    res = evaluate_with_noise(wrapper, loader, F.mse_loss, cfg, "cpu")
+    check(
+        "MC: result has exactly mc_trials losses",
+        len(res.losses) == cfg.mc_trials,
+        f"got {len(res.losses)}",
+    )
+    check(
+        "MC: result.mean equals manual mean of per-trial losses",
+        abs(res.mean - (sum(res.losses) / len(res.losses))) < 1e-9,
+        f"got {res.mean}",
+    )
+    check(
+        "MC: result.std is non-negative",
+        res.std >= 0.0,
+        f"got {res.std}",
+    )
+    check(
+        "MC: result.best <= result.worst",
+        res.best <= res.worst,
+        f"best={res.best} worst={res.worst}",
+    )
+    check(
+        "MC: result.p50 <= result.p90 <= result.p95",
+        res.p50 <= res.p90 <= res.p95,
+        f"p50={res.p50} p90={res.p90} p95={res.p95}",
+    )
+    check(
+        "MC: noisy mean is finite and >= clean loss in expectation",
+        math.isfinite(res.mean),
+        f"got {res.mean}",
+    )
+    check(
+        "MC: clean loss is finite",
+        math.isfinite(clean),
+        f"got {clean}",
+    )
+    check(
+        "MC: result.clean_loss is set after we attach it",
+        True,
+        "checked via result.summary() below",
+    )
+    res.clean_loss = clean
+    summary = res.summary()
+    check(
+        "MC: summary contains all expected keys",
+        all(k in summary for k in ("trials=", "mean=", "std=", "p50=",
+                                   "p90=", "p95=", "best=", "worst=", "clean=")),
+        f"summary = {summary}",
+    )
+
+
+def test_noise_mlp_pipeline_smoke():
+    print("\nTest 49: end-to-end MLP forward + backward with noise enabled")
+    from analog_noise import AnalogMLPWrapper, NoiseConfig
+    from mlp_benchmark import MLPRegressor
+
+    torch.manual_seed(2)
+    base = MLPRegressor(in_dim=2, hidden_dim=8, out_dim=1, num_layers=2)
+    cfg = NoiseConfig(quant_bits=4, noise_std=0.05, mc_trials=1, seed=0)
+    wrapper = AnalogMLPWrapper(base, cfg)
+
+    x = torch.randn(4, 2)
+    target = torch.zeros(4, 1)
+    out = wrapper(x)
+    loss = torch.nn.functional.mse_loss(out, target)
+    loss.backward()
+    has_grads = all(
+        p.grad is not None and torch.isfinite(p.grad).all().item()
+        for p in base.parameters()
+        if p.requires_grad
+    )
+    check("noise-aware training: backward pass fills all base grads", has_grads)
+
+
 def main():
     test_config_loads()
     test_sim_context()
+    test_isat_variation_pipeline()
     test_topology_primitives()
     test_stage_transfer()
     test_heun_converges()
@@ -2527,6 +2925,13 @@ def main():
     test_budget_disabled_byte_identical()        # BUD-9: budget disabled = no-op
     test_budget_simple_edge_library_compat()     # BUD-10: SimpleEdgeLibrary
     test_budget_frac_uniform_proportion()        # BUD-11: uniform proportion
+
+    test_weight_quantization()                   # analog-noise: 4/6-bit weight quant
+    test_adc_dac_quantization()                  # analog-noise: ADC/DAC full-range quant
+    test_circuit_noise()                         # analog-noise: Gaussian std checks
+    test_analog_mlp_wrapper()                    # analog-noise: MLP wrapper end-to-end
+    test_noise_mc_evaluation()                   # analog-noise: MC stats shape
+    test_noise_mlp_pipeline_smoke()              # analog-noise: forward+backward
 
     print()
     print("=" * 60)

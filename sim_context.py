@@ -38,13 +38,20 @@ class SimContext:
             :class:`DeprecationWarning`.
         global_gain_shift: Scalar log-multiplicative shift on cell gm
             (e.g. +0.05 ≈ +5% global gm drift). Applied as gm *= exp(shift).
+        global_isat_shift: Scalar log-multiplicative shift on cell isat.
+            Applied as isat *= exp(shift).
         edge_mismatch: Optional [num_edges, num_cells] log-multiplicative
             mismatch tensor applied to gm. Pass None to disable.
+        edge_isat_mismatch: Optional [num_edges, num_cells]
+            log-multiplicative mismatch tensor applied to isat.
+            Pass None to disable.
     """
 
     temp_c: float = VARIATION["temp_c_default"]
     global_gain_shift: float = 0.0
+    global_isat_shift: float = 0.0
     edge_mismatch: torch.Tensor | None = None
+    edge_isat_mismatch: torch.Tensor | None = None
 
     def __post_init__(self):
         if self.temp_c != VARIATION["temp_c_default"]:
@@ -56,13 +63,37 @@ class SimContext:
             )
 
     def to(self, device, dtype=None):
-        """Move mismatch tensor to device/dtype; return self for chaining."""
+        """Move mismatch tensors to device/dtype; return self for chaining."""
+        kw = {"device": device}
+        if dtype is not None:
+            kw["dtype"] = dtype
         if self.edge_mismatch is not None:
-            kw = {"device": device}
-            if dtype is not None:
-                kw["dtype"] = dtype
             self.edge_mismatch = self.edge_mismatch.to(**kw)
+        if self.edge_isat_mismatch is not None:
+            self.edge_isat_mismatch = self.edge_isat_mismatch.to(**kw)
         return self
+
+    def slice_edges(self, start: int, end: int) -> "SimContext":
+        """Return a per-stage view of this context for edges [start:end).
+
+        All scalar fields are propagated unchanged; both ``edge_mismatch``
+        and ``edge_isat_mismatch`` tensors are sliced along dim 0 if present.
+        """
+        return SimContext(
+            temp_c=self.temp_c,
+            global_gain_shift=self.global_gain_shift,
+            global_isat_shift=self.global_isat_shift,
+            edge_mismatch=(
+                None
+                if self.edge_mismatch is None
+                else self.edge_mismatch[start:end]
+            ),
+            edge_isat_mismatch=(
+                None
+                if self.edge_isat_mismatch is None
+                else self.edge_isat_mismatch[start:end]
+            ),
+        )
 
 
 def sample_random_context(
@@ -72,6 +103,8 @@ def sample_random_context(
     temp_choices: list[float] | None = None,
     gain_shift_std: float | None = None,
     mismatch_std: float | None = None,
+    global_isat_shift_std: float | None = None,
+    isat_mismatch_std: float | None = None,
     device: str | torch.device = "cpu",
     dtype: torch.dtype = torch.float32,
     generator: torch.Generator | None = None,
@@ -80,9 +113,10 @@ def sample_random_context(
 ) -> SimContext:
     """Sample a random SimContext for a training iteration.
 
-    If `gain_shift_std` / `mismatch_std` are not provided, defaults from
-    config.VARIATION are used. If `seed` is provided (and `generator` is
-    not), a new CPU generator is created from that seed.
+    If `gain_shift_std`, `mismatch_std`, `global_isat_shift_std`, or
+    `isat_mismatch_std` are not provided, defaults from config.VARIATION
+    are used. If `seed` is provided (and `generator` is not), a new
+    generator is created from that seed.
 
     Note (RR-C): ``temp_c`` sampling is deprecated. By default
     ``sample_random_context`` returns ``VARIATION["temp_c_default"]`` (27.0).
@@ -94,11 +128,26 @@ def sample_random_context(
         gain_shift_std = float(VARIATION["global_gain_shift_std"])
     if mismatch_std is None:
         mismatch_std = float(VARIATION["edge_mismatch_std"])
+    if global_isat_shift_std is None:
+        global_isat_shift_std = float(
+            VARIATION.get("global_isat_shift_std", 0.0)
+        )
+    if isat_mismatch_std is None:
+        isat_mismatch_std = float(
+            VARIATION.get("edge_isat_mismatch_std", 0.0)
+        )
     if generator is None:
         generator = torch.Generator(device=device)
         if seed is not None:
             generator.manual_seed(int(seed))
-    gain_shift = torch.randn(1, generator=generator, dtype=dtype, device=device).item() * gain_shift_std
+    gain_shift = (
+        torch.randn(1, generator=generator, dtype=dtype, device=device).item()
+        * gain_shift_std
+    )
+    isat_shift = (
+        torch.randn(1, generator=generator, dtype=dtype, device=device).item()
+        * global_isat_shift_std
+    )
     if legacy_temp:
         warnings.warn(
             "legacy_temp=True samples temp_c from temp_choices. This path is "
@@ -110,5 +159,32 @@ def sample_random_context(
         temp = random.choice(choices)
     else:
         temp = float(VARIATION["temp_c_default"])
-    mismatch = torch.randn(num_edges, num_cells, dtype=dtype, device=device, generator=generator) * mismatch_std
-    return SimContext(temp_c=temp, global_gain_shift=gain_shift, edge_mismatch=mismatch)
+    mismatch = (
+        torch.randn(
+            num_edges,
+            num_cells,
+            dtype=dtype,
+            device=device,
+            generator=generator,
+        )
+        * mismatch_std
+    )
+    isat_mismatch = (
+        torch.randn(
+            num_edges,
+            num_cells,
+            dtype=dtype,
+            device=device,
+            generator=generator,
+        )
+        * isat_mismatch_std
+        if isat_mismatch_std > 0.0
+        else None
+    )
+    return SimContext(
+        temp_c=temp,
+        global_gain_shift=gain_shift,
+        global_isat_shift=isat_shift,
+        edge_mismatch=mismatch,
+        edge_isat_mismatch=isat_mismatch,
+    )

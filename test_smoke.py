@@ -2684,6 +2684,154 @@ def test_noise_mlp_pipeline_smoke():
     check("noise-aware training: backward pass fills all base grads", has_grads)
 
 
+def test_no_adc_flag():
+    print("\nTest 50: --no-adc disables per-layer ADC/DAC quantization")
+    import subprocess
+    import os
+    import tempfile
+    import torch.nn.functional as F
+    from analog_noise import (
+        AnalogMLPWrapper, NoiseConfig, evaluate_clean, evaluate_with_noise,
+    )
+    from mlp_benchmark import MLPRegressor
+
+    # 1. CLI flag present in both scripts' --help output
+    venv_py = "/home/annaik/Documents/ASPDAC_2026/venv/bin/python"
+    smooth_help = subprocess.run(
+        [venv_py,
+         "/home/annaik/Documents/ASPDAC_2026/kirchhoff_redesign/ideal/mlp_benchmark.py",
+         "--help"],
+        capture_output=True, text=True,
+    ).stdout
+    housing_help = subprocess.run(
+        [venv_py,
+         "/home/annaik/Documents/ASPDAC_2026/kirchhoff_redesign/ideal/mlp_benchmark_housing.py",
+         "--help"],
+        capture_output=True, text=True,
+    ).stdout
+    check("--no-adc flag present in mlp_benchmark.py --help",
+          "--no-adc" in smooth_help)
+    check("--no-adc flag present in mlp_benchmark_housing.py --help",
+          "--no-adc" in housing_help)
+
+    # 2. NoiseConfig with all three quantize flags False: pure-digital mode.
+    # Only weight quantization and circuit noise apply; activations pass through
+    # without per-layer rounding.
+    torch.manual_seed(3)
+    base = MLPRegressor(in_dim=2, hidden_dim=8, out_dim=1, num_layers=2)
+    base.eval()
+
+    # Reference: weight quant only, noise off, no ADC/DAC
+    cfg_pure = NoiseConfig(
+        quant_bits=4,
+        noise_std=0.0,
+        mc_trials=1,
+        quantize_input=False,
+        quantize_output=False,
+        quantize_intermediate=False,
+        weight_noise=False,
+        activation_noise=False,
+    )
+    wrapper_pure = AnalogMLPWrapper(base, cfg_pure)
+    x = torch.randn(4, 2)
+    y_pure = wrapper_pure(x)
+
+    # Compare with a manual reference that quantizes weights but leaves
+    # activations alone (uses the same scale logic as fake_quantize_symmetric).
+    from analog_noise import fake_quantize_symmetric
+    with torch.no_grad():
+        q_fc1 = fake_quantize_symmetric(base.fc1.weight, bits=4, ste=False)
+        q_fc2 = fake_quantize_symmetric(base.fc2.weight, bits=4, ste=False)
+        h = F.relu(F.linear(x, q_fc1, base.fc1.bias))
+        y_ref = F.linear(h, q_fc2, base.fc2.bias)
+    check(
+        "no-adc: wrapper output matches manual weight-only quantization",
+        torch.allclose(y_pure, y_ref, atol=1e-5),
+        f"max diff = {(y_pure - y_ref).abs().max().item():.3e}",
+    )
+
+    # 3. With circuit noise + --no-adc, output should differ from base
+    # (weights are perturbed) but stay finite and well-behaved.
+    cfg_noisy = NoiseConfig(
+        quant_bits=4,
+        noise_std=0.05,
+        mc_trials=1,
+        seed=7,
+        quantize_input=False,
+        quantize_output=False,
+        quantize_intermediate=False,
+    )
+    wrapper_noisy = AnalogMLPWrapper(base, cfg_noisy)
+    y_noisy = wrapper_noisy(x)
+    with torch.no_grad():
+        y_base = base(x)
+    check("no-adc + circuit noise: output finite",
+          torch.isfinite(y_noisy).all().item())
+    check("no-adc + circuit noise: output differs from clean base",
+          not torch.allclose(y_noisy, y_base, atol=1e-3))
+
+    # 4. Compare degradation with and without --no-adc. Pure-digital should
+    # generally degrade less than full analog-accelerator mode.
+    loader = [(torch.randn(8, 2), torch.zeros(8, 1)) for _ in range(2)]
+
+    cfg_full = NoiseConfig(
+        quant_bits=4, noise_std=0.05, mc_trials=5, seed=0,
+        quantize_input=True, quantize_output=True, quantize_intermediate=True,
+    )
+    cfg_digital = NoiseConfig(
+        quant_bits=4, noise_std=0.05, mc_trials=5, seed=0,
+        quantize_input=False, quantize_output=False, quantize_intermediate=False,
+    )
+    wrapper_full = AnalogMLPWrapper(
+        MLPRegressor(in_dim=2, hidden_dim=8, out_dim=1), cfg_full,
+    )
+    wrapper_digital = AnalogMLPWrapper(
+        MLPRegressor(in_dim=2, hidden_dim=8, out_dim=1), cfg_digital,
+    )
+    res_full = evaluate_with_noise(wrapper_full, loader, F.mse_loss,
+                                   cfg_full, "cpu")
+    res_digital = evaluate_with_noise(wrapper_digital, loader, F.mse_loss,
+                                      cfg_digital, "cpu")
+    check(
+        "no-adc: pure-digital degradation <= full analog degradation",
+        res_digital.mean <= res_full.mean + 1e-3,
+        f"digital={res_digital.mean:.6f}, full={res_full.mean:.6f}",
+    )
+
+    # 5. End-to-end CLI smoke: train tiny model with --noise --no-adc and
+    # confirm noise_metrics.txt records adc_quantization: False.
+    with tempfile.TemporaryDirectory() as tmp:
+        out_dir = os.path.join(tmp, "out")
+        result = subprocess.run(
+            [venv_py,
+             "/home/annaik/Documents/ASPDAC_2026/kirchhoff_redesign/ideal/mlp_benchmark.py",
+             "--epochs", "2", "--patience", "100",
+             "--hidden-dim", "20",
+             "--noise", "--no-adc", "--quant-bits", "4",
+             "--mc-trials", "3",
+             "--output", out_dir],
+            capture_output=True, text=True,
+            cwd="/home/annaik/Documents/ASPDAC_2026/kirchhoff_redesign/ideal",
+        )
+        metrics_path = os.path.join(out_dir, "noise_metrics.txt")
+        check(
+            "no-adc CLI smoke: --noise --no-adc exit OK",
+            result.returncode == 0,
+            f"rc={result.returncode}, stderr={result.stderr[-300:]}",
+        )
+        check(
+            "no-adc CLI smoke: noise_metrics.txt created",
+            os.path.exists(metrics_path),
+        )
+        if os.path.exists(metrics_path):
+            text = open(metrics_path).read()
+            check(
+                "no-adc CLI smoke: noise_metrics.txt records adc_quantization: False",
+                "adc_quantization: False" in text,
+                f"contents: {text}",
+            )
+
+
 def main():
     test_config_loads()
     test_sim_context()
@@ -2932,6 +3080,7 @@ def main():
     test_analog_mlp_wrapper()                    # analog-noise: MLP wrapper end-to-end
     test_noise_mc_evaluation()                   # analog-noise: MC stats shape
     test_noise_mlp_pipeline_smoke()              # analog-noise: forward+backward
+    test_no_adc_flag()                           # analog-noise: --no-adc CLI flag
 
     print()
     print("=" * 60)

@@ -275,6 +275,12 @@ def main():
                              "quantization (default: 3.0).")
     parser.add_argument("--noise-seed", type=int, default=0,
                         help="Seed for noise sampling (default: 0).")
+    parser.add_argument("--no-adc", action="store_true",
+                        help="Disable per-layer ADC/DAC quantization "
+                             "(pure-digital accelerator mode: weight "
+                             "quantization + circuit noise only, no "
+                             "inter-layer converters). Only effective when "
+                             "--noise or --noise-aware is set.")
     args = parser.parse_args()
 
     epochs = args.epochs if args.epochs is not None else int(OPTIM["epochs"])
@@ -304,6 +310,9 @@ def main():
         noise_std=args.noise_std if args.noise or args.noise_aware else 0.0,
         mc_trials=args.mc_trials,
         seed=args.noise_seed,
+        quantize_input=not args.no_adc,
+        quantize_output=not args.no_adc,
+        quantize_intermediate=not args.no_adc,
     )
     train_wrapper: AnalogMLPWrapper | None = None
     if args.noise_aware:
@@ -472,13 +481,17 @@ def main():
         print(
             f"[mlp_housing] running MC noise eval: quant_bits={args.quant_bits} "
             f"noise_std={args.noise_std} trials={args.mc_trials} "
-            f"adc_full_range={args.adc_full_range} seed={args.noise_seed}"
+            f"adc_full_range={args.adc_full_range} seed={args.noise_seed} "
+            f"adc_enabled={not args.no_adc}"
         )
         eval_cfg = NoiseConfig(
             quant_bits=args.quant_bits,
             noise_std=args.noise_std,
             mc_trials=args.mc_trials,
             seed=args.noise_seed,
+            quantize_input=not args.no_adc,
+            quantize_output=not args.no_adc,
+            quantize_intermediate=not args.no_adc,
         )
         eval_wrapper = AnalogMLPWrapper(
             net, eval_cfg, adc_full_range=args.adc_full_range,
@@ -504,6 +517,7 @@ def main():
             f.write(f"adc_full_range: {args.adc_full_range}\n")
             f.write(f"noise_seed: {args.noise_seed}\n")
             f.write(f"noise_aware_training: {bool(args.noise_aware)}\n")
+            f.write(f"adc_quantization: {not bool(args.no_adc)}\n")
             f.write(f"clean_val_huber: {clean_loss:.6f}\n")
             f.write(f"noisy_mean: {noise_result.mean:.6f}\n")
             f.write(f"noisy_std: {noise_result.std:.6f}\n")

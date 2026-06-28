@@ -762,6 +762,7 @@ def _run_noise_evaluation(
     out_dir: Path,
     label: str,
     cell_mode: str = "ste",
+    metric_name: str = "mse",
 ) -> dict:
     """Run kirchhoff-noise MC evaluation on ``base_net`` and write metrics.
 
@@ -838,7 +839,7 @@ def _run_noise_evaluation(
         f.write(f"noise_seed: {args.noise_seed}\n")
         f.write(f"noise_aware_training: {bool(args.noise_aware)}\n")
         f.write(f"label: {label}\n")
-        f.write(f"clean_val_mse: {clean_val:.6f}\n")
+        f.write(f"clean_val_{metric_name}: {clean_val:.6f}\n")
         f.write(f"noisy_mean: {result.mean:.6f}\n")
         f.write(f"noisy_std: {result.std:.6f}\n")
         f.write(f"noisy_p50: {result.p50:.6f}\n")
@@ -3932,6 +3933,7 @@ def main():
     # --noise or --noise-aware is set.
     # ----------------------------------------------------------------
     if args.noise or args.noise_aware:
+        metric_name = PRESETS[args.problem]["loss"]
         if needs_prune:
             # When pruning is on, evaluate both pre-prune (best checkpoint)
             # and post-prune (deployable) networks so the user can compare.
@@ -3942,17 +3944,20 @@ def main():
                 raw_net, val_loader, task_fn, ctx_factory,
                 device, args, out_dir, "main",
                 cell_mode="ste",
+                metric_name=metric_name,
             )
             _run_noise_evaluation(
                 raw_pruned, val_loader, task_fn, ctx_factory,
                 device, args, out_dir, "pruned",
                 cell_mode="ste",
+                metric_name=metric_name,
             )
         else:
             _run_noise_evaluation(
                 raw_net, val_loader, task_fn, ctx_factory,
                 device, args, out_dir, "main",
                 cell_mode="ste",
+                metric_name=metric_name,
             )
 
     print(f"[train] done — artifacts in {out_dir}")

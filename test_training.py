@@ -1,0 +1,839 @@
+"""Training tests for KirchhoffNet.
+
+These tests verify training loops, optimizer steps, and full grid
+forward/backward passes. Moved out of test_smoke.py so the smoke test
+stays fast.
+
+Run with:
+    ~/Documents/ASPDAC_2026/venv/bin/python kirchhoff_redesign/ideal/test_training.py
+"""
+
+import copy
+import os
+import sys
+import math
+import torch
+import torch.nn.functional as F
+
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+if THIS_DIR not in sys.path:
+    sys.path.insert(0, THIS_DIR)
+
+passed = 0
+failed = 0
+
+
+def check(name, condition, msg=""):
+    global passed, failed
+    status = "PASS" if condition else "FAIL"
+    suffix = f": {msg}" if msg and not condition else ""
+    print(f"  [{status}] {name}{suffix}")
+    if condition:
+        passed += 1
+    else:
+        failed += 1
+
+
+def main():
+    test_sparsity_push()
+    test_round_trip_preset()
+    test_no_adc_flag()
+    test_smooth2d_preset()
+    test_smooth2d_grid_preset()
+    test_housing_grid_preset()
+    test_persistent_drive_auto_fan_out()
+    test_mlp_benchmark()
+    test_mlp_benchmark_tanh()
+    test_v15_cell_parameters_preset_smooth2d_grid()
+    test_stage_lr_scale_scheduler_compat()
+
+    print()
+    print("=" * 60)
+    print(f"Training test results: {passed} passed, {failed} failed")
+    print("=" * 60)
+    if failed:
+        sys.exit(1)
+    else:
+        sys.exit(0)
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+def test_sparsity_push():
+    print("\nTest 8: sparsity regularizer reduces P(active) over training")
+    from cell_library import IdealizedCellLibrary
+    from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
+    from kirchhoff_net import KirchhoffNetWithIO, KirchhoffNet
+    from io_mapper import InputMapper, OutputMapper
+    from sim_context import SimContext
+    from train import compute_loss, make_optimizer, default_ctx_factory, LAMBDAS
+
+    cell_lib = IdealizedCellLibrary()
+    hid = cluster_graph(3, edge_prob=0.5, seed=0)
+    builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
+    topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
+                         proj_pattern="all_to_all")
+    stage, active, _ = topology_to_stage(topo, cell_lib=cell_lib)
+    core = KirchhoffNet(stages=[stage], transfers=[], stage_times=[0.3], stage_steps=[8])
+    inp = InputMapper(in_dim=1, out_dim=3)
+    out = OutputMapper(node_dim=3, out_dim=1)
+    net = KirchhoffNetWithIO(inp, core, out, hid_count=3, proj_count=0)
+
+    opt = make_optimizer(net, lr=1e-2)
+    u = torch.linspace(-1.0, 1.0, 16).unsqueeze(1)
+    target = torch.zeros(16, 1)
+    ctx_factory = default_ctx_factory(net)
+
+    with torch.no_grad():
+        probs_before = F.softmax(stage.logits, dim=-1).clone()
+
+    lambdas = dict(LAMBDAS)
+    lambdas["sparsity"] = 1.0
+    for step in range(50):
+        ctx = ctx_factory(batch_size=16, device=u.device)
+        opt.zero_grad()
+        loss_task, loss_structural = compute_loss(net, u, target, ctx, F.mse_loss, lambdas=lambdas, tau=1.0)
+        loss_task.backward(retain_graph=True)
+        loss_structural.backward()
+        opt.step()
+
+    with torch.no_grad():
+        probs_after = F.softmax(stage.logits, dim=-1)
+
+    p_active_before = probs_before[:, :3].sum().item()
+    p_active_after = probs_after[:, :3].sum().item()
+    check("sparsity: P(active) decreased", p_active_after < p_active_before,
+          f"before={p_active_before:.3f} after={p_active_after:.3f}")
+    check("sparsity: P(Z) increased", probs_after[:, 3].mean().item() > probs_before[:, 3].mean().item())
+
+
+def test_round_trip_preset():
+    print("\nTest 10: end-to-end round-trip with sinx preset (forward + backward + step)")
+    from topology import build_net_from_preset
+    from cell_library import make_default_library
+    from sim_context import SimContext
+    from train import compute_loss, make_optimizer, default_ctx_factory, LAMBDAS
+
+    net = build_net_from_preset("sinx", cell_lib=make_default_library())
+
+    u = torch.linspace(-math.pi, math.pi, 32).unsqueeze(1)
+    target = torch.sin(u)
+    opt = make_optimizer(net, lr=1e-3)
+    ctx_factory = default_ctx_factory(net)
+    ctx = ctx_factory(batch_size=32, device=u.device)
+
+    loss_task, loss_structural, parts = compute_loss(net, u, target, ctx, F.mse_loss, return_parts=True)
+    check("sinx preset: total loss finite", math.isfinite(parts["total"]))
+    check("sinx preset: task loss finite", math.isfinite(parts["task"]))
+
+    loss_task.backward(retain_graph=True)
+    loss_structural.backward()
+    torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=5.0)
+    opt.step()
+    check("sinx preset: optimization step OK", True)
+
+    # Second forward should differ from first (parameters changed)
+    with torch.no_grad():
+        y1, _ = net(u, ctx=SimContext(), store_trajectory=False)
+        y2, _ = net(u, ctx=SimContext(), store_trajectory=False)
+    check("sinx preset: re-forward succeeds (no NaN)", torch.isfinite(y2).all().item())
+
+
+def test_no_adc_flag():
+    print("\nTest 50: --no-adc disables per-layer ADC/DAC quantization")
+    import subprocess
+    import tempfile
+    import torch.nn.functional as F
+    from analog_noise import (
+        AnalogMLPWrapper, NoiseConfig, evaluate_clean, evaluate_with_noise,
+    )
+    from mlp_benchmark import MLPRegressor
+
+    # 1. CLI flag present in both scripts' --help output
+    venv_py = "/home/annaik/Documents/ASPDAC_2026/venv/bin/python"
+    smooth_help = subprocess.run(
+        [venv_py,
+         "/home/annaik/Documents/ASPDAC_2026/kirchhoff_redesign/ideal/mlp_benchmark.py",
+         "--help"],
+        capture_output=True, text=True,
+    ).stdout
+    housing_help = subprocess.run(
+        [venv_py,
+         "/home/annaik/Documents/ASPDAC_2026/kirchhoff_redesign/ideal/mlp_benchmark_housing.py",
+         "--help"],
+        capture_output=True, text=True,
+    ).stdout
+    check("--no-adc flag present in mlp_benchmark.py --help",
+          "--no-adc" in smooth_help)
+    check("--no-adc flag present in mlp_benchmark_housing.py --help",
+          "--no-adc" in housing_help)
+
+    # 2. NoiseConfig with all three quantize flags False: pure-digital mode.
+    torch.manual_seed(3)
+    base = MLPRegressor(in_dim=2, hidden_dim=8, out_dim=1, num_layers=2)
+    base.eval()
+
+    cfg_pure = NoiseConfig(
+        quant_bits=4,
+        noise_std=0.0,
+        mc_trials=1,
+        quantize_input=False,
+        quantize_output=False,
+        quantize_intermediate=False,
+        weight_noise=False,
+        activation_noise=False,
+    )
+    wrapper_pure = AnalogMLPWrapper(base, cfg_pure)
+    x = torch.randn(4, 2)
+    y_pure = wrapper_pure(x)
+
+    from analog_noise import fake_quantize_symmetric
+    with torch.no_grad():
+        q_fc1 = fake_quantize_symmetric(base.fc1.weight, bits=4, ste=False)
+        q_fc2 = fake_quantize_symmetric(base.fc2.weight, bits=4, ste=False)
+        h = F.relu(F.linear(x, q_fc1, base.fc1.bias))
+        y_ref = F.linear(h, q_fc2, base.fc2.bias)
+    check(
+        "no-adc: wrapper output matches manual weight-only quantization",
+        torch.allclose(y_pure, y_ref, atol=1e-5),
+        f"max diff = {(y_pure - y_ref).abs().max().item():.3e}",
+    )
+
+    # 3. With circuit noise + --no-adc, output should differ from base
+    cfg_noisy = NoiseConfig(
+        quant_bits=4,
+        noise_std=0.05,
+        mc_trials=1,
+        seed=7,
+        quantize_input=False,
+        quantize_output=False,
+        quantize_intermediate=False,
+    )
+    wrapper_noisy = AnalogMLPWrapper(base, cfg_noisy)
+    y_noisy = wrapper_noisy(x)
+    with torch.no_grad():
+        y_base = base(x)
+    check("no-adc + circuit noise: output finite",
+          torch.isfinite(y_noisy).all().item())
+    check("no-adc + circuit noise: output differs from clean base",
+          not torch.allclose(y_noisy, y_base, atol=1e-3))
+
+    # 4. Compare degradation with and without --no-adc.
+    loader = [(torch.randn(8, 2), torch.zeros(8, 1)) for _ in range(2)]
+
+    cfg_full = NoiseConfig(
+        quant_bits=4, noise_std=0.05, mc_trials=5, seed=0,
+        quantize_input=True, quantize_output=True, quantize_intermediate=True,
+    )
+    cfg_digital = NoiseConfig(
+        quant_bits=4, noise_std=0.05, mc_trials=5, seed=0,
+        quantize_input=False, quantize_output=False, quantize_intermediate=False,
+    )
+    wrapper_full = AnalogMLPWrapper(
+        MLPRegressor(in_dim=2, hidden_dim=8, out_dim=1), cfg_full,
+    )
+    wrapper_digital = AnalogMLPWrapper(
+        MLPRegressor(in_dim=2, hidden_dim=8, out_dim=1), cfg_digital,
+    )
+    res_full = evaluate_with_noise(wrapper_full, loader, F.mse_loss,
+                                   cfg_full, "cpu")
+    res_digital = evaluate_with_noise(wrapper_digital, loader, F.mse_loss,
+                                      cfg_digital, "cpu")
+    check(
+        "no-adc: pure-digital degradation <= full analog degradation",
+        res_digital.mean <= res_full.mean + 1e-3,
+        f"digital={res_digital.mean:.6f}, full={res_full.mean:.6f}",
+    )
+
+    # 5. End-to-end CLI smoke: train tiny model with --noise --no-adc
+    with tempfile.TemporaryDirectory() as tmp:
+        out_dir = os.path.join(tmp, "out")
+        result = subprocess.run(
+            [venv_py,
+             "/home/annaik/Documents/ASPDAC_2026/kirchhoff_redesign/ideal/mlp_benchmark.py",
+             "--epochs", "1", "--patience", "100",
+             "--hidden-dim", "20",
+             "--noise", "--no-adc", "--quant-bits", "4",
+             "--mc-trials", "3",
+             "--output", out_dir],
+            capture_output=True, text=True,
+            cwd="/home/annaik/Documents/ASPDAC_2026/kirchhoff_redesign/ideal",
+        )
+        metrics_path = os.path.join(out_dir, "noise_metrics.txt")
+        check(
+            "no-adc CLI smoke: --noise --no-adc exit OK",
+            result.returncode == 0,
+            f"rc={result.returncode}, stderr={result.stderr[-300:]}",
+        )
+        check(
+            "no-adc CLI smoke: noise_metrics.txt created",
+            os.path.exists(metrics_path),
+        )
+        if os.path.exists(metrics_path):
+            text = open(metrics_path).read()
+            check(
+                "no-adc CLI smoke: noise_metrics.txt records adc_quantization: False",
+                "adc_quantization: False" in text,
+                f"contents: {text}",
+            )
+
+
+def test_smooth2d_preset():
+    print("\nTest NN: smooth2d preset structure and Franke dataset")
+    from config import PRESETS
+    from topology import build_net_from_preset
+    from cell_library import make_default_library
+    from io_mapper import SparseInputMapper
+
+    cfg = PRESETS.get("smooth2d")
+    check("smooth2d present in PRESETS", cfg is not None)
+    if cfg is None:
+        return
+
+    s = cfg["stages"][0]
+    check("smooth2d: 1 stage", len(cfg["stages"]) == 1)
+    check("smooth2d: num_inputs=2", s["num_inputs"] == 2)
+    check("smooth2d: num_hidden=10", s["num_hidden"] == 10)
+    check("smooth2d: num_proj=2", s["num_proj"] == 2)
+    check("smooth2d: line topology (topology-fix: no 1-hop write->read bypass)",
+          s["hidden_family"] == "line")
+    check("smooth2d: radius=2 (line topology)", s["hidden_kwargs"].get("radius") == 2)
+    check("smooth2d: write_idx=[0,1]", cfg["write_idx"] == [0, 1])
+    check("smooth2d: read_idx=[9] (hidden, not proj)", cfg["read_idx"] == [9])
+    check("smooth2d: loss=mse", cfg["loss"] == "mse")
+    check("smooth2d: out_dim=1", cfg["out_dim"] == 1)
+    from config import SOLVER
+    check("smooth2d: t_span=SOLVER.t_span",
+          s["t_span"] == SOLVER["t_span"],
+          f"got {s['t_span']}")
+    check("smooth2d: num_steps=SOLVER.num_steps",
+          s["num_steps"] == SOLVER["num_steps"],
+          f"got {s['num_steps']}")
+    check("smooth2d: no lambdas override", "lambdas" not in cfg)
+
+    cell_lib = make_default_library()
+    net = build_net_from_preset("smooth2d", cell_lib=cell_lib)
+    check("smooth2d: builds successfully", net is not None)
+    check("smooth2d: write_idx=[0,1]", net.write_idx == [0, 1])
+    check("smooth2d: read_idx=[9]", net.read_idx == [9])
+    check("smooth2d: uses SparseInputMapper",
+          isinstance(net.input_mapper, SparseInputMapper))
+    check("smooth2d: hid_count=10", net.hid_count == 10)
+    check("smooth2d: proj_count=2", net.proj_count == 2)
+
+    u = torch.rand(8, 2)
+    ctx = None
+    out, _ = net(u, ctx=ctx)
+    check("smooth2d: forward shape (8,1)", out.shape == (8, 1))
+    check("smooth2d: forward output is finite", torch.isfinite(out).all().item())
+
+    from train_script import _franke
+    x1 = torch.linspace(0, 1, 50)
+    x2 = torch.linspace(0, 1, 50)
+    gx1, gx2 = torch.meshgrid(x1, x2, indexing="ij")
+    f = _franke(gx1, gx2)
+    check("smooth2d: Franke output is finite", torch.isfinite(f).all().item())
+    check("smooth2d: Franke range in plausible bounds",
+          f.min().item() >= -0.1 and f.max().item() <= 1.3,
+          f"min={f.min().item():.4f} max={f.max().item():.4f}")
+
+    from train import make_optimizer
+    from train_script import make_data_smooth2d
+    train_loader, _, task_fn = make_data_smooth2d(batch_size=8, val_size=16)
+    optimizer = make_optimizer(net, lr=1e-3)
+    net.train()
+    for u_b, y_b in train_loader:
+        optimizer.zero_grad()
+        out_b, _ = net(u_b, ctx=None)
+        loss = task_fn(out_b, y_b)
+        loss.backward()
+        optimizer.step()
+        check("smooth2d: 1-batch backward finite", math.isfinite(float(loss.item())))
+        break
+
+
+def test_smooth2d_grid_preset():
+    print("\nTest NN2: smooth2d_grid preset (7x7 grid + 3 proj, fan-out I/O, 3 stages)")
+    from config import PRESETS
+    from topology import build_net_from_preset
+    from cell_library import make_default_library
+    from io_mapper import FanOutInputMapper, OutputMapper
+    from stage_transfer import StageTransfer
+
+    cfg = PRESETS.get("smooth2d_grid")
+    check("smooth2d_grid present in PRESETS", cfg is not None)
+    if cfg is None:
+        return
+
+    s = cfg["stages"][0]
+    check("smooth2d_grid: 3 stages (multistage-smooth2d-grid spec)",
+          len(cfg["stages"]) == 3)
+    check("smooth2d_grid: num_inputs=2", s["num_inputs"] == 2)
+    check("smooth2d_grid: num_hidden=49", s["num_hidden"] == 49)
+    check("smooth2d_grid: num_proj=3", s["num_proj"] == 3)
+    check("smooth2d_grid: hidden_family=grid", s["hidden_family"] == "grid")
+    check("smooth2d_grid: height=7", s["hidden_kwargs"].get("height") == 7)
+    check("smooth2d_grid: width=7", s["hidden_kwargs"].get("width") == 7)
+    check("smooth2d_grid: kernel_size=3 (8-neighbor)",
+          s["hidden_kwargs"].get("kernel_size") == 3)
+    check("smooth2d_grid: write_mode=fan_out", cfg.get("write_mode") == "fan_out")
+    check("smooth2d_grid: write_fan_out maps both inputs",
+          cfg.get("write_fan_out") == {0: [0, 14, 28, 42], 1: [6, 20, 34, 48]})
+    check("smooth2d_grid: read_idx = 7 center column + 3 proj",
+          cfg["read_idx"] == [3, 10, 17, 24, 31, 38, 45, 49, 50, 51])
+    check("smooth2d_grid: loss=mse", cfg["loss"] == "mse")
+    check("smooth2d_grid: out_dim=1", cfg["out_dim"] == 1)
+    check("smooth2d_grid: per-stage t_span=5/3 (~1.667)",
+          abs(s["t_span"] - 5.0 / 3) < 1e-6)
+    check("smooth2d_grid: per-stage num_steps=17 (round(50/3))",
+          s["num_steps"] == 17)
+    check("smooth2d_grid: all 3 stages share t_span/num_steps",
+          all(st["t_span"] == s["t_span"] and st["num_steps"] == s["num_steps"]
+              for st in cfg["stages"]))
+    check("smooth2d_grid: proj_pattern=all_to_all",
+          s.get("proj_pattern") == "all_to_all")
+    check("smooth2d_grid: legacy preset lambdas edge_gate=5e-6",
+          cfg.get("lambdas", {}).get("edge_gate") == 5e-6)
+    check("smooth2d_grid: legacy preset lambdas node_gate=0.0 (deprecate-node-gates)",
+          cfg.get("lambdas", {}).get("node_gate") == 0.0)
+    check("smooth2d_grid: legacy preset lambdas power=1e-5",
+          cfg.get("lambdas", {}).get("power") == 1e-5)
+    check("smooth2d_grid: legacy preset lambdas capacitance=0.0 (deprecate-node-gates)",
+          cfg.get("lambdas", {}).get("capacitance") == 0.0)
+
+    cell_lib = make_default_library()
+    net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
+    check("smooth2d_grid: builds successfully (center column reads >= 3 hops from writes)",
+          net is not None)
+    check("smooth2d_grid: core has 3 stages", len(net.core.stages) == 3)
+    check("smooth2d_grid: core has 2 StageTransfer modules (N-1)",
+          len(net.core.transfers) == 2)
+    check("smooth2d_grid: all transfers are StageTransfer instances",
+          all(isinstance(t, StageTransfer) for t in net.core.transfers))
+    check("smooth2d_grid: all transfers are identity (52->52)",
+          all(t.in_nodes == 52 and t.out_nodes == 52 for t in net.core.transfers))
+    check("smooth2d_grid: write_idx = sorted union of fan_out targets",
+          net.write_idx == [0, 6, 14, 20, 28, 34, 42, 48])
+    check("smooth2d_grid: read_idx = 7 center column + 3 proj",
+          net.read_idx == [3, 10, 17, 24, 31, 38, 45, 49, 50, 51])
+    check("smooth2d_grid: uses FanOutInputMapper",
+          isinstance(net.input_mapper, FanOutInputMapper))
+    check("smooth2d_grid: hid_count=49", net.hid_count == 49)
+    check("smooth2d_grid: proj_count=3", net.proj_count == 3)
+    check("smooth2d_grid: final_hid_count=49", net.final_hid_count == 49)
+    check("smooth2d_grid: final_proj_count=3", net.final_proj_count == 3)
+    check("smooth2d_grid: OutputMapper is sparse read (read_idx set)",
+          isinstance(net.output_mapper, OutputMapper)
+          and net.output_mapper.read_idx == [3, 10, 17, 24, 31, 38, 45, 49, 50, 51])
+
+    n_hidden = 49
+    n_proj = 3
+    n_hidden_edges = 156
+    n_hidden_repeat = n_hidden_edges * 2
+    n_proj_edges = n_hidden * n_proj
+    expected_total = n_hidden_repeat + n_proj_edges
+    for i, stage in enumerate(net.core.stages):
+        check(f"smooth2d_grid: stage {i} edge count = {expected_total} (grid 312 + proj 147)",
+              int(stage.src.shape[0]) == expected_total,
+              f"got {int(stage.src.shape[0])}")
+        check(f"smooth2d_grid: stage {i} num_nodes=52 (49 hid + 3 proj)",
+              int(stage.num_nodes) == 52)
+        check(f"smooth2d_grid: stage {i} has positive logits parameter",
+              stage.logits.shape == (expected_total, 4))
+
+    check("smooth2d_grid: write_idx entries in [0, hid_count)",
+          all(0 <= w < net.hid_count for w in net.write_idx))
+    check("smooth2d_grid: read_idx entries in [0, final_state_dim)",
+          all(0 <= r < net.final_hid_count + net.final_proj_count
+              for r in net.read_idx))
+
+    u = torch.rand(8, 2)
+    ctx = None
+    out, _ = net(u, ctx=ctx)
+    check("smooth2d_grid: forward shape (8,1)", out.shape == (8, 1))
+    check("smooth2d_grid: forward output is finite",
+          torch.isfinite(out).all().item())
+
+    from train import make_optimizer
+    from train_script import make_data_smooth2d
+    train_loader, _, task_fn = make_data_smooth2d(batch_size=8, val_size=16)
+    optimizer = make_optimizer(net, lr=1e-3)
+    net.train()
+    for u_b, y_b in train_loader:
+        optimizer.zero_grad()
+        out_b, _ = net(u_b, ctx=None)
+        loss = task_fn(out_b, y_b)
+        loss.backward()
+        optimizer.step()
+        check("smooth2d_grid: 1-batch backward finite on 49-node grid",
+              math.isfinite(float(loss.item())))
+        break
+
+    from io_mapper import InputMapper, FanOutInputMapper
+    net_dense = build_net_from_preset(
+        "smooth2d_grid", cell_lib=make_default_library(), write_mode="dense",
+    )
+    check("smooth2d_grid: write_mode='dense' override produces InputMapper",
+          isinstance(net_dense.input_mapper, InputMapper)
+          and type(net_dense.input_mapper) is InputMapper,
+          f"got {type(net_dense.input_mapper).__name__}")
+    net_fanout = build_net_from_preset(
+        "smooth2d_grid", cell_lib=make_default_library(),
+    )
+    check("smooth2d_grid: default (no write_mode) produces FanOutInputMapper",
+          isinstance(net_fanout.input_mapper, FanOutInputMapper),
+          f"got {type(net_fanout.input_mapper).__name__}")
+
+
+def test_housing_grid_preset():
+    print("\nTest NN3: housing_grid preset (5x5 grid + 3 proj, dense I/O, 3 stages, Huber loss)")
+    from config import PRESETS, make_housing_grid_preset
+    from topology import build_net_from_preset
+    from cell_library import make_default_library
+    from io_mapper import InputMapper, OutputMapper
+    from stage_transfer import StageTransfer
+
+    cfg = PRESETS.get("housing_grid")
+    check("housing_grid present in PRESETS", cfg is not None)
+    if cfg is None:
+        return
+
+    s = cfg["stages"][0]
+    check("housing_grid: 3 stages (mirrors smooth2d_grid)",
+          len(cfg["stages"]) == 3)
+    check("housing_grid: num_inputs=8 (CA housing features)", s["num_inputs"] == 8)
+    check("housing_grid: num_hidden=25 (5x5 grid)", s["num_hidden"] == 25)
+    check("housing_grid: num_proj=3", s["num_proj"] == 3)
+    check("housing_grid: hidden_family=grid", s["hidden_family"] == "grid")
+    check("housing_grid: height=5", s["hidden_kwargs"].get("height") == 5)
+    check("housing_grid: width=5", s["hidden_kwargs"].get("width") == 5)
+    check("housing_grid: kernel_size=3 (8-neighbor)",
+          s["hidden_kwargs"].get("kernel_size") == 3)
+    check("housing_grid: write_mode=dense", cfg.get("write_mode") == "dense")
+    check("housing_grid: write_mode=dense (no explicit write_idx needed)",
+          cfg.get("write_mode") == "dense" and cfg.get("write_idx") is None)
+    check("housing_grid: loss=huber", cfg["loss"] == "huber")
+    check("housing_grid: out_dim=1", cfg["out_dim"] == 1)
+    check("housing_grid: schedule=three_phase",
+          cfg.get("schedule") == "three_phase")
+    check("housing_grid: tau_anneal=True",
+          cfg.get("tau_anneal", True) is True)
+    check("housing_grid: per-stage t_span=5/3 (~1.667)",
+          abs(s["t_span"] - 5.0 / 3) < 1e-6)
+    check("housing_grid: per-stage num_steps=17 (round(50/3))",
+          s["num_steps"] == 17)
+    check("housing_grid: all 3 stages share t_span/num_steps",
+          all(st["t_span"] == s["t_span"] and st["num_steps"] == s["num_steps"]
+              for st in cfg["stages"]))
+    check("housing_grid: read_idx = center column (5 nodes) + 3 proj = 8 reads",
+          len(cfg["read_idx"]) == 8
+          and cfg["read_idx"][:5] == [2, 7, 12, 17, 22]
+          and cfg["read_idx"][5:] == [25, 26, 27])
+    check("housing_grid: preset lambdas edge_gate=5e-6",
+          cfg.get("lambdas", {}).get("edge_gate") == 5e-6)
+    check("housing_grid: preset lambdas node_gate=0.0 (deprecate-node-gates)",
+          cfg.get("lambdas", {}).get("node_gate") == 0.0)
+    check("housing_grid: preset lambdas power=1e-5",
+          cfg.get("lambdas", {}).get("power") == 1e-5)
+    check("housing_grid: preset lambdas capacitance=0.0 (deprecate-node-gates)",
+          cfg.get("lambdas", {}).get("capacitance") == 0.0)
+    check("housing_grid: preset lambdas rail=0.1",
+          cfg.get("lambdas", {}).get("rail") == 0.1)
+
+    cell_lib = make_default_library()
+    net = build_net_from_preset("housing_grid", cell_lib=cell_lib)
+    check("housing_grid: builds successfully", net is not None)
+    check("housing_grid: core has 3 stages", len(net.core.stages) == 3)
+    check("housing_grid: core has 2 StageTransfer modules (N-1)",
+          len(net.core.transfers) == 2)
+    check("housing_grid: all transfers are StageTransfer instances",
+          all(isinstance(t, StageTransfer) for t in net.core.transfers))
+    check("housing_grid: all transfers are identity (28->28)",
+          all(t.in_nodes == 28 and t.out_nodes == 28 for t in net.core.transfers))
+    check("housing_grid: write_idx is None (dense mode = all hidden)",
+          net.write_idx is None)
+    check("housing_grid: read_idx = 8 nodes (5 hidden center col + 3 proj)",
+          net.read_idx == [2, 7, 12, 17, 22, 25, 26, 27])
+    check("housing_grid: uses plain InputMapper (dense write)",
+          isinstance(net.input_mapper, InputMapper)
+          and type(net.input_mapper) is InputMapper)
+    check("housing_grid: input_mapper gain is (8, 25) dense (8 inputs -> 25 hidden)",
+          net.input_mapper.gain.weight.shape == (25, 8))
+    check("housing_grid: hid_count=25", net.hid_count == 25)
+    check("housing_grid: proj_count=3", net.proj_count == 3)
+    check("housing_grid: final_hid_count=25", net.final_hid_count == 25)
+    check("housing_grid: final_proj_count=3", net.final_proj_count == 3)
+    check("housing_grid: OutputMapper is sparse read (read_idx set)",
+          isinstance(net.output_mapper, OutputMapper)
+          and net.output_mapper.read_idx == [2, 7, 12, 17, 22, 25, 26, 27])
+
+    n_hidden = 25
+    n_proj = 3
+    n_hidden_edges = 72
+    n_hidden_repeat = n_hidden_edges * 2
+    n_proj_edges = n_hidden * n_proj
+    expected_total = n_hidden_repeat + n_proj_edges
+    for i, stage in enumerate(net.core.stages):
+        check(f"housing_grid: stage {i} edge count = {expected_total} (grid 144 + proj {n_proj_edges})",
+              int(stage.src.shape[0]) == expected_total,
+              f"got {int(stage.src.shape[0])}")
+        check(f"housing_grid: stage {i} num_nodes=28 (25 hid + 3 proj)",
+              int(stage.num_nodes) == 28)
+        check(f"housing_grid: stage {i} has positive logits parameter",
+              stage.logits.shape == (expected_total, 4))
+
+    check("housing_grid: read_idx entries in [0, final_state_dim)",
+          all(0 <= r < net.final_hid_count + net.final_proj_count
+              for r in net.read_idx))
+    check("housing_grid: 5 read nodes are hidden (center column)",
+          sum(1 for r in net.read_idx if r < net.hid_count) == 5)
+    check("housing_grid: 3 read nodes are proj",
+          sum(1 for r in net.read_idx if r >= net.hid_count) == 3)
+
+    u = torch.rand(8, 8)
+    ctx = None
+    out, _ = net(u, ctx=ctx)
+    check("housing_grid: forward shape (8,1)", out.shape == (8, 1))
+    check("housing_grid: forward output is finite",
+          torch.isfinite(out).all().item())
+
+    cfg4 = make_housing_grid_preset(grid_size=4)
+    check("make_housing_grid_preset(4): 4x4 grid, 16 hidden",
+          cfg4["stages"][0]["num_hidden"] == 16)
+    check("make_housing_grid_preset(4): 3 stages",
+          len(cfg4["stages"]) == 3)
+    check("make_housing_grid_preset(4): write_mode still dense",
+          cfg4["write_mode"] == "dense")
+
+
+def test_persistent_drive_auto_fan_out():
+    print("\nTest PD-1: --persistent-drive auto-injects write_fan_out for non-fan_out presets")
+    from train_script import _build_grid_write_fan_out
+    from config import make_housing_grid_preset, PRESETS
+    from topology import build_net_from_preset
+    from cell_library import make_cell_library
+
+    cfg = make_housing_grid_preset(grid_size=5)
+    check("housing_grid base preset has write_mode='dense' (no fan_out)",
+          cfg["write_mode"] == "dense")
+    check("housing_grid base preset has NO write_fan_out",
+          "write_fan_out" not in cfg or cfg.get("write_fan_out") is None)
+
+    num_inputs = int(cfg["stages"][0]["num_inputs"])
+    fan_out = _build_grid_write_fan_out(num_inputs=num_inputs, grid_size=5)
+    check("_build_grid_write_fan_out: one entry per input",
+          len(fan_out) == num_inputs)
+    all_targets = [t for tgts in fan_out.values() for t in tgts]
+    check("_build_grid_write_fan_out: all targets unique",
+          len(all_targets) == len(set(all_targets)))
+    check("_build_grid_write_fan_out: every input has >= 1 target",
+          all(len(v) >= 1 for v in fan_out.values()))
+
+    active = dict(PRESETS.get("housing_grid", {}))
+    if "write_fan_out" in active:
+        active.pop("write_fan_out", None)
+    active["write_fan_out"] = fan_out
+    active["write_mode"] = "fan_out"
+    PRESETS["housing_grid"] = active
+
+    try:
+        cell_lib = make_cell_library("legacy")
+        net = build_net_from_preset(
+            "housing_grid",
+            cell_lib=cell_lib,
+            write_mode="fan_out",
+            read_mode=None,
+            write_idx=None,
+            read_idx=None,
+            enable_drive=True,
+        )
+        from io_mapper import FanOutInputMapper
+        check("housing_grid + persistent-drive uses FanOutInputMapper",
+              isinstance(net.input_mapper, FanOutInputMapper))
+        check("housing_grid + persistent-drive has drive_mappers",
+              net.drive_mappers is not None and len(net.drive_mappers) == 3)
+        check("housing_grid + persistent-drive: forward output is finite",
+              torch.isfinite(net(torch.rand(4, 8), ctx=None)[0]).all().item())
+    finally:
+        PRESETS["housing_grid"] = make_housing_grid_preset(grid_size=5)
+
+
+def test_mlp_benchmark():
+    print("\nTest OO: minimal MLP benchmark for smooth2d")
+    from mlp_benchmark import MLPRegressor, count_parameters
+
+    net = MLPRegressor(in_dim=2, hidden_dim=100, out_dim=1)
+    n_params = count_parameters(net)
+    check("mlp: default hidden_dim=100 produces 401 params", n_params == 401,
+          f"got {n_params}")
+
+    x = torch.randn(8, 2)
+    y = net(x)
+    check("mlp: forward output shape (8,1)", tuple(y.shape) == (8, 1))
+    check("mlp: forward output is finite", torch.isfinite(y).all().item())
+
+    for h in (8, 16, 32, 64, 100, 128):
+        m = MLPRegressor(in_dim=2, hidden_dim=h, out_dim=1)
+        expected = 4 * h + 1
+        check(f"mlp: hidden_dim={h} -> {expected} params",
+              count_parameters(m) == expected)
+
+    x = torch.randn(4, 2, requires_grad=False)
+    target = torch.randn(4, 1)
+    out = net(x)
+    loss = F.mse_loss(out, target)
+    loss.backward()
+    grad_ok = (
+        net.fc1.weight.grad is not None
+        and net.fc1.bias.grad is not None
+        and net.fc2.weight.grad is not None
+        and net.fc2.bias.grad is not None
+    )
+    check("mlp: all 4 parameter tensors receive gradients", grad_ok)
+
+    from mlp_benchmark import validate
+    from train_script import make_data_smooth2d
+    train_loader, val_loader, task_fn = make_data_smooth2d(batch_size=128, val_size=200)
+    optimizer = torch.optim.AdamW(net.parameters(), lr=1e-3)
+    initial_val = validate(net, val_loader, task_fn, device="cpu")
+
+    net.train()
+    n_steps = 0
+    for u_b, y_b in train_loader:
+        optimizer.zero_grad()
+        out_b = net(u_b)
+        loss_b = task_fn(out_b, y_b)
+        loss_b.backward()
+        optimizer.step()
+        n_steps += 1
+        if n_steps >= 5:
+            break
+    after_val = validate(net, val_loader, task_fn, device="cpu")
+    check("mlp: 5-step training reduces val loss",
+          after_val < initial_val,
+          f"before={initial_val:.4f} after={after_val:.4f}")
+
+
+def test_mlp_benchmark_tanh():
+    print("\nTest OO-b: tanh-activation MLP benchmark for smooth2d")
+    from mlp_benchmark import MLPRegressor, count_parameters
+
+    net = MLPRegressor(in_dim=2, hidden_dim=100, out_dim=1, activation="tanh")
+    n_params = count_parameters(net)
+    check("mlp-tanh: hidden_dim=100 produces 401 params", n_params == 401,
+          f"got {n_params}")
+    check("mlp-tanh: activation string stored as 'tanh'", net.activation == "tanh")
+
+    x = torch.randn(8, 2)
+    y = net(x)
+    check("mlp-tanh: forward output shape (8,1)", tuple(y.shape) == (8, 1))
+    check("mlp-tanh: forward output is finite", torch.isfinite(y).all().item())
+
+    with torch.no_grad():
+        h_pre = net.fc1(x)
+        h_post = torch.tanh(h_pre)
+    check("mlp-tanh: hidden activation bounded in (-1, 1)",
+          (h_post > -1.0).all().item() and (h_post < 1.0).all().item())
+
+    for h in (8, 16, 32, 64, 100, 128):
+        m = MLPRegressor(in_dim=2, hidden_dim=h, out_dim=1, activation="tanh")
+        expected = 4 * h + 1
+        check(f"mlp-tanh: hidden_dim={h} -> {expected} params",
+              count_parameters(m) == expected)
+
+    x = torch.randn(4, 2)
+    target = torch.randn(4, 1)
+    out = net(x)
+    loss = F.mse_loss(out, target)
+    loss.backward()
+    grad_ok = (
+        net.fc1.weight.grad is not None
+        and net.fc1.bias.grad is not None
+        and net.fc2.weight.grad is not None
+        and net.fc2.bias.grad is not None
+    )
+    check("mlp-tanh: all 4 parameter tensors receive gradients", grad_ok)
+
+    raised = False
+    try:
+        MLPRegressor(in_dim=2, hidden_dim=10, out_dim=1, activation="sigmoid")
+    except ValueError:
+        raised = True
+    check("mlp-tanh: invalid activation raises ValueError", raised)
+
+    from mlp_benchmark import validate
+    from train_script import make_data_smooth2d
+    train_loader, val_loader, task_fn = make_data_smooth2d(batch_size=128, val_size=200)
+    optimizer = torch.optim.AdamW(net.parameters(), lr=1e-3)
+    initial_val = validate(net, val_loader, task_fn, device="cpu")
+    net.train()
+    n_steps = 0
+    for u_b, y_b in train_loader:
+        optimizer.zero_grad()
+        out_b = net(u_b)
+        loss_b = task_fn(out_b, y_b)
+        loss_b.backward()
+        optimizer.step()
+        n_steps += 1
+        if n_steps >= 5:
+            break
+    after_val = validate(net, val_loader, task_fn, device="cpu")
+    check("mlp-tanh: 5-step training reduces val loss",
+          after_val < initial_val,
+          f"before={initial_val:.4f} after={after_val:.4f}")
+
+
+def test_v15_cell_parameters_preset_smooth2d_grid():
+    """V15-10: v15 library works with build_net_from_preset on smooth2d_grid."""
+    print("\nTest V15-10: v15 library with smooth2d_grid build")
+    from cell_library import IdealizedCellLibrary
+    from topology import build_net_from_preset
+    cell_lib = IdealizedCellLibrary(library_name="v15")
+    net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
+    import torch
+    x = torch.randn(4, 2)
+    with torch.no_grad():
+        y, traj = net(x, ctx=None, store_trajectory=False)
+    check("V15-10: network output finite",
+          torch.isfinite(y).all().item())
+    check("V15-10: network output shape (4, 1)",
+          y.shape == (4, 1),
+          f"got {y.shape}")
+    for stage in net.core.stages:
+        check(f"V15-10: stage logits shape[-1] == 6",
+              stage.logits.shape[-1] == 6,
+              f"got {stage.logits.shape[-1]}")
+
+
+def test_stage_lr_scale_scheduler_compat():
+    """SLS-3: CosineAnnealingLR works correctly with multi-group optimizer."""
+    print("\nTest SLS-3: scheduler compatibility with staged optimizer")
+    from train import make_optimizer
+    from config import PRESETS, OPTIM
+    from topology import build_net_from_preset
+    from cell_library import make_default_library
+    from torch.optim.lr_scheduler import CosineAnnealingLR
+
+    cell_lib = make_default_library()
+    net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
+    optim = make_optimizer(net, lr=1e-3, stage_lr_scale=10.0)
+    scheduler = CosineAnnealingLR(optim, T_max=100, eta_min=OPTIM["scheduler_eta_min"])
+
+    initial_lrs = [g["lr"] for g in optim.param_groups]
+    scheduler.step()
+    stepped_lrs = [g["lr"] for g in optim.param_groups]
+
+    check("SLS-3: all groups reduced after one scheduler step",
+          all(s < i for s, i in zip(stepped_lrs, initial_lrs)),
+          f"initial={initial_lrs}, after_step={stepped_lrs}")
+    ratios_before = [i / j for i, j in zip(initial_lrs[:-1], initial_lrs[1:])]
+    ratios_after  = [i / j for i, j in zip(stepped_lrs[:-1], stepped_lrs[1:])]
+    check("SLS-3: group LR ratios preserved after scheduler step",
+          all(abs(rb - ra) < 1e-4 for rb, ra in zip(ratios_before, ratios_after)),
+          f"ratios before={ratios_before}, after={ratios_after}")
+
+
+if __name__ == "__main__":
+    main()

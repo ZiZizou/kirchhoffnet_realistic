@@ -2600,17 +2600,34 @@ def main():
             f"seed={args.noise_seed}"
         )
 
+    if args.noise or args.noise_aware:
+        print(
+            f"[noise] {'noise-aware training + ' if args.noise_aware else ''}"
+            f"post-training MC eval enabled: quant_bits={args.quant_bits} "
+            f"noise_std={args.noise_std} mc_trials={args.mc_trials} "
+            f"adc_full_range={args.adc_full_range} seed={args.noise_seed}"
+        )
+
     if args.variation:
+        gss = VARIATION["global_gain_shift_std"]
+        ems = VARIATION["edge_mismatch_std"]
+        giss = VARIATION.get("global_isat_shift_std", 0.0)
+        ims = VARIATION.get("edge_isat_mismatch_std", 0.0)
+        print(
+            f"[variation] enabled: global_gain_shift_std={gss} "
+            f"edge_mismatch_std={ems} global_isat_shift_std={giss} "
+            f"edge_isat_mismatch_std={ims}"
+        )
         def ctx_factory(batch_size_: int, device: torch.device = device, **_):
             total_edges = sum(s.num_edges() for s in raw_net.core.stages)
             return sample_random_context(
                 num_edges=total_edges,
                 num_cells=raw_net.core.stages[0].cell_lib.num_cells,
                 device=device,
-                gain_shift_std=VARIATION["global_gain_shift_std"],
-                mismatch_std=VARIATION["edge_mismatch_std"],
-                global_isat_shift_std=VARIATION.get("global_isat_shift_std", 0.0),
-                isat_mismatch_std=VARIATION.get("edge_isat_mismatch_std", 0.0),
+                gain_shift_std=gss,
+                mismatch_std=ems,
+                global_isat_shift_std=giss,
+                isat_mismatch_std=ims,
             )
     else:
         ctx_factory = make_static_ctx_factory()

@@ -120,12 +120,17 @@ from io_mapper import (
 
 # Monkey-patch _compute_regularizers to handle DataParallel wrapping
 # (train.py is read-only on Kaggle; DataParallel strips module internals)
+# kirchhoff-noise: also unwraps KirchhoffNetNoiseWrapper before stage access.
 import train as _train_module
 _orig_compute_regularizers = _train_module._compute_regularizers
 
 def _dp_safe_compute_regularizers(net, trajs, tau, lambdas):
+    # Unwrap DataParallel first (outer-most), then kirchhoff-noise wrapper
+    # so regularizer code reaches the base KirchhoffNetWithIO stages.
     if isinstance(net, torch.nn.DataParallel):
         net = net.module
+    if hasattr(net, "base") and hasattr(net, "_stage_noise_std"):
+        net = net.base
     return _orig_compute_regularizers(net, trajs, tau, lambdas)
 
 _train_module._compute_regularizers = _dp_safe_compute_regularizers
@@ -745,6 +750,107 @@ def _save_config_snapshot(out_dir: Path, problem: str, args, lambdas: dict,
             f.write(f"  read_mode: {args.read_mode}\n")
             f.write(f"  write_idx: {args.write_idx}\n")
             f.write(f"  read_idx: {args.read_idx}\n")
+
+
+def _run_noise_evaluation(
+    base_net,
+    val_loader,
+    task_fn,
+    ctx_factory,
+    device,
+    args,
+    out_dir: Path,
+    label: str,
+) -> dict:
+    """Run kirchhoff-noise MC evaluation on ``base_net`` and write metrics.
+
+    Wraps ``base_net`` in ``KirchhoffNetNoiseWrapper``, runs a clean eval
+    plus ``args.mc_trials`` noisy trials, and writes
+    ``out_dir / f"noise_metrics_{label}.txt"`` (or
+    ``noise_metrics.txt`` when ``label == "main"``).
+
+    Returns:
+        dict with keys ``clean_val`` (float), ``noise_mean``,
+        ``noise_std``, ``noise_p50``, ``noise_p90``, ``noise_p95``,
+        ``degradation_mean``, ``per_trial_losses``.
+    """
+    from analog_noise import NoiseConfig
+    from kirchhoff_noise import (
+        KirchhoffNetNoiseWrapper,
+        evaluate_kirchhoff_clean,
+        evaluate_kirchhoff_with_noise,
+    )
+
+    eval_cfg = NoiseConfig(
+        quant_bits=args.quant_bits,
+        noise_std=args.noise_std,
+        quantize_input=True,
+        quantize_output=True,
+        quantize_intermediate=True,
+        weight_noise=True,
+        activation_noise=True,
+        mc_trials=args.mc_trials,
+        seed=args.noise_seed,
+    )
+    eval_wrapper = KirchhoffNetNoiseWrapper(
+        base_net, eval_cfg, adc_full_range=args.adc_full_range,
+    )
+    eval_wrapper.to(device)
+    eval_wrapper.eval()
+
+    print(
+        f"[noise] {label}: running MC noise eval: quant_bits={args.quant_bits} "
+        f"noise_std={args.noise_std} trials={args.mc_trials} "
+        f"adc_full_range={args.adc_full_range} seed={args.noise_seed}"
+    )
+    clean_val = evaluate_kirchhoff_clean(
+        eval_wrapper, val_loader, task_fn, ctx_factory, device,
+    )
+    result = evaluate_kirchhoff_with_noise(
+        eval_wrapper, val_loader, task_fn, ctx_factory, eval_cfg, device,
+    )
+    result.clean_loss = clean_val
+    degradation = result.mean - clean_val
+    print(
+        f"[noise] {label}: clean={clean_val:.6f} "
+        f"noisy_mean={result.mean:.6f} noisy_std={result.std:.6f} "
+        f"p90={result.p90:.6f} p95={result.p95:.6f} "
+        f"degradation_mean={degradation:+.6f}"
+    )
+
+    suffix = "" if label == "main" else f"_{label}"
+    metrics_path = out_dir / f"noise_metrics{suffix}.txt"
+    with open(metrics_path, "w") as f:
+        f.write(f"quant_bits: {args.quant_bits}\n")
+        f.write(f"noise_std: {args.noise_std}\n")
+        f.write(f"mc_trials: {args.mc_trials}\n")
+        f.write(f"adc_full_range: {args.adc_full_range}\n")
+        f.write(f"noise_seed: {args.noise_seed}\n")
+        f.write(f"noise_aware_training: {bool(args.noise_aware)}\n")
+        f.write(f"label: {label}\n")
+        f.write(f"clean_val_mse: {clean_val:.6f}\n")
+        f.write(f"noisy_mean: {result.mean:.6f}\n")
+        f.write(f"noisy_std: {result.std:.6f}\n")
+        f.write(f"noisy_p50: {result.p50:.6f}\n")
+        f.write(f"noisy_p90: {result.p90:.6f}\n")
+        f.write(f"noisy_p95: {result.p95:.6f}\n")
+        f.write(f"noisy_best: {result.best:.6f}\n")
+        f.write(f"noisy_worst: {result.worst:.6f}\n")
+        f.write(f"degradation_mean: {degradation:.6f}\n")
+        f.write("per_trial_losses:\n")
+        for i, l in enumerate(result.losses):
+            f.write(f"  trial_{i:03d}: {l:.6f}\n")
+
+    return {
+        "clean_val": clean_val,
+        "noise_mean": result.mean,
+        "noise_std": result.std,
+        "noise_p50": result.p50,
+        "noise_p90": result.p90,
+        "noise_p95": result.p95,
+        "degradation_mean": degradation,
+        "per_trial_losses": result.losses,
+    }
 
 
 def make_data_sinx(batch_size: int, val_size: int = 1024):
@@ -1947,6 +2053,54 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "(per-source), or 'both' (multiplicative).",
     )
 
+    # --- kirchhoff-noise: ADC/DAC quant + circuit noise (analog-noise parity) ---
+    parser.add_argument(
+        "--noise", dest="noise", action="store_true", default=False,
+        help="Run Monte Carlo analog-noise evaluation (ADC/DAC quant + "
+             "circuit noise) on the trained model and write "
+             "noise_metrics.txt. Composes with --variation: variation "
+             "perturbs gm/isat via SimContext, noise perturbs state "
+             "voltages per stage.",
+    )
+    parser.add_argument(
+        "--noise-aware", dest="noise_aware", action="store_true", default=False,
+        help="Train under analog noise so the KirchhoffNet becomes robust "
+             "to ADC/DAC quantization and circuit noise. Implies --noise "
+             "for final evaluation.",
+    )
+    parser.add_argument(
+        "--quant-bits", type=int, choices=[4, 6], default=4,
+        dest="quant_bits",
+        help="Bit-width for ADC/DAC quantization (default: 4). Used when "
+             "--noise or --noise-aware is set.",
+    )
+    parser.add_argument(
+        "--noise-std", type=float, default=0.05,
+        dest="noise_std",
+        help="Standard deviation of additive Gaussian circuit noise on "
+             "the analog state voltages and on the output mapper (default: "
+             "0.05). Used when --noise or --noise-aware is set.",
+    )
+    parser.add_argument(
+        "--mc-trials", type=int, default=20,
+        dest="mc_trials",
+        help="Number of Monte Carlo trials for noisy evaluation "
+             "(default: 20). Used when --noise or --noise-aware is set.",
+    )
+    parser.add_argument(
+        "--adc-full-range", type=float, default=3.0,
+        dest="adc_full_range",
+        help="Symmetric full-scale range for ADC/DAC quantization "
+             "(default: 3.0). Used when --noise or --noise-aware is set.",
+    )
+    parser.add_argument(
+        "--noise-seed", type=int, default=0,
+        dest="noise_seed",
+        help="Seed for analog-noise sampling (default: 0). Each MC trial "
+             "uses noise_seed + trial_idx as its seed. Used when --noise "
+             "or --noise-aware is set.",
+    )
+
 
 # ----------------------------------------------------------------
 # Pruning helpers (PIT): transferable I/O mapper reconstruction.
@@ -2404,6 +2558,48 @@ def main():
 
     raw_net = _unwrap(net)
 
+    # kirchhoff-noise: build the noise-aware training wrapper if requested.
+    # When --noise-aware is set, we use ``train_wrapper`` for forward passes
+    # inside compute_loss (the regularizer monkey-patch above unwraps to base
+    # for stage access). When only --noise is set, the wrapper is built later
+    # for post-training MC eval.
+    train_wrapper: "KirchhoffNetNoiseWrapper | None" = None
+    train_noise_cfg: "NoiseConfig | None" = None
+    if args.noise_aware:
+        from analog_noise import NoiseConfig
+        from kirchhoff_noise import KirchhoffNetNoiseWrapper
+        train_noise_cfg = NoiseConfig(
+            quant_bits=args.quant_bits,
+            noise_std=args.noise_std,
+            quantize_input=True,
+            quantize_output=True,
+            quantize_intermediate=True,
+            weight_noise=True,
+            activation_noise=True,
+            seed=args.noise_seed,
+        )
+        # Wrap the BASE KirchhoffNetWithIO so the wrapper.base is the
+        # unwrapped model. The wrapper's parameters() / state_dict()
+        # delegate to base, so DataParallel state_dict/parameters of
+        # the original net still work. We then mirror ``net``'s
+        # DataParallel wrapping so the noise-aware forward still
+        # benefits from multi-GPU parallelism. The regularizer monkey
+        # patch unwraps both layers to reach the base stages.
+        train_wrapper = KirchhoffNetNoiseWrapper(
+            raw_net, train_noise_cfg, adc_full_range=args.adc_full_range,
+        )
+        train_wrapper.to(device)
+        if parallel_enabled and n_gpus >= 2:
+            train_wrapper = torch.nn.DataParallel(
+                train_wrapper, device_ids=list(range(n_gpus)),
+            )
+            print(f"[noise] DataParallel enabled on {n_gpus} GPUs for train_wrapper")
+        print(
+            f"[noise] noise-aware training: quant_bits={args.quant_bits} "
+            f"noise_std={args.noise_std} adc_full_range={args.adc_full_range} "
+            f"seed={args.noise_seed}"
+        )
+
     if args.variation:
         def ctx_factory(batch_size_: int, device: torch.device = device, **_):
             total_edges = sum(s.num_edges() for s in raw_net.core.stages)
@@ -2682,7 +2878,8 @@ def main():
                 kd_teacher = teacher_net
                 kd_lambda = float(SCHEDULE_FOUR_PHASE.get("lambda_kd", 1.0))
             loss_task, loss_structural, _ = compute_loss(
-                net, u, target, ctx, task_fn,
+                train_wrapper if train_wrapper is not None else net,
+                u, target, ctx, task_fn,
                 lambdas=effective_lambdas, tau=tau, return_parts=True,
                 amp=amp_enabled, amp_dtype=amp_dtype, reg_scale=reg_scale,
                 cell_mode=cell_mode,
@@ -3060,6 +3257,13 @@ def main():
         raw_net, cell_order=raw_net.core.stages[0].cell_lib._cell_order,
         save_path=str(out_dir / "pipeline.png"),
     )
+
+    # ----------------------------------------------------------------
+    # kirchhoff-noise: post-training MC noise evaluation. Skip during
+    # pruning pipeline because the noise eval reuses val_loader; do it
+    # AFTER pruning+retrain completes instead so the noise metrics
+    # describe the final deployable network.
+    # ----------------------------------------------------------------
 
     # ----------------------------------------------------------------
     # Complexity-regularized pruning pipeline (CP-6).
@@ -3678,6 +3882,33 @@ def main():
                 f.write(f"best_val_pruned: {best_val_pruned:.6f}\n")
                 f.write(f"best_epoch_pruned: {best_epoch_pruned}\n")
                 f.write(f"scheduler: {args.use_scheduler}\n")
+
+    # ----------------------------------------------------------------
+    # kirchhoff-noise: final MC noise evaluation on the deployable
+    # network. With prune+retrain this is the pruned network; otherwise
+    # it's the best-checkpoint pre-prune network. Runs only when
+    # --noise or --noise-aware is set.
+    # ----------------------------------------------------------------
+    if args.noise or args.noise_aware:
+        if needs_prune:
+            # When pruning is on, evaluate both pre-prune (best checkpoint)
+            # and post-prune (deployable) networks so the user can compare.
+            raw_pruned = pruned_net.module if isinstance(pruned_net, torch.nn.DataParallel) else pruned_net
+            if best_state_pruned is not None:
+                raw_pruned.load_state_dict(best_state_pruned)
+            _run_noise_evaluation(
+                raw_net, val_loader, task_fn, ctx_factory,
+                device, args, out_dir, "main",
+            )
+            _run_noise_evaluation(
+                raw_pruned, val_loader, task_fn, ctx_factory,
+                device, args, out_dir, "pruned",
+            )
+        else:
+            _run_noise_evaluation(
+                raw_net, val_loader, task_fn, ctx_factory,
+                device, args, out_dir, "main",
+            )
 
     print(f"[train] done — artifacts in {out_dir}")
 

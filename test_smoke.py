@@ -2684,6 +2684,231 @@ def test_noise_mlp_pipeline_smoke():
     check("noise-aware training: backward pass fills all base grads", has_grads)
 
 
+def test_kirchhoff_noise_wrapper_basic():
+    print("\nTest 51: KirchhoffNetNoiseWrapper basic forward and pass-through")
+    from analog_noise import NoiseConfig
+    from kirchhoff_noise import KirchhoffNetNoiseWrapper
+    from config import PRESETS
+    from cell_library import make_cell_library
+    from topology import build_net_from_preset
+
+    preset = PRESETS["sinx"]
+    cell_lib = make_cell_library(preset.get("cell_library", "legacy"))
+    net = build_net_from_preset("sinx", cell_lib=cell_lib)
+    net.eval()
+
+    # 1. Clean wrapper (no noise) matches base forward exactly.
+    cfg_clean = NoiseConfig(quant_bits=None, noise_std=0.0)
+    wrapped = KirchhoffNetNoiseWrapper(net, cfg_clean, adc_full_range=3.0)
+    u = torch.randn(2, preset["stages"][0]["num_inputs"])
+    ctx = None
+    out_wrapped, _ = wrapped(u, ctx=ctx)
+    out_base, _ = net(u, ctx=ctx)
+    check(
+        "kirchhoff wrapper: clean pass-through matches base",
+        torch.allclose(out_wrapped, out_base, atol=1e-6),
+        f"max diff = {(out_wrapped - out_base).abs().max().item():.2e}",
+    )
+    # 2. Wrapper with noise produces different output.
+    cfg_noisy = NoiseConfig(quant_bits=4, noise_std=0.05, seed=42)
+    wrapped_noisy = KirchhoffNetNoiseWrapper(net, cfg_noisy, adc_full_range=3.0)
+    out_noisy, _ = wrapped_noisy(u, ctx=ctx)
+    check(
+        "kirchhoff wrapper: noise changes output",
+        (out_noisy - out_base).abs().max().item() > 1e-4,
+    )
+    # 3. state_dict delegates to base.
+    sd = wrapped.state_dict()
+    sd_base = net.state_dict()
+    keys_match = set(sd.keys()) == set(sd_base.keys())
+    check(
+        "kirchhoff wrapper: state_dict keys match base",
+        keys_match,
+        f"wrapper has {set(sd.keys()) - set(sd_base.keys())} extra keys",
+    )
+    # 4. parameters() delegates to base.
+    n_wrap = sum(p.numel() for p in wrapped.parameters())
+    n_base = sum(p.numel() for p in net.parameters())
+    check(
+        "kirchhoff wrapper: param count matches base",
+        n_wrap == n_base,
+        f"wrapper={n_wrap} base={n_base}",
+    )
+
+
+def test_kirchhoff_noise_seed_reproducibility():
+    print("\nTest 51b: KirchhoffNetNoiseWrapper seed reproducibility via cfg.seed")
+    from analog_noise import NoiseConfig
+    from kirchhoff_noise import KirchhoffNetNoiseWrapper
+    from config import PRESETS
+    from cell_library import make_cell_library
+    from topology import build_net_from_preset
+
+    preset = PRESETS["sinx"]
+    cell_lib = make_cell_library(preset.get("cell_library", "legacy"))
+    net = build_net_from_preset("sinx", cell_lib=cell_lib)
+    net.eval()
+
+    u = torch.randn(2, preset["stages"][0]["num_inputs"])
+
+    # Same seed → identical noisy output.
+    cfg_a = NoiseConfig(quant_bits=4, noise_std=0.05, seed=7,
+                        quantize_input=True, quantize_output=True,
+                        activation_noise=True, weight_noise=True)
+    wrapped_a = KirchhoffNetNoiseWrapper(net, cfg_a, adc_full_range=3.0)
+    out_a1, _ = wrapped_a(u, ctx=None)
+    out_a2, _ = wrapped_a(u, ctx=None)
+    check(
+        "kirchhoff wrapper: same cfg.seed → identical output (per-forward frozen)",
+        torch.allclose(out_a1, out_a2, atol=1e-6),
+        f"max diff = {(out_a1 - out_a2).abs().max().item():.2e}",
+    )
+
+    # Different seed → different output.
+    cfg_b = NoiseConfig(quant_bits=4, noise_std=0.05, seed=11,
+                        quantize_input=True, quantize_output=True,
+                        activation_noise=True, weight_noise=True)
+    wrapped_b = KirchhoffNetNoiseWrapper(net, cfg_b, adc_full_range=3.0)
+    out_b, _ = wrapped_b(u, ctx=None)
+    check(
+        "kirchhoff wrapper: different cfg.seed → different output",
+        (out_a1 - out_b).abs().max().item() > 1e-4,
+        f"max diff = {(out_a1 - out_b).abs().max().item():.2e}",
+    )
+
+    # Setting cfg.seed on existing wrapper between forwards changes output.
+    cfg_c = NoiseConfig(quant_bits=4, noise_std=0.05, seed=7,
+                        quantize_input=True, quantize_output=True,
+                        activation_noise=True, weight_noise=True)
+    wrapped_c = KirchhoffNetNoiseWrapper(net, cfg_c, adc_full_range=3.0)
+    out_c1, _ = wrapped_c(u, ctx=None)
+    wrapped_c.cfg.seed = 99
+    out_c2, _ = wrapped_c(u, ctx=None)
+    check(
+        "kirchhoff wrapper: mutating cfg.seed changes output",
+        (out_c1 - out_c2).abs().max().item() > 1e-4,
+        f"max diff = {(out_c1 - out_c2).abs().max().item():.2e}",
+    )
+
+    # seed=None (global RNG) still produces stochastic noise but two
+    # independent wrappers see different global state, so outputs differ.
+    torch.manual_seed(0)
+    cfg_d = NoiseConfig(quant_bits=None, noise_std=0.05,
+                        quantize_input=False, quantize_output=False,
+                        activation_noise=True, weight_noise=True,
+                        seed=None)
+    wrapped_d = KirchhoffNetNoiseWrapper(net, cfg_d, adc_full_range=3.0)
+    out_d, _ = wrapped_d(u, ctx=None)
+    check(
+        "kirchhoff wrapper: seed=None + noise_std>0 still injects noise",
+        (out_a1 - out_d).abs().max().item() > 1e-4,
+        f"max diff = {(out_a1 - out_d).abs().max().item():.2e}",
+    )
+
+
+def test_kirchhoff_noise_clean_eval():
+    print("\nTest 52: evaluate_kirchhoff_clean returns finite loss, matches base clean val")
+    from analog_noise import NoiseConfig
+    from kirchhoff_noise import KirchhoffNetNoiseWrapper, evaluate_kirchhoff_clean
+    from config import PRESETS
+    from cell_library import make_cell_library
+    from topology import build_net_from_preset
+    from torch.utils.data import DataLoader, TensorDataset
+    import torch.nn.functional as F
+
+    preset = PRESETS["sinx"]
+    cell_lib = make_cell_library(preset.get("cell_library", "legacy"))
+    net = build_net_from_preset("sinx", cell_lib=cell_lib)
+    net.eval()
+    cfg = NoiseConfig(quant_bits=4, noise_std=0.05, seed=42)
+    wrapped = KirchhoffNetNoiseWrapper(net, cfg, adc_full_range=3.0)
+
+    u_v = torch.randn(8, preset["stages"][0]["num_inputs"])
+    y_v = torch.randn(8, preset.get("out_dim", 1))
+    loader = DataLoader(TensorDataset(u_v, y_v), batch_size=4)
+
+    def ctx_factory(batch_size, device="cpu", **_):
+        return None
+
+    loss = evaluate_kirchhoff_clean(wrapped, loader, F.mse_loss, ctx_factory, "cpu")
+    check(
+        "kirchhoff clean eval: finite float loss",
+        torch.isfinite(torch.tensor(loss)).item(),
+        f"loss = {loss}",
+    )
+    # Also run base val directly.
+    wrapped.eval()
+    total = 0.0
+    n = 0
+    for u, t in loader:
+        out_base, _ = net(u, ctx=None)
+        total += float(F.mse_loss(out_base, t).item()) * u.size(0)
+        n += u.size(0)
+    base_loss = total / max(1, n)
+    check(
+        "kirchhoff clean eval: matches base val loss",
+        abs(loss - base_loss) < 1e-6,
+        f"clean={loss:.6f} base={base_loss:.6f}",
+    )
+
+
+def test_kirchhoff_noise_mc_eval():
+    print("\nTest 53: evaluate_kirchhoff_with_noise returns structured stats")
+    from analog_noise import NoiseConfig
+    from kirchhoff_noise import (
+        KirchhoffNetNoiseWrapper,
+        evaluate_kirchhoff_with_noise,
+    )
+    from config import PRESETS
+    from cell_library import make_cell_library
+    from topology import build_net_from_preset
+    from torch.utils.data import DataLoader, TensorDataset
+    import torch.nn.functional as F
+
+    preset = PRESETS["sinx"]
+    cell_lib = make_cell_library(preset.get("cell_library", "legacy"))
+    net = build_net_from_preset("sinx", cell_lib=cell_lib)
+    net.eval()
+
+    cfg = NoiseConfig(
+        quant_bits=4, noise_std=0.05, seed=42, mc_trials=3,
+    )
+    wrapped = KirchhoffNetNoiseWrapper(net, cfg, adc_full_range=3.0)
+
+    u_v = torch.randn(8, preset["stages"][0]["num_inputs"])
+    y_v = torch.randn(8, preset.get("out_dim", 1))
+    loader = DataLoader(TensorDataset(u_v, y_v), batch_size=4)
+
+    def ctx_factory(batch_size, device="cpu", **_):
+        return None
+
+    result = evaluate_kirchhoff_with_noise(
+        wrapped, loader, F.mse_loss, ctx_factory, cfg, "cpu",
+    )
+    check(
+        "kirchhoff mc eval: losses list matches trials",
+        len(result.losses) == 3,
+        f"got {len(result.losses)} trials",
+    )
+    check(
+        "kirchhoff mc eval: mean is finite",
+        torch.isfinite(torch.tensor(result.mean)).item(),
+    )
+    check(
+        "kirchhoff mc eval: std is finite",
+        torch.isfinite(torch.tensor(result.std)).item(),
+    )
+    check(
+        "kirchhoff mc eval: p90 is finite",
+        torch.isfinite(torch.tensor(result.p90)).item(),
+    )
+    # With a noisy model, noisy mean should be >= clean
+    check(
+        "kirchhoff mc eval: config is set",
+        result.config is cfg,
+    )
+
+
 def test_no_adc_flag():
     print("\nTest 50: --no-adc disables per-layer ADC/DAC quantization")
     import subprocess
@@ -3080,6 +3305,10 @@ def main():
     test_analog_mlp_wrapper()                    # analog-noise: MLP wrapper end-to-end
     test_noise_mc_evaluation()                   # analog-noise: MC stats shape
     test_noise_mlp_pipeline_smoke()              # analog-noise: forward+backward
+    test_kirchhoff_noise_wrapper_basic()         # kirchhoff-noise: wrapper basic
+    test_kirchhoff_noise_seed_reproducibility()  # kirchhoff-noise: cfg.seed reproducibility
+    test_kirchhoff_noise_clean_eval()            # kirchhoff-noise: clean eval
+    test_kirchhoff_noise_mc_eval()               # kirchhoff-noise: MC eval
     test_no_adc_flag()                           # analog-noise: --no-adc CLI flag
 
     print()

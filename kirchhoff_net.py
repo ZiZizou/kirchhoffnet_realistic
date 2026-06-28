@@ -83,6 +83,8 @@ class KirchhoffNet(nn.Module):
         drive_scales: list[float] | None = None,
         solver: str = "heun",
         deq_cfg: dict | None = None,
+        stage_noise_std: float = 0.0,
+        stage_noise_generator: torch.Generator | None = None,
     ):
         x = x0
         all_trajs = []
@@ -117,6 +119,19 @@ class KirchhoffNet(nn.Module):
             stage_ctxs.append(stage_ctx)
             if store_trajectory and traj is not None:
                 all_trajs.append(traj)
+            # kirchhoff-noise: per-stage additive Gaussian noise on the state
+            # vector (thermal/IR-drop modeling on the analog voltage rails).
+            # One fresh sample per stage; frozen across all Heun substeps
+            # within that stage (NOT resampled inside rhs()) to preserve
+            # the deterministic-ODE assumption of the Heun integrator.
+            if stage_noise_std > 0.0:
+                if stage_noise_generator is not None:
+                    noise = torch.empty_like(x)
+                    noise.normal_(mean=0.0, std=stage_noise_std,
+                                  generator=stage_noise_generator)
+                    x = x + noise
+                else:
+                    x = x + torch.randn_like(x) * stage_noise_std
             if i < len(self.transfers):
                 x = self.transfers[i](x)
         self.last_stage_outputs = stage_outputs
@@ -289,6 +304,8 @@ class KirchhoffNetWithIO(nn.Module):
         cell_mode: str = "soft",
         solver: str = "heun",
         deq_cfg: dict | None = None,
+        stage_noise_std: float = 0.0,
+        stage_noise_generator: torch.Generator | None = None,
     ):
         x0 = self.input_mapper(u)
         if x0.size(1) != self.hid_count:
@@ -320,6 +337,8 @@ class KirchhoffNetWithIO(nn.Module):
                 drive_scales=self.drive_scales if self.enable_drive else None,
                 solver=solver,
                 deq_cfg=deq_cfg,
+                stage_noise_std=stage_noise_std,
+                stage_noise_generator=stage_noise_generator,
             )
         if self.read_idx is not None:
             x_read = x_final

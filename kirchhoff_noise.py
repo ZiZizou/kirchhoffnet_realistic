@@ -212,12 +212,16 @@ def _kirchhoff_forward(
     wrapper: KirchhoffNetNoiseWrapper,
     u: torch.Tensor,
     ctx,
+    cell_mode: str = "ste",
 ) -> torch.Tensor:
     """Run the wrapped KirchhoffNet forward once with the current wrapper state.
 
     Returns just the output tensor (discards trajectories).
+
+    ``cell_mode`` defaults to ``"ste"`` so the noise evaluation matches the
+    deployable hard-cell behavior used during Phase B/C training.
     """
-    y, _ = wrapper(u, ctx=ctx)
+    y, _ = wrapper(u, ctx=ctx, cell_mode=cell_mode)
     return y
 
 
@@ -231,6 +235,7 @@ def evaluate_kirchhoff_with_noise(
     device: torch.device | str,
     trials: int | None = None,
     base_seed: int | None = None,
+    cell_mode: str = "ste",
 ) -> NoiseBenchmarkResult:
     """Run multi-trial Monte Carlo evaluation under KirchhoffNet analog noise.
 
@@ -251,6 +256,9 @@ def evaluate_kirchhoff_with_noise(
         trials: Number of MC trials (defaults to ``cfg.mc_trials``).
         base_seed: If provided, each trial uses ``base_seed + trial_idx`` as
             noise seed for reproducibility. Defaults to ``cfg.seed``.
+        cell_mode: Cell selection mode forwarded to the wrapped model.
+            Defaults to ``"ste"`` so the eval matches the deployable
+            hard-cell behavior used during Phase B/C training.
 
     Returns:
         ``NoiseBenchmarkResult`` with per-trial losses plus summary stats.
@@ -270,7 +278,7 @@ def evaluate_kirchhoff_with_noise(
             u = u.to(device)
             target = target.to(device)
             ctx = ctx_factory(u.size(0), device=device)
-            out = _kirchhoff_forward(wrapper, u, ctx)
+            out = _kirchhoff_forward(wrapper, u, ctx, cell_mode=cell_mode)
             loss = task_fn(out, target)
             total += float(loss.item()) * u.size(0)
             n += u.size(0)
@@ -300,6 +308,7 @@ def evaluate_kirchhoff_clean(
     task_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     ctx_factory: Callable,
     device: torch.device | str,
+    cell_mode: str = "ste",
 ) -> float:
     """Evaluate the underlying KirchhoffNet with all noise disabled.
 
@@ -307,6 +316,9 @@ def evaluate_kirchhoff_clean(
     should pass a clean-context factory). Temporarily disables quantization
     and circuit noise on the wrapper, runs a single pass, and restores
     the wrapper's original config.
+
+    ``cell_mode`` defaults to ``"ste"`` so the clean eval matches the
+    deployable hard-cell behavior used during Phase B/C training.
     """
     saved = (
         wrapper.cfg.quant_bits,
@@ -333,7 +345,7 @@ def evaluate_kirchhoff_clean(
         u = u.to(device)
         target = target.to(device)
         ctx = ctx_factory(u.size(0), device=device)
-        out = _kirchhoff_forward(wrapper, u, ctx)
+        out = _kirchhoff_forward(wrapper, u, ctx, cell_mode=cell_mode)
         loss = task_fn(out, target)
         total += float(loss.item()) * u.size(0)
         n += u.size(0)

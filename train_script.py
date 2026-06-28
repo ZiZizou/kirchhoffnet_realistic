@@ -761,6 +761,7 @@ def _run_noise_evaluation(
     args,
     out_dir: Path,
     label: str,
+    cell_mode: str = "ste",
 ) -> dict:
     """Run kirchhoff-noise MC evaluation on ``base_net`` and write metrics.
 
@@ -768,6 +769,12 @@ def _run_noise_evaluation(
     plus ``args.mc_trials`` noisy trials, and writes
     ``out_dir / f"noise_metrics_{label}.txt"`` (or
     ``noise_metrics.txt`` when ``label == "main"``).
+
+    Both the clean and the noisy passes are evaluated with ``cell_mode``
+    (default ``"ste"``) so the result matches the deployable hard-cell
+    behavior used during Phase B/C training. Legacy (non-phased) models
+    trained purely with soft cells will therefore be evaluated in STE
+    mode — flag this in any legacy-result reporting.
 
     Returns:
         dict with keys ``clean_val`` (float), ``noise_mean``,
@@ -801,13 +808,16 @@ def _run_noise_evaluation(
     print(
         f"[noise] {label}: running MC noise eval: quant_bits={args.quant_bits} "
         f"noise_std={args.noise_std} trials={args.mc_trials} "
-        f"adc_full_range={args.adc_full_range} seed={args.noise_seed}"
+        f"adc_full_range={args.adc_full_range} seed={args.noise_seed} "
+        f"cell_mode={cell_mode}"
     )
     clean_val = evaluate_kirchhoff_clean(
         eval_wrapper, val_loader, task_fn, ctx_factory, device,
+        cell_mode=cell_mode,
     )
     result = evaluate_kirchhoff_with_noise(
         eval_wrapper, val_loader, task_fn, ctx_factory, eval_cfg, device,
+        cell_mode=cell_mode,
     )
     result.clean_loss = clean_val
     degradation = result.mean - clean_val
@@ -3931,15 +3941,18 @@ def main():
             _run_noise_evaluation(
                 raw_net, val_loader, task_fn, ctx_factory,
                 device, args, out_dir, "main",
+                cell_mode="ste",
             )
             _run_noise_evaluation(
                 raw_pruned, val_loader, task_fn, ctx_factory,
                 device, args, out_dir, "pruned",
+                cell_mode="ste",
             )
         else:
             _run_noise_evaluation(
                 raw_net, val_loader, task_fn, ctx_factory,
                 device, args, out_dir, "main",
+                cell_mode="ste",
             )
 
     print(f"[train] done — artifacts in {out_dir}")

@@ -3450,7 +3450,10 @@ def main():
                 raw_net.to("cpu")
             except Exception:
                 pass
-            raw_net = None
+            # Keep raw_net alive on CPU so the post-training noise evaluation
+            # can still use it. GPU memory is freed by .to("cpu") above;
+            # setting raw_net = None would break the noise eval call below
+            # that passes raw_net to _run_noise_evaluation().
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

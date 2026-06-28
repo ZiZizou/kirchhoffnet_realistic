@@ -2618,11 +2618,16 @@ def main():
             f"edge_mismatch_std={ems} global_isat_shift_std={giss} "
             f"edge_isat_mismatch_std={ims}"
         )
+        # Capture raw_net by value via default arg so the closure
+        # does not break when raw_net is later reassigned (e.g. to
+        # None during the free-memory step before building pruned_net).
+        _raw_net = raw_net
+        _num_cells = _raw_net.core.stages[0].cell_lib.num_cells
         def ctx_factory(batch_size_: int, device: torch.device = device, **_):
-            total_edges = sum(s.num_edges() for s in raw_net.core.stages)
+            total_edges = sum(s.num_edges() for s in _raw_net.core.stages)
             return sample_random_context(
                 num_edges=total_edges,
-                num_cells=raw_net.core.stages[0].cell_lib.num_cells,
+                num_cells=_num_cells,
                 device=device,
                 gain_shift_std=gss,
                 mismatch_std=ems,
@@ -3487,6 +3492,14 @@ def main():
         # For three_phase, Phase C retrain is always enabled and uses the remainder
         # of the epoch budget. For legacy, respect the --retrain flag.
         retrain_enabled = args.retrain if schedule_mode == "legacy" else True
+        best_state_pruned = None  # initialized for noise eval (may be overwritten by retrain)
+        if retrain_enabled and pre_edges - post_edges == 0:
+            print(
+                f"[prune] 0 edges removed — skipping Phase C retrain "
+                f"(compact network = original with {post_edges} edges, "
+                f"{post_nodes} nodes)"
+            )
+            retrain_enabled = False
         if retrain_enabled:
             if schedule_mode in ("three_phase", "four_phase"):
                 c_epochs = c_total
@@ -3566,7 +3579,6 @@ def main():
             retrain_deq_log_path = deq_val_log_path
             best_val_pruned = float("inf")
             best_epoch_pruned = -1
-            best_state_pruned = None
             best_metric_name_c = "val"  # four-phase-redesign/Phase 1b
             ewop = 0
             # retrain-oom-fix/REQ-4: log memory after pruned_net, optimizer,

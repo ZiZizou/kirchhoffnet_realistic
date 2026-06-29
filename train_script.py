@@ -752,6 +752,196 @@ def _save_config_snapshot(out_dir: Path, problem: str, args, lambdas: dict,
             f.write(f"  read_idx: {args.read_idx}\n")
 
 
+def _run_noise_diagnostics(
+    raw_net,
+    val_loader,
+    task_fn,
+    ctx_factory,
+    device,
+    args,
+    out_dir,
+    best_epoch,
+    best_val,
+    best_metric_name,
+    compile_enabled,
+    schedule_mode,
+    needs_prune,
+):
+    """Collect 8 diagnostic data points at the post-training noise-eval site.
+
+    Goal: isolate why `clean_val_mse` in noise_metrics.txt diverges from
+    the last validation loss in loss_history.txt (observed for smooth2d_grid
+    but not housing_grid). Writes a structured `noise_diagnostics.txt`.
+
+    Diagnostics:
+      D1 validate(raw_net) directly — training path
+      D2 evaluate_kirchhoff_clean via fresh wrapper — noise path
+      D3 tensor-level output comparison on one batch
+      D4 checkpoint metadata (best_epoch, best_val, best_metric_name)
+      D5 raw_net state_dict hash vs saved model.pt
+      D6 device location of model and input tensors
+      D7 torch.compile state of cell_lib
+      D8 cell_mode consistency between training and noise eval
+    """
+    import hashlib
+    from analog_noise import NoiseConfig
+    from kirchhoff_noise import KirchhoffNetNoiseWrapper, evaluate_kirchhoff_clean
+
+    diag: dict[str, object] = {}
+    diag["problem"] = str(args.problem)
+    diag["needs_prune"] = bool(needs_prune)
+    diag["compile_enabled"] = bool(compile_enabled)
+
+    # D4 — checkpoint metadata
+    diag["D4_best_epoch"] = int(best_epoch)
+    diag["D4_best_val"] = float(best_val)
+    diag["D4_best_metric_name"] = str(best_metric_name)
+
+    # D6 — device location
+    try:
+        diag["D6_raw_net_device"] = str(next(raw_net.parameters()).device)
+    except Exception as e:
+        diag["D6_raw_net_device"] = f"ERR: {e}"
+    try:
+        diag["D6_input_device"] = str(next(iter(val_loader))[0].device)
+    except Exception as e:
+        diag["D6_input_device"] = f"ERR: {e}"
+
+    # D5 — model state hash vs saved model.pt
+    try:
+        raw_state = raw_net.state_dict()
+        state_keys = sorted(raw_state.keys())
+        flat = []
+        for k in state_keys:
+            flat.append(k)
+            flat.append(raw_state[k].detach().cpu().reshape(-1).tolist())
+        state_str = repr(flat)
+        diag["D5_raw_net_hash"] = hashlib.sha256(state_str.encode()).hexdigest()
+        diag["D5_raw_net_keys"] = len(state_keys)
+
+        pt_path = out_dir / "model.pt"
+        if pt_path.exists():
+            pt_state = torch.load(pt_path, map_location="cpu")
+            pt_keys = sorted(pt_state.keys())
+            pt_flat = []
+            for k in pt_keys:
+                pt_flat.append(k)
+                pt_flat.append(pt_state[k].detach().cpu().reshape(-1).tolist())
+            pt_str = repr(pt_flat)
+            diag["D5_model_pt_hash"] = hashlib.sha256(pt_str.encode()).hexdigest()
+            diag["D5_model_pt_keys"] = len(pt_keys)
+            diag["D5_state_matches_model_pt"] = bool(
+                diag["D5_raw_net_hash"] == diag["D5_model_pt_hash"]
+            )
+        else:
+            diag["D5_model_pt_hash"] = "MISSING"
+            diag["D5_state_matches_model_pt"] = False
+    except Exception as e:
+        diag["D5_error"] = f"ERR: {e}"
+
+    # D7 — compile state of cell_lib
+    try:
+        diag["D7_compile_enabled"] = bool(compile_enabled)
+        stages = list(raw_net.core.stages)
+        compiled_per_stage = []
+        shared_libs = []
+        for i, s in enumerate(stages):
+            lib = getattr(s, "cell_lib", None)
+            is_compiled = lib is not None and hasattr(lib.forward, "__wrapped__")
+            compiled_per_stage.append(bool(is_compiled))
+        for i in range(len(stages)):
+            for j in range(i + 1, len(stages)):
+                if stages[i].cell_lib is stages[j].cell_lib:
+                    shared_libs.append(f"{i}-{j}")
+        diag["D7_cell_lib_compiled_per_stage"] = compiled_per_stage
+        diag["D7_shared_cell_lib_pairs"] = shared_libs
+    except Exception as e:
+        diag["D7_error"] = f"ERR: {e}"
+
+    # D8 — cell mode consistency
+    try:
+        train_b_cell_mode = _resolve_cell_mode(args.cell_mode, "B", schedule_mode)
+        diag["D8_phase_b_cell_mode"] = str(train_b_cell_mode)
+        diag["D8_noise_eval_cell_mode"] = "ste"
+        diag["D8_cell_mode_match"] = bool(train_b_cell_mode == "ste")
+    except Exception as e:
+        diag["D8_error"] = f"ERR: {e}"
+
+    # D1 — direct clean validation (training path)
+    # Ensure raw_net is on `device` before validation. After the prune
+    # pipeline (needs_prune=True) raw_net is moved to CPU to free GPU
+    # memory (see line ~3646); validation would otherwise fail with
+    # "Input type (CUDA) and weight type (CPU) do not match".
+    try:
+        raw_net.to(device)
+        raw_net.eval()
+        v1 = validate(
+            raw_net, val_loader, task_fn, ctx_factory, device,
+            cell_mode="ste", solver="heun",
+        )
+        diag["D1_validate_raw_net"] = float(v1)
+    except Exception as e:
+        diag["D1_validate_raw_net"] = f"ERR: {e}"
+
+    # D2 — clean evaluation via wrapper (noise eval path)
+    try:
+        eval_cfg = NoiseConfig(
+            quant_bits=args.quant_bits,
+            noise_std=args.noise_std,
+            quantize_input=True,
+            quantize_output=True,
+            quantize_intermediate=True,
+            weight_noise=True,
+            activation_noise=True,
+            mc_trials=args.mc_trials,
+            seed=args.noise_seed,
+        )
+        diag_wrapper = KirchhoffNetNoiseWrapper(
+            raw_net, eval_cfg, adc_full_range=args.adc_full_range,
+        )
+        diag_wrapper.to(device)
+        diag_wrapper.eval()
+        v2 = evaluate_kirchhoff_clean(
+            diag_wrapper, val_loader, task_fn, ctx_factory, device,
+            cell_mode="ste",
+        )
+        diag["D2_evaluate_kirchhoff_clean"] = float(v2)
+    except Exception as e:
+        diag["D2_evaluate_kirchhoff_clean"] = f"ERR: {e}"
+
+    # D3 — tensor-level output comparison on one batch
+    try:
+        u_sample, _ = next(iter(val_loader))
+        u_sample = u_sample[:8].to(device)
+        ctx_sample = ctx_factory(u_sample.size(0), device=device)
+        with torch.no_grad():
+            out_raw, _ = raw_net(
+                u_sample, ctx=ctx_sample, store_trajectory=False,
+                cell_mode="ste", solver="heun",
+            )
+            out_wrap, _ = diag_wrapper(
+                u_sample, ctx=ctx_sample, cell_mode="ste",
+            )
+        diff = (out_raw - out_wrap).abs()
+        diag["D3_max_output_diff"] = float(diff.max().item())
+        diag["D3_mean_output_diff"] = float(diff.mean().item())
+        diag["D3_raw_out_sample"] = [float(x) for x in out_raw[:3].flatten()[:6].tolist()]
+        diag["D3_wrap_out_sample"] = [float(x) for x in out_wrap[:3].flatten()[:6].tolist()]
+    except Exception as e:
+        diag["D3_error"] = f"ERR: {e}"
+
+    # Write diagnostics
+    diag_path = out_dir / "noise_diagnostics.txt"
+    with open(diag_path, "w") as f:
+        f.write("# Noise Evaluation Diagnostics\n")
+        f.write(f"# problem: {args.problem}\n")
+        f.write(f"# needs_prune: {needs_prune}\n")
+        f.write(f"# compile_enabled: {compile_enabled}\n\n")
+        for key, val in diag.items():
+            f.write(f"{key}: {val}\n")
+    print(f"[diag] wrote {diag_path}")
+
+
 def _run_noise_evaluation(
     base_net,
     val_loader,
@@ -3925,6 +4115,18 @@ def main():
                 f.write(f"best_val_pruned: {best_val_pruned:.6f}\n")
                 f.write(f"best_epoch_pruned: {best_epoch_pruned}\n")
                 f.write(f"scheduler: {args.use_scheduler}\n")
+
+    # ----------------------------------------------------------------
+    # Diagnostic probe: collect D1-D8 right before noise eval so we can
+    # isolate the noise-eval clean-loss mismatch vs training val loss.
+    # ----------------------------------------------------------------
+    if args.noise or args.noise_aware:
+        _run_noise_diagnostics(
+            raw_net, val_loader, task_fn, ctx_factory,
+            device, args, out_dir,
+            best_epoch, best_val, best_metric_name,
+            compile_enabled, schedule_mode, needs_prune,
+        )
 
     # ----------------------------------------------------------------
     # kirchhoff-noise: final MC noise evaluation on the deployable

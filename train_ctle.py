@@ -957,6 +957,12 @@ def collect_gradient_norms(raw_net):
     """
     stage_sq = {}
     stage_components = ("logits", "raw_mult", "raw_leak", "z_logits", "u_logits")
+    # Per-edge device parameter suffixes: covers SimpleEdgeLibrary.param
+    # (I=ReLU/tanh(p0*Vsrc+p1*Vdest+p2)), RealisticTanhLibrary
+    # (alpha_raw, bias_raw), and RealisticTanhUpgradeLibrary (alpha_raw,
+    # gm_raw, isat_raw, bias_raw). All contribute to the same `device_param`
+    # gradient-norm metric per stage.
+    device_param_suffixes = ("param", "alpha_raw", "bias_raw", "gm_raw", "isat_raw")
     transfer_sq = 0.0
     transfer_found = False
     in_sq = 0.0
@@ -970,7 +976,7 @@ def collect_gradient_norms(raw_net):
                 if name.endswith("." + comp):
                     stage_idx = int(name.split(".stages.")[1].split(".")[0])
                     stage_sq.setdefault(f"stage{stage_idx}_{comp}", 0.0)
-            if name.endswith(".cell_lib.param"):
+            if any(name.endswith(".cell_lib." + s) for s in device_param_suffixes):
                 stage_idx = int(name.split(".stages.")[1].split(".")[0])
                 stage_sq.setdefault(f"stage{stage_idx}_device_param", 0.0)
 
@@ -984,7 +990,7 @@ def collect_gradient_norms(raw_net):
                     stage_idx = int(name.split(".stages.")[1].split(".")[0])
                     key = f"stage{stage_idx}_{comp}"
                     stage_sq[key] = stage_sq.get(key, 0.0) + gnorm_sq
-            if name.endswith(".cell_lib.param"):
+            if any(name.endswith(".cell_lib." + s) for s in device_param_suffixes):
                 stage_idx = int(name.split(".stages.")[1].split(".")[0])
                 key = f"stage{stage_idx}_device_param"
                 stage_sq[key] = stage_sq.get(key, 0.0) + gnorm_sq
@@ -1158,9 +1164,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--cell-library", type=str, default=None, dest="cell_library",
-        choices=["legacy", "v15", "v2", "relu", "tanh"],
+        choices=["legacy", "v15", "v2", "relu", "tanh", "tanh_realistic", "tanh_realistic_upgrade"],
         help="Cell library: 'legacy' (L,S,P,Z, default), 'v15' (O_weak,O_hard,P0,N0,D1,Z), "
-             "'relu' (I=ReLU(p0*Vsrc+p1*Vdest+p2)), 'tanh' (I=tanh(p0*Vsrc+p1*Vdest+p2)).",
+             "'relu' (I=ReLU(p0*Vsrc+p1*Vdest+p2)), 'tanh' (I=tanh(p0*Vsrc+p1*Vdest+p2)), "
+             "'tanh_realistic' (I=tanh(A*Vsrc - B*Vdest + C), A,B>0, A+B=1), "
+             "'tanh_realistic_upgrade' (I=Isat*tanh(gm*(A*Vsrc - B*Vdest) + C), "
+             "bounded gm/Isat per-edge).",
     )
     parser.add_argument(
         "--output", type=Path, default=Path("./output_ctle"),

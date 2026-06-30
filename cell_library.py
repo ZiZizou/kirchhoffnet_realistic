@@ -26,10 +26,24 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from config import CELL_LIBRARIES, PHYS, cells_to_tensor_dict
+from config import (
+    CELL_LIBRARIES,
+    PHYS,
+    TANH_REALISTIC_GM_MAX,
+    TANH_REALISTIC_GM_MIN,
+    TANH_REALISTIC_ISAT_MAX,
+    TANH_REALISTIC_ISAT_MIN,
+    cells_to_tensor_dict,
+)
 
 
-__all__ = ["IdealizedCellLibrary", "SimpleEdgeLibrary", "make_cell_library"]
+__all__ = [
+    "IdealizedCellLibrary",
+    "RealisticTanhLibrary",
+    "RealisticTanhUpgradeLibrary",
+    "SimpleEdgeLibrary",
+    "make_cell_library",
+]
 
 
 class IdealizedCellLibrary(nn.Module):
@@ -289,9 +303,10 @@ class SimpleEdgeLibrary(nn.Module):
     ) -> torch.Tensor:
         """Compute edge currents.
 
-        ``logits``, ``raw_mult``, ``tau``, and ``cell_mode`` are ignored
-        (no cell selection / multiplicity for this library).
+        ``logits``, ``raw_mult``, ``tau``, ``cell_mode``, and ``ctx`` are
+        ignored (no cell selection / multiplicity for this library).
         """
+        del logits, raw_mult, tau, cell_mode, ctx
         batch, num_edges = x_src.shape
         u = (self.param[0].unsqueeze(0) * x_src
              + self.param[1].unsqueeze(0) * x_dst
@@ -309,18 +324,203 @@ class SimpleEdgeLibrary(nn.Module):
         pass
 
 
-def make_cell_library(library_name: str, num_edges: int | None = None) -> IdealizedCellLibrary | SimpleEdgeLibrary:
-    """Factory: returns ``SimpleEdgeLibrary`` for ``relu``/``tanh``,
-    ``IdealizedCellLibrary`` for ``legacy``/``v15``/``v2`` (and any other
-    bounded macro library registered in ``CELL_LIBRARIES``).
+class RealisticTanhLibrary(nn.Module):
+    """Per-edge constrained-differential tanh device.
 
-    When ``num_edges`` is ``None`` (template), the returned
-    ``SimpleEdgeLibrary`` is created with ``num_edges=1`` and must be
-    replaced with a per-stage instance via
-    ``SimpleEdgeLibrary(num_edges=actual, mode=...)`` before use.
+    Per-edge formula::
+
+        I = tanh(A * Vsrc - B * Vdest + C)
+
+    where ``A = sigmoid(alpha_raw)``, ``B = 1 - A`` (so ``A, B > 0`` and
+    ``A + B = 1`` exactly), and ``C = bias_raw`` (initialized to zero so
+    the bias is dormant at start but learns freely during training).
+
+    Holds three learnable parameters of shape ``[E]`` each:
+      - ``alpha_raw``: unconstrained source/destination mix coefficient.
+      - ``bias_raw``: additive pre-tanh bias, init=0.
+
+    Multi-edge parameters (multiplicity / cell logits) are not used:
+    ``DifferentialStage`` skips them for simple-edge libraries. Compliance
+    gating (src/dst rail clamp) is applied after the tanh evaluation.
     """
+
+    def __init__(self, num_edges: int) -> None:
+        super().__init__()
+        self.alpha_raw = nn.Parameter(torch.randn(num_edges))
+        self.bias_raw = nn.Parameter(torch.zeros(num_edges))
+        self._cell_order = ["S"]
+        self.z_index = 0
+        self._beta_softness = float(PHYS["beta_softness"])
+
+    @property
+    def num_cells(self) -> int:
+        return 1
+
+    @property
+    def has_z_cell(self) -> bool:
+        return False
+
+    def gm_values(self) -> torch.Tensor:
+        """No per-cell gm concept for this device; returns zeros."""
+        return torch.zeros(1, device=self.alpha_raw.device)
+
+    def forward(
+        self,
+        x_src: torch.Tensor,
+        x_dst: torch.Tensor,
+        logits: torch.Tensor,
+        raw_mult: torch.Tensor,
+        x_max: float,
+        ctx,
+        tau: float = 1.0,
+        cell_mode: str = "soft",
+    ) -> torch.Tensor:
+        """Compute edge currents.
+
+        ``logits``, ``raw_mult``, ``tau``, ``cell_mode``, and ``ctx`` are
+        ignored (single-cell device; no library selection or multiplicity).
+        """
+        del logits, raw_mult, tau, cell_mode, ctx
+        A = torch.sigmoid(self.alpha_raw).unsqueeze(0)  # [1, E]
+        B = 1.0 - A
+        u = A * x_src - B * x_dst + self.bias_raw.unsqueeze(0)
+        i_cell = torch.tanh(u)
+
+        gate_src = torch.sigmoid((x_max - x_src.abs()) / self._beta_softness)
+        gate_dst = torch.sigmoid((x_max - x_dst.abs()) / self._beta_softness)
+        gate = gate_src * gate_dst
+
+        return gate * i_cell
+
+    def compile_forward(self, backend: str = "inductor"):
+        pass
+
+
+class RealisticTanhUpgradeLibrary(nn.Module):
+    """Per-edge saturated realistic tanh device with bounded gain/saturation.
+
+    Per-edge formula::
+
+        I = Isat * tanh(gm * (A * Vsrc - B * Vdest) + C)
+
+    Parameterization (all per-edge, shape ``[E]``):
+      - ``alpha_raw`` → A = sigmoid(alpha_raw), B = 1 - A (so A, B > 0, A+B=1).
+      - ``gm_raw``    → gm = gm_min + (gm_max - gm_min) * sigmoid(gm_raw).
+      - ``isat_raw``  → Isat = isat_min + (isat_max - isat_min) * sigmoid(isat_raw).
+      - ``bias_raw``  → C (initialized to zero; always included, never gated).
+
+    Boundary defaults come from ``config.TANH_REALISTIC_*`` and can be
+    overridden per-instance via constructor kwargs. Initial ``gm`` and
+    ``Isat`` sit at the geometric midpoint (sigmoid(0)=0.5 → (min+max)/2).
+
+    No cell selection / multiplicity. Compliance gating applied after tanh.
+    """
+
+    def __init__(
+        self,
+        num_edges: int,
+        gm_min: float | None = None,
+        gm_max: float | None = None,
+        isat_min: float | None = None,
+        isat_max: float | None = None,
+    ) -> None:
+        super().__init__()
+        self.gm_min = float(gm_min if gm_min is not None else TANH_REALISTIC_GM_MIN)
+        self.gm_max = float(gm_max if gm_max is not None else TANH_REALISTIC_GM_MAX)
+        self.isat_min = float(isat_min if isat_min is not None else TANH_REALISTIC_ISAT_MIN)
+        self.isat_max = float(isat_max if isat_max is not None else TANH_REALISTIC_ISAT_MAX)
+        if self.gm_max <= self.gm_min:
+            raise ValueError(
+                f"RealisticTanhUpgradeLibrary requires gm_max > gm_min, "
+                f"got [{self.gm_min}, {self.gm_max}]"
+            )
+        if self.isat_max <= self.isat_min:
+            raise ValueError(
+                f"RealisticTanhUpgradeLibrary requires isat_max > isat_min, "
+                f"got [{self.isat_min}, {self.isat_max}]"
+            )
+
+        self.alpha_raw = nn.Parameter(torch.randn(num_edges))
+        self.gm_raw = nn.Parameter(torch.zeros(num_edges))
+        self.isat_raw = nn.Parameter(torch.zeros(num_edges))
+        self.bias_raw = nn.Parameter(torch.zeros(num_edges))
+
+        self._cell_order = ["S"]
+        self.z_index = 0
+        self._beta_softness = float(PHYS["beta_softness"])
+
+    @property
+    def num_cells(self) -> int:
+        return 1
+
+    @property
+    def has_z_cell(self) -> bool:
+        return False
+
+    def gm_values(self) -> torch.Tensor:
+        """No per-cell gm concept for this device; returns zeros."""
+        return torch.zeros(1, device=self.alpha_raw.device)
+
+    def forward(
+        self,
+        x_src: torch.Tensor,
+        x_dst: torch.Tensor,
+        logits: torch.Tensor,
+        raw_mult: torch.Tensor,
+        x_max: float,
+        ctx,
+        tau: float = 1.0,
+        cell_mode: str = "soft",
+    ) -> torch.Tensor:
+        """Compute edge currents.
+
+        ``logits``, ``raw_mult``, ``tau``, ``cell_mode``, and ``ctx`` are
+        ignored (single-cell device; no library selection, multiplicity, or
+        PVT/mismatch support).
+        """
+        del logits, raw_mult, tau, cell_mode, ctx
+        sig_alpha = torch.sigmoid(self.alpha_raw)
+        A = sig_alpha.unsqueeze(0)  # [1, E]
+        B = 1.0 - A
+        sig_gm = torch.sigmoid(self.gm_raw)
+        gm = self.gm_min + (self.gm_max - self.gm_min) * sig_gm  # [E]
+        sig_isat = torch.sigmoid(self.isat_raw)
+        isat = (self.isat_min + (self.isat_max - self.isat_min) * sig_isat).clamp_min(1e-6)  # [E]
+        u = (A * x_src - B * x_dst) * gm.unsqueeze(0) + self.bias_raw.unsqueeze(0)
+        i_cell = isat.unsqueeze(0) * torch.tanh(u)
+
+        gate_src = torch.sigmoid((x_max - x_src.abs()) / self._beta_softness)
+        gate_dst = torch.sigmoid((x_max - x_dst.abs()) / self._beta_softness)
+        gate = gate_src * gate_dst
+
+        return gate * i_cell
+
+    def compile_forward(self, backend: str = "inductor"):
+        pass
+
+
+def make_cell_library(
+    library_name: str, num_edges: int | None = None
+) -> IdealizedCellLibrary | SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary:
+    """Factory: returns the appropriate edge-library class.
+
+    Simple per-edge devices (``relu``, ``tanh``, ``tanh_realistic``,
+    ``tanh_realistic_upgrade``) return ``SimpleEdgeLibrary``,
+    ``RealisticTanhLibrary``, or ``RealisticTanhUpgradeLibrary`` respectively.
+    ``legacy``/``v15``/``v2`` (and any other bounded-macro library
+    registered in ``CELL_LIBRARIES``) return ``IdealizedCellLibrary``.
+
+    When ``num_edges`` is ``None`` (template), the returned simple library
+    is created with ``num_edges=1`` and must be replaced with a per-stage
+    instance (matching the actual edge count) before use.
+    """
+    n = num_edges if num_edges is not None else 1
     if library_name in ("relu", "tanh"):
-        return SimpleEdgeLibrary(num_edges=num_edges if num_edges is not None else 1, mode=library_name)
+        return SimpleEdgeLibrary(num_edges=n, mode=library_name)
+    if library_name == "tanh_realistic":
+        return RealisticTanhLibrary(num_edges=n)
+    if library_name == "tanh_realistic_upgrade":
+        return RealisticTanhUpgradeLibrary(num_edges=n)
     return IdealizedCellLibrary(library_name=library_name)
 
 

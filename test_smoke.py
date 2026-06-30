@@ -3024,6 +3024,10 @@ def main():
     test_simple_edge_prune()                     # SE-2
     test_simple_edge_regularizers()              # SE-3
     test_simple_edge_diagnostics()               # SE-4
+    test_tanh_realistic_construction()           # TR-1
+    test_tanh_realistic_prune()                  # TR-2
+    test_tanh_realistic_upgrade()                # TRU-1
+    test_tanh_realistic_upgrade_prune()          # TRU-2
 
     # Fixed seed tests (fixed-seed plan)
     test_seed_everything_deterministic()         # SEED-1: model init determinism
@@ -6014,6 +6018,202 @@ def test_simple_edge_regularizers():
     check("SE-3: node_gates mean = 1.0 (deprecated, returns all-ones)", float(u_gates.mean().item()) == 1.0)
     check("SE-3: sparsity w[:,:0] = 0", float(w[:, :z_idx].sum().item()) == 0.0)
     check("SE-3: rail finite", math.isfinite(float(_stage_rail_loss(stage, traj).item())))
+
+
+def test_tanh_realistic_construction():
+    """TR-1: RealisticTanhLibrary construction, invariants, and forward."""
+    print("\nTest TR-1: RealisticTanhLibrary construction + forward")
+    from cell_library import RealisticTanhLibrary, make_cell_library
+    from topology import build_net_from_config
+    from config import PRESETS
+
+    lib = RealisticTanhLibrary(num_edges=10)
+    check("TR-1: num_cells=1", lib.num_cells == 1, f"got {lib.num_cells}")
+    check("TR-1: z_index=0", lib.z_index == 0, f"got {lib.z_index}")
+    check("TR-1: has_z_cell=False", not lib.has_z_cell, f"got {lib.has_z_cell}")
+    check("TR-1: alpha_raw shape [10]", lib.alpha_raw.shape == (10,), f"got {lib.alpha_raw.shape}")
+    check("TR-1: bias_raw shape [10]", lib.bias_raw.shape == (10,), f"got {lib.bias_raw.shape}")
+    check("TR-1: bias_raw init=0", lib.bias_raw.abs().sum().item() == 0.0)
+    A = torch.sigmoid(lib.alpha_raw)
+    B = 1.0 - A
+    check("TR-1: A>0", (A > 0).all())
+    check("TR-1: B>0", (B > 0).all())
+    check("TR-1: A+B=1 (exact)", (A + B - 1.0).abs().max().item() < 1e-7)
+
+    x_src = torch.randn(4, 10)
+    x_dst = torch.randn(4, 10)
+    out = lib(x_src, x_dst, logits=None, raw_mult=None, x_max=3.0, ctx=None)
+    check("TR-1: forward shape", out.shape == (4, 10), f"got {out.shape}")
+    check("TR-1: forward finite", torch.isfinite(out).all().item())
+    loss = out.sum()
+    loss.backward()
+    check("TR-1: grad alpha_raw", lib.alpha_raw.grad is not None)
+    check("TR-1: grad bias_raw", lib.bias_raw.grad is not None)
+
+    # Pipeline integration
+    cell_lib = make_cell_library("tanh_realistic")
+    preset = dict(PRESETS["smooth2d_grid"])
+    preset["stages"] = preset["stages"][:1]
+    net = build_net_from_config(preset, cell_lib=cell_lib, enable_drive=False)
+    stage = net.core.stages[0]
+    check("TR-1: stage logits None", stage.logits is None)
+    check("TR-1: stage raw_mult None", stage.raw_mult is None)
+    check("TR-1: stage cell_lib is RealisticTanhLibrary",
+          isinstance(stage.cell_lib, RealisticTanhLibrary))
+    out, _ = net(torch.randn(4, 2), ctx=None, store_trajectory=False)
+    check("TR-1: output finite (pipeline)", torch.isfinite(out).all().item())
+    check("TR-1: output shape (4,1)", out.shape == (4, 1), f"got {out.shape}")
+    loss = out.sum()
+    loss.backward()
+    check("TR-1: grad on alpha_raw (pipeline)", stage.cell_lib.alpha_raw.grad is not None)
+    check("TR-1: grad on bias_raw (pipeline)", stage.cell_lib.bias_raw.grad is not None)
+    check("TR-1: grad on z_logits", stage.z_logits.grad is not None)
+    check("TR-1: grad on raw_leak", stage.raw_leak.grad is not None)
+    check("TR-1 deprecate-node-gates: u_logits no grad",
+          stage.u_logits.grad is None, f"got {stage.u_logits.grad}")
+
+
+def test_tanh_realistic_prune():
+    """TR-2: RealisticTanhLibrary pruning."""
+    print("\nTest TR-2: RealisticTanhLibrary pruning")
+    from cell_library import RealisticTanhLibrary, make_cell_library
+    from topology import build_net_from_config, prune_network
+    from config import PRESETS
+
+    cell_lib = make_cell_library("tanh_realistic")
+    preset = dict(PRESETS["smooth2d_grid"])
+    preset["stages"] = preset["stages"][:1]
+    net = build_net_from_config(preset, cell_lib=cell_lib, enable_drive=False)
+
+    for stage in net.core.stages:
+        with torch.no_grad():
+            stage.z_logits.fill_(2.0)
+            n = stage.z_logits.numel()
+            stage.z_logits[:n // 2] = -3.0
+
+    pruned_core, _ = prune_network(net.core, edge_threshold=0.5, prune_nodes_by_gate=False)
+    check("TR-2: pruned has fewer edges",
+          sum(s.num_edges() for s in pruned_core.stages) < sum(s.num_edges() for s in net.core.stages))
+    for i, stage in enumerate(pruned_core.stages):
+        check(f"TR-2: stage {i} alpha_raw matches edges",
+              stage.cell_lib.alpha_raw.shape == (stage.num_edges(),),
+              f"alpha_raw {stage.cell_lib.alpha_raw.shape} vs edges {stage.num_edges()}")
+        check(f"TR-2: stage {i} bias_raw matches edges",
+              stage.cell_lib.bias_raw.shape == (stage.num_edges(),),
+              f"bias_raw {stage.cell_lib.bias_raw.shape} vs edges {stage.num_edges()}")
+
+
+def test_tanh_realistic_upgrade():
+    """TRU-1: RealisticTanhUpgradeLibrary construction, invariants, and forward."""
+    print("\nTest TRU-1: RealisticTanhUpgradeLibrary construction + forward")
+    from cell_library import RealisticTanhUpgradeLibrary, make_cell_library
+    from topology import build_net_from_config, topology_to_stage
+    from config import PRESETS, TANH_REALISTIC_GM_MIN, TANH_REALISTIC_GM_MAX, TANH_REALISTIC_ISAT_MIN, TANH_REALISTIC_ISAT_MAX
+
+    lib = RealisticTanhUpgradeLibrary(num_edges=10)
+    check("TRU-1: num_cells=1", lib.num_cells == 1, f"got {lib.num_cells}")
+    check("TRU-1: z_index=0", lib.z_index == 0, f"got {lib.z_index}")
+    check("TRU-1: has_z_cell=False", not lib.has_z_cell)
+    check("TRU-1: alpha_raw shape [10]", lib.alpha_raw.shape == (10,), f"got {lib.alpha_raw.shape}")
+    check("TRU-1: gm_raw shape [10]", lib.gm_raw.shape == (10,), f"got {lib.gm_raw.shape}")
+    check("TRU-1: isat_raw shape [10]", lib.isat_raw.shape == (10,), f"got {lib.isat_raw.shape}")
+    check("TRU-1: bias_raw shape [10]", lib.bias_raw.shape == (10,), f"got {lib.bias_raw.shape}")
+    check("TRU-1: gm_raw init=0", lib.gm_raw.abs().sum().item() == 0.0)
+    check("TRU-1: isat_raw init=0", lib.isat_raw.abs().sum().item() == 0.0)
+    check("TRU-1: bias_raw init=0", lib.bias_raw.abs().sum().item() == 0.0)
+
+    # Default boundaries from config
+    check("TRU-1: gm_min from config", lib.gm_min == TANH_REALISTIC_GM_MIN, f"got {lib.gm_min}")
+    check("TRU-1: gm_max from config", lib.gm_max == TANH_REALISTIC_GM_MAX, f"got {lib.gm_max}")
+    check("TRU-1: isat_min from config", lib.isat_min == TANH_REALISTIC_ISAT_MIN, f"got {lib.isat_min}")
+    check("TRU-1: isat_max from config", lib.isat_max == TANH_REALISTIC_ISAT_MAX, f"got {lib.isat_max}")
+
+    # Custom boundaries
+    lib2 = RealisticTanhUpgradeLibrary(num_edges=3, gm_min=0.5, gm_max=2.0, isat_min=0.1, isat_max=1.0)
+    check("TRU-1: custom gm_min", lib2.gm_min == 0.5, f"got {lib2.gm_min}")
+    check("TRU-1: custom gm_max", lib2.gm_max == 2.0, f"got {lib2.gm_max}")
+    check("TRU-1: custom isat_min", lib2.isat_min == 0.1, f"got {lib2.isat_min}")
+    check("TRU-1: custom isat_max", lib2.isat_max == 1.0, f"got {lib2.isat_max}")
+
+    A = torch.sigmoid(lib.alpha_raw)
+    B = 1.0 - A
+    check("TRU-1: A>0 (upgrade)", (A > 0).all())
+    check("TRU-1: B>0 (upgrade)", (B > 0).all())
+    check("TRU-1: A+B=1 (upgrade)", (A + B - 1.0).abs().max().item() < 1e-7)
+
+    sig_gm = torch.sigmoid(lib.gm_raw)
+    gm = TANH_REALISTIC_GM_MIN + (TANH_REALISTIC_GM_MAX - TANH_REALISTIC_GM_MIN) * sig_gm
+    check("TRU-1: gm in [gm_min, gm_max]",
+          TANH_REALISTIC_GM_MIN <= gm.min().item() and gm.max().item() <= TANH_REALISTIC_GM_MAX)
+    sig_isat = torch.sigmoid(lib.isat_raw)
+    isat_v = TANH_REALISTIC_ISAT_MIN + (TANH_REALISTIC_ISAT_MAX - TANH_REALISTIC_ISAT_MIN) * sig_isat
+    check("TRU-1: isat in [isat_min, isat_max]",
+          TANH_REALISTIC_ISAT_MIN <= isat_v.min().item() and isat_v.max().item() <= TANH_REALISTIC_ISAT_MAX)
+
+    x_src = torch.randn(4, 10)
+    x_dst = torch.randn(4, 10)
+    out = lib(x_src, x_dst, logits=None, raw_mult=None, x_max=3.0, ctx=None)
+    check("TRU-1: forward shape", out.shape == (4, 10), f"got {out.shape}")
+    check("TRU-1: forward finite", torch.isfinite(out).all().item())
+    loss = out.sum()
+    loss.backward()
+    check("TRU-1: grad alpha_raw", lib.alpha_raw.grad is not None)
+    check("TRU-1: grad gm_raw", lib.gm_raw.grad is not None)
+    check("TRU-1: grad isat_raw", lib.isat_raw.grad is not None)
+    check("TRU-1: grad bias_raw", lib.bias_raw.grad is not None)
+
+    # Pipeline integration
+    cell_lib = make_cell_library("tanh_realistic_upgrade")
+    preset = dict(PRESETS["smooth2d_grid"])
+    preset["stages"] = preset["stages"][:1]
+    net = build_net_from_config(preset, cell_lib=cell_lib, enable_drive=False)
+    stage = net.core.stages[0]
+    check("TRU-1: stage logits None (upgrade)", stage.logits is None)
+    check("TRU-1: stage raw_mult None (upgrade)", stage.raw_mult is None)
+    check("TRU-1: stage cell_lib is RealisticTanhUpgradeLibrary",
+          isinstance(stage.cell_lib, RealisticTanhUpgradeLibrary))
+    out, _ = net(torch.randn(4, 2), ctx=None, store_trajectory=False)
+    check("TRU-1: output finite (pipeline, upgrade)", torch.isfinite(out).all().item())
+    check("TRU-1: output shape (4,1)", out.shape == (4, 1), f"got {out.shape}")
+    loss = out.sum()
+    loss.backward()
+    check("TRU-1: grad alpha_raw (pipeline)", stage.cell_lib.alpha_raw.grad is not None)
+    check("TRU-1: grad gm_raw (pipeline)", stage.cell_lib.gm_raw.grad is not None)
+    check("TRU-1: grad isat_raw (pipeline)", stage.cell_lib.isat_raw.grad is not None)
+    check("TRU-1: grad bias_raw (pipeline)", stage.cell_lib.bias_raw.grad is not None)
+    check("TRU-1: grad z_logits (upgrade)", stage.z_logits.grad is not None)
+    check("TRU-1: grad raw_leak (upgrade)", stage.raw_leak.grad is not None)
+    check("TRU-1 deprecate-node-gates: u_logits no grad (upgrade)",
+          stage.u_logits.grad is None, f"got {stage.u_logits.grad}")
+
+
+def test_tanh_realistic_upgrade_prune():
+    """TRU-2: RealisticTanhUpgradeLibrary pruning."""
+    print("\nTest TRU-2: RealisticTanhUpgradeLibrary pruning")
+    from cell_library import RealisticTanhUpgradeLibrary, make_cell_library
+    from topology import build_net_from_config, prune_network
+    from config import PRESETS
+
+    cell_lib = make_cell_library("tanh_realistic_upgrade")
+    preset = dict(PRESETS["smooth2d_grid"])
+    preset["stages"] = preset["stages"][:1]
+    net = build_net_from_config(preset, cell_lib=cell_lib, enable_drive=False)
+
+    for stage in net.core.stages:
+        with torch.no_grad():
+            stage.z_logits.fill_(2.0)
+            n = stage.z_logits.numel()
+            stage.z_logits[:n // 2] = -3.0
+
+    pruned_core, _ = prune_network(net.core, edge_threshold=0.5, prune_nodes_by_gate=False)
+    check("TRU-2: pruned has fewer edges",
+          sum(s.num_edges() for s in pruned_core.stages) < sum(s.num_edges() for s in net.core.stages))
+    for i, stage in enumerate(pruned_core.stages):
+        for name in ("alpha_raw", "gm_raw", "isat_raw", "bias_raw"):
+            p = getattr(stage.cell_lib, name)
+            check(f"TRU-2: stage {i} {name} matches edges",
+                  p.shape == (stage.num_edges(),),
+                  f"{name} {p.shape} vs edges {stage.num_edges()}")
 
 
 def test_simple_edge_diagnostics():

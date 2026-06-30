@@ -35,7 +35,11 @@ from config import (
 )
 from sim_context import SimContext, sample_random_context
 from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
-from cell_library import SimpleEdgeLibrary
+from cell_library import (
+    RealisticTanhLibrary,
+    RealisticTanhUpgradeLibrary,
+    SimpleEdgeLibrary,
+)
 
 
 __all__ = [
@@ -1443,8 +1447,19 @@ def apply_ablation(net, ablation: str) -> None:
                 stage.logits = nn.Parameter(stage.logits.new_zeros(0, stage.logits.shape[-1]))
             if stage.raw_mult is not None:
                 stage.raw_mult = nn.Parameter(stage.raw_mult.new_zeros(0))
-            if isinstance(getattr(stage, 'cell_lib', None), SimpleEdgeLibrary):
+            cell_lib = getattr(stage, 'cell_lib', None)
+            if isinstance(cell_lib, SimpleEdgeLibrary):
                 stage.cell_lib.param = nn.Parameter(stage.cell_lib.param.new_zeros(3, 0))
+            elif isinstance(cell_lib, RealisticTanhLibrary):
+                stage.cell_lib.alpha_raw = nn.Parameter(stage.cell_lib.alpha_raw.new_zeros(0))
+                stage.cell_lib.bias_raw = nn.Parameter(stage.cell_lib.bias_raw.new_zeros(0))
+            elif isinstance(cell_lib, RealisticTanhUpgradeLibrary):
+                for name in ("alpha_raw", "gm_raw", "isat_raw", "bias_raw"):
+                    setattr(
+                        stage.cell_lib,
+                        name,
+                        nn.Parameter(getattr(stage.cell_lib, name).new_zeros(0)),
+                    )
             stage.raw_leak = nn.Parameter(stage.raw_leak.new_zeros(stage.num_nodes))
             stage.z_logits = nn.Parameter(stage.z_logits.new_zeros(0))
         return

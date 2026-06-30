@@ -256,7 +256,18 @@ CELL_LIBRARIES = {
     "v2": _CELL_LIBRARY_V2,
     "relu": {"cells": {}, "cell_order": ["S"], "device": "relu"},
     "tanh": {"cells": {}, "cell_order": ["S"], "device": "tanh"},
+    "tanh_realistic": {"cells": {}, "cell_order": ["S"], "device": "tanh_realistic"},
+    "tanh_realistic_upgrade": {"cells": {}, "cell_order": ["S"], "device": "tanh_realistic_upgrade"},
 }
+
+# tanh_realistic_upgrade defaults: per-edge gm and Isat use bounded
+# sigmoid parameterization gm = gm_min + (gm_max - gm_min) * sigmoid(gm_raw),
+# isat = isat_min + (isat_max - isat_min) * sigmoid(isat_raw). Overridable
+# via the RealisticTanhUpgradeLibrary constructor.
+TANH_REALISTIC_GM_MIN = 0.01
+TANH_REALISTIC_GM_MAX = 10.0
+TANH_REALISTIC_ISAT_MIN = 0.01
+TANH_REALISTIC_ISAT_MAX = 10.0
 
 # Legacy globals for backward compatibility.
 CELL_LIBRARY = _CELL_LIBRARY_LEGACY["cells"]

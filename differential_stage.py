@@ -31,7 +31,19 @@ from config import (
     PHYS,
     SOLVER,
 )
-from cell_library import IdealizedCellLibrary, SimpleEdgeLibrary
+from cell_library import (
+    IdealizedCellLibrary,
+    RealisticTanhLibrary,
+    RealisticTanhUpgradeLibrary,
+    SimpleEdgeLibrary,
+)
+
+
+_SIMPLE_DEVICE_TYPES = (
+    SimpleEdgeLibrary,
+    RealisticTanhLibrary,
+    RealisticTanhUpgradeLibrary,
+)
 
 
 __all__ = ["DifferentialStage"]
@@ -64,7 +76,7 @@ class DifferentialStage(nn.Module):
         num_nodes: int,
         src: list[int],
         dst: list[int],
-        cell_lib: IdealizedCellLibrary,
+        cell_lib: IdealizedCellLibrary | SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary,
         c_eff: float | None = None,
         x_max: float | None = None,
         clip_current: float | None = None,
@@ -110,7 +122,7 @@ class DifferentialStage(nn.Module):
             self.drive_isat = 0.0
 
         E = len(src)
-        self._is_simple = isinstance(cell_lib, SimpleEdgeLibrary)
+        self._is_simple = isinstance(cell_lib, _SIMPLE_DEVICE_TYPES)
 
         if self._is_simple:
             self.logits = None
@@ -641,7 +653,19 @@ class DifferentialStage(nn.Module):
         """Return parameter counts including gate parameters (for diagnostics)."""
         logits_n = int(self.logits.numel()) if self.logits is not None else 0
         raw_mult_n = int(self.raw_mult.numel()) if self.raw_mult is not None else 0
-        device_n = int(self.cell_lib.param.numel()) if isinstance(self.cell_lib, SimpleEdgeLibrary) else 0
+        if isinstance(self.cell_lib, SimpleEdgeLibrary):
+            device_n = int(self.cell_lib.param.numel())
+        elif isinstance(self.cell_lib, RealisticTanhLibrary):
+            device_n = int(self.cell_lib.alpha_raw.numel()) + int(self.cell_lib.bias_raw.numel())
+        elif isinstance(self.cell_lib, RealisticTanhUpgradeLibrary):
+            device_n = (
+                int(self.cell_lib.alpha_raw.numel())
+                + int(self.cell_lib.gm_raw.numel())
+                + int(self.cell_lib.isat_raw.numel())
+                + int(self.cell_lib.bias_raw.numel())
+            )
+        else:
+            device_n = 0
         return {
             "logits": logits_n,
             "raw_mult": raw_mult_n,

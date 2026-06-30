@@ -1452,14 +1452,17 @@ def apply_ablation(net, ablation: str) -> None:
                 stage.cell_lib.param = nn.Parameter(stage.cell_lib.param.new_zeros(3, 0))
             elif isinstance(cell_lib, RealisticTanhLibrary):
                 stage.cell_lib.alpha_raw = nn.Parameter(stage.cell_lib.alpha_raw.new_zeros(0))
-                stage.cell_lib.bias_raw = nn.Parameter(stage.cell_lib.bias_raw.new_zeros(0))
+                if hasattr(stage.cell_lib, "bias_raw"):
+                    stage.cell_lib.bias_raw = nn.Parameter(stage.cell_lib.bias_raw.new_zeros(0))
             elif isinstance(cell_lib, RealisticTanhUpgradeLibrary):
-                for name in ("alpha_raw", "gm_raw", "isat_raw", "bias_raw"):
+                for name in ("alpha_raw", "gm_raw", "isat_raw"):
                     setattr(
                         stage.cell_lib,
                         name,
                         nn.Parameter(getattr(stage.cell_lib, name).new_zeros(0)),
                     )
+                if hasattr(stage.cell_lib, "bias_raw"):
+                    stage.cell_lib.bias_raw = nn.Parameter(stage.cell_lib.bias_raw.new_zeros(0))
             stage.raw_leak = nn.Parameter(stage.raw_leak.new_zeros(stage.num_nodes))
             stage.z_logits = nn.Parameter(stage.z_logits.new_zeros(0))
         return

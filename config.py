@@ -256,8 +256,8 @@ CELL_LIBRARIES = {
     "v2": _CELL_LIBRARY_V2,
     "relu": {"cells": {}, "cell_order": ["S"], "device": "relu"},
     "tanh": {"cells": {}, "cell_order": ["S"], "device": "tanh"},
-    "tanh_realistic": {"cells": {}, "cell_order": ["S"], "device": "tanh_realistic"},
-    "tanh_realistic_upgrade": {"cells": {}, "cell_order": ["S"], "device": "tanh_realistic_upgrade"},
+    "tanh_realistic": {"cells": {}, "cell_order": ["S"], "device": "tanh_realistic", "BIAS_ENABLED": False},
+    "tanh_realistic_upgrade": {"cells": {}, "cell_order": ["S"], "device": "tanh_realistic_upgrade", "BIAS_ENABLED": False},
 }
 
 # tanh_realistic_upgrade defaults: per-edge gm and Isat use bounded

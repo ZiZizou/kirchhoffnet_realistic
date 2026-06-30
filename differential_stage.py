@@ -656,14 +656,17 @@ class DifferentialStage(nn.Module):
         if isinstance(self.cell_lib, SimpleEdgeLibrary):
             device_n = int(self.cell_lib.param.numel())
         elif isinstance(self.cell_lib, RealisticTanhLibrary):
-            device_n = int(self.cell_lib.alpha_raw.numel()) + int(self.cell_lib.bias_raw.numel())
+            device_n = int(self.cell_lib.alpha_raw.numel())
+            if hasattr(self.cell_lib, "bias_raw"):
+                device_n += int(self.cell_lib.bias_raw.numel())
         elif isinstance(self.cell_lib, RealisticTanhUpgradeLibrary):
             device_n = (
                 int(self.cell_lib.alpha_raw.numel())
                 + int(self.cell_lib.gm_raw.numel())
                 + int(self.cell_lib.isat_raw.numel())
-                + int(self.cell_lib.bias_raw.numel())
             )
+            if hasattr(self.cell_lib, "bias_raw"):
+                device_n += int(self.cell_lib.bias_raw.numel())
         else:
             device_n = 0
         return {

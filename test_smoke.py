@@ -6032,8 +6032,10 @@ def test_tanh_realistic_construction():
     check("TR-1: z_index=0", lib.z_index == 0, f"got {lib.z_index}")
     check("TR-1: has_z_cell=False", not lib.has_z_cell, f"got {lib.has_z_cell}")
     check("TR-1: alpha_raw shape [10]", lib.alpha_raw.shape == (10,), f"got {lib.alpha_raw.shape}")
-    check("TR-1: bias_raw shape [10]", lib.bias_raw.shape == (10,), f"got {lib.bias_raw.shape}")
-    check("TR-1: bias_raw init=0", lib.bias_raw.abs().sum().item() == 0.0)
+    check("TR-1: bias_enabled=False by default", lib._bias_enabled is False)
+    check("TR-1: bias_raw absent by default",
+          not hasattr(lib, "bias_raw"),
+          f"got hasattr={hasattr(lib, 'bias_raw')}")
     A = torch.sigmoid(lib.alpha_raw)
     B = 1.0 - A
     check("TR-1: A>0", (A > 0).all())
@@ -6048,9 +6050,21 @@ def test_tanh_realistic_construction():
     loss = out.sum()
     loss.backward()
     check("TR-1: grad alpha_raw", lib.alpha_raw.grad is not None)
-    check("TR-1: grad bias_raw", lib.bias_raw.grad is not None)
 
-    # Pipeline integration
+    # bias_enabled=True variant: bias_raw must exist, init=0, receive grad
+    lib_bias = RealisticTanhLibrary(num_edges=10, bias_enabled=True)
+    check("TR-1: bias_enabled=True => bias_raw exists",
+          hasattr(lib_bias, "bias_raw"))
+    check("TR-1: bias_enabled=True => bias_raw shape [10]",
+          lib_bias.bias_raw.shape == (10,))
+    check("TR-1: bias_enabled=True => bias_raw init=0",
+          lib_bias.bias_raw.abs().sum().item() == 0.0)
+    out2 = lib_bias(x_src, x_dst, logits=None, raw_mult=None, x_max=3.0, ctx=None)
+    out2.sum().backward()
+    check("TR-1: bias_enabled=True => grad bias_raw",
+          lib_bias.bias_raw.grad is not None)
+
+    # Pipeline integration (default config has BIAS_ENABLED=False)
     cell_lib = make_cell_library("tanh_realistic")
     preset = dict(PRESETS["smooth2d_grid"])
     preset["stages"] = preset["stages"][:1]
@@ -6060,13 +6074,14 @@ def test_tanh_realistic_construction():
     check("TR-1: stage raw_mult None", stage.raw_mult is None)
     check("TR-1: stage cell_lib is RealisticTanhLibrary",
           isinstance(stage.cell_lib, RealisticTanhLibrary))
+    check("TR-1: pipeline bias_raw absent (BIAS_ENABLED=False)",
+          not hasattr(stage.cell_lib, "bias_raw"))
     out, _ = net(torch.randn(4, 2), ctx=None, store_trajectory=False)
     check("TR-1: output finite (pipeline)", torch.isfinite(out).all().item())
     check("TR-1: output shape (4,1)", out.shape == (4, 1), f"got {out.shape}")
     loss = out.sum()
     loss.backward()
     check("TR-1: grad on alpha_raw (pipeline)", stage.cell_lib.alpha_raw.grad is not None)
-    check("TR-1: grad on bias_raw (pipeline)", stage.cell_lib.bias_raw.grad is not None)
     check("TR-1: grad on z_logits", stage.z_logits.grad is not None)
     check("TR-1: grad on raw_leak", stage.raw_leak.grad is not None)
     check("TR-1 deprecate-node-gates: u_logits no grad",
@@ -6098,9 +6113,32 @@ def test_tanh_realistic_prune():
         check(f"TR-2: stage {i} alpha_raw matches edges",
               stage.cell_lib.alpha_raw.shape == (stage.num_edges(),),
               f"alpha_raw {stage.cell_lib.alpha_raw.shape} vs edges {stage.num_edges()}")
-        check(f"TR-2: stage {i} bias_raw matches edges",
-              stage.cell_lib.bias_raw.shape == (stage.num_edges(),),
-              f"bias_raw {stage.cell_lib.bias_raw.shape} vs edges {stage.num_edges()}")
+        check("TR-2: bias_raw remains absent when BIAS_ENABLED=False",
+              not hasattr(stage.cell_lib, "bias_raw"))
+
+    # With bias_enabled=True, prune should preserve bias_raw
+    from config import CELL_LIBRARIES as _CL
+    _orig_entry = _CL["tanh_realistic"]
+    _CL["tanh_realistic"] = {**_orig_entry, "BIAS_ENABLED": True}
+    try:
+        cell_lib_b = make_cell_library("tanh_realistic")
+        preset_b = dict(PRESETS["smooth2d_grid"])
+        preset_b["stages"] = preset_b["stages"][:1]
+        net_b = build_net_from_config(preset_b, cell_lib=cell_lib_b, enable_drive=False)
+        for stage in net_b.core.stages:
+            with torch.no_grad():
+                stage.z_logits.fill_(2.0)
+                n = stage.z_logits.numel()
+                stage.z_logits[:n // 2] = -3.0
+        pruned_b, _ = prune_network(net_b.core, edge_threshold=0.5, prune_nodes_by_gate=False)
+        for i, stage in enumerate(pruned_b.stages):
+            check(f"TR-2 bias: stage {i} bias_raw present",
+                  hasattr(stage.cell_lib, "bias_raw"))
+            check(f"TR-2 bias: stage {i} bias_raw shape matches edges",
+                  stage.cell_lib.bias_raw.shape == (stage.num_edges(),),
+                  f"bias_raw {stage.cell_lib.bias_raw.shape} vs edges {stage.num_edges()}")
+    finally:
+        _CL["tanh_realistic"] = _orig_entry
 
 
 def test_tanh_realistic_upgrade():
@@ -6117,10 +6155,12 @@ def test_tanh_realistic_upgrade():
     check("TRU-1: alpha_raw shape [10]", lib.alpha_raw.shape == (10,), f"got {lib.alpha_raw.shape}")
     check("TRU-1: gm_raw shape [10]", lib.gm_raw.shape == (10,), f"got {lib.gm_raw.shape}")
     check("TRU-1: isat_raw shape [10]", lib.isat_raw.shape == (10,), f"got {lib.isat_raw.shape}")
-    check("TRU-1: bias_raw shape [10]", lib.bias_raw.shape == (10,), f"got {lib.bias_raw.shape}")
+    check("TRU-1: bias_enabled=False by default", lib._bias_enabled is False)
+    check("TRU-1: bias_raw absent by default",
+          not hasattr(lib, "bias_raw"),
+          f"got hasattr={hasattr(lib, 'bias_raw')}")
     check("TRU-1: gm_raw init=0", lib.gm_raw.abs().sum().item() == 0.0)
     check("TRU-1: isat_raw init=0", lib.isat_raw.abs().sum().item() == 0.0)
-    check("TRU-1: bias_raw init=0", lib.bias_raw.abs().sum().item() == 0.0)
 
     # Default boundaries from config
     check("TRU-1: gm_min from config", lib.gm_min == TANH_REALISTIC_GM_MIN, f"got {lib.gm_min}")
@@ -6160,7 +6200,19 @@ def test_tanh_realistic_upgrade():
     check("TRU-1: grad alpha_raw", lib.alpha_raw.grad is not None)
     check("TRU-1: grad gm_raw", lib.gm_raw.grad is not None)
     check("TRU-1: grad isat_raw", lib.isat_raw.grad is not None)
-    check("TRU-1: grad bias_raw", lib.bias_raw.grad is not None)
+
+    # bias_enabled=True variant
+    lib_bias = RealisticTanhUpgradeLibrary(num_edges=10, bias_enabled=True)
+    check("TRU-1: bias_enabled=True => bias_raw exists",
+          hasattr(lib_bias, "bias_raw"))
+    check("TRU-1: bias_enabled=True => bias_raw shape [10]",
+          lib_bias.bias_raw.shape == (10,))
+    check("TRU-1: bias_enabled=True => bias_raw init=0",
+          lib_bias.bias_raw.abs().sum().item() == 0.0)
+    out2 = lib_bias(x_src, x_dst, logits=None, raw_mult=None, x_max=3.0, ctx=None)
+    out2.sum().backward()
+    check("TRU-1: bias_enabled=True => grad bias_raw",
+          lib_bias.bias_raw.grad is not None)
 
     # Pipeline integration
     cell_lib = make_cell_library("tanh_realistic_upgrade")
@@ -6172,6 +6224,8 @@ def test_tanh_realistic_upgrade():
     check("TRU-1: stage raw_mult None (upgrade)", stage.raw_mult is None)
     check("TRU-1: stage cell_lib is RealisticTanhUpgradeLibrary",
           isinstance(stage.cell_lib, RealisticTanhUpgradeLibrary))
+    check("TRU-1: pipeline bias_raw absent (BIAS_ENABLED=False)",
+          not hasattr(stage.cell_lib, "bias_raw"))
     out, _ = net(torch.randn(4, 2), ctx=None, store_trajectory=False)
     check("TRU-1: output finite (pipeline, upgrade)", torch.isfinite(out).all().item())
     check("TRU-1: output shape (4,1)", out.shape == (4, 1), f"got {out.shape}")
@@ -6180,7 +6234,6 @@ def test_tanh_realistic_upgrade():
     check("TRU-1: grad alpha_raw (pipeline)", stage.cell_lib.alpha_raw.grad is not None)
     check("TRU-1: grad gm_raw (pipeline)", stage.cell_lib.gm_raw.grad is not None)
     check("TRU-1: grad isat_raw (pipeline)", stage.cell_lib.isat_raw.grad is not None)
-    check("TRU-1: grad bias_raw (pipeline)", stage.cell_lib.bias_raw.grad is not None)
     check("TRU-1: grad z_logits (upgrade)", stage.z_logits.grad is not None)
     check("TRU-1: grad raw_leak (upgrade)", stage.raw_leak.grad is not None)
     check("TRU-1 deprecate-node-gates: u_logits no grad (upgrade)",
@@ -6192,7 +6245,7 @@ def test_tanh_realistic_upgrade_prune():
     print("\nTest TRU-2: RealisticTanhUpgradeLibrary pruning")
     from cell_library import RealisticTanhUpgradeLibrary, make_cell_library
     from topology import build_net_from_config, prune_network
-    from config import PRESETS
+    from config import PRESETS, CELL_LIBRARIES
 
     cell_lib = make_cell_library("tanh_realistic_upgrade")
     preset = dict(PRESETS["smooth2d_grid"])
@@ -6209,11 +6262,36 @@ def test_tanh_realistic_upgrade_prune():
     check("TRU-2: pruned has fewer edges",
           sum(s.num_edges() for s in pruned_core.stages) < sum(s.num_edges() for s in net.core.stages))
     for i, stage in enumerate(pruned_core.stages):
-        for name in ("alpha_raw", "gm_raw", "isat_raw", "bias_raw"):
+        for name in ("alpha_raw", "gm_raw", "isat_raw"):
             p = getattr(stage.cell_lib, name)
             check(f"TRU-2: stage {i} {name} matches edges",
                   p.shape == (stage.num_edges(),),
                   f"{name} {p.shape} vs edges {stage.num_edges()}")
+        check("TRU-2: bias_raw absent when BIAS_ENABLED=False",
+              not hasattr(stage.cell_lib, "bias_raw"))
+
+    # With bias_enabled=True, prune should preserve bias_raw
+    _orig_entry = CELL_LIBRARIES["tanh_realistic_upgrade"]
+    CELL_LIBRARIES["tanh_realistic_upgrade"] = {**_orig_entry, "BIAS_ENABLED": True}
+    try:
+        cell_lib_b = make_cell_library("tanh_realistic_upgrade")
+        preset_b = dict(PRESETS["smooth2d_grid"])
+        preset_b["stages"] = preset_b["stages"][:1]
+        net_b = build_net_from_config(preset_b, cell_lib=cell_lib_b, enable_drive=False)
+        for stage in net_b.core.stages:
+            with torch.no_grad():
+                stage.z_logits.fill_(2.0)
+                n = stage.z_logits.numel()
+                stage.z_logits[:n // 2] = -3.0
+        pruned_b, _ = prune_network(net_b.core, edge_threshold=0.5, prune_nodes_by_gate=False)
+        for i, stage in enumerate(pruned_b.stages):
+            check(f"TRU-2 bias: stage {i} bias_raw present",
+                  hasattr(stage.cell_lib, "bias_raw"))
+            check(f"TRU-2 bias: stage {i} bias_raw matches edges",
+                  stage.cell_lib.bias_raw.shape == (stage.num_edges(),),
+                  f"bias_raw {stage.cell_lib.bias_raw.shape} vs edges {stage.num_edges()}")
+    finally:
+        CELL_LIBRARIES["tanh_realistic_upgrade"] = _orig_entry
 
 
 def test_simple_edge_diagnostics():

@@ -801,7 +801,10 @@ def prune_stage(
     if is_simple_classic:
         new_lib = SimpleEdgeLibrary(num_edges=len(new_src), mode=stage.cell_lib._mode)
     elif is_realistic:
-        new_lib = RealisticTanhLibrary(num_edges=len(new_src))
+        new_lib = RealisticTanhLibrary(
+            num_edges=len(new_src),
+            bias_enabled=stage.cell_lib._bias_enabled,
+        )
     elif is_realistic_upgrade:
         old = stage.cell_lib
         new_lib = RealisticTanhUpgradeLibrary(
@@ -810,6 +813,7 @@ def prune_stage(
             gm_max=old.gm_max,
             isat_min=old.isat_min,
             isat_max=old.isat_max,
+            bias_enabled=old._bias_enabled,
         )
     else:
         new_lib = stage.cell_lib
@@ -835,13 +839,18 @@ def prune_stage(
                 new_stage.cell_lib.alpha_raw.data.copy_(
                     stage.cell_lib.alpha_raw.data[edge_idx_old].cpu()
                 )
-                new_stage.cell_lib.bias_raw.data.copy_(
-                    stage.cell_lib.bias_raw.data[edge_idx_old].cpu()
-                )
+                if hasattr(new_stage.cell_lib, "bias_raw") and hasattr(stage.cell_lib, "bias_raw"):
+                    new_stage.cell_lib.bias_raw.data.copy_(
+                        stage.cell_lib.bias_raw.data[edge_idx_old].cpu()
+                    )
             elif is_realistic_upgrade:
-                for name in ("alpha_raw", "gm_raw", "isat_raw", "bias_raw"):
+                for name in ("alpha_raw", "gm_raw", "isat_raw"):
                     new_stage.cell_lib.get_parameter(name).data.copy_(
                         stage.cell_lib.get_parameter(name).data[edge_idx_old].cpu()
+                    )
+                if hasattr(new_stage.cell_lib, "bias_raw") and hasattr(stage.cell_lib, "bias_raw"):
+                    new_stage.cell_lib.bias_raw.data.copy_(
+                        stage.cell_lib.bias_raw.data[edge_idx_old].cpu()
                     )
             else:
                 new_stage.logits.data.copy_(stage.logits.data[edge_idx_old].cpu())
@@ -1043,7 +1052,10 @@ def topology_to_stage(
     if isinstance(cell_lib, SimpleEdgeLibrary):
         cell_lib = SimpleEdgeLibrary(num_edges=len(remapped_src), mode=cell_lib._mode)
     elif isinstance(cell_lib, RealisticTanhLibrary):
-        cell_lib = RealisticTanhLibrary(num_edges=len(remapped_src))
+        cell_lib = RealisticTanhLibrary(
+            num_edges=len(remapped_src),
+            bias_enabled=cell_lib._bias_enabled,
+        )
     elif isinstance(cell_lib, RealisticTanhUpgradeLibrary):
         cell_lib = RealisticTanhUpgradeLibrary(
             num_edges=len(remapped_src),
@@ -1051,6 +1063,7 @@ def topology_to_stage(
             gm_max=cell_lib.gm_max,
             isat_min=cell_lib.isat_min,
             isat_max=cell_lib.isat_max,
+            bias_enabled=cell_lib._bias_enabled,
         )
 
     stage = DifferentialStage(

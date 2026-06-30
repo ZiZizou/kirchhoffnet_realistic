@@ -332,22 +332,28 @@ class RealisticTanhLibrary(nn.Module):
         I = tanh(A * Vsrc - B * Vdest + C)
 
     where ``A = sigmoid(alpha_raw)``, ``B = 1 - A`` (so ``A, B > 0`` and
-    ``A + B = 1`` exactly), and ``C = bias_raw`` (initialized to zero so
-    the bias is dormant at start but learns freely during training).
+    ``A + B = 1`` exactly), and ``C = bias_raw`` when ``bias_enabled=True``
+    (otherwise ``C = 0`` exactly, no parameter, no gradient).
 
-    Holds three learnable parameters of shape ``[E]`` each:
-      - ``alpha_raw``: unconstrained source/destination mix coefficient.
-      - ``bias_raw``: additive pre-tanh bias, init=0.
+    Holds one or two learnable parameters of shape ``[E]``:
+      - ``alpha_raw``: unconstrained source/destination mix coefficient (always present).
+      - ``bias_raw``:  additive pre-tanh bias, init=0; only present when
+        ``bias_enabled=True``.
+
+    ``bias_enabled`` defaults to ``False``. Set via ``config.py`` library
+    entry ``BIAS_ENABLED`` or by passing the kwarg to the constructor.
 
     Multi-edge parameters (multiplicity / cell logits) are not used:
     ``DifferentialStage`` skips them for simple-edge libraries. Compliance
     gating (src/dst rail clamp) is applied after the tanh evaluation.
     """
 
-    def __init__(self, num_edges: int) -> None:
+    def __init__(self, num_edges: int, bias_enabled: bool = False) -> None:
         super().__init__()
+        self._bias_enabled = bool(bias_enabled)
         self.alpha_raw = nn.Parameter(torch.randn(num_edges))
-        self.bias_raw = nn.Parameter(torch.zeros(num_edges))
+        if self._bias_enabled:
+            self.bias_raw = nn.Parameter(torch.zeros(num_edges))
         self._cell_order = ["S"]
         self.z_index = 0
         self._beta_softness = float(PHYS["beta_softness"])
@@ -379,11 +385,14 @@ class RealisticTanhLibrary(nn.Module):
 
         ``logits``, ``raw_mult``, ``tau``, ``cell_mode``, and ``ctx`` are
         ignored (single-cell device; no library selection or multiplicity).
+        When ``bias_enabled=False`` the bias term is identically zero and
+        ``self.bias_raw`` is not referenced (no gradient flows).
         """
         del logits, raw_mult, tau, cell_mode, ctx
         A = torch.sigmoid(self.alpha_raw).unsqueeze(0)  # [1, E]
         B = 1.0 - A
-        u = A * x_src - B * x_dst + self.bias_raw.unsqueeze(0)
+        bias = self.bias_raw.unsqueeze(0) if self._bias_enabled else 0.0
+        u = A * x_src - B * x_dst + bias
         i_cell = torch.tanh(u)
 
         gate_src = torch.sigmoid((x_max - x_src.abs()) / self._beta_softness)
@@ -407,11 +416,15 @@ class RealisticTanhUpgradeLibrary(nn.Module):
       - ``alpha_raw`` → A = sigmoid(alpha_raw), B = 1 - A (so A, B > 0, A+B=1).
       - ``gm_raw``    → gm = gm_min + (gm_max - gm_min) * sigmoid(gm_raw).
       - ``isat_raw``  → Isat = isat_min + (isat_max - isat_min) * sigmoid(isat_raw).
-      - ``bias_raw``  → C (initialized to zero; always included, never gated).
+      - ``bias_raw``  → C; only present when ``bias_enabled=True`` (init=0).
+        When disabled, ``C = 0`` exactly and ``bias_raw`` does not exist.
 
     Boundary defaults come from ``config.TANH_REALISTIC_*`` and can be
     overridden per-instance via constructor kwargs. Initial ``gm`` and
     ``Isat`` sit at the geometric midpoint (sigmoid(0)=0.5 → (min+max)/2).
+
+    ``bias_enabled`` defaults to ``False``. Set via ``config.py`` library
+    entry ``BIAS_ENABLED`` or by passing the kwarg to the constructor.
 
     No cell selection / multiplicity. Compliance gating applied after tanh.
     """
@@ -423,6 +436,7 @@ class RealisticTanhUpgradeLibrary(nn.Module):
         gm_max: float | None = None,
         isat_min: float | None = None,
         isat_max: float | None = None,
+        bias_enabled: bool = False,
     ) -> None:
         super().__init__()
         self.gm_min = float(gm_min if gm_min is not None else TANH_REALISTIC_GM_MIN)
@@ -440,10 +454,12 @@ class RealisticTanhUpgradeLibrary(nn.Module):
                 f"got [{self.isat_min}, {self.isat_max}]"
             )
 
+        self._bias_enabled = bool(bias_enabled)
         self.alpha_raw = nn.Parameter(torch.randn(num_edges))
-        self.gm_raw = nn.Parameter(torch.zeros(num_edges))
-        self.isat_raw = nn.Parameter(torch.zeros(num_edges))
-        self.bias_raw = nn.Parameter(torch.zeros(num_edges))
+        self.gm_raw = torch.full((num_edges,), -2.3)
+        self.isat_raw = torch.full((num_edges,), -2.3)
+        if self._bias_enabled:
+            self.bias_raw = nn.Parameter(torch.zeros(num_edges))
 
         self._cell_order = ["S"]
         self.z_index = 0
@@ -476,7 +492,8 @@ class RealisticTanhUpgradeLibrary(nn.Module):
 
         ``logits``, ``raw_mult``, ``tau``, ``cell_mode``, and ``ctx`` are
         ignored (single-cell device; no library selection, multiplicity, or
-        PVT/mismatch support).
+        PVT/mismatch support). When ``bias_enabled=False`` the bias term is
+        identically zero and ``self.bias_raw`` is not referenced.
         """
         del logits, raw_mult, tau, cell_mode, ctx
         sig_alpha = torch.sigmoid(self.alpha_raw)
@@ -486,7 +503,8 @@ class RealisticTanhUpgradeLibrary(nn.Module):
         gm = self.gm_min + (self.gm_max - self.gm_min) * sig_gm  # [E]
         sig_isat = torch.sigmoid(self.isat_raw)
         isat = (self.isat_min + (self.isat_max - self.isat_min) * sig_isat).clamp_min(1e-6)  # [E]
-        u = (A * x_src - B * x_dst) * gm.unsqueeze(0) + self.bias_raw.unsqueeze(0)
+        bias = self.bias_raw.unsqueeze(0) if self._bias_enabled else 0.0
+        u = (A * x_src - B * x_dst) * gm.unsqueeze(0) + bias
         i_cell = isat.unsqueeze(0) * torch.tanh(u)
 
         gate_src = torch.sigmoid((x_max - x_src.abs()) / self._beta_softness)
@@ -510,6 +528,10 @@ def make_cell_library(
     ``legacy``/``v15``/``v2`` (and any other bounded-macro library
     registered in ``CELL_LIBRARIES``) return ``IdealizedCellLibrary``.
 
+    The factory reads ``BIAS_ENABLED`` from the corresponding
+    ``CELL_LIBRARIES[library_name]`` entry (default ``False``) and passes
+    it to ``RealisticTanhLibrary`` / ``RealisticTanhUpgradeLibrary``.
+
     When ``num_edges`` is ``None`` (template), the returned simple library
     is created with ``num_edges=1`` and must be replaced with a per-stage
     instance (matching the actual edge count) before use.
@@ -518,9 +540,11 @@ def make_cell_library(
     if library_name in ("relu", "tanh"):
         return SimpleEdgeLibrary(num_edges=n, mode=library_name)
     if library_name == "tanh_realistic":
-        return RealisticTanhLibrary(num_edges=n)
+        bias_enabled = bool(CELL_LIBRARIES[library_name].get("BIAS_ENABLED", False))
+        return RealisticTanhLibrary(num_edges=n, bias_enabled=bias_enabled)
     if library_name == "tanh_realistic_upgrade":
-        return RealisticTanhUpgradeLibrary(num_edges=n)
+        bias_enabled = bool(CELL_LIBRARIES[library_name].get("BIAS_ENABLED", False))
+        return RealisticTanhUpgradeLibrary(num_edges=n, bias_enabled=bias_enabled)
     return IdealizedCellLibrary(library_name=library_name)
 
 

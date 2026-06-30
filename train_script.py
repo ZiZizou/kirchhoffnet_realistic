@@ -1652,10 +1652,14 @@ def collect_gradient_norms(raw_net):
     stage_components = ("logits", "raw_mult", "raw_leak", "z_logits", "u_logits")
     # Per-edge device parameter suffixes: covers SimpleEdgeLibrary.param
     # (I=ReLU/tanh(p0*Vsrc+p1*Vdest+p2)), RealisticTanhLibrary
-    # (alpha_raw, bias_raw), and RealisticTanhUpgradeLibrary (alpha_raw,
-    # gm_raw, isat_raw, bias_raw). All contribute to the same `device_param`
+    # (alpha_raw, bias_raw), RealisticTanhUpgradeLibrary (alpha_raw,
+    # gm_raw, isat_raw, bias_raw), and FreeTanhLibrary (a_raw, b_raw, s_raw,
+    # gm_raw, isat_raw, theta_raw). All contribute to the same `device_param`
     # gradient-norm metric per stage.
-    device_param_suffixes = ("param", "alpha_raw", "bias_raw", "gm_raw", "isat_raw")
+    device_param_suffixes = (
+        "param", "alpha_raw", "bias_raw", "gm_raw", "isat_raw",
+        "a_raw", "b_raw", "s_raw", "theta_raw",
+    )
     transfer_sq = 0.0
     transfer_found = False
     in_sq = 0.0
@@ -1850,13 +1854,15 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--cell-library", type=str, default=None, dest="cell_library",
-        choices=["legacy", "v15", "v2", "relu", "tanh", "tanh_realistic", "tanh_realistic_upgrade"],
+        choices=["legacy", "v15", "v2", "relu", "tanh", "tanh_realistic", "tanh_realistic_upgrade", "tanh_free"],
         help="Cell library: 'legacy' (L,S,P,Z, default), 'v15' (O_weak,O_hard,P0,N0,D1,Z), "
              "'v2' (mix-code/bias-code bounded library), "
              "'relu' (I=ReLU(p0*Vsrc+p1*Vdest+p2)), 'tanh' (I=tanh(p0*Vsrc+p1*Vdest+p2)), "
              "'tanh_realistic' (I=tanh(A*Vsrc - B*Vdest + C), A,B>0, A+B=1), "
              "'tanh_realistic_upgrade' (I=Isat*tanh(gm*(A*Vsrc - B*Vdest) + C), "
-             "bounded gm/Isat per-edge). "
+             "bounded gm/Isat per-edge), "
+             "'tanh_free' (I=Isat*tanh(gm*(s*(A*Vsrc - B*Vdest) + theta)), "
+             "A,B>=0 independent (no A+B=1), s=+/-1 via STE, bounded gm/Isat per-edge). "
              "Overrides the preset's cell_library key if present.",
     )
     parser.add_argument(

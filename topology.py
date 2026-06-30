@@ -25,6 +25,7 @@ import torch.nn as nn
 from config import PRESETS
 from differential_stage import DifferentialStage
 from cell_library import (
+    FreeTanhLibrary,
     IdealizedCellLibrary,
     RealisticTanhLibrary,
     RealisticTanhUpgradeLibrary,
@@ -794,10 +795,11 @@ def prune_stage(
         new_write_idx = [node_remap[int(idx)] for idx in stage._drive_idx.tolist()
                          if int(idx) in node_remap] if drive_surviving else None
 
-    is_simple = isinstance(stage.cell_lib, (SimpleEdgeLibrary, RealisticTanhLibrary, RealisticTanhUpgradeLibrary))
+    is_simple = isinstance(stage.cell_lib, (SimpleEdgeLibrary, RealisticTanhLibrary, RealisticTanhUpgradeLibrary, FreeTanhLibrary))
     is_simple_classic = isinstance(stage.cell_lib, SimpleEdgeLibrary)
     is_realistic = isinstance(stage.cell_lib, RealisticTanhLibrary)
     is_realistic_upgrade = isinstance(stage.cell_lib, RealisticTanhUpgradeLibrary)
+    is_free_tanh = isinstance(stage.cell_lib, FreeTanhLibrary)
     if is_simple_classic:
         new_lib = SimpleEdgeLibrary(num_edges=len(new_src), mode=stage.cell_lib._mode)
     elif is_realistic:
@@ -808,6 +810,16 @@ def prune_stage(
     elif is_realistic_upgrade:
         old = stage.cell_lib
         new_lib = RealisticTanhUpgradeLibrary(
+            num_edges=len(new_src),
+            gm_min=old.gm_min,
+            gm_max=old.gm_max,
+            isat_min=old.isat_min,
+            isat_max=old.isat_max,
+            bias_enabled=old._bias_enabled,
+        )
+    elif is_free_tanh:
+        old = stage.cell_lib
+        new_lib = FreeTanhLibrary(
             num_edges=len(new_src),
             gm_min=old.gm_min,
             gm_max=old.gm_max,
@@ -851,6 +863,15 @@ def prune_stage(
                 if hasattr(new_stage.cell_lib, "bias_raw") and hasattr(stage.cell_lib, "bias_raw"):
                     new_stage.cell_lib.bias_raw.data.copy_(
                         stage.cell_lib.bias_raw.data[edge_idx_old].cpu()
+                    )
+            elif is_free_tanh:
+                for name in ("a_raw", "b_raw", "s_raw", "gm_raw", "isat_raw"):
+                    new_stage.cell_lib.get_parameter(name).data.copy_(
+                        stage.cell_lib.get_parameter(name).data[edge_idx_old].cpu()
+                    )
+                if hasattr(new_stage.cell_lib, "theta_raw") and hasattr(stage.cell_lib, "theta_raw"):
+                    new_stage.cell_lib.theta_raw.data.copy_(
+                        stage.cell_lib.theta_raw.data[edge_idx_old].cpu()
                     )
             else:
                 new_stage.logits.data.copy_(stage.logits.data[edge_idx_old].cpu())
@@ -1016,7 +1037,7 @@ def validate_topology(topo: SparseTopology, max_hidden_density: float = 0.5) -> 
 
 def topology_to_stage(
     topo: SparseTopology,
-    cell_lib: IdealizedCellLibrary | SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary,
+    cell_lib: IdealizedCellLibrary | SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary,
     c_eff: float | None = None,
     x_max: float | None = None,
     clip_current: float | None = None,
@@ -1065,6 +1086,15 @@ def topology_to_stage(
             isat_max=cell_lib.isat_max,
             bias_enabled=cell_lib._bias_enabled,
         )
+    elif isinstance(cell_lib, FreeTanhLibrary):
+        cell_lib = FreeTanhLibrary(
+            num_edges=len(remapped_src),
+            gm_min=cell_lib.gm_min,
+            gm_max=cell_lib.gm_max,
+            isat_min=cell_lib.isat_min,
+            isat_max=cell_lib.isat_max,
+            bias_enabled=cell_lib._bias_enabled,
+        )
 
     stage = DifferentialStage(
         num_nodes=len(active_nodes),
@@ -1084,7 +1114,7 @@ def topology_to_stage(
 
 def build_net_from_preset(
     preset_name: str,
-    cell_lib: IdealizedCellLibrary | SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary,
+    cell_lib: IdealizedCellLibrary | SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary,
     write_mode: str | None = None,
     read_mode: str | None = None,
     write_idx: list[int] | None = None,
@@ -1118,7 +1148,7 @@ def build_net_from_preset(
 
 def build_net_from_config(
     cfg: dict,
-    cell_lib: IdealizedCellLibrary | SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary,
+    cell_lib: IdealizedCellLibrary | SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary,
     enable_drive: bool = False,
 ):
     """Build a KirchhoffNetWithIO from a full config dict."""

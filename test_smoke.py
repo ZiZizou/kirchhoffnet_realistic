@@ -3028,6 +3028,8 @@ def main():
     test_tanh_realistic_prune()                  # TR-2
     test_tanh_realistic_upgrade()                # TRU-1
     test_tanh_realistic_upgrade_prune()          # TRU-2
+    test_free_tanh_construction()                # FT-1
+    test_free_tanh_prune()                       # FT-2
 
     # Fixed seed tests (fixed-seed plan)
     test_seed_everything_deterministic()         # SEED-1: model init determinism
@@ -6159,8 +6161,12 @@ def test_tanh_realistic_upgrade():
     check("TRU-1: bias_raw absent by default",
           not hasattr(lib, "bias_raw"),
           f"got hasattr={hasattr(lib, 'bias_raw')}")
-    check("TRU-1: gm_raw init=0", lib.gm_raw.abs().sum().item() == 0.0)
-    check("TRU-1: isat_raw init=0", lib.isat_raw.abs().sum().item() == 0.0)
+    check("TRU-1: gm_raw is nn.Parameter (bugfix)", isinstance(lib.gm_raw, torch.nn.Parameter))
+    check("TRU-1: isat_raw is nn.Parameter (bugfix)", isinstance(lib.isat_raw, torch.nn.Parameter))
+    check("TRU-1: gm_raw init=-2.3 (sigmoid midpoint logic)",
+          torch.allclose(lib.gm_raw, torch.full((10,), -2.3)))
+    check("TRU-1: isat_raw init=-2.3 (sigmoid midpoint logic)",
+          torch.allclose(lib.isat_raw, torch.full((10,), -2.3)))
 
     # Default boundaries from config
     check("TRU-1: gm_min from config", lib.gm_min == TANH_REALISTIC_GM_MIN, f"got {lib.gm_min}")
@@ -6292,6 +6298,177 @@ def test_tanh_realistic_upgrade_prune():
                   f"bias_raw {stage.cell_lib.bias_raw.shape} vs edges {stage.num_edges()}")
     finally:
         CELL_LIBRARIES["tanh_realistic_upgrade"] = _orig_entry
+
+
+def test_free_tanh_construction():
+    """FT-1: FreeTanhLibrary construction, invariants, and forward."""
+    print("\nTest FT-1: FreeTanhLibrary construction + forward")
+    import torch.nn.functional as F
+    from cell_library import FreeTanhLibrary, make_cell_library
+    from topology import build_net_from_config
+    from config import PRESETS, TANH_REALISTIC_GM_MIN, TANH_REALISTIC_GM_MAX, TANH_REALISTIC_ISAT_MIN, TANH_REALISTIC_ISAT_MAX
+
+    lib = FreeTanhLibrary(num_edges=10)
+    check("FT-1: num_cells=1", lib.num_cells == 1, f"got {lib.num_cells}")
+    check("FT-1: z_index=0", lib.z_index == 0, f"got {lib.z_index}")
+    check("FT-1: has_z_cell=False", not lib.has_z_cell)
+    check("FT-1: a_raw shape [10]", lib.a_raw.shape == (10,), f"got {lib.a_raw.shape}")
+    check("FT-1: b_raw shape [10]", lib.b_raw.shape == (10,), f"got {lib.b_raw.shape}")
+    check("FT-1: s_raw shape [10]", lib.s_raw.shape == (10,), f"got {lib.s_raw.shape}")
+    check("FT-1: gm_raw shape [10]", lib.gm_raw.shape == (10,), f"got {lib.gm_raw.shape}")
+    check("FT-1: isat_raw shape [10]", lib.isat_raw.shape == (10,), f"got {lib.isat_raw.shape}")
+    check("FT-1: bias_enabled=False by default", lib._bias_enabled is False)
+    check("FT-1: theta_raw absent by default",
+          not hasattr(lib, "theta_raw"),
+          f"got hasattr={hasattr(lib, 'theta_raw')}")
+
+    check("FT-1: a_raw is nn.Parameter", isinstance(lib.a_raw, torch.nn.Parameter))
+    check("FT-1: b_raw is nn.Parameter", isinstance(lib.b_raw, torch.nn.Parameter))
+    check("FT-1: s_raw is nn.Parameter", isinstance(lib.s_raw, torch.nn.Parameter))
+    check("FT-1: gm_raw is nn.Parameter (bugfix)", isinstance(lib.gm_raw, torch.nn.Parameter))
+    check("FT-1: isat_raw is nn.Parameter (bugfix)", isinstance(lib.isat_raw, torch.nn.Parameter))
+
+    check("FT-1: gm_raw init=-2.3", torch.allclose(lib.gm_raw, torch.full((10,), -2.3)))
+    check("FT-1: isat_raw init=-2.3", torch.allclose(lib.isat_raw, torch.full((10,), -2.3)))
+
+    check("FT-1: gm_min from config", lib.gm_min == TANH_REALISTIC_GM_MIN, f"got {lib.gm_min}")
+    check("FT-1: gm_max from config", lib.gm_max == TANH_REALISTIC_GM_MAX, f"got {lib.gm_max}")
+    check("FT-1: isat_min from config", lib.isat_min == TANH_REALISTIC_ISAT_MIN, f"got {lib.isat_min}")
+    check("FT-1: isat_max from config", lib.isat_max == TANH_REALISTIC_ISAT_MAX, f"got {lib.isat_max}")
+
+    lib2 = FreeTanhLibrary(num_edges=3, gm_min=0.5, gm_max=2.0, isat_min=0.1, isat_max=1.0)
+    check("FT-1: custom gm_min", lib2.gm_min == 0.5, f"got {lib2.gm_min}")
+    check("FT-1: custom gm_max", lib2.gm_max == 2.0, f"got {lib2.gm_max}")
+    check("FT-1: custom isat_min", lib2.isat_min == 0.1, f"got {lib2.isat_min}")
+    check("FT-1: custom isat_max", lib2.isat_max == 1.0, f"got {lib2.isat_max}")
+
+    A = F.softplus(lib.a_raw)
+    B = F.softplus(lib.b_raw)
+    check("FT-1: A>0", (A > 0).all())
+    check("FT-1: B>0", (B > 0).all())
+    check("FT-1: A independent of B (not constrained)",
+          not torch.allclose(A + B, torch.ones_like(A), atol=1e-3))
+
+    s = torch.sign(lib.s_raw)
+    check("FT-1: s in {-1, +1}",
+          ((s == -1) | (s == 1)).all(),
+          f"unique s values: {torch.unique(s).tolist()}")
+
+    sig_gm = torch.sigmoid(lib.gm_raw)
+    gm = TANH_REALISTIC_GM_MIN + (TANH_REALISTIC_GM_MAX - TANH_REALISTIC_GM_MIN) * sig_gm
+    check("FT-1: gm in [gm_min, gm_max]",
+          TANH_REALISTIC_GM_MIN <= gm.min().item() and gm.max().item() <= TANH_REALISTIC_GM_MAX)
+    sig_isat = torch.sigmoid(lib.isat_raw)
+    isat_v = TANH_REALISTIC_ISAT_MIN + (TANH_REALISTIC_ISAT_MAX - TANH_REALISTIC_ISAT_MIN) * sig_isat
+    check("FT-1: isat in [isat_min, isat_max]",
+          TANH_REALISTIC_ISAT_MIN <= isat_v.min().item() and isat_v.max().item() <= TANH_REALISTIC_ISAT_MAX)
+
+    x_src = torch.randn(4, 10)
+    x_dst = torch.randn(4, 10)
+    out = lib(x_src, x_dst, logits=None, raw_mult=None, x_max=3.0, ctx=None)
+    check("FT-1: forward shape", out.shape == (4, 10), f"got {out.shape}")
+    check("FT-1: forward finite", torch.isfinite(out).all().item())
+    loss = out.sum()
+    loss.backward()
+    check("FT-1: grad a_raw", lib.a_raw.grad is not None)
+    check("FT-1: grad b_raw", lib.b_raw.grad is not None)
+    check("FT-1: grad s_raw", lib.s_raw.grad is not None)
+    check("FT-1: grad gm_raw", lib.gm_raw.grad is not None)
+    check("FT-1: grad isat_raw", lib.isat_raw.grad is not None)
+
+    # bias_enabled=True variant
+    lib_bias = FreeTanhLibrary(num_edges=10, bias_enabled=True)
+    check("FT-1: bias_enabled=True => theta_raw exists",
+          hasattr(lib_bias, "theta_raw"))
+    check("FT-1: bias_enabled=True => theta_raw shape [10]",
+          lib_bias.theta_raw.shape == (10,))
+    check("FT-1: bias_enabled=True => theta_raw init=0",
+          lib_bias.theta_raw.abs().sum().item() == 0.0)
+    out2 = lib_bias(x_src, x_dst, logits=None, raw_mult=None, x_max=3.0, ctx=None)
+    out2.sum().backward()
+    check("FT-1: bias_enabled=True => grad theta_raw",
+          lib_bias.theta_raw.grad is not None)
+
+    # Pipeline integration
+    cell_lib = make_cell_library("tanh_free")
+    preset = dict(PRESETS["smooth2d_grid"])
+    preset["stages"] = preset["stages"][:1]
+    net = build_net_from_config(preset, cell_lib=cell_lib, enable_drive=False)
+    stage = net.core.stages[0]
+    check("FT-1: stage logits None", stage.logits is None)
+    check("FT-1: stage raw_mult None", stage.raw_mult is None)
+    check("FT-1: stage cell_lib is FreeTanhLibrary",
+          isinstance(stage.cell_lib, FreeTanhLibrary))
+    check("FT-1: pipeline theta_raw absent (BIAS_ENABLED=False)",
+          not hasattr(stage.cell_lib, "theta_raw"))
+    out, _ = net(torch.randn(4, 2), ctx=None, store_trajectory=False)
+    check("FT-1: output finite (pipeline)", torch.isfinite(out).all().item())
+    check("FT-1: output shape (4,1)", out.shape == (4, 1), f"got {out.shape}")
+    loss = out.sum()
+    loss.backward()
+    check("FT-1: grad a_raw (pipeline)", stage.cell_lib.a_raw.grad is not None)
+    check("FT-1: grad b_raw (pipeline)", stage.cell_lib.b_raw.grad is not None)
+    check("FT-1: grad s_raw (pipeline)", stage.cell_lib.s_raw.grad is not None)
+    check("FT-1: grad gm_raw (pipeline)", stage.cell_lib.gm_raw.grad is not None)
+    check("FT-1: grad isat_raw (pipeline)", stage.cell_lib.isat_raw.grad is not None)
+    check("FT-1: grad z_logits", stage.z_logits.grad is not None)
+    check("FT-1: grad raw_leak", stage.raw_leak.grad is not None)
+    check("FT-1 deprecate-node-gates: u_logits no grad",
+          stage.u_logits.grad is None, f"got {stage.u_logits.grad}")
+
+
+def test_free_tanh_prune():
+    """FT-2: FreeTanhLibrary pruning."""
+    print("\nTest FT-2: FreeTanhLibrary pruning")
+    from cell_library import FreeTanhLibrary, make_cell_library
+    from topology import build_net_from_config, prune_network
+    from config import PRESETS, CELL_LIBRARIES
+
+    cell_lib = make_cell_library("tanh_free")
+    preset = dict(PRESETS["smooth2d_grid"])
+    preset["stages"] = preset["stages"][:1]
+    net = build_net_from_config(preset, cell_lib=cell_lib, enable_drive=False)
+
+    for stage in net.core.stages:
+        with torch.no_grad():
+            stage.z_logits.fill_(2.0)
+            n = stage.z_logits.numel()
+            stage.z_logits[:n // 2] = -3.0
+
+    pruned_core, _ = prune_network(net.core, edge_threshold=0.5, prune_nodes_by_gate=False)
+    check("FT-2: pruned has fewer edges",
+          sum(s.num_edges() for s in pruned_core.stages) < sum(s.num_edges() for s in net.core.stages))
+    for i, stage in enumerate(pruned_core.stages):
+        for name in ("a_raw", "b_raw", "s_raw", "gm_raw", "isat_raw"):
+            p = getattr(stage.cell_lib, name)
+            check(f"FT-2: stage {i} {name} matches edges",
+                  p.shape == (stage.num_edges(),),
+                  f"{name} {p.shape} vs edges {stage.num_edges()}")
+        check("FT-2: theta_raw absent when BIAS_ENABLED=False",
+              not hasattr(stage.cell_lib, "theta_raw"))
+
+    # With bias_enabled=True, prune should preserve theta_raw
+    _orig_entry = CELL_LIBRARIES["tanh_free"]
+    CELL_LIBRARIES["tanh_free"] = {**_orig_entry, "BIAS_ENABLED": True}
+    try:
+        cell_lib_b = make_cell_library("tanh_free")
+        preset_b = dict(PRESETS["smooth2d_grid"])
+        preset_b["stages"] = preset_b["stages"][:1]
+        net_b = build_net_from_config(preset_b, cell_lib=cell_lib_b, enable_drive=False)
+        for stage in net_b.core.stages:
+            with torch.no_grad():
+                stage.z_logits.fill_(2.0)
+                n = stage.z_logits.numel()
+                stage.z_logits[:n // 2] = -3.0
+        pruned_b, _ = prune_network(net_b.core, edge_threshold=0.5, prune_nodes_by_gate=False)
+        for i, stage in enumerate(pruned_b.stages):
+            check(f"FT-2 bias: stage {i} theta_raw present",
+                  hasattr(stage.cell_lib, "theta_raw"))
+            check(f"FT-2 bias: stage {i} theta_raw matches edges",
+                  stage.cell_lib.theta_raw.shape == (stage.num_edges(),),
+                  f"theta_raw {stage.cell_lib.theta_raw.shape} vs edges {stage.num_edges()}")
+    finally:
+        CELL_LIBRARIES["tanh_free"] = _orig_entry
 
 
 def test_simple_edge_diagnostics():

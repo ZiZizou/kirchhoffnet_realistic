@@ -258,6 +258,7 @@ CELL_LIBRARIES = {
     "tanh": {"cells": {}, "cell_order": ["S"], "device": "tanh"},
     "tanh_realistic": {"cells": {}, "cell_order": ["S"], "device": "tanh_realistic", "BIAS_ENABLED": False},
     "tanh_realistic_upgrade": {"cells": {}, "cell_order": ["S"], "device": "tanh_realistic_upgrade", "BIAS_ENABLED": False},
+    "tanh_free": {"cells": {}, "cell_order": ["S"], "device": "tanh_free", "BIAS_ENABLED": False},
 }
 
 # tanh_realistic_upgrade defaults: per-edge gm and Isat use bounded

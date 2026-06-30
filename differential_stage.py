@@ -32,6 +32,7 @@ from config import (
     SOLVER,
 )
 from cell_library import (
+    FreeTanhLibrary,
     IdealizedCellLibrary,
     RealisticTanhLibrary,
     RealisticTanhUpgradeLibrary,
@@ -43,6 +44,7 @@ _SIMPLE_DEVICE_TYPES = (
     SimpleEdgeLibrary,
     RealisticTanhLibrary,
     RealisticTanhUpgradeLibrary,
+    FreeTanhLibrary,
 )
 
 
@@ -76,7 +78,7 @@ class DifferentialStage(nn.Module):
         num_nodes: int,
         src: list[int],
         dst: list[int],
-        cell_lib: IdealizedCellLibrary | SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary,
+        cell_lib: IdealizedCellLibrary | SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary,
         c_eff: float | None = None,
         x_max: float | None = None,
         clip_current: float | None = None,
@@ -667,6 +669,16 @@ class DifferentialStage(nn.Module):
             )
             if hasattr(self.cell_lib, "bias_raw"):
                 device_n += int(self.cell_lib.bias_raw.numel())
+        elif isinstance(self.cell_lib, FreeTanhLibrary):
+            device_n = (
+                int(self.cell_lib.a_raw.numel())
+                + int(self.cell_lib.b_raw.numel())
+                + int(self.cell_lib.s_raw.numel())
+                + int(self.cell_lib.gm_raw.numel())
+                + int(self.cell_lib.isat_raw.numel())
+            )
+            if hasattr(self.cell_lib, "theta_raw"):
+                device_n += int(self.cell_lib.theta_raw.numel())
         else:
             device_n = 0
         return {

@@ -41,6 +41,7 @@ __all__ = [
     "IdealizedCellLibrary",
     "RealisticTanhLibrary",
     "RealisticTanhUpgradeLibrary",
+    "FreeTanhLibrary",
     "SimpleEdgeLibrary",
     "make_cell_library",
 ]
@@ -456,8 +457,8 @@ class RealisticTanhUpgradeLibrary(nn.Module):
 
         self._bias_enabled = bool(bias_enabled)
         self.alpha_raw = nn.Parameter(torch.randn(num_edges))
-        self.gm_raw = torch.full((num_edges,), -2.3)
-        self.isat_raw = torch.full((num_edges,), -2.3)
+        self.gm_raw = nn.Parameter(torch.full((num_edges,), -2.3))
+        self.isat_raw = nn.Parameter(torch.full((num_edges,), -2.3))
         if self._bias_enabled:
             self.bias_raw = nn.Parameter(torch.zeros(num_edges))
 
@@ -517,20 +518,145 @@ class RealisticTanhUpgradeLibrary(nn.Module):
         pass
 
 
+class FreeTanhLibrary(nn.Module):
+    """Per-edge signed-realistic tanh device with independent A/B and STE sign.
+
+    Per-edge formula::
+
+        I = I_sat * tanh(gm * (s * (A * Vsrc - B * Vdest) + theta))
+
+    Parameterization (all per-edge, shape ``[E]``):
+      - ``a_raw``   → A = softplus(a_raw), A >= 0, no upper bound, independent of B.
+      - ``b_raw``   → B = softplus(b_raw), B >= 0, no upper bound, no sum constraint
+                       (A + B is not required to equal 1).
+      - ``s_raw``   → s = sign(s_raw) (forward discrete ±1; backward uses a
+                       straight-through estimator so grad flows through s_raw).
+      - ``gm_raw``  → gm = gm_min + (gm_max - gm_min) * sigmoid(gm_raw).
+      - ``isat_raw``→ Isat = clamp_min(isat_min + (isat_max - isat_min) * sigmoid(isat_raw), 1e-6).
+      - ``theta_raw``→ theta; only present when ``bias_enabled=True`` (init=0).
+                       When disabled, ``theta = 0`` exactly and ``theta_raw`` does
+                       not exist (no parameter, no gradient).
+
+    All six raw tensors are registered as ``nn.Parameter`` so the optimizer
+    tracks and updates them.
+
+    Boundary defaults come from ``config.TANH_REALISTIC_*`` and can be
+    overridden per-instance via constructor kwargs. Initial ``gm`` and
+    ``Isat`` sit at the geometric midpoint (sigmoid(0)=0.5 → (min+max)/2).
+
+    ``bias_enabled`` defaults to ``False``. Set via ``config.py`` library
+    entry ``BIAS_ENABLED`` or by passing the kwarg to the constructor.
+
+    No cell selection / multiplicity. Compliance gating applied after tanh.
+    """
+
+    def __init__(
+        self,
+        num_edges: int,
+        gm_min: float | None = None,
+        gm_max: float | None = None,
+        isat_min: float | None = None,
+        isat_max: float | None = None,
+        bias_enabled: bool = False,
+    ) -> None:
+        super().__init__()
+        self.gm_min = float(gm_min if gm_min is not None else TANH_REALISTIC_GM_MIN)
+        self.gm_max = float(gm_max if gm_max is not None else TANH_REALISTIC_GM_MAX)
+        self.isat_min = float(isat_min if isat_min is not None else TANH_REALISTIC_ISAT_MIN)
+        self.isat_max = float(isat_max if isat_max is not None else TANH_REALISTIC_ISAT_MAX)
+        if self.gm_max <= self.gm_min:
+            raise ValueError(
+                f"FreeTanhLibrary requires gm_max > gm_min, "
+                f"got [{self.gm_min}, {self.gm_max}]"
+            )
+        if self.isat_max <= self.isat_min:
+            raise ValueError(
+                f"FreeTanhLibrary requires isat_max > isat_min, "
+                f"got [{self.isat_min}, {self.isat_max}]"
+            )
+
+        self._bias_enabled = bool(bias_enabled)
+        self.a_raw = nn.Parameter(torch.randn(num_edges))
+        self.b_raw = nn.Parameter(torch.randn(num_edges))
+        self.s_raw = nn.Parameter(torch.randn(num_edges))
+        self.gm_raw = nn.Parameter(torch.full((num_edges,), -2.3))
+        self.isat_raw = nn.Parameter(torch.full((num_edges,), -2.3))
+        if self._bias_enabled:
+            self.theta_raw = nn.Parameter(torch.zeros(num_edges))
+
+        self._cell_order = ["S"]
+        self.z_index = 0
+        self._beta_softness = float(PHYS["beta_softness"])
+
+    @property
+    def num_cells(self) -> int:
+        return 1
+
+    @property
+    def has_z_cell(self) -> bool:
+        return False
+
+    def gm_values(self) -> torch.Tensor:
+        """No per-cell gm concept for this device; returns zeros."""
+        return torch.zeros(1, device=self.a_raw.device)
+
+    def forward(
+        self,
+        x_src: torch.Tensor,
+        x_dst: torch.Tensor,
+        logits: torch.Tensor,
+        raw_mult: torch.Tensor,
+        x_max: float,
+        ctx,
+        tau: float = 1.0,
+        cell_mode: str = "soft",
+    ) -> torch.Tensor:
+        """Compute edge currents.
+
+        ``logits``, ``raw_mult``, ``tau``, ``cell_mode``, and ``ctx`` are
+        ignored (single-cell device; no library selection, multiplicity, or
+        PVT/mismatch support). When ``bias_enabled=False`` the theta term
+        is identically zero and ``self.theta_raw`` is not referenced.
+        """
+        del logits, raw_mult, tau, cell_mode, ctx
+        A = torch.nn.functional.softplus(self.a_raw).unsqueeze(0)  # [1, E]
+        B = torch.nn.functional.softplus(self.b_raw).unsqueeze(0)  # [1, E]
+        s = torch.sign(self.s_raw)  # [E]
+        s_ste = s + self.s_raw - self.s_raw.detach()  # STE: forward ±1, backward grad=1
+        sig_gm = torch.sigmoid(self.gm_raw)
+        gm = self.gm_min + (self.gm_max - self.gm_min) * sig_gm  # [E]
+        sig_isat = torch.sigmoid(self.isat_raw)
+        isat = (self.isat_min + (self.isat_max - self.isat_min) * sig_isat).clamp_min(1e-6)  # [E]
+        theta = self.theta_raw.unsqueeze(0) if self._bias_enabled else 0.0
+        u = (s_ste.unsqueeze(0) * (A * x_src - B * x_dst) + theta) * gm.unsqueeze(0)
+        i_cell = isat.unsqueeze(0) * torch.tanh(u)
+
+        gate_src = torch.sigmoid((x_max - x_src.abs()) / self._beta_softness)
+        gate_dst = torch.sigmoid((x_max - x_dst.abs()) / self._beta_softness)
+        gate = gate_src * gate_dst
+
+        return gate * i_cell
+
+    def compile_forward(self, backend: str = "inductor"):
+        pass
+
+
 def make_cell_library(
     library_name: str, num_edges: int | None = None
-) -> IdealizedCellLibrary | SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary:
+) -> IdealizedCellLibrary | SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary:
     """Factory: returns the appropriate edge-library class.
 
     Simple per-edge devices (``relu``, ``tanh``, ``tanh_realistic``,
-    ``tanh_realistic_upgrade``) return ``SimpleEdgeLibrary``,
-    ``RealisticTanhLibrary``, or ``RealisticTanhUpgradeLibrary`` respectively.
-    ``legacy``/``v15``/``v2`` (and any other bounded-macro library
-    registered in ``CELL_LIBRARIES``) return ``IdealizedCellLibrary``.
+    ``tanh_realistic_upgrade``, ``tanh_free``) return ``SimpleEdgeLibrary``,
+    ``RealisticTanhLibrary``, ``RealisticTanhUpgradeLibrary``, or
+    ``FreeTanhLibrary`` respectively. ``legacy``/``v15``/``v2`` (and any
+    other bounded-macro library registered in ``CELL_LIBRARIES``) return
+    ``IdealizedCellLibrary``.
 
     The factory reads ``BIAS_ENABLED`` from the corresponding
     ``CELL_LIBRARIES[library_name]`` entry (default ``False``) and passes
-    it to ``RealisticTanhLibrary`` / ``RealisticTanhUpgradeLibrary``.
+    it to ``RealisticTanhLibrary`` / ``RealisticTanhUpgradeLibrary`` /
+    ``FreeTanhLibrary``.
 
     When ``num_edges`` is ``None`` (template), the returned simple library
     is created with ``num_edges=1`` and must be replaced with a per-stage
@@ -545,6 +671,9 @@ def make_cell_library(
     if library_name == "tanh_realistic_upgrade":
         bias_enabled = bool(CELL_LIBRARIES[library_name].get("BIAS_ENABLED", False))
         return RealisticTanhUpgradeLibrary(num_edges=n, bias_enabled=bias_enabled)
+    if library_name == "tanh_free":
+        bias_enabled = bool(CELL_LIBRARIES[library_name].get("BIAS_ENABLED", False))
+        return FreeTanhLibrary(num_edges=n, bias_enabled=bias_enabled)
     return IdealizedCellLibrary(library_name=library_name)
 
 

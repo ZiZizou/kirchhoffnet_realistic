@@ -1118,7 +1118,7 @@ def make_data_housing(batch_size: int):
     to -114): dividing by column max alone would clamp the negative
     Longitude max to 1e-6 and produce values of ~-1e8 that overflow float16
     under AMP (zeroing all gradients via 0*inf=NaN in the backward pass).
-    Targets are standardized. Training loss is L1 (MAE).
+    Targets are standardized. Training loss is Huber (delta=1.0).
 
     Returns ``(train_loader, val_loader, task_fn, inverse_stats)`` where
     ``inverse_stats`` is ``{"y_mean": ..., "y_std": ...}`` for
@@ -1134,7 +1134,7 @@ def make_data_housing(batch_size: int):
     train_loader, val_loader = _make_data_split(X, y_norm, batch_size)
 
     def task_fn(y_pred, y_target):
-        return F.l1_loss(y_pred, y_target)
+        return F.huber_loss(y_pred, y_target, delta=1.0)
 
     inverse_stats = {"y_mean": y_mean, "y_std": y_std}
     return train_loader, val_loader, task_fn, inverse_stats

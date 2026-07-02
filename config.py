@@ -700,7 +700,7 @@ PRESET_HOUSING = {
         },
     ],
     "use_robust_input": True,
-    "loss": "mae",
+    "loss": "huber",
     "out_dim": 1,
     "write_idx": [0, 1, 2, 3, 4, 5, 6, 7],
     "read_idx": [15],

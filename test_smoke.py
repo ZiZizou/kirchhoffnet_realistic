@@ -3271,11 +3271,11 @@ def test_housing_data_normalization_float16_safe():
     import torch.nn.functional as F
     a = torch.tensor([0.0, 0.5, 1.0, 2.0])
     b = torch.tensor([0.5, 0.5, 0.5, 0.5])
-    l1 = task_fn(a, b)
-    expected = F.l1_loss(a, b)
-    check("housing: task_fn is L1 (MAE) loss",
-          abs(float(l1) - float(expected)) < 1e-6,
-          f"got {float(l1):.6f}, expected {float(expected):.6f}")
+    huber = task_fn(a, b)
+    expected = F.huber_loss(a, b, delta=1.0)
+    check("housing: task_fn is Huber loss (delta=1.0)",
+          abs(float(huber) - float(expected)) < 1e-6,
+          f"got {float(huber):.6f}, expected {float(expected):.6f}")
 
 
 

@@ -3067,6 +3067,10 @@ def main():
     test_budget_simple_edge_library_compat()     # BUD-10: SimpleEdgeLibrary
     test_budget_frac_uniform_proportion()        # BUD-11: uniform proportion
 
+    test_friedman1_benchmark()                   # MLP benchmark: Friedman #1
+    test_friedman2_benchmark()                   # MLP benchmark: Friedman #2
+    test_friedman3_benchmark()                   # MLP benchmark: Friedman #3
+
     test_weight_quantization()                   # analog-noise: 4/6-bit weight quant
     test_adc_dac_quantization()                  # analog-noise: ADC/DAC full-range quant
     test_circuit_noise()                         # analog-noise: Gaussian std checks
@@ -7461,6 +7465,133 @@ def test_budget_frac_uniform_proportion():
     check("all groups have equal mean gate (frac is uniform)",
           max(means) - min(means) < 0.05,
           f"group mean gates: {means}")
+
+
+def test_friedman1_benchmark():
+    print("\nFriedman #1 MLP benchmark: data + model + one training step")
+    from mlp_benchmark_friedman1 import (
+        MLPRegressor,
+        _friedman1,
+        make_data_friedman1,
+        _FRIEDMAN1_IN_DIM,
+    )
+    check("_FRIEDMAN1_IN_DIM == 10", _FRIEDMAN1_IN_DIM == 10)
+    x = torch.rand(8, 10)
+    y = _friedman1(x)
+    check("_friedman1 output shape is (8,)", tuple(y.shape) == (8,))
+    check("_friedman1 output is finite", bool(torch.isfinite(y).all().item()))
+    check("_friedman1 output is bounded (~[0, 30] for U(0,1)^5 inputs)",
+          bool((y >= 0.0).all().item()) and bool((y <= 30.0).all().item()))
+
+    net = MLPRegressor(in_dim=10, hidden_dim=16, num_layers=2, activation="relu")
+    out = net(x)
+    check("MLPRegressor(10->16->1) output finite",
+          bool(torch.isfinite(out).all().item()))
+    check("MLPRegressor(10->16->1) output shape (8,1)",
+          tuple(out.shape) == (8, 1))
+
+    tr, va, task, inv = make_data_friedman1(batch_size=128, noise_std=0.0, val_size=64)
+    check("Friedman1 train loader > 0 batches", len(tr) > 0)
+    check("Friedman1 val loader > 0 batches", len(va) > 0)
+    check("Friedman1 inverse_stats has y_mean/y_std",
+          "y_mean" in inv and "y_std" in inv)
+
+    opt = torch.optim.AdamW(net.parameters(), lr=1e-3)
+    for u, t in tr:
+        opt.zero_grad()
+        loss = task(net(u), t)
+        loss.backward()
+        opt.step()
+        check("Friedman1 first training step loss finite",
+              bool(torch.isfinite(loss).item()))
+        break
+
+
+def test_friedman2_benchmark():
+    print("\nFriedman #2 MLP benchmark: data + model + one training step")
+    from mlp_benchmark_friedman2 import (
+        MLPRegressor,
+        _friedman2,
+        make_data_friedman2,
+        _FRIEDMAN2_IN_DIM,
+    )
+    check("_FRIEDMAN2_IN_DIM == 4", _FRIEDMAN2_IN_DIM == 4)
+    x = torch.rand(8, 4)
+    x[:, 0] = x[:, 0] * 100.0
+    x[:, 1] = x[:, 1] * 520 * math.pi + 40 * math.pi
+    x[:, 3] = x[:, 3] * 10.0 + 1.0
+    y = _friedman2(x)
+    check("_friedman2 output shape is (8,)", tuple(y.shape) == (8,))
+    check("_friedman2 output is finite", bool(torch.isfinite(y).all().item()))
+    check("_friedman2 output is non-negative (sqrt)",
+          bool((y >= 0.0).all().item()))
+
+    net = MLPRegressor(in_dim=4, hidden_dim=16, num_layers=2, activation="relu")
+    out = net(x)
+    check("MLPRegressor(4->16->1) output finite",
+          bool(torch.isfinite(out).all().item()))
+    check("MLPRegressor(4->16->1) output shape (8,1)",
+          tuple(out.shape) == (8, 1))
+
+    tr, va, task, inv = make_data_friedman2(batch_size=128, noise_std=0.0, val_size=64)
+    check("Friedman2 train loader > 0 batches", len(tr) > 0)
+    check("Friedman2 val loader > 0 batches", len(va) > 0)
+    check("Friedman2 inverse_stats has y_mean/y_std",
+          "y_mean" in inv and "y_std" in inv)
+
+    opt = torch.optim.AdamW(net.parameters(), lr=1e-3)
+    for u, t in tr:
+        opt.zero_grad()
+        loss = task(net(u), t)
+        loss.backward()
+        opt.step()
+        check("Friedman2 first training step loss finite",
+              bool(torch.isfinite(loss).item()))
+        break
+
+
+def test_friedman3_benchmark():
+    print("\nFriedman #3 MLP benchmark: data + model + one training step")
+    from mlp_benchmark_friedman3 import (
+        MLPRegressor,
+        _friedman3,
+        make_data_friedman3,
+        _FRIEDMAN3_IN_DIM,
+    )
+    check("_FRIEDMAN3_IN_DIM == 4", _FRIEDMAN3_IN_DIM == 4)
+    x = torch.rand(8, 4)
+    x[:, 0] = x[:, 0] * 100.0
+    x[:, 1] = x[:, 1] * 520 * math.pi + 40 * math.pi
+    x[:, 3] = x[:, 3] * 10.0 + 1.0
+    y = _friedman3(x)
+    check("_friedman3 output shape is (8,)", tuple(y.shape) == (8,))
+    check("_friedman3 output is finite", bool(torch.isfinite(y).all().item()))
+    check("_friedman3 output is bounded in (-pi/2, pi/2)",
+          bool((y > -math.pi / 2).all().item())
+          and bool((y < math.pi / 2).all().item()))
+
+    net = MLPRegressor(in_dim=4, hidden_dim=16, num_layers=2, activation="relu")
+    out = net(x)
+    check("MLPRegressor(4->16->1) output finite",
+          bool(torch.isfinite(out).all().item()))
+    check("MLPRegressor(4->16->1) output shape (8,1)",
+          tuple(out.shape) == (8, 1))
+
+    tr, va, task, inv = make_data_friedman3(batch_size=128, noise_std=0.0, val_size=64)
+    check("Friedman3 train loader > 0 batches", len(tr) > 0)
+    check("Friedman3 val loader > 0 batches", len(va) > 0)
+    check("Friedman3 inverse_stats has y_mean/y_std",
+          "y_mean" in inv and "y_std" in inv)
+
+    opt = torch.optim.AdamW(net.parameters(), lr=1e-3)
+    for u, t in tr:
+        opt.zero_grad()
+        loss = task(net(u), t)
+        loss.backward()
+        opt.step()
+        check("Friedman3 first training step loss finite",
+              bool(torch.isfinite(loss).item()))
+        break
 
 
 if __name__ == "__main__":

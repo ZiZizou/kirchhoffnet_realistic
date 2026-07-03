@@ -53,7 +53,6 @@ from train_script import _lhs_samples
 from analog_noise import (
     AnalogMLPWrapper,
     NoiseConfig,
-    NoiseBenchmarkResult,
     evaluate_clean,
     evaluate_with_noise,
 )
@@ -271,7 +270,7 @@ def plot_output_fit(out, target, save_path, title):
     plt.close(fig)
 
 
-def plot_loss_curve(history, val_history, save_path, title):
+def plot_loss_curve(history, val_history, save_path, title, loss_label: str = "MSE"):
     plt = _import_matplotlib()
     if plt is None:
         return
@@ -279,7 +278,7 @@ def plot_loss_curve(history, val_history, save_path, title):
     ax.plot(history, label="train", color="C0")
     ax.plot(val_history, label="val", color="C3")
     ax.set_xlabel("epoch")
-    ax.set_ylabel("MSE loss")
+    ax.set_ylabel(f"{loss_label} loss")
     ax.set_title(title)
     ax.set_yscale("log")
     ax.legend()
@@ -318,6 +317,8 @@ def main():
                              "noise (default: 1.0, the Friedman #1 canonical value).")
     parser.add_argument("--activation", choices=["relu", "tanh"], default="relu",
                         help="Hidden activation (default: relu)")
+    parser.add_argument("--loss", choices=["mse", "huber"], default="mse",
+                        help="Loss function (default: mse). Huber uses delta=1.0.")
     parser.add_argument("--output", type=Path, default=Path("./output/mlp_friedman1"),
                         help="Output directory (default: ./output/mlp_friedman1)")
     parser.add_argument("--device", default=None,
@@ -391,11 +392,15 @@ def main():
     train_loader, val_loader, task_fn, inverse_stats = make_data_friedman1(
         batch_size=batch_size, noise_std=args.target_noise_std
     )
+    if args.loss == "huber":
+        task_fn = lambda o, t: F.huber_loss(o, t, delta=1.0)
+    else:
+        task_fn = F.mse_loss
     optimizer = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=weight_decay)
 
     print(
         f"[mlp_friedman1] hidden_dim={args.hidden_dim} num_layers={args.num_layers} "
-        f"params={n_params} activation={args.activation} "
+        f"params={n_params} activation={args.activation} loss={args.loss} "
         f"epochs={epochs} lr={lr} weight_decay={weight_decay} "
         f"batch_size={batch_size} grad_clip_norm={grad_clip_norm} "
         f"target_noise_std={args.target_noise_std} device={device} output={out_dir}"
@@ -408,6 +413,7 @@ def main():
         f.write(f"num_layers: {args.num_layers}\n")
         f.write(f"hidden_dim: {args.hidden_dim}\n")
         f.write(f"activation: {args.activation}\n")
+        f.write(f"loss: {args.loss}\n")
         f.write(f"epochs: {epochs}\n")
         f.write(f"lr: {lr}\n")
         f.write(f"weight_decay: {weight_decay}\n")
@@ -422,6 +428,9 @@ def main():
         f.write(f"dataset: Friedman #1 (10-dim, 5 relevant + 5 dummy, "
                 f"20k LHS train / 4k uniform val, sigma={args.target_noise_std}, "
                 f"normalized targets)\n")
+
+    loss_label = args.loss.upper()
+    loss_metric_key = f"val_{args.loss}"
 
     history = []
     val_history = []
@@ -510,6 +519,7 @@ def main():
         history, val_history,
         save_path=str(out_dir / "loss_curve.png"),
         title=f"MLP (hidden={args.hidden_dim}, layers={args.num_layers}, {args.activation}, {n_params} params) — Friedman #1",
+        loss_label=loss_label,
     )
 
     val_batch = next(iter(val_loader))
@@ -527,15 +537,15 @@ def main():
     full_val_loss = validate(net, val_loader, task_fn, device)
     final_mse, final_rmse, final_mae = compute_orig_metrics(net, val_loader, inverse_stats, device)
     print(
-        f"[mlp_friedman1] final val MSE = {full_val_loss:.6f} "
+        f"[mlp_friedman1] final val {loss_label} = {full_val_loss:.6f} "
         f"(best val = {best_val:.6f} @ epoch {best_epoch})  "
         f"MSE_orig={final_mse:.4f}  RMSE_orig={final_rmse:.4f}  MAE_orig={final_mae:.4f}"
     )
     with open(out_dir / "final_metrics.txt", "w") as f:
         f.write(f"param_count: {n_params}\n")
-        f.write(f"best_val_mse: {best_val:.6f}\n")
+        f.write(f"best_{loss_metric_key}: {best_val:.6f}\n")
         f.write(f"best_epoch: {best_epoch}\n")
-        f.write(f"final_val_mse: {full_val_loss:.6f}\n")
+        f.write(f"final_{loss_metric_key}: {full_val_loss:.6f}\n")
         f.write(f"final_mse_orig: {final_mse:.6f}\n")
         f.write(f"final_rmse_orig: {final_rmse:.6f}\n")
         f.write(f"final_mae_orig: {final_mae:.6f}\n")

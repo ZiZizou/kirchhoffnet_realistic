@@ -925,10 +925,218 @@ def make_housing_grid_preset(
 # Static default: 5x5 grid, 3 stages, 3 proj nodes (mirrors smooth2d_grid).
 PRESET_HOUSING_GRID = make_housing_grid_preset(grid_size=5)
 
+
+# =============================================================================
+# Friedman synthetic regression problems (friedman-tasks plan).
+# Each uses Huber loss (delta=1.0), torus default topology, three_phase
+# schedule, sparse write (write_mode="one_to_one" + write_idx) and sparse
+# read (OutputMapper with read_idx) — all CLI-overridable. To satisfy the
+# >1-hop write->read topology validation in topology.py, reads point at
+# projection nodes (num_proj=0 keeps hidden+proj layout simple, but the
+# torus's tight Chebyshev-1 neighborhood makes any read_idx on hidden
+# nodes fail the validation when writes spread across the grid).
+# =============================================================================
+
+
+def make_friedman1_preset(
+    grid_size: int = 5,
+    num_stages: int = 1,
+    num_proj: int = 3,
+    bidirectional: bool = False,
+    edge_repeats: int = 1,
+) -> dict:
+    """Build the friedman1 preset dict (10-dim Friedman synthetic regression).
+
+    Input is 10-dim uniform in [0,1]^10 (x1..x5 carry signal, x6..x10 are
+    dummy noise). Default topology is a 5x5 torus (25 hidden nodes). Writes
+    are spread evenly across the grid via stride=floor(25/10)=2
+    ([0,2,4,6,8,10,12,14,16,18]). Reads point at projection nodes (idx
+    ``[num_hidden .. num_hidden+num_proj]``) to satisfy the >1-hop topology
+    validation in ``topology.validate_topology_degrees``.
+
+    Loss is declared as ``huber`` for preset metadata consistency; the
+    actual training loss is ``F.huber_loss(delta=1.0)`` in
+    ``train_script.make_data_friedman1``. Validation logs are reported in
+    the original Friedman-target units via inverse normalization.
+
+    All topology/training flags are CLI-overridable: --hidden-family,
+    --grid-size, --schedule, --edge-repeats, --write-mode, --read-mode,
+    --num-hidden.
+    """
+    if edge_repeats < 1 or edge_repeats > 8:
+        raise ValueError(f"edge_repeats must be in [1, 8], got {edge_repeats}")
+    num_inputs = 10
+    num_hidden = grid_size * grid_size
+    n_stages = max(1, num_stages)
+    # write_idx: spread 10 inputs evenly across the 25-cell torus (stride=2).
+    write_idx = [2 * i for i in range(num_inputs)]
+    _stage_cfg = {
+        "num_inputs": num_inputs,
+        "num_hidden": num_hidden,
+        "num_proj": num_proj,
+        "num_outputs": 0,
+        "hidden_family": "torus",
+        "hidden_kwargs": {"height": grid_size, "width": grid_size, "kernel_size": 3, "bidirectional": bidirectional},
+        "edge_repeats": edge_repeats,
+        "input_pattern": "all_to_all",
+        "output_pattern": "all_to_all",
+        "proj_pattern": "all_to_all",
+        "t_span": SOLVER["t_span"] / n_stages,
+        "num_steps": round(SOLVER["num_steps"] / n_stages),
+    }
+    # Read from projection nodes only (validation skips when all_read_are_proj).
+    read_idx = list(range(num_hidden, num_hidden + num_proj))
+    return {
+        "stages": [_stage_cfg] * n_stages,
+        "use_robust_input": False,
+        "loss": "huber",
+        "out_dim": 1,
+        "write_mode": "one_to_one",
+        "write_idx": write_idx,
+        "read_idx": read_idx,
+        "read_mode": "sparse",
+        "schedule": "three_phase",
+        "lambdas": {
+            "sparsity": 1e-5,
+            "edge_gate": 0,
+            "node_gate": 0.0,        # DEPRECATED (deprecate-node-gates)
+            "power": 1e-5,
+            "capacitance": 0.0,      # DEPRECATED (deprecate-node-gates)
+            "rail": 0.1,
+        },
+        "tau_anneal": True,
+    }
+
+
+def make_friedman2_preset(
+    grid_size: int = 4,
+    num_stages: int = 1,
+    num_proj: int = 3,
+    bidirectional: bool = False,
+    edge_repeats: int = 1,
+) -> dict:
+    """Build the friedman2 preset dict (4-dim Friedman synthetic regression).
+
+    Same topology rules as friedman1 but with a 4x4 torus (16 hidden nodes)
+    and only 4 inputs. Writes are one per column of the grid
+    ([0, 4, 8, 12] on a 4x4). Reads point at projection nodes.
+
+    The formula is ``y = sqrt(x1^2 + (x2*x3 - 1/(x2*x4))^2)`` with
+    per-dim ranges x1~U(0,100), x2~U(40π,560π), x3~U(0,1), x4~U(1,11).
+    Loss is Huber (delta=1.0).
+    """
+    if edge_repeats < 1 or edge_repeats > 8:
+        raise ValueError(f"edge_repeats must be in [1, 8], got {edge_repeats}")
+    num_inputs = 4
+    num_hidden = grid_size * grid_size
+    n_stages = max(1, num_stages)
+    # write_idx: one input per column on a 4x4 (stride=4).
+    write_idx = [i * grid_size for i in range(num_inputs)]
+    _stage_cfg = {
+        "num_inputs": num_inputs,
+        "num_hidden": num_hidden,
+        "num_proj": num_proj,
+        "num_outputs": 0,
+        "hidden_family": "torus",
+        "hidden_kwargs": {"height": grid_size, "width": grid_size, "kernel_size": 3, "bidirectional": bidirectional},
+        "edge_repeats": edge_repeats,
+        "input_pattern": "all_to_all",
+        "output_pattern": "all_to_all",
+        "proj_pattern": "all_to_all",
+        "t_span": SOLVER["t_span"] / n_stages,
+        "num_steps": round(SOLVER["num_steps"] / n_stages),
+    }
+    read_idx = list(range(num_hidden, num_hidden + num_proj))
+    return {
+        "stages": [_stage_cfg] * n_stages,
+        "use_robust_input": False,
+        "loss": "huber",
+        "out_dim": 1,
+        "write_mode": "one_to_one",
+        "write_idx": write_idx,
+        "read_idx": read_idx,
+        "read_mode": "sparse",
+        "schedule": "three_phase",
+        "lambdas": {
+            "sparsity": 1e-5,
+            "edge_gate": 0,
+            "node_gate": 0.0,        # DEPRECATED (deprecate-node-gates)
+            "power": 1e-5,
+            "capacitance": 0.0,      # DEPRECATED (deprecate-node-gates)
+            "rail": 0.1,
+        },
+        "tau_anneal": True,
+    }
+
+
+def make_friedman3_preset(
+    grid_size: int = 4,
+    num_stages: int = 1,
+    num_proj: int = 3,
+    bidirectional: bool = False,
+    edge_repeats: int = 1,
+) -> dict:
+    """Build the friedman3 preset dict (4-dim Friedman synthetic regression).
+
+    Identical layout to friedman2 (4x4 torus, one input per column). The
+    formula is ``y = arctan((x2*x3 - 1/(x2*x4)) / x1)`` with the same
+    per-dim ranges as friedman2. Loss is Huber (delta=1.0).
+    """
+    if edge_repeats < 1 or edge_repeats > 8:
+        raise ValueError(f"edge_repeats must be in [1, 8], got {edge_repeats}")
+    num_inputs = 4
+    num_hidden = grid_size * grid_size
+    n_stages = max(1, num_stages)
+    write_idx = [i * grid_size for i in range(num_inputs)]
+    _stage_cfg = {
+        "num_inputs": num_inputs,
+        "num_hidden": num_hidden,
+        "num_proj": num_proj,
+        "num_outputs": 0,
+        "hidden_family": "torus",
+        "hidden_kwargs": {"height": grid_size, "width": grid_size, "kernel_size": 3, "bidirectional": bidirectional},
+        "edge_repeats": edge_repeats,
+        "input_pattern": "all_to_all",
+        "output_pattern": "all_to_all",
+        "proj_pattern": "all_to_all",
+        "t_span": SOLVER["t_span"] / n_stages,
+        "num_steps": round(SOLVER["num_steps"] / n_stages),
+    }
+    read_idx = list(range(num_hidden, num_hidden + num_proj))
+    return {
+        "stages": [_stage_cfg] * n_stages,
+        "use_robust_input": False,
+        "loss": "huber",
+        "out_dim": 1,
+        "write_mode": "one_to_one",
+        "write_idx": write_idx,
+        "read_idx": read_idx,
+        "read_mode": "sparse",
+        "schedule": "three_phase",
+        "lambdas": {
+            "sparsity": 1e-5,
+            "edge_gate": 0,
+            "node_gate": 0.0,        # DEPRECATED (deprecate-node-gates)
+            "power": 1e-5,
+            "capacitance": 0.0,      # DEPRECATED (deprecate-node-gates)
+            "rail": 0.1,
+        },
+        "tau_anneal": True,
+    }
+
+
+# Static defaults: friedman1 -> 5x5 torus (25 hidden), friedman2/3 -> 4x4 (16 hidden).
+PRESET_FRIEDMAN1 = make_friedman1_preset(grid_size=5)
+PRESET_FRIEDMAN2 = make_friedman2_preset(grid_size=4)
+PRESET_FRIEDMAN3 = make_friedman3_preset(grid_size=4)
+
 PRESETS = {
     "sinx": PRESET_SINX,
     "housing": PRESET_HOUSING,
     "smooth2d": PRESET_SMOOTH2D,
     "smooth2d_grid": PRESET_SMOOTH2D_GRID,
     "housing_grid": PRESET_HOUSING_GRID,
+    "friedman1": PRESET_FRIEDMAN1,
+    "friedman2": PRESET_FRIEDMAN2,
+    "friedman3": PRESET_FRIEDMAN3,
 }

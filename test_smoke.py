@@ -82,8 +82,8 @@ def test_config_loads():
           "reg_warmup_epochs" in config.OPTIM)
     check("OPTIM has reg_anneal_epochs (RR-A)",
           "reg_anneal_epochs" in config.OPTIM)
-    check("PRESETS has sinx, housing, smooth2d, smooth2d_grid, housing_grid",
-          set(config.PRESETS.keys()) == {"sinx", "housing", "smooth2d", "smooth2d_grid", "housing_grid"})
+    check("PRESETS has sinx, housing, smooth2d, smooth2d_grid, housing_grid, friedman1, friedman2, friedman3",
+          set(config.PRESETS.keys()) == {"sinx", "housing", "smooth2d", "smooth2d_grid", "housing_grid", "friedman1", "friedman2", "friedman3"})
 
     t = config.cells_to_tensor_dict()
     check("cells_to_tensor_dict: gm shape (4,)", t["gm"].shape == (4,))
@@ -2944,6 +2944,14 @@ def main():
 
     test_housing_grid_data_huber_loss()
     test_housing_data_normalization_float16_safe()
+    # Friedman synthetic regression problems (friedman-tasks plan)
+    test_friedman_presets_registered()
+    test_friedman_target_functions()
+    test_friedman_data_friedman1()
+    test_friedman_data_friedman2()
+    test_friedman_data_friedman3()
+    test_friedman_make_data_dispatch()
+    test_friedman_net_build_and_forward()
     test_dynamic_preset_grid_injects_fan_out()
     test_fan_out_outer_col_exhaustion_fallback()
     test_persistent_drive_non_grid_raises()
@@ -3310,6 +3318,224 @@ def test_housing_data_normalization_float16_safe():
     check("housing: task_fn is Huber loss (delta=1.0)",
           abs(float(huber) - float(expected)) < 1e-6,
           f"got {float(huber):.6f}, expected {float(expected):.6f}")
+
+
+# ---- Friedman #1/#2/#3 synthetic regression data tests (friedman-tasks plan) ----
+
+def test_friedman_presets_registered():
+    print("\nTest FR-0: Friedman presets are registered in PRESETS")
+    import config
+    for name in ("friedman1", "friedman2", "friedman3"):
+        check(f"PRESETS has {name}", name in config.PRESETS)
+        preset = config.PRESETS[name]
+        check(f"{name}: loss == 'huber'", preset["loss"] == "huber")
+        check(f"{name}: schedule == 'three_phase'", preset["schedule"] == "three_phase")
+        check(f"{name}: write_mode == 'one_to_one' (sparse)",
+              preset["write_mode"] == "one_to_one")
+        check(f"{name}: read_mode == 'sparse'",
+              preset["read_mode"] == "sparse")
+        check(f"{name}: hidden_family == 'torus'",
+              preset["stages"][0]["hidden_family"] == "torus")
+        # Num inputs match the formula dimensions.
+        expected_inputs = {"friedman1": 10, "friedman2": 4, "friedman3": 4}[name]
+        check(f"{name}: num_inputs == {expected_inputs}",
+              preset["stages"][0]["num_inputs"] == expected_inputs)
+        # write_idx must have one entry per input.
+        check(f"{name}: len(write_idx) == num_inputs",
+              len(preset["write_idx"]) == expected_inputs)
+        # read_idx points at projection nodes (>=num_hidden).
+        nh = preset["stages"][0]["num_hidden"]
+        check(f"{name}: read_idx entries all >= num_hidden (proj)",
+              all(r >= nh for r in preset["read_idx"]))
+
+
+def test_friedman_target_functions():
+    print("\nTest FR-1: _friedman1/2/3 produce correct shapes and finite values")
+    try:
+        from train_script import _friedman1, _friedman2, _friedman3
+    except ImportError as e:
+        check("import _friedman1/2/3", False, f"failed: {e}")
+        return
+
+    import torch
+    # Friedman #1: shape (B, 10) -> (B,)
+    u1 = torch.rand(8, 10)
+    y1 = _friedman1(u1)
+    check("_friedman1: output shape (B,)", tuple(y1.shape) == (8,))
+    check("_friedman1: values finite", torch.isfinite(y1).all().item())
+
+    # Friedman #2/3: shape (B, 4) -> (B,). Scale inputs to per-dim ranges.
+    import math
+    u = torch.rand(8, 4)
+    u[..., 0] *= 100.0                          # x1 ~ U(0, 100)
+    u[..., 1] = 40 * math.pi + u[..., 1] * 520 * math.pi   # x2 ~ U(40π, 560π)
+    u[..., 2] *= 1.0                            # x3 ~ U(0, 1)
+    u[..., 3] = 1.0 + u[..., 3] * 10.0          # x4 ~ U(1, 11)
+    y2 = _friedman2(u)
+    y3 = _friedman3(u)
+    check("_friedman2: output shape (B,)", tuple(y2.shape) == (8,))
+    check("_friedman2: values finite (non-negative because sqrt)",
+          torch.isfinite(y2).all().item() and (y2 >= 0).all().item())
+    check("_friedman3: output shape (B,)", tuple(y3.shape) == (8,))
+    check("_friedman3: values finite (atan outputs in (-pi/2, pi/2))",
+          torch.isfinite(y3).all().item() and (y3.abs() <= math.pi / 2 + 1e-6).all().item())
+
+
+def test_friedman_data_friedman1():
+    print("\nTest FR-2: make_data_friedman1 returns (loader, loader, task_fn, inverse_stats)")
+    try:
+        from train_script import make_data_friedman1
+    except ImportError as e:
+        check("import make_data_friedman1", False, f"failed: {e}")
+        return
+
+    import torch
+    import torch.nn.functional as F
+    train_loader, val_loader, task_fn, inverse_stats = make_data_friedman1(batch_size=128)
+    check("friedman1: returns 4-tuple with inverse_stats",
+          inverse_stats is not None and "y_mean" in inverse_stats and "y_std" in inverse_stats)
+    check("friedman1: inverse_stats have finite y_mean and y_std > 0",
+          float(inverse_stats["y_std"]) > 0 and torch.isfinite(
+              torch.tensor(inverse_stats["y_mean"])).item())
+
+    # Task fn is Huber loss with delta=1.0.
+    a = torch.tensor([0.0, 0.5, 1.0, 2.0])
+    b = torch.tensor([0.5, 0.5, 0.5, 0.5])
+    huber = task_fn(a, b)
+    expected = F.huber_loss(a, b, delta=1.0)
+    check("friedman1: task_fn is Huber loss (delta=1.0)",
+          abs(float(huber) - float(expected)) < 1e-6)
+
+    # Data shapes.
+    for u_b, y_b in train_loader:
+        check("friedman1: input batch shape (B, 10)", u_b.shape[1] == 10)
+        check("friedman1: target batch shape (B, 1)", y_b.shape[1] == 1)
+        check("friedman1: input values in [0, 1]",
+              u_b.min() >= -1e-6 and u_b.max() <= 1.0 + 1e-6)
+        check("friedman1: no NaN/inf in features", torch.isfinite(u_b).all().item())
+        check("friedman1: no NaN/inf in targets", torch.isfinite(y_b).all().item())
+        break
+
+    # target_noise_std=0 disables the additive noise.
+    train_loader0, _, _, inv0 = make_data_friedman1(batch_size=128, noise_std=0.0)
+    a = next(iter(train_loader0))[1][:64]
+    b = next(iter(train_loader))[1][:64]
+    # With noise=0 the train targets' std should equal the unperturbed signal std.
+    check("friedman1: noise_std=0 produces a tighter y_std",
+          float(inv0["y_std"]) <= float(inverse_stats["y_std"]) + 1e-6)
+
+
+def test_friedman_data_friedman2():
+    print("\nTest FR-3: make_data_friedman2 returns (loader, loader, task_fn, inverse_stats)")
+    try:
+        from train_script import make_data_friedman2
+    except ImportError as e:
+        check("import make_data_friedman2", False, f"failed: {e}")
+        return
+
+    import torch
+    import torch.nn.functional as F
+    train_loader, val_loader, task_fn, inverse_stats = make_data_friedman2(batch_size=128)
+    check("friedman2: returns 4-tuple with inverse_stats",
+          inverse_stats is not None and "y_mean" in inverse_stats and "y_std" in inverse_stats)
+
+    a = torch.tensor([0.0, 0.5, 1.0, 2.0])
+    b = torch.tensor([0.5, 0.5, 0.5, 0.5])
+    huber = task_fn(a, b)
+    expected = F.huber_loss(a, b, delta=1.0)
+    check("friedman2: task_fn is Huber loss (delta=1.0)",
+          abs(float(huber) - float(expected)) < 1e-6)
+
+    for u_b, y_b in train_loader:
+        check("friedman2: input batch shape (B, 4)", u_b.shape[1] == 4)
+        check("friedman2: target batch shape (B, 1)", y_b.shape[1] == 1)
+        check("friedman2: x1 in [0, 100]", u_b[:, 0].min() >= -1e-6 and u_b[:, 0].max() <= 100 + 1e-6)
+        import math
+        check("friedman2: x2 in [40π, 560π]",
+              u_b[:, 1].min() >= 40 * math.pi - 1e-3
+              and u_b[:, 1].max() <= 560 * math.pi + 1e-3)
+        check("friedman2: x3 in [0, 1]", u_b[:, 2].min() >= -1e-6 and u_b[:, 2].max() <= 1 + 1e-6)
+        check("friedman2: x4 in [1, 11]",
+              u_b[:, 3].min() >= 1 - 1e-6 and u_b[:, 3].max() <= 11 + 1e-6)
+        check("friedman2: targets finite (z-scored, may be negative)",
+              torch.isfinite(y_b).all().item())
+        check("friedman2: no NaN/inf", torch.isfinite(u_b).all().item() and torch.isfinite(y_b).all().item())
+        break
+
+
+def test_friedman_data_friedman3():
+    print("\nTest FR-4: make_data_friedman3 returns (loader, loader, task_fn, inverse_stats)")
+    try:
+        from train_script import make_data_friedman3
+    except ImportError as e:
+        check("import make_data_friedman3", False, f"failed: {e}")
+        return
+
+    import torch
+    import torch.nn.functional as F
+    train_loader, val_loader, task_fn, inverse_stats = make_data_friedman3(batch_size=128)
+    check("friedman3: returns 4-tuple with inverse_stats",
+          inverse_stats is not None and "y_mean" in inverse_stats and "y_std" in inverse_stats)
+
+    a = torch.tensor([0.0, 0.5, 1.0, 2.0])
+    b = torch.tensor([0.5, 0.5, 0.5, 0.5])
+    huber = task_fn(a, b)
+    expected = F.huber_loss(a, b, delta=1.0)
+    check("friedman3: task_fn is Huber loss (delta=1.0)",
+          abs(float(huber) - float(expected)) < 1e-6)
+
+    for u_b, y_b in train_loader:
+        check("friedman3: input batch shape (B, 4)", u_b.shape[1] == 4)
+        check("friedman3: target batch shape (B, 1)", y_b.shape[1] == 1)
+        check("friedman3: no NaN/inf", torch.isfinite(u_b).all().item() and torch.isfinite(y_b).all().item())
+        break
+
+
+def test_friedman_make_data_dispatch():
+    print("\nTest FR-5: make_data dispatches friedman1/2/3 with noise_std kwarg")
+    try:
+        from train_script import make_data
+    except ImportError as e:
+        check("import make_data", False, f"failed: {e}")
+        return
+
+    for problem in ("friedman1", "friedman2", "friedman3"):
+        out = make_data(problem, batch_size=128, noise_std=0.5)
+        check(f"make_data({problem}): returns 4-tuple", len(out) == 4)
+        _, _, _, inv = out
+        check(f"make_data({problem}): inverse_stats valid",
+              inv is not None and "y_mean" in inv)
+
+
+def test_friedman_net_build_and_forward():
+    print("\nTest FR-6: build_net_from_preset(friedman{1,2,3}) forward pass finite")
+    try:
+        from topology import build_net_from_preset
+        from cell_library import IdealizedCellLibrary
+    except ImportError as e:
+        check("import", False, f"failed: {e}")
+        return
+
+    import torch
+    from sim_context import SimContext
+
+    for problem, n_in in (("friedman1", 10), ("friedman2", 4), ("friedman3", 4)):
+        try:
+            cell_lib = IdealizedCellLibrary()
+            net = build_net_from_preset(problem, cell_lib)
+        except Exception as e:
+            check(f"{problem}: build_net_from_preset", False, f"failed: {e}")
+            continue
+        n_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
+        check(f"{problem}: net built with {n_params} params", n_params > 0)
+        u = torch.rand(8, n_in)
+        ctx = SimContext()
+        with torch.no_grad():
+            out, _ = net(u, ctx=ctx, store_trajectory=False,
+                         cell_mode="soft", solver="heun")
+        check(f"{problem}: output shape (8, 1)", tuple(out.shape) == (8, 1))
+        check(f"{problem}: output values finite",
+              torch.isfinite(out).all().item())
 
 
 

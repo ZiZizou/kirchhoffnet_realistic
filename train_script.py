@@ -31,6 +31,7 @@ import copy
 import time
 import warnings
 import gc
+import math
 from pathlib import Path
 
 # retrain-oom-fix/REQ-3: reduce CUDA memory fragmentation by allowing
@@ -1309,7 +1310,212 @@ def make_data_smooth2d(batch_size: int, val_size: int = 4000):
     return train_loader, val_loader, F.mse_loss
 
 
-def make_data(problem: str, batch_size: int):
+# =============================================================================
+# Friedman synthetic regression problems (friedman-tasks plan).
+# Mirrors the housing-grid data style: 20k LHS train + 4k uniform val,
+# target z-score normalization, Huber task_fn with delta=1.0, and
+# inverse_stats for reporting metrics in original target units.
+# =============================================================================
+
+_FRIEDMAN1_IN_DIM = 10
+_FRIEDMAN1_RELEVANT = 5
+_FRIEDMAN2_IN_DIM = 4
+_FRIEDMAN3_IN_DIM = 4
+_FRIEDMAN2_PI = math.pi
+_FRIEDMAN2_RANGES = [
+    (0.0, 100.0),
+    (40.0 * _FRIEDMAN2_PI, 560.0 * _FRIEDMAN2_PI),
+    (0.0, 1.0),
+    (1.0, 11.0),
+]
+
+
+def _friedman1(x: torch.Tensor) -> torch.Tensor:
+    """Friedman #1 target.
+
+    Args:
+        x: Tensor of shape (..., 10). Only the first 5 columns carry
+           signal; columns 5..9 are ignored.
+
+    Returns:
+        Tensor of shape (...) with the deterministic (noise-free) target.
+    """
+    if x.shape[-1] < _FRIEDMAN1_RELEVANT:
+        raise ValueError(
+            f"_friedman1 requires at least {_FRIEDMAN1_RELEVANT} input columns, "
+            f"got {x.shape[-1]}"
+        )
+    x1 = x[..., 0]
+    x2 = x[..., 1]
+    x3 = x[..., 2]
+    x4 = x[..., 3]
+    x5 = x[..., 4]
+    return (
+        10.0 * torch.sin(math.pi * x1 * x2)
+        + 20.0 * (x3 - 0.5) ** 2
+        + 10.0 * x4
+        + 5.0 * x5
+    )
+
+
+def _friedman2(x: torch.Tensor) -> torch.Tensor:
+    """Friedman #2 target.
+
+    Args:
+        x: Tensor of shape (..., 4) with x[..., 0] ~ U(0, 100),
+           x[..., 1] ~ U(40π, 560π), x[..., 2] ~ U(0, 1),
+           x[..., 3] ~ U(1, 11).
+
+    Returns:
+        Tensor of shape (...) with the deterministic (noise-free) target.
+    """
+    if x.shape[-1] != _FRIEDMAN2_IN_DIM:
+        raise ValueError(
+            f"_friedman2 requires exactly {_FRIEDMAN2_IN_DIM} input columns, "
+            f"got {x.shape[-1]}"
+        )
+    x1 = x[..., 0]
+    x2 = x[..., 1]
+    x3 = x[..., 2]
+    x4 = x[..., 3]
+    inner = (x2 * x3) - (1.0 / (x2 * x4))
+    return torch.sqrt(x1 ** 2 + inner ** 2)
+
+
+def _friedman3(x: torch.Tensor) -> torch.Tensor:
+    """Friedman #3 target.
+
+    Args:
+        x: Tensor of shape (..., 4) with x[..., 0] ~ U(0, 100),
+           x[..., 1] ~ U(40π, 560π), x[..., 2] ~ U(0, 1),
+           x[..., 3] ~ U(1, 11).
+
+    Returns:
+        Tensor of shape (...) with the deterministic (noise-free) target.
+    """
+    if x.shape[-1] != _FRIEDMAN3_IN_DIM:
+        raise ValueError(
+            f"_friedman3 requires exactly {_FRIEDMAN3_IN_DIM} input columns, "
+            f"got {x.shape[-1]}"
+        )
+    x1 = x[..., 0]
+    x2 = x[..., 1]
+    x3 = x[..., 2]
+    x4 = x[..., 3]
+    inner = (x2 * x3) - (1.0 / (x2 * x4))
+    return torch.atan(inner / x1)
+
+
+def _scale_lhs_to_ranges(u_unit: torch.Tensor, ranges: list[tuple[float, float]]) -> torch.Tensor:
+    """Linearly scale [0, 1] uniform/LHS samples to per-dim (lo, hi) ranges."""
+    out = u_unit.clone()
+    for i, (lo, hi) in enumerate(ranges):
+        out[..., i] = lo + (hi - lo) * u_unit[..., i]
+    return out
+
+
+def make_data_friedman1(batch_size: int, noise_std: float = 1.0, val_size: int = 4000):
+    """Friedman #1 train/val loaders with target standardization (10-dim).
+
+    Train inputs are LHS samples in [0, 1]^10; val inputs are uniform
+    random. Targets are z-scored using train mean/std; ``inverse_stats``
+    is returned so downstream RMSE/MAE can be reported in original units.
+    Training loss is Huber (delta=1.0).
+    """
+    n_train = 20000
+    u_train = _lhs_samples(n_train, _FRIEDMAN1_IN_DIM, seed=42)
+    y_train = _friedman1(u_train).unsqueeze(1)
+
+    torch.manual_seed(42)
+    u_val = torch.rand(val_size, _FRIEDMAN1_IN_DIM)
+    y_val = _friedman1(u_val).unsqueeze(1)
+
+    if noise_std > 0:
+        y_train = y_train + noise_std * torch.randn_like(y_train)
+
+    y_mean = float(y_train.mean().item())
+    y_std = float(y_train.std().clamp(min=1e-6).item())
+    y_train_n = (y_train - y_mean) / y_std
+    y_val_n = (y_val - y_mean) / y_std
+
+    train_loader = DataLoader(
+        TensorDataset(u_train, y_train_n), batch_size=batch_size, shuffle=True
+    )
+    val_loader = DataLoader(
+        TensorDataset(u_val, y_val_n), batch_size=batch_size, shuffle=False
+    )
+    inverse_stats = {"y_mean": y_mean, "y_std": y_std}
+    return train_loader, val_loader, lambda o, t: F.huber_loss(o, t, delta=1.0), inverse_stats
+
+
+def make_data_friedman2(batch_size: int, noise_std: float = 1.0, val_size: int = 4000):
+    """Friedman #2 train/val loaders with target standardization (4-dim, per-dim ranges).
+
+    Per-dim ranges x1~U(0,100), x2~U(40π,560π), x3~U(0,1), x4~U(1,11).
+    Training loss is Huber (delta=1.0).
+    """
+    n_train = 20000
+    u_train_unit = _lhs_samples(n_train, _FRIEDMAN2_IN_DIM, seed=42)
+    u_train = _scale_lhs_to_ranges(u_train_unit, _FRIEDMAN2_RANGES)
+    y_train = _friedman2(u_train).unsqueeze(1)
+
+    torch.manual_seed(42)
+    u_val_unit = torch.rand(val_size, _FRIEDMAN2_IN_DIM)
+    u_val = _scale_lhs_to_ranges(u_val_unit, _FRIEDMAN2_RANGES)
+    y_val = _friedman2(u_val).unsqueeze(1)
+
+    if noise_std > 0:
+        y_train = y_train + noise_std * torch.randn_like(y_train)
+
+    y_mean = float(y_train.mean().item())
+    y_std = float(y_train.std().clamp(min=1e-6).item())
+    y_train_n = (y_train - y_mean) / y_std
+    y_val_n = (y_val - y_mean) / y_std
+
+    train_loader = DataLoader(
+        TensorDataset(u_train, y_train_n), batch_size=batch_size, shuffle=True
+    )
+    val_loader = DataLoader(
+        TensorDataset(u_val, y_val_n), batch_size=batch_size, shuffle=False
+    )
+    inverse_stats = {"y_mean": y_mean, "y_std": y_std}
+    return train_loader, val_loader, lambda o, t: F.huber_loss(o, t, delta=1.0), inverse_stats
+
+
+def make_data_friedman3(batch_size: int, noise_std: float = 1.0, val_size: int = 4000):
+    """Friedman #3 train/val loaders with target standardization (4-dim, per-dim ranges).
+
+    Same per-dim ranges as friedman2. Training loss is Huber (delta=1.0).
+    """
+    n_train = 20000
+    u_train_unit = _lhs_samples(n_train, _FRIEDMAN3_IN_DIM, seed=42)
+    u_train = _scale_lhs_to_ranges(u_train_unit, _FRIEDMAN2_RANGES)
+    y_train = _friedman3(u_train).unsqueeze(1)
+
+    torch.manual_seed(42)
+    u_val_unit = torch.rand(val_size, _FRIEDMAN3_IN_DIM)
+    u_val = _scale_lhs_to_ranges(u_val_unit, _FRIEDMAN2_RANGES)
+    y_val = _friedman3(u_val).unsqueeze(1)
+
+    if noise_std > 0:
+        y_train = y_train + noise_std * torch.randn_like(y_train)
+
+    y_mean = float(y_train.mean().item())
+    y_std = float(y_train.std().clamp(min=1e-6).item())
+    y_train_n = (y_train - y_mean) / y_std
+    y_val_n = (y_val - y_mean) / y_std
+
+    train_loader = DataLoader(
+        TensorDataset(u_train, y_train_n), batch_size=batch_size, shuffle=True
+    )
+    val_loader = DataLoader(
+        TensorDataset(u_val, y_val_n), batch_size=batch_size, shuffle=False
+    )
+    inverse_stats = {"y_mean": y_mean, "y_std": y_std}
+    return train_loader, val_loader, lambda o, t: F.huber_loss(o, t, delta=1.0), inverse_stats
+
+
+def make_data(problem: str, batch_size: int, **kwargs):
     if problem == "sinx":
         return make_data_sinx(batch_size)
     if problem == "housing":
@@ -1320,6 +1526,12 @@ def make_data(problem: str, batch_size: int):
         return make_data_smooth2d(batch_size)
     if problem == "housing_grid":
         return make_data_housing_grid(batch_size)
+    if problem == "friedman1":
+        return make_data_friedman1(batch_size, noise_std=kwargs.get("noise_std", 1.0))
+    if problem == "friedman2":
+        return make_data_friedman2(batch_size, noise_std=kwargs.get("noise_std", 1.0))
+    if problem == "friedman3":
+        return make_data_friedman3(batch_size, noise_std=kwargs.get("noise_std", 1.0))
     raise ValueError(f"Unknown problem: {problem}")
 
 
@@ -1931,8 +2143,17 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
     """Populate ``parser`` with the train_script CLI flags.  Split out of
     ``main()`` so smoke tests can introspect the flag surface (PP-5)."""
     parser.add_argument(
-        "--problem", choices=["sinx", "housing", "smooth2d", "smooth2d_grid", "housing_grid"], default="sinx",
-        help="Task to train (default: sinx)",
+        "--problem", choices=["sinx", "housing", "smooth2d", "smooth2d_grid", "housing_grid", "friedman1", "friedman2", "friedman3"], default="sinx",
+        help="Task to train (default: sinx). friedman{1,2,3} follow the "
+             "Friedman (1991) MARS synthetic regression benchmarks; targets "
+             "are standardized and trained with Huber loss (delta=1.0).",
+    )
+    parser.add_argument(
+        "--target-noise-std", type=float, default=1.0, dest="target_noise_std",
+        help="Standard deviation of additive Gaussian noise on the target "
+             "values for friedman{1,2,3} problems (default: 1.0, the "
+             "Friedman (1991) canonical value). Set to 0 to disable target "
+             "noise. Has no effect for non-friedman problems.",
     )
     parser.add_argument(
         "--grid-size", type=int, default=None, dest="grid_size",
@@ -2850,7 +3071,10 @@ def main():
     )
     effective_read_mode = "sparse" if net.read_idx is not None else "dense"
 
-    data_out = make_data(args.problem, batch_size)
+    data_kwargs = {}
+    if args.problem in ("friedman1", "friedman2", "friedman3"):
+        data_kwargs["noise_std"] = args.target_noise_std
+    data_out = make_data(args.problem, batch_size, **data_kwargs)
     if len(data_out) == 4:
         train_loader, val_loader, task_fn, inverse_stats = data_out
     else:

@@ -425,6 +425,11 @@ def _validate_hidden_family_args(args) -> None:
       - --hidden-family=cluster requires --num-hidden N (N >= 2)
       - --hidden-family=cluster + --grid-size is an error
         (cluster ignores grid; mixing is misleading)
+      - --hidden-family=small_world requires --num-hidden N (N >= 2)
+        and --small-world-k must be even, >= 2, < N
+      - --hidden-family=small_world + --grid-size is an error
+        (small_world ignores grid; mixing is misleading)
+      - --hidden-family=torus uses --grid-size (mirrors grid family)
       - --edge-repeats must be in [1, 8]
       - --num-stages must be >= 1
       - --num-hidden without --hidden-family emits a warning (ignored)
@@ -472,6 +477,43 @@ def _validate_hidden_family_args(args) -> None:
         if nh is not None:
             print(
                 f"[train] note: --num-hidden={nh} is ignored for grid family; "
+                f"use --grid-size N (default per problem)"
+            )
+    elif hf == "small_world":
+        if nh is None:
+            raise ValueError(
+                "--hidden-family=small_world requires --num-hidden N to be set. "
+                "Pass an integer (e.g. --num-hidden 25) to specify the "
+                "number of hidden nodes."
+            )
+        if nh < 2:
+            raise ValueError(
+                f"--num-hidden must be >= 2 for small_world family, got {nh}"
+            )
+        if gs is not None:
+            raise ValueError(
+                "--grid-size is not compatible with --hidden-family=small_world "
+                "(small_world has no spatial grid; --num-hidden controls size)."
+            )
+        sw_k = getattr(args, "small_world_k", None)
+        if sw_k is not None:
+            if sw_k < 2 or sw_k % 2 != 0:
+                raise ValueError(
+                    f"--small-world-k must be even and >= 2, got {sw_k}"
+                )
+            if sw_k >= nh:
+                raise ValueError(
+                    f"--small-world-k must be < --num-hidden (k={sw_k}, num_hidden={nh})"
+                )
+        sw_p = getattr(args, "small_world_p", None)
+        if sw_p is not None and not (0.0 <= sw_p <= 1.0):
+            raise ValueError(
+                f"--small-world-p must be in [0, 1], got {sw_p}"
+            )
+    elif hf == "torus":
+        if nh is not None:
+            print(
+                f"[train] note: --num-hidden={nh} is ignored for torus family; "
                 f"use --grid-size N (default per problem)"
             )
 
@@ -560,29 +602,39 @@ def _make_dynamic_preset(
     bidirectional: bool = False,
     write_mode_override: str | None = None,
     read_mode_override: str | None = None,
+    small_world_k: int = 4,
+    small_world_p: float = 0.3,
+    small_world_seed: int = 0,
 ) -> dict:
     """Build a fresh preset dict that overrides the topology of the named
     problem. Preserves problem-specific fields (num_inputs, loss, out_dim,
     use_robust_input, schedule, lambdas, tau_anneal, write_idx default).
 
-    Args:
+Args:
         problem: Base problem name (e.g. 'housing', 'sinx').
-        hidden_family: 'grid' or 'cluster'.
-        num_hidden: Number of hidden nodes. For 'grid', must equal
+        hidden_family: 'grid' | 'cluster' | 'small_world' | 'torus'.
+        num_hidden: Number of hidden nodes. For 'grid' / 'torus', must equal
             grid_size**2 (we recompute grid_size from num_hidden if not
-            given). For 'cluster', used directly.
+            given). For 'cluster' / 'small_world', used directly.
         num_stages: Number of ODE stages (default 1).
         edge_repeats: Parallel edges per hidden pair (default 2).
-        grid_size: For 'grid' family; height/width. If None and family='grid',
-            defaults to 5 (matches housing_grid default).
+        grid_size: For 'grid' / 'torus' family; height/width. If None and
+            family='grid', defaults to 5 (matches housing_grid default).
+            For 'torus', defaults to round(sqrt(num_hidden)) if not given.
         bidirectional: Emit two directed edges per hidden node pair (i->j
             AND j->i). Doubles the hidden edge count and gives asymmetric
             cells (P/rectifier) true bidirectional capability. Composes
             multiplicatively with ``edge_repeats``.
         write_mode_override: If set, use this write_mode instead of
             family default. CLI --write-mode takes precedence.
-        read_mode_override: If set, use this read_mode instead of family
-            default. CLI --read-mode takes precedence.
+        read_mode_override: If set, use this read_mode instead of
+            family default. CLI --read-mode takes precedence.
+        small_world_k: For 'small_world' family; even ring-lattice degree
+            (default 4).
+        small_world_p: For 'small_world' family; rewiring probability in
+            [0, 1] (default 0.3).
+        small_world_seed: For 'small_world' family; RNG seed for rewiring
+            (default 0).
 
     Returns:
         Fresh dict ready to assign to ``PRESETS[problem]`` before calling
@@ -610,6 +662,43 @@ def _make_dynamic_preset(
         read_idx = list(range(eff_num_hidden))
         eff_read_mode = "sparse" if read_mode_override is None else read_mode_override
         # Remove preset write_idx (incompatible with dense write).
+        base.pop("write_idx", None)
+    elif hidden_family == "small_world":
+        num_proj = 0
+        eff_num_hidden = int(num_hidden)
+        hidden_kwargs = {
+            "k": int(small_world_k),
+            "p": float(small_world_p),
+            "seed": int(small_world_seed),
+            "bidirectional": bidirectional,
+        }
+        eff_write_mode = (
+            write_mode_override if write_mode_override is not None else "dense"
+        )
+        read_idx = list(range(eff_num_hidden))
+        eff_read_mode = "sparse" if read_mode_override is None else read_mode_override
+        base.pop("write_idx", None)
+    elif hidden_family == "torus":
+        if grid_size is None:
+            grid_size = max(2, round(int(num_hidden) ** 0.5))
+        eff_num_hidden = grid_size * grid_size
+        if num_hidden is not None and eff_num_hidden != int(num_hidden):
+            print(
+                f"[train] note: --num-hidden={num_hidden} rounded to "
+                f"grid_size={grid_size} (eff_num_hidden={eff_num_hidden})"
+            )
+        num_proj = 0
+        hidden_kwargs = {
+            "height": grid_size,
+            "width": grid_size,
+            "kernel_size": 3,
+            "bidirectional": bidirectional,
+        }
+        eff_write_mode = (
+            write_mode_override if write_mode_override is not None else "dense"
+        )
+        read_idx = list(range(eff_num_hidden))
+        eff_read_mode = "sparse" if read_mode_override is None else read_mode_override
         base.pop("write_idx", None)
     elif hidden_family == "grid":
         if grid_size is None:
@@ -1867,14 +1956,18 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--hidden-family", type=str, default=None, dest="hidden_family",
-        choices=["grid", "cluster"],
+        choices=["grid", "cluster", "small_world", "torus"],
         help="Hidden-node topology family (default: from preset). "
              "'grid' uses a 2D grid graph (requires --grid-size). "
              "'cluster' uses a fully connected Erdos-Renyi graph "
-             "(requires --num-hidden). When set, dynamically rebuilds the "
-             "preset's stages config to use the specified family instead "
-             "of the hardcoded preset topology. Mutually exclusive with "
-             "the preset's default family when combined with --grid-size.",
+             "(requires --num-hidden). "
+             "'small_world' uses a Watts-Strogatz small-world graph "
+             "(requires --num-hidden; --small-world-k/p/seed tune it). "
+             "'torus' uses a 2D grid with periodic boundary conditions "
+             "(uses --grid-size). "
+             "When set, dynamically rebuilds the preset's stages config "
+             "to use the specified family instead of the hardcoded preset "
+             "topology.",
     )
     parser.add_argument(
         "--num-hidden", type=int, default=None, dest="num_hidden",
@@ -1906,6 +1999,23 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--no-bidirectional", dest="bidirectional", action="store_false",
         help="Disable dual edges per node pair (default).",
+    )
+    parser.add_argument(
+        "--small-world-k", type=int, default=4, dest="small_world_k",
+        help="Small-world neighbor count per node in the ring lattice "
+             "(default: 4, must be even and < num_hidden). "
+             "Used only when --hidden-family=small_world.",
+    )
+    parser.add_argument(
+        "--small-world-p", type=float, default=0.3, dest="small_world_p",
+        help="Small-world rewiring probability in [0, 1] "
+             "(default: 0.3). p=0 recovers a ring lattice, p=1 produces "
+             "a random regular graph. Used only when --hidden-family=small_world.",
+    )
+    parser.add_argument(
+        "--small-world-seed", type=int, default=0, dest="small_world_seed",
+        help="Small-world rewiring RNG seed (default: 0). "
+             "Used only when --hidden-family=small_world.",
     )
     parser.add_argument(
         "--output", type=Path, default=Path("./output"),
@@ -2635,6 +2745,9 @@ def main():
             bidirectional=args.bidirectional,
             write_mode_override=args.write_mode,
             read_mode_override=args.read_mode,
+            small_world_k=args.small_world_k,
+            small_world_p=args.small_world_p,
+            small_world_seed=args.small_world_seed,
         )
         PRESETS[args.problem] = new_preset
         print(

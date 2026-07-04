@@ -1,7 +1,8 @@
 """Topology generators for the differential KirchhoffNet.
 
 Three-layer API:
-  1. Primitives: line_graph, ring_graph, grid_graph, cluster_graph, empty_graph
+  1. Primitives: line_graph, ring_graph, grid_graph, cluster_graph,
+     small_world_graph, torus_graph, empty_graph
   2. Connectors: connect_bipartite, connect_projection
   3. Composer:   StageTopologyBuilder, MultiStageTopology.from_config()
 
@@ -40,6 +41,8 @@ __all__ = [
     "ring_graph",
     "grid_graph",
     "cluster_graph",
+    "small_world_graph",
+    "torus_graph",
     "empty_graph",
     "repeat_edges",
     "connect_bipartite",
@@ -232,6 +235,166 @@ def cluster_graph(n_nodes: int, edge_prob: float = 0.3, seed: int = 0, bidirecti
         edge_type=[EDGE_TYPE_HIDDEN] * len(src),
         node_kind=[NODE_KIND_HIDDEN] * n_nodes,
         hidden_node_ids=list(range(n_nodes)),
+    )
+
+
+def small_world_graph(
+    n_nodes: int,
+    k: int = 4,
+    p: float = 0.3,
+    seed: int = 0,
+    bidirectional: bool = False,
+) -> SparseTopology:
+    """Watts-Strogatz small-world graph.
+
+    Starts with a ring lattice where each node connects to its k nearest
+    neighbors (k must be even). Then each edge (i, j) is rewired with
+    probability p: the destination j is replaced by a uniformly random
+    distinct node j' (not i, and not already an edge of i). This produces
+    the characteristic small-world property: high clustering coefficient
+    plus short average path length.
+
+    Emits a single directed edge per undirected pair by default (j > i).
+    L/S cells (odd I-V) provide implicit bidirectional conduction via sign
+    reversal. With ``bidirectional=True``, both (i, j) and (j, i) are
+    emitted (2x edge count) so asymmetric cells (P/rectifier) get true
+    bidirectional capability.
+
+    Args:
+        n_nodes: Number of hidden nodes (must be >= 2).
+        k: Each node's degree in the initial ring lattice (even, >= 2,
+            < n_nodes).
+        p: Rewiring probability in [0, 1]. p=0 recovers the ring lattice;
+            p=1 produces a random regular graph (no self-loops, no parallel
+            edges).
+        seed: RNG seed for rewiring determinism.
+        bidirectional: If True, emit both directions for every undirected pair.
+
+    Raises:
+        ValueError: On invalid n_nodes / k / p.
+    """
+    if n_nodes <= 0:
+        raise ValueError("n_nodes must be positive")
+    if n_nodes < 2:
+        raise ValueError("n_nodes must be >= 2")
+    if k < 2 or k % 2 != 0:
+        raise ValueError(f"k must be even and >= 2, got {k}")
+    if k >= n_nodes:
+        raise ValueError(f"k must be < n_nodes, got k={k}, n_nodes={n_nodes}")
+    if not (0.0 <= p <= 1.0):
+        raise ValueError(f"p must be in [0, 1], got {p}")
+
+    half = k // 2
+    # Build initial ring lattice as undirected pairs {(min, max)}.
+    pairs: set[tuple[int, int]] = set()
+    for i in range(n_nodes):
+        for r in range(1, half + 1):
+            j = (i + r) % n_nodes
+            a, b = (i, j) if i < j else (j, i)
+            pairs.add((a, b))
+
+    # Rewire with probability p.
+    rng = random.Random(seed)
+    rewired_pairs: set[tuple[int, int]] = set()
+    for (a, b) in pairs:
+        if p > 0.0 and rng.random() < p:
+            # Pick a new neighbor for a: must be != a, and (a, new) not already
+            # an edge in either direction. Try a bounded number of times
+            # before giving up (rare in practice; preserves no-self-loop
+            # / no-parallel-edge invariants).
+            new_b = b
+            attempts = 0
+            while True:
+                cand = rng.randrange(n_nodes)
+                if cand == a:
+                    attempts += 1
+                    if attempts > 100:
+                        break
+                    continue
+                pair = (a, cand) if a < cand else (cand, a)
+                if pair in pairs or pair in rewired_pairs:
+                    attempts += 1
+                    if attempts > 100:
+                        break
+                    continue
+                new_b = cand
+                break
+            lo, hi = (a, new_b) if a < new_b else (new_b, a)
+            rewired_pairs.add((lo, hi))
+        else:
+            rewired_pairs.add((a, b))
+
+    src: list[int] = []
+    dst: list[int] = []
+    for (a, b) in rewired_pairs:
+        src.append(a); dst.append(b)
+        if bidirectional:
+            src.append(b); dst.append(a)
+
+    return SparseTopology(
+        num_nodes=n_nodes,
+        src=src, dst=dst,
+        edge_type=[EDGE_TYPE_HIDDEN] * len(src),
+        node_kind=[NODE_KIND_HIDDEN] * n_nodes,
+        hidden_node_ids=list(range(n_nodes)),
+    )
+
+
+def torus_graph(
+    height: int,
+    width: int,
+    kernel_size: int = 3,
+    bidirectional: bool = False,
+) -> SparseTopology:
+    """2D grid with periodic boundary conditions (wrap-around).
+
+    Same neighbor structure as :func:`grid_graph`, but row and column indices
+    wrap around: ``nr = (r + dr) % height``, ``nc = (c + dc) % width``. Every
+    node has the same number of neighbors (no boundary nodes), giving a
+    regular lattice with smaller diameter than the non-periodic grid.
+
+    Node id = ``row * width + col``. Emits a single directed edge per
+    undirected pair (j > i) by default; L/S cells provide implicit
+    bidirectional conduction. With ``bidirectional=True``, both (i, j) and
+    (j, i) are emitted for asymmetric cells.
+
+    Args:
+        height: Number of rows (must be >= 1).
+        width: Number of columns (must be >= 1).
+        kernel_size: Neighborhood half-size (positive odd integer). 3 means
+            each node connects to its 8 immediate neighbors on the torus.
+        bidirectional: If True, emit both directions for every undirected pair.
+
+    Raises:
+        ValueError: On non-positive height/width, or invalid kernel_size.
+    """
+    if height <= 0 or width <= 0:
+        raise ValueError("height and width must be positive")
+    if kernel_size < 1 or kernel_size % 2 == 0:
+        raise ValueError("kernel_size must be a positive odd integer")
+    n = height * width
+    pad = kernel_size // 2
+    src, dst = [], []
+    for r in range(height):
+        for c in range(width):
+            i = r * width + c
+            for dr in range(-pad, pad + 1):
+                for dc in range(-pad, pad + 1):
+                    if dr == 0 and dc == 0:
+                        continue
+                    nr = (r + dr) % height
+                    nc = (c + dc) % width
+                    j = nr * width + nc
+                    if j > i:
+                        src.append(i); dst.append(j)
+                        if bidirectional:
+                            src.append(j); dst.append(i)
+    return SparseTopology(
+        num_nodes=n,
+        src=src, dst=dst,
+        edge_type=[EDGE_TYPE_HIDDEN] * len(src),
+        node_kind=[NODE_KIND_HIDDEN] * n,
+        hidden_node_ids=list(range(n)),
     )
 
 
@@ -463,6 +626,10 @@ class MultiStageTopology:
                 hid = ring_graph(cfg["num_hidden"], **hidden_kwargs)
             elif family == "grid":
                 hid = grid_graph(**hidden_kwargs)
+            elif family == "small_world":
+                hid = small_world_graph(cfg["num_hidden"], **hidden_kwargs)
+            elif family == "torus":
+                hid = torus_graph(**hidden_kwargs)
             elif family == "cluster":
                 hid = cluster_graph(cfg["num_hidden"], **hidden_kwargs)
             elif family == "empty":

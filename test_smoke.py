@@ -229,7 +229,8 @@ def test_isat_variation_pipeline():
 def test_topology_primitives():
     print("\nTest 3: topology primitives generate well-formed graphs")
     from topology import (
-        line_graph, ring_graph, grid_graph, cluster_graph, empty_graph
+        line_graph, ring_graph, grid_graph, cluster_graph,
+        small_world_graph, torus_graph, empty_graph,
     )
     lg = line_graph(5, radius=1)
     check("line_graph n=5 rad=1: edges", lg.num_edges() == 4)
@@ -249,6 +250,27 @@ def test_topology_primitives():
 
     cg = cluster_graph(6, edge_prob=0.5, seed=42)
     check("cluster_graph n=6: 6 nodes", cg.num_nodes == 6)
+
+    sw = small_world_graph(10, k=4, p=0.3, seed=42)
+    check("small_world_graph n=10: 10 nodes", sw.num_nodes == 10)
+    check("small_world_graph: edges > 0", sw.num_edges() > 0)
+    check("small_world_graph: no self-loops",
+          all(s != d for s, d in zip(sw.src, sw.dst)))
+    # p=0 recovers the ring lattice (k//2 neighbors per node).
+    sw_p0 = small_world_graph(10, k=4, p=0.0, seed=0)
+    rg_ref = ring_graph(10, radius=2)
+    check("small_world_graph p=0 edge count == ring_graph radius=2",
+          sw_p0.num_edges() == rg_ref.num_edges(),
+          f"sw_p0={sw_p0.num_edges()}, ring={rg_ref.num_edges()}")
+
+    tg = torus_graph(3, 3, kernel_size=3)
+    check("torus_graph 3x3: 9 nodes", tg.num_nodes == 9)
+    # 3x3 torus, kernel=3: each node has 8 neighbors; unique undirected pairs.
+    check("torus_graph 3x3 kernel=3: edges > 0", tg.num_edges() > 0)
+    check("torus_graph 3x3 kernel=3: full connectivity (36 unique pairs)",
+          tg.num_edges() == 36, f"got {tg.num_edges()}")
+    check("torus_graph: no self-loops",
+          all(s != d for s, d in zip(tg.src, tg.dst)))
 
     eg = empty_graph(4)
     check("empty_graph 0 edges", eg.num_edges() == 0)
@@ -3002,6 +3024,14 @@ def main():
     test_bidir_default_is_false()                 # BIDI-6: backward compat
     test_bidir_preset_factories_accept_param()    # BIDI-7: preset factories
     test_bidir_full_net_build()                   # BIDI-8: full net build
+    test_bidir_small_world_graph_doubles_edges()  # BIDI-9: small_world primitive
+    test_bidir_torus_graph_doubles_edges()        # BIDI-10: torus primitive
+
+    # Small world + torus primitive tests (small-world-torus plan)
+    test_small_world_validations()                # SW-1: arg validation
+    test_small_world_p0_matches_ring()            # SW-2: p=0 == ring
+    test_torus_validations()                      # T-1: arg validation
+    test_torus_3x3_full_connectivity()            # T-2: 3x3 torus == K_9
 
     # Parallel edge repeats tests (parallel-edge-repeats plan)
     test_repeat_edges_identity()                  # REP-1: n=1 identity
@@ -5403,8 +5433,129 @@ def test_bidir_cluster_graph_doubles_edges():
     edges_bidir = set(zip(c2.src, c2.dst))
     all_reversed = all((d, s) in edges_bidir for s, d in edges_single)
     check("BIDI-4: every single edge has its reverse", all_reversed)
-    no_self_loops = all(s != d for s, d in edges_bidir)
+    no_self_loops = all(s != d for s, d in zip(c2.src, c2.dst))
     check("BIDI-4: no self-loops in bidirectional", no_self_loops)
+
+
+def test_bidir_small_world_graph_doubles_edges():
+    """small_world_graph(bidirectional=True) emits exactly 2x the edges of bidirectional=False."""
+    print("\nTest BIDI-9: small_world_graph bidirectional doubles edge count")
+    from topology import small_world_graph
+    s1 = small_world_graph(12, k=4, p=0.3, seed=0, bidirectional=False)
+    s2 = small_world_graph(12, k=4, p=0.3, seed=0, bidirectional=True)
+    check("BIDI-9: small_world single edges > 0", len(s1.src) > 0,
+          f"single={len(s1.src)}")
+    check("BIDI-9: small_world bidirectional = 2 * single",
+          len(s2.src) == 2 * len(s1.src),
+          f"single={len(s1.src)}, bidir={len(s2.src)}")
+    edges_single = set(zip(s1.src, s1.dst))
+    edges_bidir = set(zip(s2.src, s2.dst))
+    all_reversed = all((d, s) in edges_bidir for s, d in edges_single)
+    check("BIDI-9: every single edge has its reverse", all_reversed)
+    no_self_loops = all(s != d for s, d in zip(s2.src, s2.dst))
+    check("BIDI-9: no self-loops in bidirectional", no_self_loops)
+
+
+def test_bidir_torus_graph_doubles_edges():
+    """torus_graph(bidirectional=True) emits exactly 2x the edges of bidirectional=False."""
+    print("\nTest BIDI-10: torus_graph bidirectional doubles edge count")
+    from topology import torus_graph
+    t1 = torus_graph(4, 4, kernel_size=3, bidirectional=False)
+    t2 = torus_graph(4, 4, kernel_size=3, bidirectional=True)
+    check("BIDI-10: torus single edges > 0", len(t1.src) > 0,
+          f"single={len(t1.src)}")
+    check("BIDI-10: torus bidirectional = 2 * single",
+          len(t2.src) == 2 * len(t1.src),
+          f"single={len(t1.src)}, bidir={len(t2.src)}")
+    edges_single = set(zip(t1.src, t1.dst))
+    edges_bidir = set(zip(t2.src, t2.dst))
+    all_reversed = all((d, s) in edges_bidir for s, d in edges_single)
+    check("BIDI-10: every single edge has its reverse", all_reversed)
+    no_self_loops = all(s != d for s, d in zip(t2.src, t2.dst))
+    check("BIDI-10: no self-loops in bidirectional", no_self_loops)
+
+
+def test_small_world_validations():
+    """small_world_graph rejects invalid n_nodes / k / p."""
+    print("\nTest SW-1: small_world_graph argument validation")
+    from topology import small_world_graph
+    try:
+        small_world_graph(n_nodes=1, k=2)
+    except ValueError as e:
+        check("SW-1: n_nodes < 2 rejected", "n_nodes must be >= 2" in str(e))
+    try:
+        small_world_graph(n_nodes=10, k=3)
+    except ValueError as e:
+        check("SW-1: odd k rejected", "k must be even" in str(e))
+    try:
+        small_world_graph(n_nodes=10, k=1)
+    except ValueError as e:
+        check("SW-1: k < 2 rejected", "k must be even and >= 2" in str(e))
+    try:
+        small_world_graph(n_nodes=10, k=10)
+    except ValueError as e:
+        check("SW-1: k >= n_nodes rejected", "k must be < n_nodes" in str(e))
+    try:
+        small_world_graph(n_nodes=10, k=4, p=-0.1)
+    except ValueError as e:
+        check("SW-1: p < 0 rejected", "p must be in [0, 1]" in str(e))
+    try:
+        small_world_graph(n_nodes=10, k=4, p=1.5)
+    except ValueError as e:
+        check("SW-1: p > 1 rejected", "p must be in [0, 1]" in str(e))
+
+
+def test_torus_validations():
+    """torus_graph rejects invalid height / width / kernel_size."""
+    print("\nTest T-1: torus_graph argument validation")
+    from topology import torus_graph
+    try:
+        torus_graph(height=0, width=3)
+    except ValueError as e:
+        check("T-1: height <= 0 rejected", "height and width must be positive" in str(e))
+    try:
+        torus_graph(height=3, width=-1)
+    except ValueError as e:
+        check("T-1: width <= 0 rejected", "height and width must be positive" in str(e))
+    try:
+        torus_graph(height=3, width=3, kernel_size=4)
+    except ValueError as e:
+        check("T-1: even kernel_size rejected", "kernel_size must be a positive odd integer" in str(e))
+    try:
+        torus_graph(height=3, width=3, kernel_size=0)
+    except ValueError as e:
+        check("T-1: kernel_size 0 rejected", "kernel_size must be a positive odd integer" in str(e))
+
+
+def test_small_world_p0_matches_ring():
+    """small_world_graph(p=0) emits the same UNDIRECTED edge set as ring_graph with k/2 radius."""
+    print("\nTest SW-2: small_world_graph p=0 == ring_graph (undirected)")
+    from topology import small_world_graph, ring_graph
+    n, k = 16, 6
+    sw = small_world_graph(n, k=k, p=0.0, seed=42)
+    rg = ring_graph(n, radius=k // 2)
+    sw_undirected = set(tuple(sorted(e)) for e in zip(sw.src, sw.dst))
+    rg_undirected = set(tuple(sorted(e)) for e in zip(rg.src, rg.dst))
+    check("SW-2: p=0 undirected edges == ring_graph undirected edges",
+          sw_undirected == rg_undirected,
+          f"sw={len(sw_undirected)}, ring={len(rg_undirected)}")
+
+
+def test_torus_3x3_full_connectivity():
+    """3x3 torus with kernel=3 has 36 unique undirected pairs (every node sees all 8 others)."""
+    print("\nTest T-2: 3x3 torus kernel=3 is the complete graph K_9")
+    from topology import torus_graph
+    tg = torus_graph(3, 3, kernel_size=3)
+    # K_9 has 9*8/2 = 36 undirected edges.
+    check("T-2: 3x3 torus kernel=3 has 36 edges", tg.num_edges() == 36,
+          f"got {tg.num_edges()}")
+    edges = set(zip(tg.src, tg.dst))
+    # Every ordered pair (i, j) with i != j must appear in some direction.
+    all_pairs_present = all(
+        (i, j) in edges or (j, i) in edges
+        for i in range(9) for j in range(9) if i != j
+    )
+    check("T-2: every unordered pair is connected", all_pairs_present)
 
 
 def test_bidir_validate_topology_passes():

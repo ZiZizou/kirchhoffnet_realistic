@@ -541,10 +541,10 @@ def compute_loss(
     )
     with autocast_ctx:
         if isinstance(net, KirchhoffNetWithIO):
-            out, trajs = net(x0, ctx=ctx, store_trajectory=True,
+            out, trajs = net(x0, store_trajectory=True,
                              solver=solver, deq_cfg=deq_cfg)
         else:
-            out, trajs = net(x0, ctx=ctx, store_trajectory=True,
+            out, trajs = net(x0, store_trajectory=True,
                              solver=solver, deq_cfg=deq_cfg)
 
         loss_task = task_fn(out, target)
@@ -636,7 +636,7 @@ def compute_solver_loss(
         torch.amp.autocast("cuda", dtype=amp_dtype) if amp else _NullContext()
     )
     with autocast_ctx:
-        out, trajs = net(b, ctx=ctx, store_trajectory=True)
+        out, trajs = net(b, store_trajectory=True)
 
         loss_res = residual_loss(out, b, A)
         loss_sol = solution_loss(out, x_star)

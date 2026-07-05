@@ -61,14 +61,14 @@ def main():
 def test_sparsity_push():
     print("\nTest 8: sparsity regularizer reduces P(active) over training")
     from cell_library import make_cell_library
-    from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
+    from topology import ring_graph, StageTopologyBuilder, topology_to_stage
     from kirchhoff_net import KirchhoffNetWithIO, KirchhoffNet
     from io_mapper import InputMapper, OutputMapper
     from sim_context import SimContext
     from train import compute_loss, make_optimizer, default_ctx_factory, LAMBDAS
 
     cell_lib = make_cell_library('tanh')
-    hid = cluster_graph(3, edge_prob=0.5, seed=0)
+    hid = ring_graph(3)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
                          proj_pattern="all_to_all")
@@ -130,8 +130,8 @@ def test_round_trip_preset():
 
     # Second forward should differ from first (parameters changed)
     with torch.no_grad():
-        y1, _ = net(u, ctx=SimContext(), store_trajectory=False)
-        y2, _ = net(u, ctx=SimContext(), store_trajectory=False)
+        y1, _ = net(u, store_trajectory=False)
+        y2, _ = net(u, store_trajectory=False)
     check("sinx preset: re-forward succeeds (no NaN)", torch.isfinite(y2).all().item())
 
 def test_no_adc_flag():
@@ -317,7 +317,7 @@ def test_smooth2d_preset():
 
     u = torch.rand(8, 2)
     ctx = None
-    out, _ = net(u, ctx=ctx)
+    out, _ = net(u)
     check("smooth2d: forward shape (8,1)", out.shape == (8, 1))
     check("smooth2d: forward output is finite", torch.isfinite(out).all().item())
 
@@ -338,7 +338,7 @@ def test_smooth2d_preset():
     net.train()
     for u_b, y_b in train_loader:
         optimizer.zero_grad()
-        out_b, _ = net(u_b, ctx=None)
+        out_b, _ = net(u_b)
         loss = task_fn(out_b, y_b)
         loss.backward()
         optimizer.step()
@@ -440,7 +440,7 @@ def test_smooth2d_grid_preset():
 
     u = torch.rand(8, 2)
     ctx = None
-    out, _ = net(u, ctx=ctx)
+    out, _ = net(u)
     check("smooth2d_grid: forward shape (8,1)", out.shape == (8, 1))
     check("smooth2d_grid: forward output is finite",
           torch.isfinite(out).all().item())
@@ -452,7 +452,7 @@ def test_smooth2d_grid_preset():
     net.train()
     for u_b, y_b in train_loader:
         optimizer.zero_grad()
-        out_b, _ = net(u_b, ctx=None)
+        out_b, _ = net(u_b)
         loss = task_fn(out_b, y_b)
         loss.backward()
         optimizer.step()
@@ -580,7 +580,7 @@ def test_housing_grid_preset():
 
     u = torch.rand(8, 8)
     ctx = None
-    out, _ = net(u, ctx=ctx)
+    out, _ = net(u)
     check("housing_grid: forward shape (8,1)", out.shape == (8, 1))
     check("housing_grid: forward output is finite",
           torch.isfinite(out).all().item())
@@ -624,7 +624,7 @@ def test_persistent_drive_auto_fan_out():
     PRESETS["housing_grid"] = active
 
     try:
-        cell_lib = make_cell_library("legacy")
+        cell_lib = make_cell_library('tanh')
         net = build_net_from_preset(
             "housing_grid",
             cell_lib=cell_lib,
@@ -640,7 +640,7 @@ def test_persistent_drive_auto_fan_out():
         check("housing_grid + persistent-drive has drive_mappers",
               net.drive_mappers is not None and len(net.drive_mappers) == 3)
         check("housing_grid + persistent-drive: forward output is finite",
-              torch.isfinite(net(torch.rand(4, 8), ctx=None)[0]).all().item())
+              torch.isfinite(net(torch.rand(4, 8))[0]).all().item())
     finally:
         PRESETS["housing_grid"] = make_housing_grid_preset(grid_size=5)
 
@@ -777,7 +777,7 @@ def test_v15_cell_parameters_preset_smooth2d_grid():
     import torch
     x = torch.randn(4, 2)
     with torch.no_grad():
-        y, traj = net(x, ctx=None, store_trajectory=False)
+        y, traj = net(x, store_trajectory=False)
     check("V15-10: network output finite",
           torch.isfinite(y).all().item())
     check("V15-10: network output shape (4, 1)",

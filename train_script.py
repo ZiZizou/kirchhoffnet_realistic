@@ -382,9 +382,6 @@ def _validate_hidden_family_args(args) -> None:
     combos so argparse-style early failure is obvious to the user.
 
     Rules:
-      - --hidden-family=cluster requires --num-hidden N (N >= 2)
-      - --hidden-family=cluster + --grid-size is an error
-        (cluster ignores grid; mixing is misleading)
       - --hidden-family=small_world requires --num-hidden N (N >= 2)
         and --small-world-k must be even, >= 2, < N
       - --hidden-family=small_world + --grid-size is an error
@@ -417,23 +414,7 @@ def _validate_hidden_family_args(args) -> None:
             )
         return
 
-    if hf == "cluster":
-        if nh is None:
-            raise ValueError(
-                "--hidden-family=cluster requires --num-hidden N to be set. "
-                "Pass an integer (e.g. --num-hidden 25) to specify the "
-                "number of hidden nodes."
-            )
-        if nh < 2:
-            raise ValueError(
-                f"--num-hidden must be >= 2 for cluster family, got {nh}"
-            )
-        if gs is not None:
-            raise ValueError(
-                "--grid-size is not compatible with --hidden-family=cluster "
-                "(cluster has no spatial grid; --num-hidden controls size)."
-             )
-    elif hf == "grid":
+    if hf == "grid":
         if nh is not None:
             print(
                 f"[train] note: --num-hidden={nh} is ignored for grid family; "
@@ -569,10 +550,10 @@ def _make_dynamic_preset(
 
 Args:
         problem: Base problem name (e.g. 'housing', 'sinx').
-        hidden_family: 'grid' | 'cluster' | 'small_world' | 'torus'.
+        hidden_family: 'grid' | 'small_world' | 'torus'.
         num_hidden: Number of hidden nodes. For 'grid' / 'torus', must equal
             grid_size**2 (we recompute grid_size from num_hidden if not
-            given). For 'cluster' / 'small_world', used directly.
+            given). For 'small_world', used directly.
         num_stages: Number of ODE stages (default 1).
         edge_repeats: Parallel edges per hidden pair (default 2).
         grid_size: For 'grid' / 'torus' family; height/width. If None and
@@ -605,21 +586,7 @@ Args:
     n_stages = max(1, int(num_stages))
     er = int(edge_repeats)
 
-    if hidden_family == "cluster":
-        num_proj = 0
-        eff_num_hidden = int(num_hidden)
-        hidden_kwargs = {
-            "edge_prob": 1.0,
-            "seed": 0,
-            "bidirectional": bidirectional}
-        eff_write_mode = (
-            write_mode_override if write_mode_override is not None else "dense"
-        )
-        read_idx = list(range(eff_num_hidden))
-        eff_read_mode = "sparse" if read_mode_override is None else read_mode_override
-        # Remove preset write_idx (incompatible with dense write).
-        base.pop("write_idx", None)
-    elif hidden_family == "small_world":
+    if hidden_family == "small_world":
         num_proj = 0
         eff_num_hidden = int(num_hidden)
         hidden_kwargs = {
@@ -1813,11 +1780,9 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "Overrides the preset's cell_library key if present.")
     parser.add_argument(
         "--hidden-family", type=str, default=None, dest="hidden_family",
-        choices=["grid", "cluster", "small_world", "torus"],
+        choices=["grid", "small_world", "torus"],
         help="Hidden-node topology family (default: from preset). "
              "'grid' uses a 2D grid graph (requires --grid-size). "
-             "'cluster' uses a fully connected Erdos-Renyi graph "
-             "(requires --num-hidden). "
              "'small_world' uses a Watts-Strogatz small-world graph "
              "(requires --num-hidden; --small-world-k/p/seed tune it). "
              "'torus' uses a 2D grid with periodic boundary conditions "
@@ -1828,7 +1793,7 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--num-hidden", type=int, default=None, dest="num_hidden",
         help="Number of hidden nodes (default: from preset). "
-             "Required when --hidden-family=cluster (must be >= 2). "
+             "Required when --hidden-family=small_world (must be >= 2). "
              "Ignored for grid family (uses --grid-size).")
     parser.add_argument(
         "--num-stages", type=int, default=None, dest="num_stages",
@@ -2378,7 +2343,7 @@ def main():
     # overrides BEFORE any other flag is consumed (e.g. before the
     # pruning-threshold resolution below).
     _apply_ablation_set(args, schedule_mode)
-    # cluster-topology CLI: validate new --hidden-family/--num-hidden/
+    # hidden-family CLI: validate --hidden-family/--num-hidden/
     # --edge-repeats/--num-stages combinations early (cheap, before any
     # expensive setup like data loading or model construction).
     _validate_hidden_family_args(args)
@@ -2491,9 +2456,9 @@ def main():
     else:
         resolved_grid_size = args.grid_size
     args.grid_size = resolved_grid_size
-    # cluster-topology CLI: when --hidden-family is specified, dynamically
+    # hidden-family CLI: when --hidden-family is specified, dynamically
     # rebuild the problem's preset to use the requested family. Done AFTER
-    # grid-size resolution so the cluster-family branch can read
+    # grid-size resolution so the family branches can read
     # args.grid_size (for error detection).
     if args.hidden_family is not None:
         eff_num_hidden = (

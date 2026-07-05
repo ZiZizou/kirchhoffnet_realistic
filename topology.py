@@ -1,7 +1,7 @@
 """Topology generators for the differential KirchhoffNet.
 
 Three-layer API:
-  1. Primitives: line_graph, ring_graph, grid_graph, cluster_graph,
+  1. Primitives: line_graph, ring_graph, grid_graph,
      small_world_graph, torus_graph, empty_graph
   2. Connectors: connect_bipartite, connect_projection
   3. Composer:   StageTopologyBuilder, MultiStageTopology.from_config()
@@ -39,7 +39,6 @@ __all__ = [
     "line_graph",
     "ring_graph",
     "grid_graph",
-    "cluster_graph",
     "small_world_graph",
     "torus_graph",
     "empty_graph",
@@ -201,39 +200,6 @@ def grid_graph(height: int, width: int, kernel_size: int = 3, bidirectional: boo
         edge_type=[EDGE_TYPE_HIDDEN] * len(src),
         node_kind=[NODE_KIND_HIDDEN] * n,
         hidden_node_ids=list(range(n)),
-    )
-
-
-def cluster_graph(n_nodes: int, edge_prob: float = 0.3, seed: int = 0, bidirectional: bool = False) -> SparseTopology:
-    """Erdős-Rényi-like sparse graph with a single directed edge per undirected pair.
-
-    For each pair (i, j) with i<j, an edge is emitted with probability
-    edge_prob in the direction (i->j). L/S cells (odd I-V) provide implicit
-    bidirectional conduction via sign reversal.
-
-    When ``bidirectional=True``, also emits the reverse direction for every
-    accepted edge: for each (i, j) edge, an additional (j, i) edge is added.
-    Edge count is exactly 2× the single-direction count. No self-loops are
-    introduced since the original pairs have i < j (i != j).
-    """
-    if n_nodes <= 0:
-        raise ValueError("n_nodes must be positive")
-    if not (0.0 <= edge_prob <= 1.0):
-        raise ValueError("edge_prob must be in [0, 1]")
-    rng = random.Random(seed)
-    src, dst = [], []
-    for i in range(n_nodes):
-        for j in range(i + 1, n_nodes):
-            if rng.random() < edge_prob:
-                src.append(i); dst.append(j)
-                if bidirectional:
-                    src.append(j); dst.append(i)
-    return SparseTopology(
-        num_nodes=n_nodes,
-        src=src, dst=dst,
-        edge_type=[EDGE_TYPE_HIDDEN] * len(src),
-        node_kind=[NODE_KIND_HIDDEN] * n_nodes,
-        hidden_node_ids=list(range(n_nodes)),
     )
 
 
@@ -617,7 +583,7 @@ class MultiStageTopology:
                 num_hidden=cfg["num_hidden"],
                 num_proj=cfg.get("num_proj", 0),
             )
-            family = cfg.get("hidden_family", "cluster")
+            family = cfg.get("hidden_family", "line")
             hidden_kwargs = dict(cfg.get("hidden_kwargs", {}))
             if family == "line":
                 hid = line_graph(cfg["num_hidden"], **hidden_kwargs)
@@ -629,8 +595,6 @@ class MultiStageTopology:
                 hid = small_world_graph(cfg["num_hidden"], **hidden_kwargs)
             elif family == "torus":
                 hid = torus_graph(**hidden_kwargs)
-            elif family == "cluster":
-                hid = cluster_graph(cfg["num_hidden"], **hidden_kwargs)
             elif family == "empty":
                 hid = empty_graph(cfg["num_hidden"])
             else:

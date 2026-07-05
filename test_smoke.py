@@ -229,8 +229,7 @@ def test_isat_variation_pipeline():
 def test_topology_primitives():
     print("\nTest 3: topology primitives generate well-formed graphs")
     from topology import (
-        line_graph, ring_graph, grid_graph, cluster_graph,
-        small_world_graph, torus_graph, empty_graph,
+small_world_graph, torus_graph, empty_graph
     )
     lg = line_graph(5, radius=1)
     check("line_graph n=5 rad=1: edges", lg.num_edges() == 4)
@@ -248,8 +247,8 @@ def test_topology_primitives():
     check("grid_graph: 2x3 kernel=3 emits 11 unique-pair edges",
           gg.num_edges() == 11, f"got {gg.num_edges()}")
 
-    cg = cluster_graph(6, edge_prob=0.5, seed=42)
-    check("cluster_graph n=6: 6 nodes", cg.num_nodes == 6)
+    cg = ring_graph(6, edge_prob=0.5, seed=42)
+    check("ring_graph n=6: 6 nodes", cg.num_nodes == 6)
 
     sw = small_world_graph(10, k=4, p=0.3, seed=42)
     check("small_world_graph n=10: 10 nodes", sw.num_nodes == 10)
@@ -294,12 +293,12 @@ def test_stage_transfer():
 def test_heun_converges():
     print("\nTest 5: Heun integration converges without explosion (small 1-stage net)")
     from cell_library import make_cell_library
-    from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
+    from topology import StageTopologyBuilder, topology_to_stage
     from kirchhoff_net import KirchhoffNet
     from sim_context import SimContext
 
     cell_lib = make_cell_library('tanh')
-    hid = cluster_graph(4, edge_prob=0.5, seed=0)
+    hid = ring_graph(4, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=4, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
                          proj_pattern="all_to_all")
@@ -318,12 +317,12 @@ def test_heun_converges():
 def test_gradient_flow():
     print("\nTest 6: gradients flow through every parameter group")
     from cell_library import make_cell_library
-    from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
+    from topology import StageTopologyBuilder, topology_to_stage
     from kirchhoff_net import KirchhoffNet
     from sim_context import SimContext
 
     cell_lib = make_cell_library('tanh')
-    hid = cluster_graph(3, edge_prob=0.5, seed=0)
+    hid = ring_graph(3, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
                          proj_pattern="all_to_all")
@@ -349,14 +348,14 @@ def test_gradient_flow():
 def test_compute_loss_finite():
     print("\nTest 7: compute_loss returns finite values for all regularizers")
     from cell_library import make_cell_library
-    from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
+    from topology import StageTopologyBuilder, topology_to_stage
     from kirchhoff_net import KirchhoffNetWithIO
     from io_mapper import InputMapper, OutputMapper
     from sim_context import SimContext
     from train import compute_loss
 
     cell_lib = make_cell_library('tanh')
-    hid = cluster_graph(4, edge_prob=0.5, seed=0)
+    hid = ring_graph(4, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=2, num_outputs=0, num_hidden=4, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
                          proj_pattern="all_to_all")
@@ -441,10 +440,10 @@ def test_housing_preset_robust():
 def test_topology_to_stage_input_output_filtering():
     print("\nTest 13: topology_to_stage filters input/output edges from ODE")
     from cell_library import make_cell_library
-    from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
+    from topology import StageTopologyBuilder, topology_to_stage
 
     cell_lib = make_cell_library('tanh')
-    hid = cluster_graph(3, edge_prob=0.5, seed=0)
+    hid = ring_graph(3, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=2, num_outputs=1, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
                          proj_pattern="all_to_all")
@@ -461,10 +460,9 @@ def test_topology_to_stage_input_output_filtering():
 def test_validate_topology():
     print("\nTest 14: validate_topology sanity checks")
     from topology import (
-        cluster_graph, StageTopologyBuilder, validate_topology,
-        SparseTopology, EDGE_TYPE_HIDDEN
+SparseTopology, EDGE_TYPE_HIDDEN
     )
-    hid = cluster_graph(4, edge_prob=0.5, seed=0)
+    hid = ring_graph(4, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=2, num_outputs=1, num_hidden=4, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
                          proj_pattern="all_to_all")
@@ -490,11 +488,11 @@ def test_validate_topology():
 def test_visualize_stage_graph():
     print("\nTest 15: visualize.plot_stage_graph runs and saves PNG")
     from cell_library import make_cell_library
-    from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
+    from topology import StageTopologyBuilder, topology_to_stage
     from visualize import plot_stage_graph
 
     cell_lib = make_cell_library('tanh')
-    hid = cluster_graph(4, edge_prob=0.5, seed=0)
+    hid = ring_graph(4, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=4, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
                          proj_pattern="all_to_all")
@@ -509,13 +507,11 @@ def test_visualize_stage_graph():
 def test_visualize_sparse_topology():
     print("\nTest 16: visualize.plot_sparse_topology runs with all 4 node kinds")
     from topology import (
-        cluster_graph, StageTopologyBuilder, EDGE_TYPE_HIDDEN, EDGE_TYPE_PROJ,
-        EDGE_TYPE_INPUT, EDGE_TYPE_OUTPUT, NODE_KIND_HIDDEN, NODE_KIND_PROJ,
-        NODE_KIND_INPUT, NODE_KIND_OUTPUT,
+EDGE_TYPE_INPUT, EDGE_TYPE_OUTPUT, NODE_KIND_HIDDEN, NODE_KIND_PROJ, NODE_KIND_INPUT, NODE_KIND_OUTPUT
     )
     from visualize import plot_sparse_topology
 
-    hid = cluster_graph(3, edge_prob=0.4, seed=0)
+    hid = ring_graph(3, edge_prob=0.4, seed=0)
     builder = StageTopologyBuilder(num_inputs=2, num_outputs=1, num_hidden=3, num_proj=1)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
                          proj_pattern="all_to_all")
@@ -530,13 +526,13 @@ def test_visualize_trajectories():
     print("\nTest 17: visualize.plot_trajectories runs on a 1-stage forward pass")
     import torch
     from cell_library import make_cell_library
-    from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
+    from topology import StageTopologyBuilder, topology_to_stage
     from kirchhoff_net import KirchhoffNet
     from sim_context import SimContext
     from visualize import plot_trajectories
 
     cell_lib = make_cell_library('tanh')
-    hid = cluster_graph(4, edge_prob=0.5, seed=0)
+    hid = ring_graph(4, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=4, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
                          proj_pattern="all_to_all")
@@ -1556,8 +1552,7 @@ def test_prune_network_returns_remap():
     print("\nTest 59: prune_network returns per-stage node remap dicts (PIT-1)")
     from cell_library import make_cell_library
     from topology import (
-        build_net_from_preset,
-        prune_network,
+build_net_from_preset, prune_network
     )
     from config import PRUNE
 
@@ -3019,7 +3014,6 @@ def main():
     test_bidir_line_graph_doubles_edges()         # BIDI-1: line primitive
     test_bidir_ring_graph_doubles_edges()         # BIDI-2: ring primitive
     test_bidir_grid_graph_doubles_edges()         # BIDI-3: grid primitive
-    test_bidir_cluster_graph_doubles_edges()      # BIDI-4: cluster primitive
     test_bidir_validate_topology_passes()         # BIDI-5: validation
     test_bidir_default_is_false()                 # BIDI-6: backward compat
     test_bidir_preset_factories_accept_param()    # BIDI-7: preset factories
@@ -5419,24 +5413,6 @@ def test_bidir_grid_graph_doubles_edges():
     check("BIDI-3: no self-loops in bidirectional", no_self_loops)
 
 
-def test_bidir_cluster_graph_doubles_edges():
-    """cluster_graph(bidirectional=True) emits exactly 2x the edges of bidirectional=False."""
-    print("\nTest BIDI-4: cluster_graph bidirectional doubles edge count")
-    from topology import cluster_graph
-    c1 = cluster_graph(10, edge_prob=0.5, seed=0, bidirectional=False)
-    c2 = cluster_graph(10, edge_prob=0.5, seed=0, bidirectional=True)
-    check("BIDI-4: cluster single edges > 0", len(c1.src) > 0,
-          f"single={len(c1.src)}")
-    check("BIDI-4: cluster bidirectional = 2 * single", len(c2.src) == 2 * len(c1.src),
-          f"single={len(c1.src)}, bidir={len(c2.src)}")
-    edges_single = set(zip(c1.src, c1.dst))
-    edges_bidir = set(zip(c2.src, c2.dst))
-    all_reversed = all((d, s) in edges_bidir for s, d in edges_single)
-    check("BIDI-4: every single edge has its reverse", all_reversed)
-    no_self_loops = all(s != d for s, d in zip(c2.src, c2.dst))
-    check("BIDI-4: no self-loops in bidirectional", no_self_loops)
-
-
 def test_bidir_small_world_graph_doubles_edges():
     """small_world_graph(bidirectional=True) emits exactly 2x the edges of bidirectional=False."""
     print("\nTest BIDI-9: small_world_graph bidirectional doubles edge count")
@@ -5561,7 +5537,7 @@ def test_torus_3x3_full_connectivity():
 def test_bidir_validate_topology_passes():
     """validate_topology() accepts bidirectional topologies without error."""
     print("\nTest BIDI-5: validate_topology passes on bidirectional topologies")
-    from topology import grid_graph, line_graph, ring_graph, cluster_graph, validate_topology
+    from topology import grid_graph, line_graph, ring_graph, ring_graph, validate_topology
     g_bi = grid_graph(7, 7, kernel_size=3, bidirectional=True)
     validate_topology(g_bi)  # Should not raise
     check("BIDI-5: validate_topology(grid 7x7 bidirectional) passed", True)
@@ -5574,15 +5550,11 @@ def test_bidir_validate_topology_passes():
     validate_topology(r_bi)
     check("BIDI-5: validate_topology(ring bidirectional) passed", True)
 
-    c_bi = cluster_graph(10, edge_prob=0.5, seed=0, bidirectional=True)
-    validate_topology(c_bi)
-    check("BIDI-5: validate_topology(cluster bidirectional) passed", True)
-
 
 def test_bidir_default_is_false():
     """bidirectional=False is the default and matches the original single-edge behavior."""
     print("\nTest BIDI-6: bidirectional defaults to False (backward compatibility)")
-    from topology import line_graph, ring_graph, grid_graph, cluster_graph
+    from topology import line_graph, ring_graph, grid_graph, ring_graph
     l_default = line_graph(8, radius=2)
     l_explicit = line_graph(8, radius=2, bidirectional=False)
     check("BIDI-6: line_graph default == bidirectional=False",
@@ -5597,11 +5569,6 @@ def test_bidir_default_is_false():
     r_explicit = ring_graph(10, radius=2, bidirectional=False)
     check("BIDI-6: ring_graph default == bidirectional=False",
           len(r_default.src) == len(r_explicit.src))
-
-    c_default = cluster_graph(10, edge_prob=0.5, seed=0)
-    c_explicit = cluster_graph(10, edge_prob=0.5, seed=0, bidirectional=False)
-    check("BIDI-6: cluster_graph default == bidirectional=False",
-          len(c_default.src) == len(c_explicit.src))
 
 
 def test_bidir_preset_factories_accept_param():
@@ -5782,7 +5749,7 @@ def test_repeat_edges_from_config_wires_through():
     """MultiStageTopology.from_config() applies edge_repeats to hidden edges only."""
     print("\nTest REP-7: from_config applies edge_repeats to hidden edges only")
     from topology import (
-        grid_graph, MultiStageTopology,
+grid_graph, MultiStageTopology
     )
     g = grid_graph(4, 4, kernel_size=3, bidirectional=False)
     base_hidden = sum(1 for t in g.edge_type if t == "hidden")
@@ -6816,12 +6783,12 @@ def test_deq_equilibrium_rhs_residual_small():
     """At DEQ equilibrium, |rhs(x*)| is small (matches DEQ definition)."""
     print("\nTest DEQ-3: |rhs(x*)| small at DEQ equilibrium")
     from cell_library import make_cell_library
-    from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
+    from topology import StageTopologyBuilder, topology_to_stage
     from sim_context import SimContext
 
     torch.manual_seed(0)
     cell_lib = make_cell_library('tanh')
-    hid = cluster_graph(3, edge_prob=0.5, seed=0)
+    hid = ring_graph(3, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
                          proj_pattern="all_to_all")
@@ -6854,12 +6821,12 @@ def test_deq_equilibrium_matches_long_horizon_heun():
     """DEQ x* matches long-horizon Heun rollout to equilibrium (contractive)."""
     print("\nTest DEQ-4: DEQ x* matches long-horizon Heun rollout")
     from cell_library import make_cell_library
-    from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
+    from topology import StageTopologyBuilder, topology_to_stage
     from sim_context import SimContext
 
     torch.manual_seed(0)
     cell_lib = make_cell_library('tanh')
-    hid = cluster_graph(3, edge_prob=0.5, seed=0)
+    hid = ring_graph(3, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
                          proj_pattern="all_to_all")
@@ -6891,12 +6858,12 @@ def test_deq_implicit_backward_gradients_finite():
     """Implicit backward under DEQ produces finite gradients for all params."""
     print("\nTest DEQ-5: implicit backward yields finite gradients")
     from cell_library import make_cell_library
-    from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
+    from topology import StageTopologyBuilder, topology_to_stage
     from sim_context import SimContext
 
     torch.manual_seed(0)
     cell_lib = make_cell_library('tanh')
-    hid = cluster_graph(3, edge_prob=0.5, seed=0)
+    hid = ring_graph(3, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
                          proj_pattern="all_to_all")
@@ -6923,12 +6890,12 @@ def test_deq_z_logits_grad_norm_at_least_bptt():
     """DEQ z_logits grad norm >= short-horizon BPTT (per Kimi note, expect 2-4 OOM lift)."""
     print("\nTest DEQ-6: DEQ z_logits grad norm >= short-horizon BPTT")
     from cell_library import make_cell_library
-    from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
+    from topology import StageTopologyBuilder, topology_to_stage
     from sim_context import SimContext
 
     torch.manual_seed(0)
     cell_lib = make_cell_library('tanh')
-    hid = cluster_graph(4, edge_prob=0.5, seed=0)
+    hid = ring_graph(4, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=4, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
                          proj_pattern="all_to_all")
@@ -6971,12 +6938,12 @@ def test_deq_input_dependence():
     """
     print("\nTest DEQ-7: DEQ input-dependence with persistent drive")
     from cell_library import make_cell_library
-    from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
+    from topology import StageTopologyBuilder, topology_to_stage
     from sim_context import SimContext
 
     torch.manual_seed(0)
     cell_lib = make_cell_library('tanh')
-    hid = cluster_graph(3, edge_prob=0.5, seed=0)
+    hid = ring_graph(3, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
                          proj_pattern="all_to_all")
@@ -7022,12 +6989,12 @@ def test_deq_ste_mode_rejected():
     """forward_equilibrium rejects cell_mode='ste' (soft-only safeguard)."""
     print("\nTest DEQ-8: forward_equilibrium rejects STE cell mode")
     from cell_library import make_cell_library
-    from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
+    from topology import StageTopologyBuilder, topology_to_stage
     from sim_context import SimContext
 
     torch.manual_seed(0)
     cell_lib = make_cell_library('tanh')
-    hid = cluster_graph(3, edge_prob=0.5, seed=0)
+    hid = ring_graph(3, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
                          proj_pattern="all_to_all")
@@ -7050,12 +7017,12 @@ def test_deq_leak_floor_enforced():
     """leak_floor=0.0 leaves Heun path unchanged (regression); >0 keeps diagonal damping."""
     print("\nTest DEQ-9: leak_floor=0.0 matches default Heun; leak_floor>0 increases leak")
     from cell_library import make_cell_library
-    from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
+    from topology import StageTopologyBuilder, topology_to_stage
     from sim_context import SimContext
 
     torch.manual_seed(0)
     cell_lib = make_cell_library('tanh')
-    hid = cluster_graph(3, edge_prob=0.5, seed=0)
+    hid = ring_graph(3, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
                          proj_pattern="all_to_all")
@@ -7076,14 +7043,14 @@ def test_deq_solver_kwarg_threads_through_kirchhoff_net():
     """KirchhoffNet.forward accepts solver='heun' and 'deq' and dispatches correctly."""
     print("\nTest DEQ-10: solver kwarg threads through KirchhoffNet / WithIO")
     from cell_library import make_cell_library
-    from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
+    from topology import StageTopologyBuilder, topology_to_stage
     from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
     from io_mapper import InputMapper, OutputMapper
     from sim_context import SimContext
 
     torch.manual_seed(0)
     cell_lib = make_cell_library('tanh')
-    hid = cluster_graph(3, edge_prob=0.5, seed=0)
+    hid = ring_graph(3, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=2, num_outputs=0, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
                          proj_pattern="all_to_all")
@@ -7114,13 +7081,13 @@ def test_deq_heun_regression_unchanged():
     """With solver='heun' (default), behavior must be unchanged from pre-DEQ path."""
     print("\nTest DEQ-11: Heun path unchanged with solver='heun'")
     from cell_library import make_cell_library
-    from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
+    from topology import StageTopologyBuilder, topology_to_stage
     from kirchhoff_net import KirchhoffNet
     from sim_context import SimContext
 
     torch.manual_seed(0)
     cell_lib = make_cell_library('tanh')
-    hid = cluster_graph(3, edge_prob=0.5, seed=0)
+    hid = ring_graph(3, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
                          proj_pattern="all_to_all")
@@ -7182,13 +7149,13 @@ def test_deq_diagnostics_jacobian_cond():
     """deq_diagnostics.estimate_jacobian_cond returns a finite cond on a tiny stage."""
     print("\nTest DEQ-14: deq_diagnostics.jacobian_cond finite")
     from cell_library import make_cell_library
-    from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
+    from topology import StageTopologyBuilder, topology_to_stage
     from sim_context import SimContext
     from deq_diagnostics import estimate_jacobian_cond
 
     torch.manual_seed(0)
     cell_lib = make_cell_library('tanh')
-    hid = cluster_graph(3, edge_prob=0.5, seed=0)
+    hid = ring_graph(3, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
                          proj_pattern="all_to_all")
@@ -7208,13 +7175,13 @@ def test_deq_diagnostics_grad_norm_compare():
     """deq_diagnostics.gradient_norm_compare returns finite z_logits & logits norms."""
     print("\nTest DEQ-15: deq_diagnostics.gradient_norm_compare returns finite norms")
     from cell_library import make_cell_library
-    from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
+    from topology import StageTopologyBuilder, topology_to_stage
     from sim_context import SimContext
     from deq_diagnostics import gradient_norm_compare
 
     torch.manual_seed(0)
     cell_lib = make_cell_library('tanh')
-    hid = cluster_graph(3, edge_prob=0.5, seed=0)
+    hid = ring_graph(3, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
                          proj_pattern="all_to_all")

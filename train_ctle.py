@@ -132,7 +132,7 @@ def params_from_logits(logits: torch.Tensor) -> dict[str, torch.Tensor]:
     return out
 
 # =============================================================================
-# CTLE preset factory (grid + cluster families)
+# CTLE preset factory (grid family)
 # =============================================================================
 
 def make_ctle_preset(
@@ -143,56 +143,43 @@ def make_ctle_preset(
     num_proj: int | None = None,
     write_mode: str | None = None,
     bidirectional: bool = False,
-    cluster_edge_prob: float = 1.0,
-    cluster_seed: int | None = None,
     q75_input: bool = False,
     edge_repeats: int = 2,
     nodes_per_target: int = 0,
     readout_offset: int = 0) -> dict:
-    """Build a 4-spec → 7-logit CTLE KirchhoffNet preset for a given family.
+    """Build a 4-spec → 7-logit CTLE KirchhoffNet preset for the grid family.
 
     ``family='grid'`` (default, backward compatible):
         Each stage has ``grid_size**2`` hidden nodes laid out on a 2D grid
         with 3x3 convolution-style neighborhood edges, plus ``num_proj``
-        projection nodes and 4 input nodes. Write mapping is fan-out from
-        4 inputs to 4 grid corners; read mapping gathers the center column
-        + all projection nodes (grid_size + num_proj features).
+        projection nodes and 4 input nodes (8 when ``q75_input=True``).
+        Write mapping is fan-out from inputs to grid corners; read mapping
+        gathers the center column + all projection nodes (grid_size +
+        num_proj features).
 
-    ``family='cluster'``:
-        Each stage has ``num_hidden`` hidden nodes wired as a fully (or
-        partially) connected Erdos-Renyi graph via
-        ``cluster_graph(num_hidden, edge_prob=cluster_edge_prob)``. Since
-        every node connects to every other, ``num_proj=0`` (no structural
-        benefit for projection nodes) and ``read_idx=list(range(num_hidden))``
-        reads every hidden node. Write mapping defaults to ``dense``
-        (all-to-all ``InputMapper``).
-
-    When ``q75_input=True``, ``family='cluster'``, and ``num_inputs`` becomes
-    8 (teacher's scale_input(): log10 + StandardScaler/Q75 expansion).
-    Caller must apply the same scaling to training inputs.
+    When ``q75_input=True``, ``num_inputs`` becomes 8 (teacher's
+    ``scale_input()``: log10 + StandardScaler/Q75 expansion). Caller must
+    apply the same scaling to training inputs.
 
     When ``nodes_per_target > 0``, group the 7 regression targets into per-target
     readout windows of ``nodes_per_target`` consecutive state nodes each. The
-    network auto-sizes so ``grid_size**2`` (grid) or ``num_hidden`` (cluster)
-    accommodates ``nodes_per_target * 7 + readout_offset`` state nodes. In
+    network auto-sizes so ``grid_size**2`` accommodates
+    ``nodes_per_target * 7 + readout_offset`` state nodes. In
     this mode ``num_proj`` is forced to 0 (no projection nodes; heads read
     directly from hidden state) and ``--prune`` must be disabled at the CLI.
 
     Args:
-        family: 'grid' or 'cluster'.
+        family: Must be 'grid'.
         grid_size: Square grid side length (grid family).
-        num_hidden: Hidden node count (cluster family). Required when family='cluster'.
+        num_hidden: Ignored for grid family (uses ``grid_size**2``).
         num_stages: Number of ODE stages.
-        num_proj: Projection node count (grid family default 7; cluster always 0).
+        num_proj: Projection node count (grid family default 7).
         write_mode: 'fan_out' | 'dense' | 'one_to_one' | None (default per family).
         bidirectional: Emit two directed edges per node pair.
-        cluster_edge_prob: Edge probability for cluster family (default 1.0 = fully connected).
-        cluster_seed: RNG seed for cluster edge sampling.
-        q75_input: When True and family='cluster', set num_inputs=8 (Q75-scaled features).
+        q75_input: When True, set ``num_inputs=8`` (Q75-scaled features).
         edge_repeats: Number of parallel edges per hidden node pair (default 2,
-            range 1-8). Composes multiplicatively with ``bidirectional``. Each
-            repeated edge gets independent cell-type logits, gate, and
-            multiplier. I/O and projection edges are NOT repeated.
+            range 1-8). Composes multiplicatively with ``bidirectional``.
+            I/O and projection edges are NOT repeated.
         nodes_per_target: If > 0, enable grouped per-target readout with this
             many state nodes per target. Auto-sizes the network.
         readout_offset: Starting state index for the first target's window
@@ -227,11 +214,8 @@ def make_ctle_preset(
         if num_hidden is not None and num_hidden != n_hidden and not grouped:
             print(f"[make_ctle_preset] note: grid mode ignores num_hidden={num_hidden}; "
                   f"using grid_size**2={n_hidden}")
-        if q75_input:
-            print(f"[make_ctle_preset] note: --q75-input is ignored for grid family "
-                  f"(only supported with cluster). num_inputs stays at 4.")
         _stage_cfg = {
-            "num_inputs": 4,
+            "num_inputs": 8 if q75_input else 4,
             "num_hidden": n_hidden,
             "num_proj": num_proj,
             "num_outputs": 0,
@@ -270,58 +254,13 @@ def make_ctle_preset(
             read_idx = center_nodes + list(range(n_hidden, n_hidden + num_proj))
 
     elif family == "cluster":
-        if grouped:
-            if num_hidden is None:
-                num_hidden = 0  # will be overwritten below
-            num_proj = 0
-            num_hidden = required_state_dim
-            print(f"[make_ctle_preset] grouped readout: nodes_per_target={nodes_per_target}, "
-                  f"offset={readout_offset} -> num_hidden auto-sized to {num_hidden}")
-        else:
-            if num_hidden is None:
-                raise ValueError(
-                    "make_ctle_preset(family='cluster') requires num_hidden to be set. "
-                    "Pass --num-hidden N on the CLI or num_hidden=N to the factory."
-                )
-            if num_hidden < 2:
-                raise ValueError(f"num_hidden must be >= 2 for cluster family (got {num_hidden})")
-            if num_proj is not None and num_proj != 0:
-                print(f"[make_ctle_preset] note: cluster mode forces num_proj=0 "
-                      f"(was {num_proj}); all hidden nodes are already fully connected.")
-        n_hidden = int(num_hidden)
-        num_proj = 0
-        n_inputs = 8 if q75_input else 4
-        if cluster_seed is None:
-            # Default to 0 if no seed was provided (caller didn't derive one).
-            cluster_seed = 0
-        _stage_cfg = {
-            "num_inputs": n_inputs,
-            "num_hidden": n_hidden,
-            "num_proj": num_proj,
-            "num_outputs": 0,
-            "hidden_family": "cluster",
-            "hidden_kwargs": {"edge_prob": cluster_edge_prob,
-                              "seed": cluster_seed,
-                              "bidirectional": bidirectional},
-            "edge_repeats": edge_repeats,
-            "input_pattern": "all_to_all",
-            "output_pattern": "all_to_all",
-            "proj_pattern": "all_to_all",
-            "t_span": SOLVER["t_span"] / n_stages,
-            "num_steps": round(SOLVER["num_steps"] / n_stages)}
-        if write_mode == "fan_out":
-            print(f"[make_ctle_preset] note: cluster mode has no spatial grid corners; "
-                  f"falling back from 'fan_out' to 'dense' write mode.")
-            eff_write = "dense"
-        else:
-            eff_write = write_mode if write_mode is not None else "dense"
-        # Grouped: read_idx=None (mapper handles windowing).
-        # Non-grouped: read every hidden node.
-        read_idx = None if grouped else list(range(n_hidden))
-        fan_out = None
+        raise ValueError(
+            "make_ctle_preset(family='cluster') is no longer supported. "
+            "Use the grid family (default) instead."
+        )
 
     else:
-        raise ValueError(f"Unknown family: {family!r} (expected 'grid' or 'cluster')")
+        raise ValueError(f"Unknown family: {family!r} (expected 'grid')")
 
     preset: dict[str, Any] = {
         "stages": [_stage_cfg] * n_stages,
@@ -353,7 +292,6 @@ def make_ctle_grid_preset(
     """Backward-compatible thin wrapper for the grid CTLE preset.
 
     Equivalent to ``make_ctle_preset(family='grid', grid_size=grid_size, ...)``.
-    Note: q75_input has no effect with grid family (only supported with cluster).
     """
     return make_ctle_preset(
         family="grid",

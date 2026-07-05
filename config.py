@@ -631,7 +631,7 @@ def cells_to_tensor_dict(library_name: str = "legacy"):
 #   num_hidden   : hidden nodes that participate in the ODE dynamics
 #   num_proj     : projection nodes (read via OutputMapper)
 #   num_outputs  : placeholder output nodes (see note below)
-#   hidden_family: 'line' | 'ring' | 'grid' | 'cluster' | 'small_world' |
+#   hidden_family: 'line' | 'ring' | 'grid' | 'small_world' |
 #                  'torus' | 'empty'
 #   *_pattern    : 'all_to_all' | 'one_to_one' | 'none' for input/output/proj
 #                  bipartite connections

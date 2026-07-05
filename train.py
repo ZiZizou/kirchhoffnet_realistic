@@ -520,8 +520,10 @@ def compute_loss(
     reg_scale: float = 1.0,
     solver: str = "heun",
     deq_cfg: dict | None = None,
+    teacher: KirchhoffNetWithIO | KirchhoffNet | None = None,
+    kd_lambda: float = 0.0,
 ):
-    """Compute total loss = task + regularizers.
+    """Compute total loss = task (optionally + KD) + regularizers.
 
     If net is a KirchhoffNetWithIO, x0 is the raw input u. If it is a plain
     KirchhoffNet, x0 is the already-bounded initial differential state.
@@ -532,6 +534,9 @@ def compute_loss(
 
     If `amp` is True, wraps forward+loss in torch.cuda.amp.autocast for
     mixed-precision training. Caller is responsible for GradScaler.
+
+    When ``teacher`` is not None, adds a knowledge-distillation term
+    ``kd_lambda * MSE(student_out, teacher_out)`` to the task loss.
     """
     if lambdas is None:
         lambdas = LAMBDAS
@@ -548,6 +553,12 @@ def compute_loss(
                              solver=solver, deq_cfg=deq_cfg)
 
         loss_task = task_fn(out, target)
+
+        if teacher is not None:
+            with torch.no_grad():
+                teacher_out, _ = teacher(x0, solver=solver, deq_cfg=deq_cfg)
+            loss_kd = kd_lambda * F.mse_loss(out, teacher_out.detach())
+            loss_task = loss_task + loss_kd
 
         if trajs is None:
             zero = loss_task.new_zeros((), requires_grad=True)

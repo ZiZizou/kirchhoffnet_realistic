@@ -2978,7 +2978,7 @@ def main():
                 lambdas=effective_lambdas, return_parts=True,
                 amp=amp_enabled, amp_dtype=amp_dtype, reg_scale=reg_scale,
                 solver=solver, deq_cfg=deq_cfg,
-                teacher=kd_teacher)
+                teacher=kd_teacher, kd_lambda=kd_lambda)
             if scaler is not None and scaler._enabled:
                 ( scaler.scale(loss_task) + scaler.scale(loss_structural) ).backward()
                 scaler.unscale_(optimizer)

@@ -1263,9 +1263,9 @@ def build_net_from_preset(
 
     Resolution precedence: explicit value > preset value > hardcoded default.
 
-    * write_mode:  "one_to_one" | "dense" | "fan_out".  When ``None``
-                   (default), use the preset's ``write_mode`` if present,
-                   else ``"one_to_one"``.
+    * write_mode:  "one_to_one" | "dense" | "fan_out" | "sparse_proj".
+                   When ``None`` (default), use the preset's ``write_mode``
+                   if present, else ``"one_to_one"``.
     * read_mode:   "sparse" | "dense".  When ``None`` (default), use the
                    preset's ``read_mode`` if present, else ``"sparse"``.
     * write_idx / read_idx: explicit index lists override preset values.
@@ -1311,6 +1311,7 @@ def build_net_from_config(
         RobustInputMapper,
         OutputMapper,
         SparseInputMapper,
+        ProjectedSparseInputMapper,
         FanOutInputMapper,
         GroupedOutputMapper,
     )
@@ -1321,9 +1322,10 @@ def build_net_from_config(
     out_dim = cfg.get("out_dim", 1)
     write_mode = cfg.get("write_mode", "one_to_one")
     read_mode = cfg.get("read_mode", "sparse")
-    if write_mode not in ("one_to_one", "dense", "fan_out"):
+    if write_mode not in ("one_to_one", "dense", "fan_out", "sparse_proj"):
         raise ValueError(
-            f"write_mode must be 'one_to_one', 'dense', or 'fan_out', got {write_mode!r}"
+            f"write_mode must be 'one_to_one', 'dense', 'fan_out', or 'sparse_proj', "
+            f"got {write_mode!r}"
         )
     if read_mode not in ("sparse", "dense"):
         raise ValueError(
@@ -1371,6 +1373,24 @@ def build_net_from_config(
         write_idx_arg = sorted(
             {t for targets in fan_out_map.values() for t in targets}
         )
+    elif write_mode == "sparse_proj":
+        preset_write_idx = cfg.get("write_idx")
+        if preset_write_idx is None:
+            raise ValueError(
+                "write_mode='sparse_proj' requires 'write_idx' in config: "
+                "list of hidden-node indices (length >= in_dim)"
+            )
+        if len(preset_write_idx) < in_dim:
+            raise ValueError(
+                f"write_mode='sparse_proj' requires len(write_idx) >= in_dim; "
+                f"got len(write_idx)={len(preset_write_idx)}, in_dim={in_dim}"
+            )
+        input_mapper = ProjectedSparseInputMapper(
+            in_dim=in_dim, out_dim=n_first_hid, write_idx=preset_write_idx
+        )
+        write_idx_arg = list(preset_write_idx)
+        if enable_drive:
+            raise ValueError("enable_drive=True requires write_mode='fan_out'")
     else:
         MapperCls = RobustInputMapper if use_robust else InputMapper
         input_mapper = MapperCls(in_dim=in_dim, out_dim=n_first_hid)

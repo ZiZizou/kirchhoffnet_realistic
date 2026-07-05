@@ -2,6 +2,9 @@
 
 InputMapper:  x_j(0) = x_max * tanh(Linear(u))
 SparseInputMapper: x_{write_idx[i]}(0) = x_max * tanh(a_i * u_i + b_i)
+ProjectedSparseInputMapper: x_{write_idx[k]}(0) = x_max * tanh(Linear(u))[k]
+                   (length(write_idx) >= in_dim; learned projection lets
+                   one input feature feed multiple target hidden nodes)
 FanOutInputMapper: x_j(0) = x_max * tanh(gain_{i,k} * u_i + bias_{i,k})
                    for j in fan_out_map[i], 0 otherwise.
 OutputMapper: y_hat = Linear(x_final)
@@ -18,6 +21,12 @@ Sparse I/O (sparse-io-mapping spec): With write_idx and read_idx lists,
 input features are written one-to-one to designated hidden nodes, and the
 readout is taken only from designated full-state indices (favoring hidden
 nodes). Non-write hidden nodes are zero-initialized at t=0.
+
+Projected sparse I/O (sparse-proj-write spec): with write_mode='sparse_proj',
+in_dim inputs are mapped through a learned nn.Linear to len(write_idx)
+targets and then scattered. Each input feature may influence multiple target
+hidden nodes (when len(write_idx) > in_dim). All non-target hidden nodes
+remain zero-initialized at t=0.
 
 Fan-out I/O (smooth2d-sanity-pass spec): With fan_out_map, each input
 feature writes to K>1 designated hidden nodes via per-target (gain, bias)
@@ -39,10 +48,12 @@ __all__ = [
     "InputMapper",
     "RobustInputMapper",
     "SparseInputMapper",
+    "ProjectedSparseInputMapper",
     "FanOutInputMapper",
     "OutputMapper",
     "GroupedOutputMapper",
 ]
+
 
 
 def _init_linear_small(linear: nn.Linear, gain_scale: float) -> None:
@@ -257,6 +268,82 @@ class FanOutInputMapper(nn.Module):
         per_target = self.x_max * torch.tanh(u_picked * self.gain + self.bias)
         x = u.new_zeros(*u.shape[:-1], self.out_dim)
         x.index_copy_(-1, self._flat_targets.to(u.device), per_target)
+        return x
+
+
+class ProjectedSparseInputMapper(nn.Module):
+    """Learned-projection sparse input writer.
+
+    Maps ``in_dim`` input features through a single ``nn.Linear`` to
+    ``len(write_idx)`` projected channels, then scatters those channels to
+    the designated hidden-node targets. Each input feature contributes to
+    ALL target channels via the learned projection weights, so
+    ``len(write_idx) >= in_dim`` is required for the projection to be a
+    proper lift (not a compression).
+
+        x_{write_idx[k]}(0) = x_max * tanh(Linear(u))[k]
+        x_j(0) = 0  for j not in write_idx
+
+    Hidden nodes NOT in ``write_idx`` are left at 0 in the mapper's output;
+    the caller (KirchhoffNetWithIO) is responsible for assembling the full
+    state vector.
+
+    Parameter count = in_dim * len(write_idx) + len(write_idx). For
+    in_dim=2, write_idx=[0, 1, 3] (out_dim=6): Linear(2, 3) = 6+3 = 9 params.
+
+    Validation:
+        - len(write_idx) must be >= in_dim (otherwise raise ValueError).
+        - All write_idx entries must be in [0, out_dim).
+        - write_idx entries must be unique.
+
+    Raises:
+        ValueError: on any of the above violations.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        write_idx: list[int],
+        x_max: float | None = None,
+    ) -> None:
+        super().__init__()
+        if len(write_idx) < in_dim:
+            raise ValueError(
+                f"ProjectedSparseInputMapper: len(write_idx)={len(write_idx)} must be "
+                f">= in_dim={in_dim} (sparse-proj-write/SPW1.5)"
+            )
+        if any(i < 0 or i >= out_dim for i in write_idx):
+            raise ValueError(
+                f"ProjectedSparseInputMapper: write_idx entries must be in "
+                f"[0, out_dim)={out_dim}, got {write_idx}"
+            )
+        if len(set(write_idx)) != len(write_idx):
+            raise ValueError(
+                f"ProjectedSparseInputMapper: write_idx entries must be unique, "
+                f"got {write_idx}"
+            )
+        self.in_dim = int(in_dim)
+        self.out_dim = int(out_dim)
+        self.write_idx = list(write_idx)
+        self.x_max = float(x_max if x_max is not None else PHYS["x_max"])
+        self.proj = nn.Linear(in_dim, len(write_idx), bias=True)
+        _init_linear_small(self.proj, gain_scale=INIT["gain_scale"])
+        self.register_buffer(
+            "_write_index",
+            torch.tensor(self.write_idx, dtype=torch.long),
+            persistent=False,
+        )
+
+    def forward(self, u: torch.Tensor) -> torch.Tensor:
+        if u.size(-1) != self.in_dim:
+            raise ValueError(
+                f"ProjectedSparseInputMapper: input has {u.size(-1)} features, "
+                f"expected in_dim={self.in_dim}"
+            )
+        projected = self.x_max * torch.tanh(self.proj(u))
+        x = u.new_zeros(*u.shape[:-1], self.out_dim)
+        x.index_copy_(-1, self._write_index.to(u.device), projected)
         return x
 
 

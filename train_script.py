@@ -108,6 +108,7 @@ from io_mapper import (
     FanOutInputMapper,
     InputMapper,
     OutputMapper,
+    ProjectedSparseInputMapper,
     RobustInputMapper,
     SparseInputMapper)
 
@@ -725,11 +726,13 @@ def _save_config_snapshot(out_dir: Path, problem: str, args, lambdas: dict,
             f.write(f"  {k}: {v}\n")
         f.write("\nI/O MAPPING:\n")
         if net is not None:
-            from io_mapper import FanOutInputMapper, SparseInputMapper, InputMapper
+            from io_mapper import FanOutInputMapper, ProjectedSparseInputMapper, SparseInputMapper, InputMapper
             if isinstance(net.input_mapper, FanOutInputMapper):
                 effective_write = "fan_out"
             elif isinstance(net.input_mapper, SparseInputMapper):
                 effective_write = "one_to_one"
+            elif isinstance(net.input_mapper, ProjectedSparseInputMapper):
+                effective_write = "sparse_proj"
             elif isinstance(net.input_mapper, InputMapper):
                 effective_write = "dense"
             else:
@@ -1930,10 +1933,12 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
         "--variation", dest="variation", action="store_true", default=False,
         help="Enable PVT/mismatch injection during training (default: off, R6.3).")
     parser.add_argument(
-        "--write-mode", choices=["one_to_one", "dense", "fan_out"], default=None,
+        "--write-mode", choices=["one_to_one", "dense", "fan_out", "sparse_proj"], default=None,
         help="Input write mapping (default: from preset). 'one_to_one' uses "
              "SparseInputMapper, 'dense' uses InputMapper (nn.Linear), "
-             "'fan_out' uses FanOutInputMapper with preset-defined targets.")
+             "'fan_out' uses FanOutInputMapper with preset-defined targets, "
+             "'sparse_proj' uses ProjectedSparseInputMapper (Linear projection "
+             "to len(write_idx) targets; requires --write-idx with len >= in_dim).")
     parser.add_argument(
         "--read-mode", choices=["sparse", "dense"], default=None,
         help="Output read mapping (default: from preset, typically 'sparse'). "
@@ -2221,6 +2226,11 @@ def _transfer_input_mapper(raw_mapper, raw_write_idx, stage0_remap,
     ``stage0_remap`` and the per-feature (gain, bias) parameters
     are copied directly (they are indexed by input, not by node).
 
+    For ProjectedSparseInputMapper, ``raw_write_idx`` is remapped through
+    ``stage0_remap`` and the ``proj`` linear weights are transferred
+    column-by-column (each output column corresponds to one write_idx
+    entry in the original ordering).
+
     For FanOutInputMapper, each target list in ``fan_out_map`` is
     remapped through ``stage0_remap``; per-(input, target)
     (gain, bias) parameters are copied directly.
@@ -2235,6 +2245,34 @@ def _transfer_input_mapper(raw_mapper, raw_write_idx, stage0_remap,
         with torch.no_grad():
             new_mapper.gain.data.copy_(raw_mapper.gain.data)
             new_mapper.bias.data.copy_(raw_mapper.bias.data)
+        return new_mapper, new_write_idx
+
+    if isinstance(raw_mapper, ProjectedSparseInputMapper):
+        if raw_write_idx is None:
+            new_write_idx = list(range(min(in_dim, pruned_first_n)))
+        else:
+            new_write_idx = _remap_indices(raw_write_idx, stage0_remap)
+        new_mapper = ProjectedSparseInputMapper(
+            in_dim=raw_mapper.in_dim,
+            out_dim=pruned_first_n,
+            write_idx=new_write_idx,
+            x_max=raw_mapper.x_max,
+        )
+        with torch.no_grad():
+            old_w = raw_mapper.proj.weight.data  # (len(raw_write_idx), in_dim)
+            old_b = raw_mapper.proj.bias.data    # (len(raw_write_idx),)
+            new_w = new_mapper.proj.weight.data  # (len(new_write_idx), in_dim)
+            new_b = new_mapper.proj.bias.data    # (len(new_write_idx),)
+            # Iterate raw_write_idx in order; surviving entries get their old
+            # row copied to the new row in the same positional order.
+            # nn.Linear weight shape: (out_features, in_dim) — rows map to
+            # write_idx entries, so we copy rows, not columns.
+            new_col = 0
+            for old_col, wi in enumerate(raw_write_idx):
+                if wi in stage0_remap:
+                    new_w[new_col, :].copy_(old_w[old_col, :])
+                    new_b[new_col].copy_(old_b[old_col])
+                    new_col += 1
         return new_mapper, new_write_idx
 
     if isinstance(raw_mapper, FanOutInputMapper):
@@ -2597,6 +2635,7 @@ def main():
     effective_write_mode = (
         "fan_out" if isinstance(net.input_mapper, FanOutInputMapper)
         else "one_to_one" if isinstance(net.input_mapper, SparseInputMapper)
+        else "sparse_proj" if isinstance(net.input_mapper, ProjectedSparseInputMapper)
         else "dense"
     )
     effective_read_mode = "sparse" if net.read_idx is not None else "dense"
@@ -3407,6 +3446,15 @@ def main():
                     pruned_write_idx = _remap_indices(raw_write_idx, stage0_remap)
                 input_mapper_pruned = SparseInputMapper(
                     in_dim=in_dim, out_dim=pruned_first_n, write_idx=pruned_write_idx)
+            elif effective_write_mode == "sparse_proj":
+                if raw_write_idx is None:
+                    raise ValueError(
+                        "write_mode='sparse_proj' requires write_idx; "
+                        "cannot synthesize for fresh-init prune retrain"
+                    )
+                pruned_write_idx = _remap_indices(raw_write_idx, stage0_remap)
+                input_mapper_pruned = ProjectedSparseInputMapper(
+                    in_dim=in_dim, out_dim=pruned_first_n, write_idx=pruned_write_idx)
             elif effective_write_mode == "fan_out":
                 fan_out_map = preset_cfg.get("write_fan_out")
                 if fan_out_map is None:
@@ -3477,7 +3525,7 @@ def main():
             proj_count=0,
             final_hid_count=pruned_last_n,
             final_proj_count=0,
-            write_idx=pruned_write_idx if effective_write_mode == "one_to_one" else None,
+            write_idx=pruned_write_idx if effective_write_mode in ("one_to_one", "sparse_proj") else None,
             read_idx=pruned_read_idx if effective_read_mode == "sparse" else None)
         pruned_net.to(device)
 

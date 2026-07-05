@@ -2954,6 +2954,12 @@ def main():
     test_fan_out_input_mapper_overlap_raises()
     test_fan_out_input_mapper_missing_input_raises()
     test_fan_out_input_mapper_out_of_range_raises()
+    test_projected_sparse_input_mapper_basic()
+    test_projected_sparse_input_mapper_param_count()
+    test_projected_sparse_input_mapper_gradients()
+    test_projected_sparse_input_mapper_short_write_idx_raises()
+    test_projected_sparse_input_mapper_out_of_range_raises()
+    test_projected_sparse_input_mapper_duplicate_raises()
     test_optim_lr_lowered()
     test_patience_default_raised()
     test_rectifier_cell()
@@ -3394,6 +3400,95 @@ def test_fan_out_input_mapper_out_of_range_raises():
     except ValueError as e:
         check("fan-out: out-of-range target raises ValueError",
               "out of range" in str(e).lower() or "out_of_range" in str(e).lower(),
+              f"got: {e}")
+
+
+# ---- ProjectedSparseInputMapper tests (sparse-proj-write spec) ----
+
+def test_projected_sparse_input_mapper_basic():
+    print("\nTest PSP-1: ProjectedSparseInputMapper basic forward + zero non-targets")
+    from io_mapper import ProjectedSparseInputMapper
+
+    m = ProjectedSparseInputMapper(in_dim=2, out_dim=6, write_idx=[0, 1, 3])
+    u = torch.tensor([[0.5, -0.2], [1.0, 0.3]])
+    y = m(u)
+    check("psp: output shape (2, 6)", y.shape == (2, 6))
+    check("psp: non-target positions (2, 4, 5) are zero",
+          torch.equal(y[:, [2, 4, 5]], torch.zeros(2, 3)),
+          f"got {y[:, [2, 4, 5]].tolist()}")
+    check("psp: target positions (0, 1, 3) are non-zero",
+          (y[:, [0, 1, 3]].abs().sum(dim=1) > 0).all().item())
+    check("psp: target values bounded by x_max",
+          (y[:, [0, 1, 3]].abs() <= m.x_max + 1e-6).all().item(),
+          f"got {y[:, [0, 1, 3]].tolist()}")
+
+
+def test_projected_sparse_input_mapper_param_count():
+    print("\nTest PSP-2: ProjectedSparseInputMapper parameter count = "
+          "in_dim * len(write_idx) + len(write_idx)")
+    from io_mapper import ProjectedSparseInputMapper
+
+    m = ProjectedSparseInputMapper(in_dim=2, out_dim=25, write_idx=[0, 5, 10])
+    n_params = sum(p.numel() for p in m.parameters() if p.requires_grad)
+    # Linear(2, 3) → 6 weights + 3 bias = 9 params
+    check("psp: Linear(2, 3) → 9 params", n_params == 9, f"got {n_params}")
+
+
+def test_projected_sparse_input_mapper_gradients():
+    print("\nTest PSP-3: ProjectedSparseInputMapper gradient flows to proj.weight and proj.bias")
+    from io_mapper import ProjectedSparseInputMapper
+
+    m = ProjectedSparseInputMapper(in_dim=2, out_dim=6, write_idx=[0, 1, 3])
+    u = torch.randn(4, 2, requires_grad=False)
+    y = m(u)
+    loss = y.pow(2).sum()
+    loss.backward()
+    has_w_grad = (m.proj.weight.grad is not None
+                  and m.proj.weight.grad.abs().sum().item() > 0)
+    has_b_grad = (m.proj.bias.grad is not None
+                  and m.proj.bias.grad.abs().sum().item() > 0)
+    check("psp: proj.weight receives gradient", has_w_grad)
+    check("psp: proj.bias receives gradient", has_b_grad)
+
+
+def test_projected_sparse_input_mapper_short_write_idx_raises():
+    print("\nTest PSP-4: ProjectedSparseInputMapper rejects len(write_idx) < in_dim")
+    from io_mapper import ProjectedSparseInputMapper
+
+    try:
+        ProjectedSparseInputMapper(in_dim=5, out_dim=10, write_idx=[0, 1, 2])
+        check("psp: len(write_idx)<in_dim raises ValueError", False, "no error raised")
+    except ValueError as e:
+        check("psp: len(write_idx)<in_dim raises ValueError",
+              "in_dim" in str(e) and "len(write_idx)" in str(e),
+              f"got: {e}")
+
+
+def test_projected_sparse_input_mapper_out_of_range_raises():
+    print("\nTest PSP-5: ProjectedSparseInputMapper rejects out-of-range write_idx")
+    from io_mapper import ProjectedSparseInputMapper
+
+    try:
+        ProjectedSparseInputMapper(in_dim=2, out_dim=5, write_idx=[0, 6])
+        check("psp: out-of-range write_idx raises ValueError", False, "no error raised")
+    except ValueError as e:
+        check("psp: out-of-range write_idx raises ValueError",
+              "out_dim" in str(e).lower() or "out_dim" in str(e)
+              or "out of range" in str(e).lower()
+              or "[0, out_dim)" in str(e),
+              f"got: {e}")
+
+
+def test_projected_sparse_input_mapper_duplicate_raises():
+    print("\nTest PSP-6: ProjectedSparseInputMapper rejects duplicate write_idx entries")
+    from io_mapper import ProjectedSparseInputMapper
+
+    try:
+        ProjectedSparseInputMapper(in_dim=2, out_dim=5, write_idx=[0, 1, 1])
+        check("psp: duplicate write_idx raises ValueError", False, "no error raised")
+    except ValueError as e:
+        check("psp: duplicate write_idx raises ValueError",
+              "unique" in str(e).lower(),
               f"got: {e}")
 
 

@@ -2033,10 +2033,7 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "Phase B1 (no pruning), readiness-gated Phase B2 (edge "
              "pruning), and a KD-anchored retrain Phase C. See "
              "spec/four-phase-schedule.md.")
-    parser.add_argument(
-        "--no-argmax-val", dest="argmax_val", action="store_false", default=True,
-        help="Disable argmax-vs-soft validation diagnostic (default: on "
-             "when --schedule three_phase is active).")
+
     parser.add_argument(
         "--ablation-set",
         choices=["none", "reg-only", "tau-only", "edge-only"], default="none",
@@ -2906,17 +2903,13 @@ def main():
         tqdm(range(ab_total), desc=ab_desc, unit="epoch")
         if tqdm is not None else range(ab_total)
     )
-    # Track argmax validation alongside soft (when enabled).
-    argmax_val_enabled = (
-        (schedule_mode in ("three_phase", "four_phase")) and args.argmax_val
-    )
-    val_argmax_history = [] if argmax_val_enabled else None
     # four-phase-redesign: solidification metrics stored for readiness check
     solid_metrics_history: list[dict] = []
     # Validate-only histories (matching cadence of solid_metrics_history)
     # Avoids duplicate entries on non-validate epochs for the readiness check.
     val_v_history: list[float] = []
-    val_argmax_v_history: list[float] = [] if argmax_val_enabled else None
+    val_argmax_history = None
+    val_argmax_v_history = None
     # housing_grid: per-epoch dicts of {val, mae_orig, rmse_orig} for
     # logging in original housing-price units (USD x 100k).
     val_orig_history: list[dict] = [] if inverse_stats is not None else None
@@ -3143,28 +3136,9 @@ def main():
                 # Store for four_phase readiness check.
                 if schedule_mode == "four_phase":
                     solid_metrics_history.append(metrics)
-            # four-phase-redesign/Phase 3d: readiness check during B2.
-            # Uses validate-only histories (val_v_history, val_argmax_v_history)
-            # to avoid duplicate entries on non-validate epochs.
-            if (
-                schedule_mode == "four_phase"
-                and phase == "B2"
-                and val_argmax_v_history is not None
-                and len(val_argmax_v_history) >= 10
-                and len(val_v_history) >= 10
-                and len(solid_metrics_history) >= 10
-            ):
-                    print(
-                        f"[four_phase] READINESS TRIGGERED at epoch {epoch}: "
-                        f"ratio={ready_details['ratio']:.3f}, "
-                        f"prob={ready_details['max_cell_prob']:.3f}, "
-                        f"stability={ready_details['stability']:.4f}, "
-                        f"improvement={ready_details['improvement_rate']:.6f}"
-                    )
+
         else:
             val_loss = val_history[-1] if val_history else avg_train
-            if val_argmax_history is not None:
-                val_argmax_history.append(val_argmax_history[-1] if val_argmax_history else val_loss)
 
         history.append(avg_train)
         val_history.append(val_loss)
@@ -3175,21 +3149,8 @@ def main():
             print(_format_deq_summary(val_deq_metrics))
 
         if do_validate:
-            # four-phase-redesign/Phase 1b: For three_phase mode in Phase B,
-            # and for four_phase mode in B1/B2, the deployable model is the
-            # hard-cell (argmax) version. Use val_argmax as checkpoint metric
-            # instead of soft val, which includes cell mixture that vanishes
-            # at deployment. Phase A still uses soft val.
-            use_argmax_ckpt = (
-                (schedule_mode == "three_phase" and phase == "B")
-                or (schedule_mode == "four_phase" and phase in ("B1", "B2"))
-            ) and val_argmax_history is not None and len(val_argmax_history) > 0
-            if use_argmax_ckpt:
-                sel_metric = float(val_argmax_history[-1])
-                sel_name = "val_argmax"
-            else:
-                sel_metric = float(val_loss)
-                sel_name = "val"
+            sel_metric = float(val_loss)
+            sel_name = "val"
             if sel_metric < best_val - args.min_delta:
                 best_val = sel_metric
                 best_epoch = epoch
@@ -3224,9 +3185,6 @@ def main():
         if tqdm is not None:
             print(
                 f"{ab_desc}  train={avg_train:.4f}  val={val_loss:.4f}"
-                + (f"  val_argmax={val_argmax_history[-1]:.4f}"
-                   if val_argmax_history is not None and len(val_argmax_history) > 0
-                   else "")
                 + f"  tau={tau:.3f}  lr={lr_str}"
                 + (f"  reg={reg_scale:.2f}" if schedule_mode == "legacy" else "")
             )
@@ -3234,10 +3192,8 @@ def main():
         else:
             print_str = (
                 f"  epoch {epoch:4d}{phase_tag}  train={avg_train:.4f}  val={val_loss:.4f}"
+                + f"  tau={tau:.3f}  lr={lr_str}"
             )
-            if val_argmax_history is not None and len(val_argmax_history) > 0:
-                print_str += f"  val_argmax={val_argmax_history[-1]:.4f}"
-            print_str += f"  tau={tau:.3f}  lr={lr_str}"
             print(print_str)
 
     # ---- DEQ diagnostics on the trained model (deq-core-prototype) ----
@@ -3287,29 +3243,8 @@ def main():
 
     history_path = out_dir / "loss_history.txt"
     with open(history_path, "w") as f:
-        has_argmax = val_argmax_history is not None and len(val_argmax_history) == len(val_history)
         has_orig = val_orig_history is not None and len(val_orig_history) == len(val_history)
-        if has_argmax and has_orig:
-            f.write("epoch\ttrain\tval\tval_argmax\tmae_orig\trmse_orig\tphase\n")
-            for i, (t, v, va, m) in enumerate(zip(history, val_history, val_argmax_history, val_orig_history)):
-                if schedule_mode == "three_phase":
-                    p = phase_for_epoch(i, epochs)
-                elif schedule_mode == "four_phase":
-                    p = phase_for_epoch_four(i, epochs)
-                else:
-                    p = "A"
-                f.write(f"{i}\t{t}\t{v}\t{va}\t{m['mae_orig']:.6f}\t{m['rmse_orig']:.6f}\t{p}\n")
-        elif has_argmax:
-            f.write("epoch\ttrain\tval\tval_argmax\tphase\n")
-            for i, (t, v, va) in enumerate(zip(history, val_history, val_argmax_history)):
-                if schedule_mode == "three_phase":
-                    p = phase_for_epoch(i, epochs)
-                elif schedule_mode == "four_phase":
-                    p = phase_for_epoch_four(i, epochs)
-                else:
-                    p = "A"
-                f.write(f"{i}\t{t}\t{v}\t{va}\t{p}\n")
-        elif has_orig:
+        if has_orig:
             f.write("epoch\ttrain\tval\tmae_orig\trmse_orig\tphase\n")
             for i, (t, v, m) in enumerate(zip(history, val_history, val_orig_history)):
                 if schedule_mode == "three_phase":
@@ -3675,7 +3610,6 @@ def main():
             )
             retrain_history = []
             retrain_val_history = []
-            retrain_val_argmax = [] if val_argmax_history is not None else None
             retrain_orig_history = [] if inverse_stats is not None else None
             retrain_deq_log_path = deq_val_log_path
             best_val_pruned = float("inf")
@@ -3839,19 +3773,8 @@ def main():
                             train_loss=avg,
                             val_loss=val,
                             metrics=val_deq_metrics)
-                    # four-phase-redesign/Phase 1b: Phase C is post-prune, the
-                    # deployable model IS the hard-cell (argmax) version, so
-                    # use val_argmax for checkpoint selection.
-                    if (
-                        schedule_mode in ("three_phase", "four_phase")
-                        and retrain_val_argmax is not None
-                        and len(retrain_val_argmax) > 0
-                    ):
-                        sel_metric_c = float(retrain_val_argmax[-1])
-                        sel_name_c = "val_argmax"
-                    else:
-                        sel_metric_c = float(val)
-                        sel_name_c = "val"
+                    sel_metric_c = float(val)
+                    sel_name_c = "val"
                     if sel_metric_c < best_val_pruned - args.min_delta:
                         best_val_pruned = sel_metric_c
                         best_epoch_pruned = repoch
@@ -3868,8 +3791,6 @@ def main():
                             break
                 else:
                     retrain_val_history.append(retrain_val_history[-1] if retrain_val_history else avg)
-                    if retrain_val_argmax is not None:
-                        retrain_val_argmax.append(retrain_val_argmax[-1] if retrain_val_argmax else avg)
                     if retrain_orig_history is not None:
                         retrain_orig_history.append(
                             retrain_orig_history[-1] if retrain_orig_history
@@ -3897,21 +3818,10 @@ def main():
                 phase_c_start = b_end if schedule_mode == "three_phase" else b2_end
                 with open(history_path, "r") as f:
                     header = f.readline().strip()
-                has_argmax = "val_argmax" in header
                 has_orig = "mae_orig" in header
                 with open(history_path, "a") as f:
                     f.write(f"\n# Phase C (prune + retrain): {post_edges}/{pre_edges} edges, {post_nodes}/{pre_nodes} nodes survived\n")
-                    if has_argmax and has_orig and retrain_orig_history is not None:
-                        for i, (t, v, va, m) in enumerate(
-                            zip(retrain_history, retrain_val_history, retrain_val_argmax, retrain_orig_history)
-                        ):
-                            global_ep = phase_c_start + i
-                            f.write(f"{global_ep}\t{t}\t{v}\t{va}\t{m['mae_orig']:.6f}\t{m['rmse_orig']:.6f}\tC\n")
-                    elif has_argmax:
-                        for i, (t, v, va) in enumerate(zip(retrain_history, retrain_val_history, retrain_val_argmax)):
-                            global_ep = phase_c_start + i
-                            f.write(f"{global_ep}\t{t}\t{v}\t{va}\tC\n")
-                    elif has_orig and retrain_orig_history is not None:
+                    if has_orig and retrain_orig_history is not None:
                         for i, (t, v, m) in enumerate(zip(retrain_history, retrain_val_history, retrain_orig_history)):
                             global_ep = phase_c_start + i
                             f.write(f"{global_ep}\t{t}\t{v}\t{m['mae_orig']:.6f}\t{m['rmse_orig']:.6f}\tC\n")

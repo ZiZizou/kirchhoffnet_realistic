@@ -742,6 +742,8 @@ def _save_config_snapshot(out_dir: Path, problem: str, args, lambdas: dict,
             if effective_write == "fan_out":
                 f.write(f"  fan_out_map: {net.input_mapper.fan_out_map}\n")
             f.write(f"  write_idx: {list(net.write_idx) if net.write_idx is not None else None}\n")
+            f.write(f"  persistent_drive: {args.persistent_drive}\n")
+            f.write(f"  drive_mode: {args.drive_mode}\n")
             f.write(f"  output_mapper: {type(net.output_mapper).__name__}\n")
             f.write(f"  read_idx: {list(net.read_idx) if net.read_idx is not None else None}\n")
             f.write(f"  hid_count: {net.hid_count}\n")
@@ -2097,9 +2099,18 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
         help="Enable persistent drive current in all stages. The drive "
              "current I_drive = I_sat * tanh(g * (x_drive - x) / I_sat) "
              "makes the fixed point x* input-dependent under DEQ. "
-             "Requires write_mode='fan_out' (the smooth2d_grid preset "
-             "already uses fan_out by default). Has no effect when "
-             "--solver heun.")
+             "Compatible with write_mode='fan_out', 'sparse_proj', and "
+             "'one_to_one' (the driven nodes are the write_idx entries). "
+             "Has no effect when --solver heun.")
+    parser.add_argument(
+        "--drive-mode", choices=["fan_out", "projection"], default="fan_out",
+        dest="drive_mode",
+        help="Drive mapper type when --persistent-drive is active. "
+             "'fan_out': per-input scalar (gain,bias) pairs drive each "
+             "node independently (no input mixing). 'projection': learned "
+             "nn.Linear(in_dim, len(write_idx)) with tanh, mixing all "
+             "inputs into every driven node (matches ProjectedSparseInputMapper). "
+             "Default: 'fan_out'.")
     parser.add_argument(
         "--leak", choices=["programmable", "non-programmable"],
         default="programmable", dest="leak",
@@ -2546,37 +2557,46 @@ def main():
             f"bidirectional={args.bidirectional} "
             f"write_mode={new_preset['write_mode']} read_mode={new_preset['read_mode']}"
         )
-    # Persistent drive: auto-force write_mode='fan_out' when enabled.
+    # Persistent drive: supports fan_out, sparse_proj, and one_to_one modes.
+    # For sparse_proj/one_to_one, the driven nodes come from --write-idx.
+    # For fan_out, auto-generate write_fan_out if missing (legacy grid behavior).
     if args.persistent_drive:
-        if args.write_mode is not None and args.write_mode != "fan_out":
+        if args.write_mode is not None and args.write_mode not in (
+                "fan_out", "sparse_proj", "one_to_one"):
             raise ValueError(
-                "--persistent-drive requires write_mode='fan_out' "
+                "--persistent-drive requires write_mode='fan_out', "
+                "'sparse_proj', or 'one_to_one' "
                 f"(got --write-mode {args.write_mode!r})"
             )
-        if args.write_mode is None:
-            args.write_mode = "fan_out"
-        # Ensure write_fan_out exists in the active preset. Some base
-        # presets (e.g. housing_grid) declare write_mode='dense' and
-        # therefore omit write_fan_out. --persistent-drive forces
-        # write_mode='fan_out', so generate a deterministic fan-out
-        # mapping consistent with the grid-family convention used by
-        # _make_dynamic_preset and make_smooth2d_grid_preset.
-        active_preset = PRESETS.get(args.problem)
-        if active_preset is None:
-            raise ValueError(
-                f"--persistent-drive: unknown problem {args.problem!r}"
-            )
-        if not active_preset.get("write_fan_out"):
-            if resolved_grid_size is None:
-                raise ValueError(
-                    f"--persistent-drive requires a grid-family topology with "
-                    f"a known grid size (problem={args.problem!r}, "
-                    f"grid_size=None). Use --hidden-family grid --grid-size N."
-                )
-            num_inputs = int(active_preset["stages"][0]["num_inputs"])
-            active_preset["write_fan_out"] = _build_grid_write_fan_out(
-                num_inputs=num_inputs, grid_size=resolved_grid_size)
-            active_preset["write_mode"] = "fan_out"
+        if args.write_mode in (None, "sparse_proj", "one_to_one"):
+            if args.write_mode is None:
+                args.write_mode = "fan_out"
+            # For sparse_proj/one_to_one: nothing to auto-generate here.
+            # build_net_from_config in topology.py handles drive mappers
+            # directly from the explicit write_idx list.
+            if args.write_mode == "fan_out":
+                # Ensure write_fan_out exists in the active preset. Some
+                # base presets (e.g. housing_grid) declare write_mode='dense'
+                # and therefore omit write_fan_out. --persistent-drive forces
+                # write_mode='fan_out', so generate a deterministic fan-out
+                # mapping consistent with the grid-family convention used by
+                # _make_dynamic_preset and make_smooth2d_grid_preset.
+                active_preset = PRESETS.get(args.problem)
+                if active_preset is None:
+                    raise ValueError(
+                        f"--persistent-drive: unknown problem {args.problem!r}"
+                    )
+                if not active_preset.get("write_fan_out"):
+                    if resolved_grid_size is None:
+                        raise ValueError(
+                            f"--persistent-drive requires a grid-family topology with "
+                            f"a known grid size (problem={args.problem!r}, "
+                            f"grid_size=None). Use --hidden-family grid --grid-size N."
+                        )
+                    num_inputs = int(active_preset["stages"][0]["num_inputs"])
+                    active_preset["write_fan_out"] = _build_grid_write_fan_out(
+                        num_inputs=num_inputs, grid_size=resolved_grid_size)
+                    active_preset["write_mode"] = "fan_out"
     net = build_net_from_preset(
         args.problem,
         cell_lib=cell_lib,
@@ -2585,6 +2605,7 @@ def main():
         write_idx=write_idx_arg,
         read_idx=read_idx_arg,
         enable_drive=args.persistent_drive,
+        drive_mode=args.drive_mode,
         leak_mode=args.leak,
         leak_constant=args.leak_constant)
     net.to(device)
@@ -2626,8 +2647,8 @@ def main():
             "[train] WARNING: --solver deq without --persistent-drive: "
             "the equilibrium x* has no input-dependent forcing term, "
             "so the network can only fit a constant target. "
-            "Add --persistent-drive (requires write_mode='fan_out') "
-            "for input-dependent fixed points."
+            "Add --persistent-drive (compatible with write_mode='fan_out', "
+            "'sparse_proj', or 'one_to_one') for input-dependent fixed points."
         )
 
     _save_config_snapshot(out_dir, args.problem, args, lambdas, net=net)

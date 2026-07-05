@@ -1256,6 +1256,7 @@ def build_net_from_preset(
     write_idx: list[int] | None = None,
     read_idx: list[int] | None = None,
     enable_drive: bool = False,
+    drive_mode: str = "fan_out",
     leak_mode: str = "programmable",
     leak_constant: float | None = None,
 ):
@@ -1269,6 +1270,14 @@ def build_net_from_preset(
     * read_mode:   "sparse" | "dense".  When ``None`` (default), use the
                    preset's ``read_mode`` if present, else ``"sparse"``.
     * write_idx / read_idx: explicit index lists override preset values.
+    * drive_mode:  "fan_out" | "projection". When ``enable_drive=True``,
+                   controls the per-stage drive mapper architecture.
+                   ``"fan_out"`` (default) uses FanOutInputMapper with
+                   per-input scalars (gain, bias) per driven node. With
+                   ``"projection"`` for write_mode='sparse_proj' or
+                   'one_to_one', uses ProjectedSparseInputMapper with a
+                   learned nn.Linear projection matching the input mapper.
+                   Only meaningful when enable_drive=True.
     * leak_mode / leak_constant: forwarded to :func:`topology_to_stage`.
     """
     if preset_name not in PRESETS:
@@ -1284,6 +1293,7 @@ def build_net_from_preset(
         cfg["read_idx"] = list(read_idx)
     return build_net_from_config(
         cfg, cell_lib=cell_lib, enable_drive=enable_drive,
+        drive_mode=drive_mode,
         leak_mode=leak_mode, leak_constant=leak_constant,
     )
 
@@ -1292,6 +1302,7 @@ def build_net_from_config(
     cfg: dict,
     cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary,
     enable_drive: bool = False,
+    drive_mode: str = "fan_out",
     leak_mode: str | None = None,
     leak_constant: float | None = None,
 ):
@@ -1300,11 +1311,19 @@ def build_net_from_config(
     ``leak_mode`` and ``leak_constant`` can be specified either explicitly or
     via the ``cfg`` dict (``cfg['leak_mode']`` / ``cfg['leak_constant']``).
     Explicit kwargs take precedence.
+
+    ``drive_mode`` ("fan_out" | "projection") controls per-stage drive
+    mapper architecture when ``enable_drive=True``. See build_net_from_preset
+    for details.
     """
     if leak_mode is None:
         leak_mode = cfg.get("leak_mode", "programmable")
     if leak_constant is None:
         leak_constant = cfg.get("leak_constant", None)
+    if drive_mode not in ("fan_out", "projection"):
+        raise ValueError(
+            f"drive_mode must be 'fan_out' or 'projection', got {drive_mode!r}"
+        )
     from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
     from io_mapper import (
         InputMapper,
@@ -1358,8 +1377,6 @@ def build_net_from_config(
             in_dim=in_dim, out_dim=n_first_hid, write_idx=preset_write_idx
         )
         write_idx_arg = list(preset_write_idx)
-        if enable_drive:
-            raise ValueError("enable_drive=True requires write_mode='fan_out'")
     elif write_mode == "fan_out":
         fan_out_map = cfg.get("write_fan_out")
         if fan_out_map is None:
@@ -1389,14 +1406,16 @@ def build_net_from_config(
             in_dim=in_dim, out_dim=n_first_hid, write_idx=preset_write_idx
         )
         write_idx_arg = list(preset_write_idx)
-        if enable_drive:
-            raise ValueError("enable_drive=True requires write_mode='fan_out'")
     else:
         MapperCls = RobustInputMapper if use_robust else InputMapper
         input_mapper = MapperCls(in_dim=in_dim, out_dim=n_first_hid)
         write_idx_arg = None
         if enable_drive:
-            raise ValueError("enable_drive=True requires write_mode='fan_out'")
+            raise ValueError(
+                "enable_drive=True requires write_mode='fan_out', "
+                "'sparse_proj', or 'one_to_one' "
+                f"(got write_mode={write_mode!r})"
+            )
 
     # Build stages with optional write_idx for persistent drive.
     stage_modules = []
@@ -1432,15 +1451,73 @@ def build_net_from_config(
 
     # Build per-stage drive mappers when persistent drive is enabled.
     drive_mappers_list = None
-    if enable_drive and fan_out_map is not None:
-        drive_mappers_list = [
-            FanOutInputMapper(
-                in_dim=in_dim,
-                out_dim=len(first_hid),
-                fan_out_map=fan_out_map,
-            )
-            for _ in range(len(stages_cfg))
-        ]
+    if enable_drive:
+        if fan_out_map is not None:
+            # write_mode == 'fan_out': use FanOutInputMapper directly.
+            drive_mappers_list = [
+                FanOutInputMapper(
+                    in_dim=in_dim,
+                    out_dim=len(first_hid),
+                    fan_out_map=fan_out_map,
+                )
+                for _ in range(len(stages_cfg))
+            ]
+        elif write_mode == "sparse_proj" and write_idx_arg is not None:
+            # write_mode == 'sparse_proj': drive targets come from write_idx.
+            # Default ('fan_out' drive_mode): round-robin assign write_idx
+            # entries to inputs to form a fan_out_map. 'projection' mode:
+            # use ProjectedSparseInputMapper with learned nn.Linear.
+            if drive_mode == "projection":
+                drive_mappers_list = [
+                    ProjectedSparseInputMapper(
+                        in_dim=in_dim,
+                        out_dim=len(first_hid),
+                        write_idx=list(write_idx_arg),
+                    )
+                    for _ in range(len(stages_cfg))
+                ]
+            else:
+                drive_fan_out = {
+                    i: list(write_idx_arg[i::in_dim])
+                    for i in range(in_dim)
+                }
+                drive_mappers_list = [
+                    FanOutInputMapper(
+                        in_dim=in_dim,
+                        out_dim=len(first_hid),
+                        fan_out_map=drive_fan_out,
+                    )
+                    for _ in range(len(stages_cfg))
+                ]
+        elif write_mode == "one_to_one" and write_idx_arg is not None:
+            # write_mode == 'one_to_one': drive targets come from write_idx.
+            # Both modes work here: 'projection' uses ProjectedSparseInputMapper
+            # (matches input mapper architecture), 'fan_out' uses 1-to-1
+            # FanOutInputMapper (one input per driven node).
+            if drive_mode == "projection":
+                drive_mappers_list = [
+                    ProjectedSparseInputMapper(
+                        in_dim=in_dim,
+                        out_dim=len(first_hid),
+                        write_idx=list(write_idx_arg),
+                    )
+                    for _ in range(len(stages_cfg))
+                ]
+            else:
+                # 1-to-1: input i -> [write_idx_arg[i]]
+                drive_fan_out = {i: [write_idx_arg[i]] for i in range(in_dim)}
+                drive_mappers_list = [
+                    FanOutInputMapper(
+                        in_dim=in_dim,
+                        out_dim=len(first_hid),
+                        fan_out_map=drive_fan_out,
+                    )
+                    for _ in range(len(stages_cfg))
+                ]
+        # else (write_mode == 'dense'): drive_mappers_list stays None.
+        # The dense-mode ValueError above already rejected this case, so
+        # reaching here means enable_drive=True without a write_idx — which
+        # only happens for dense mode. Leave drive disabled (no mappers).
 
     grouped_cfg = cfg.get("grouped_readout")
     if grouped_cfg is not None:

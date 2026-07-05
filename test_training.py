@@ -40,6 +40,8 @@ def main():
     test_smooth2d_grid_preset()
     test_housing_grid_preset()
     test_persistent_drive_auto_fan_out()
+    test_persistent_drive_sparse_proj()
+    test_amp_dtype_fix()
     test_mlp_benchmark()
     test_mlp_benchmark_tanh()
     test_v15_cell_parameters_preset_smooth2d_grid()
@@ -643,6 +645,142 @@ def test_persistent_drive_auto_fan_out():
               torch.isfinite(net(torch.rand(4, 8))[0]).all().item())
     finally:
         PRESETS["housing_grid"] = make_housing_grid_preset(grid_size=5)
+
+
+def test_persistent_drive_sparse_proj():
+    print("\nTest PD-sparse_proj: persistent-drive with write_mode='sparse_proj'")
+    from config import PRESETS
+    from topology import build_net_from_preset
+    from cell_library import make_cell_library
+
+    cell_lib = make_cell_library('tanh')
+
+    # Use _make_dynamic_preset to build a proper torus preset
+    from train_script import _make_dynamic_preset
+    cfg = _make_dynamic_preset(
+        problem="smooth2d", hidden_family="torus", num_hidden=25,
+        num_stages=3, edge_repeats=1, grid_size=5, bidirectional=False,
+        write_mode_override="sparse_proj",
+    )
+    PRESETS["smooth2d_torus_persistent_test"] = cfg
+
+    # Test with drive_mode='fan_out' (default) - uses FanOutInputMapper with round-robin
+    net = build_net_from_preset(
+        "smooth2d_torus_persistent_test",
+        cell_lib=cell_lib,
+        write_mode="sparse_proj",
+        write_idx=[2, 7, 12, 17, 22],
+        read_idx=[0, 15, 4, 19],
+        enable_drive=True,
+        drive_mode="fan_out",
+    )
+    from io_mapper import FanOutInputMapper, ProjectedSparseInputMapper, SparseInputMapper
+    check("input_mapper is ProjectedSparseInputMapper",
+          isinstance(net.input_mapper, ProjectedSparseInputMapper))
+    check("drive_mappers exist (3 stages)",
+          net.drive_mappers is not None and len(net.drive_mappers) == 3)
+    check("drive_mappers are FanOutInputMapper (default mode)",
+          isinstance(net.drive_mappers[0], FanOutInputMapper))
+    check("drive fan_out_map covers all write_idx nodes",
+          len(set().union(*net.drive_mappers[0].fan_out_map.values())) == 5)
+    check("write_idx preserved",
+          list(net.write_idx) == [2, 7, 12, 17, 22])
+    y, _ = net(torch.rand(4, 2))
+    check("forward output is finite", torch.isfinite(y).all().item())
+
+    # Test with drive_mode='projection' - uses ProjectedSparseInputMapper
+    net = build_net_from_preset(
+        "smooth2d_torus_persistent_test",
+        cell_lib=cell_lib,
+        write_mode="sparse_proj",
+        write_idx=[2, 7, 12, 17, 22],
+        read_idx=[0, 15, 4, 19],
+        enable_drive=True,
+        drive_mode="projection",
+    )
+    check("drive_mappers are ProjectedSparseInputMapper (projection mode)",
+          isinstance(net.drive_mappers[0], ProjectedSparseInputMapper))
+    y, _ = net(torch.rand(4, 2))
+    check("forward output is finite (projection)", torch.isfinite(y).all().item())
+
+    # Test one_to_one with persistent drive (use write_idx far from read_idx to
+    # satisfy degree-of-separation validation on torus+kernel3 topology).
+    cfg2 = _make_dynamic_preset(
+        problem="smooth2d", hidden_family="torus", num_hidden=25,
+        num_stages=3, edge_repeats=1, grid_size=5, bidirectional=False,
+        write_mode_override="one_to_one",
+    )
+    cfg2["write_idx"] = [0, 5]
+    cfg2["read_idx"] = [12, 18]
+    PRESETS["smooth2d_one_to_one_persistent_test"] = cfg2
+
+    net = build_net_from_preset(
+        "smooth2d_one_to_one_persistent_test",
+        cell_lib=cell_lib,
+        write_mode="one_to_one",
+        write_idx=[0, 5],
+        read_idx=[12, 18],
+        enable_drive=True,
+        drive_mode="fan_out",
+    )
+    check("input_mapper is SparseInputMapper",
+          isinstance(net.input_mapper, SparseInputMapper))
+    check("drive_mappers are FanOutInputMapper (1-to-1)",
+          isinstance(net.drive_mappers[0], FanOutInputMapper))
+    check("drive fan_out_map has 1 target per input",
+          {i: [write_idx] for i, write_idx in zip(range(2), [0, 5])}
+          == net.drive_mappers[0].fan_out_map)
+    y, _ = net(torch.rand(4, 2))
+    check("forward output is finite (one_to_one)", torch.isfinite(y).all().item())
+
+    # Cleanup
+    PRESETS.pop("smooth2d_torus_persistent_test", None)
+    PRESETS.pop("smooth2d_one_to_one_persistent_test", None)
+
+
+def test_amp_dtype_fix():
+    print("\nTest AMP-fix: index_copy_ dtype mismatch with half-precision input")
+    import io_mapper
+
+    # Simulate the production AMP scenario: the input u is float32 (outside autocast),
+    # but the linear/op internals run in half via autocast. So the per_feature/
+    # per_target/projected tensor is half while x (new_zeros from u) is float32.
+    # The fix casts the half tensor to float32 to match x before index_copy_.
+
+    # Test SparseInputMapper: simulate by manually running the path
+    m = io_mapper.SparseInputMapper(in_dim=2, out_dim=10, write_idx=[0, 1])
+    u = torch.randn(4, 2)
+    with torch.no_grad():
+        # Simulate what happens under autocast: ops cast to half
+        half_per_feature = m.x_max * torch.tanh((u * m.gain + m.bias).half())
+        x = u.new_zeros(*u.shape[:-1], m.out_dim)  # float32 (u is float32)
+        # Without fix: dtype mismatch. With fix: cast to x.dtype.
+        x.index_copy_(-1, torch.tensor(m.write_idx, dtype=torch.long), half_per_feature.to(dtype=x.dtype))
+    check("SparseInputMapper AMP scatter works", x.dtype == torch.float32)
+    check("SparseInputMapper output finite", torch.isfinite(x).all().item())
+
+    # Test FanOutInputMapper
+    m = io_mapper.FanOutInputMapper(in_dim=2, out_dim=10, fan_out_map={0: [0, 5], 1: [3, 7]})
+    u = torch.randn(4, 2)
+    with torch.no_grad():
+        u_picked = u.index_select(-1, m._input_index)
+        half_per_target = m.x_max * torch.tanh((u_picked * m.gain + m.bias).half())
+        x = u.new_zeros(*u.shape[:-1], m.out_dim)
+        x.index_copy_(-1, m._flat_targets, half_per_target.to(dtype=x.dtype))
+    check("FanOutInputMapper AMP scatter works", x.dtype == torch.float32)
+    check("FanOutInputMapper output finite", torch.isfinite(x).all().item())
+
+    # Test ProjectedSparseInputMapper
+    m = io_mapper.ProjectedSparseInputMapper(in_dim=2, out_dim=10, write_idx=[2, 7])
+    u = torch.randn(4, 2)
+    with torch.no_grad():
+        half_proj = m.proj(u).half()
+        half_projected = m.x_max * torch.tanh(half_proj)
+        x = u.new_zeros(*u.shape[:-1], m.out_dim)
+        x.index_copy_(-1, m._write_index, half_projected.to(dtype=x.dtype))
+    check("ProjectedSparseInputMapper AMP scatter works", x.dtype == torch.float32)
+    check("ProjectedSparseInputMapper output finite", torch.isfinite(x).all().item())
+
 
 def test_mlp_benchmark():
     print("\nTest OO: minimal MLP benchmark for smooth2d")

@@ -154,7 +154,7 @@ class SparseInputMapper(nn.Module):
         per_feature = self.x_max * torch.tanh(u * self.gain + self.bias)
         x = u.new_zeros(*u.shape[:-1], self.out_dim)
         idx = torch.tensor(self.write_idx, dtype=torch.long, device=u.device)
-        x.index_copy_(-1, idx, per_feature)
+        x.index_copy_(-1, idx, per_feature.to(dtype=x.dtype))
         return x
 
 
@@ -267,7 +267,7 @@ class FanOutInputMapper(nn.Module):
         u_picked = u.index_select(-1, self._input_index.to(u.device))
         per_target = self.x_max * torch.tanh(u_picked * self.gain + self.bias)
         x = u.new_zeros(*u.shape[:-1], self.out_dim)
-        x.index_copy_(-1, self._flat_targets.to(u.device), per_target)
+        x.index_copy_(-1, self._flat_targets.to(u.device), per_target.to(dtype=x.dtype))
         return x
 
 
@@ -343,7 +343,7 @@ class ProjectedSparseInputMapper(nn.Module):
             )
         projected = self.x_max * torch.tanh(self.proj(u))
         x = u.new_zeros(*u.shape[:-1], self.out_dim)
-        x.index_copy_(-1, self._write_index.to(u.device), projected)
+        x.index_copy_(-1, self._write_index.to(u.device), projected.to(dtype=x.dtype))
         return x
 
 

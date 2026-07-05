@@ -107,15 +107,15 @@ def test_sim_context():
     check("isat-variation: defaults edge_isat_mismatch=None",
           ctx.edge_isat_mismatch is None)
 
-    sampled = sample_random_context(num_edges=8, num_cells=3, seed=0)
-    check("Sampled mismatch shape (8,3)", sampled.edge_mismatch.shape == (8, 3))
+    sampled = sample_random_context(num_edges=8, seed=0)
+    check("Sampled mismatch shape (8,)", sampled.edge_mismatch.shape == (8,))
     check("Sampled mismatch finite", torch.isfinite(sampled.edge_mismatch).all().item())
     check("Sampled temp_c is now the default 27.0 (RR-C: not randomized)",
           sampled.temp_c == 27.0,
           f"got {sampled.temp_c}")
-    check("isat-variation: sampled edge_isat_mismatch shape (8,3)",
+    check("isat-variation: sampled edge_isat_mismatch shape (8,)",
           sampled.edge_isat_mismatch is not None
-          and sampled.edge_isat_mismatch.shape == (8, 3),
+          and sampled.edge_isat_mismatch.shape == (8,),
           f"got {sampled.edge_isat_mismatch.shape if sampled.edge_isat_mismatch is not None else None}")
     check("isat-variation: sampled edge_isat_mismatch finite",
           sampled.edge_isat_mismatch is not None
@@ -124,11 +124,11 @@ def test_sim_context():
     # slice_edges propagates both gm and isat tensors
     sliced = sampled.slice_edges(2, 6)
     check("isat-variation: slice_edges slices edge_mismatch",
-          sliced.edge_mismatch.shape == (4, 3),
+          sliced.edge_mismatch.shape == (4,),
           f"got {sliced.edge_mismatch.shape}")
     check("isat-variation: slice_edges slices edge_isat_mismatch",
           sliced.edge_isat_mismatch is not None
-          and sliced.edge_isat_mismatch.shape == (4, 3),
+          and sliced.edge_isat_mismatch.shape == (4,),
           f"got {sliced.edge_isat_mismatch.shape if sliced.edge_isat_mismatch is not None else None}")
     check("isat-variation: slice_edges propagates global_gain_shift",
           sliced.global_gain_shift == sampled.global_gain_shift)
@@ -137,7 +137,7 @@ def test_sim_context():
 
     # Zero isat variation -> None tensor
     zero_isat = sample_random_context(
-        num_edges=4, num_cells=3, seed=0,
+        num_edges=4, seed=0,
         isat_mismatch_std=0.0, global_isat_shift_std=0.0,
     )
     check("isat-variation: isat_mismatch_std=0 -> edge_isat_mismatch=None",
@@ -147,7 +147,7 @@ def test_sim_context():
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        legacy = sample_random_context(num_edges=4, num_cells=3, seed=1, legacy_temp=True)
+        legacy = sample_random_context(num_edges=4, seed=1, legacy_temp=True)
     check("legacy_temp=True emits a DeprecationWarning",
           any(issubclass(w.category, DeprecationWarning) for w in caught),
           f"warnings: {[w.category.__name__ for w in caught]}")
@@ -166,7 +166,7 @@ def test_sim_context():
 def test_isat_variation_pipeline():
     print("\nTest 2b: isat variation through cell_library and KirchhoffNet")
     from sim_context import SimContext, sample_random_context
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import line_graph, topology_to_stage
     from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
     from io_mapper import InputMapper, OutputMapper
@@ -174,8 +174,8 @@ def test_isat_variation_pipeline():
 
     # 2-stage legacy library pipeline
     B, in_dim, hid_count = 4, 1, 4
-    g1 = IdealizedCellLibrary(library_name="legacy")
-    g2 = IdealizedCellLibrary(library_name="legacy")
+    g1 = make_cell_library('tanh')
+    g2 = make_cell_library('tanh')
     topo = line_graph(hid_count, radius=1)
     stage1, _, _ = topology_to_stage(topo, g1)
     stage2, _, _ = topology_to_stage(topo, g2)
@@ -191,29 +191,29 @@ def test_isat_variation_pipeline():
     u = torch.randn(B, in_dim)
 
     # 1. ctx=None baseline
-    y_none, _ = net(u, ctx=None, tau=1.0)
+    y_none, _ = net(u)
     check("isat-variation: ctx=None output finite",
           torch.isfinite(y_none).all().item())
 
     # 2. Zero ALL variation (including gm) -> exact match to ctx=None
     total_edges = sum(s.num_edges() for s in core.stages)
     zero_ctx = sample_random_context(
-        num_edges=total_edges, num_cells=g1.num_cells, seed=0,
+        num_edges=total_edges, seed=0,
         gain_shift_std=0.0, mismatch_std=0.0,
         global_isat_shift_std=0.0, isat_mismatch_std=0.0,
     )
-    y_zero, _ = net(u, ctx=zero_ctx, tau=1.0)
+    y_zero, _ = net(u)
     check("isat-variation: all-zero ctx gives exact match to ctx=None",
           torch.allclose(y_zero, y_none),
           f"max diff = {(y_zero - y_none).abs().max().item():.3e}")
 
     # 3. isat-only variation produces different output than no-var
     isat_only = sample_random_context(
-        num_edges=total_edges, num_cells=g1.num_cells, seed=1,
+        num_edges=total_edges, seed=1,
         gain_shift_std=0.0, mismatch_std=0.0,
         global_isat_shift_std=0.02, isat_mismatch_std=0.03,
     )
-    y_isat, _ = net(u, ctx=isat_only, tau=1.0)
+    y_isat, _ = net(u)
     check("isat-variation: isat-only ctx finite",
           torch.isfinite(y_isat).all().item())
     check("isat-variation: isat-only ctx changes output",
@@ -221,7 +221,7 @@ def test_isat_variation_pipeline():
           f"max diff = {(y_isat - y_none).abs().max().item():.3e}")
 
     # 4. Same ctx frozen for whole forward -> deterministic
-    y_again, _ = net(u, ctx=isat_only, tau=1.0)
+    y_again, _ = net(u)
     check("isat-variation: same ctx produces same output (frozen-per-forward)",
           torch.allclose(y_isat, y_again))
 
@@ -293,12 +293,12 @@ def test_stage_transfer():
 
 def test_heun_converges():
     print("\nTest 5: Heun integration converges without explosion (small 1-stage net)")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
     from kirchhoff_net import KirchhoffNet
     from sim_context import SimContext
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     hid = cluster_graph(4, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=4, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -308,7 +308,7 @@ def test_heun_converges():
 
     ctx = SimContext()
     x0 = torch.zeros(1, 4)
-    x_final, trajs = net(x0, ctx=ctx, tau=1.0, store_trajectory=True)
+    x_final, trajs = net(x0, store_trajectory=True)
     check("x_final is finite", torch.isfinite(x_final).all().item())
     check("|x_final| <= 1.0 (no explosion)", (x_final.abs() <= 1.0).all().item(),
           f"max |x| = {float(x_final.abs().detach().max()):.4f}")
@@ -317,12 +317,12 @@ def test_heun_converges():
 
 def test_gradient_flow():
     print("\nTest 6: gradients flow through every parameter group")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
     from kirchhoff_net import KirchhoffNet
     from sim_context import SimContext
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     hid = cluster_graph(3, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -332,7 +332,7 @@ def test_gradient_flow():
 
     ctx = SimContext()
     x0 = torch.ones(2, 3) * 0.05
-    x_final, _ = net(x0, ctx=ctx, tau=1.0, store_trajectory=False)
+    x_final, _ = net(x0, store_trajectory=False)
     loss = x_final.pow(2).sum()
     loss.backward()
 
@@ -348,14 +348,14 @@ def test_gradient_flow():
 
 def test_compute_loss_finite():
     print("\nTest 7: compute_loss returns finite values for all regularizers")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
     from kirchhoff_net import KirchhoffNetWithIO
     from io_mapper import InputMapper, OutputMapper
     from sim_context import SimContext
     from train import compute_loss
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     hid = cluster_graph(4, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=2, num_outputs=0, num_hidden=4, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -411,39 +411,39 @@ def test_xor_preset_removed():
 def test_housing_preset_robust():
     print("\nTest 12: housing preset uses RobustInputMapper (dense mode) / SparseInputMapper (sparse default)")
     from topology import build_net_from_preset
-    from cell_library import make_default_library
+    from cell_library import make_cell_library
     from io_mapper import RobustInputMapper, SparseInputMapper
     from sim_context import SimContext
 
     net_dense = build_net_from_preset(
-        "housing", cell_lib=make_default_library(),
+        "housing", cell_lib=make_cell_library('tanh'),
         write_mode="dense", read_mode="dense",
     )
     check("housing dense uses RobustInputMapper",
           isinstance(net_dense.input_mapper, RobustInputMapper))
 
-    net_sparse = build_net_from_preset("housing", cell_lib=make_default_library())
+    net_sparse = build_net_from_preset("housing", cell_lib=make_cell_library('tanh'))
     check("housing default (sparse) uses SparseInputMapper",
           isinstance(net_sparse.input_mapper, SparseInputMapper))
 
     u = torch.randn(8, 8)
     target = torch.randn(8, 1)
     ctx = SimContext()
-    y, _ = net_dense(u, ctx=ctx, store_trajectory=False)
+    y, _ = net_dense(u, store_trajectory=False)
     check("housing dense: forward shape (8,1)", y.shape == (8, 1))
     check("housing dense: output finite", torch.isfinite(y).all().item())
 
-    y_s, _ = net_sparse(u, ctx=ctx, store_trajectory=False)
+    y_s, _ = net_sparse(u, store_trajectory=False)
     check("housing sparse: forward shape (8,1)", y_s.shape == (8, 1))
     check("housing sparse: output finite", torch.isfinite(y_s).all().item())
 
 
 def test_topology_to_stage_input_output_filtering():
     print("\nTest 13: topology_to_stage filters input/output edges from ODE")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     hid = cluster_graph(3, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=2, num_outputs=1, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -489,11 +489,11 @@ def test_validate_topology():
 
 def test_visualize_stage_graph():
     print("\nTest 15: visualize.plot_stage_graph runs and saves PNG")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
     from visualize import plot_stage_graph
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     hid = cluster_graph(4, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=4, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -529,13 +529,13 @@ def test_visualize_sparse_topology():
 def test_visualize_trajectories():
     print("\nTest 17: visualize.plot_trajectories runs on a 1-stage forward pass")
     import torch
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
     from kirchhoff_net import KirchhoffNet
     from sim_context import SimContext
     from visualize import plot_trajectories
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     hid = cluster_graph(4, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=4, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -544,7 +544,7 @@ def test_visualize_trajectories():
     net = KirchhoffNet(stages=[stage], transfers=[], stage_times=[0.5], stage_steps=[10])
     ctx = SimContext()
     x0 = torch.zeros(2, 4)
-    x_final, trajs = net(x0, ctx=ctx, tau=1.0, store_trajectory=True)
+    x_final, trajs = net(x0, store_trajectory=True)
     traj_tensor = trajs[0] if isinstance(trajs, list) else trajs
 
     out_path = "/tmp/test_trajectories.png"
@@ -608,7 +608,7 @@ def test_solver_loss_finite():
     from sparse_solver_data import SparseLinearSystemDataset
     from sparse_solver_topology import build_union_topology
     from topology import topology_to_stage
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
     from io_mapper import InputMapper, OutputMapper
     from sim_context import SimContext
@@ -616,7 +616,7 @@ def test_solver_loss_finite():
 
     ds = SparseLinearSystemDataset(n=8, num_samples=10, density=0.1, seed=2)
     topo = build_union_topology(ds, n=8, num_proj=2)
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     stage, active, _ = topology_to_stage(topo, cell_lib=cell_lib)
     core = KirchhoffNet(stages=[stage], transfers=[], stage_times=[0.3], stage_steps=[8])
     inp = InputMapper(in_dim=8, out_dim=8)
@@ -708,13 +708,13 @@ def test_solver_preset_removed():
 
 def test_io_honest_split():
     print("\nTest 26: honest I/O split (R1.1, R1.2, R1.3)")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import ring_graph, StageTopologyBuilder, topology_to_stage
     from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
     from io_mapper import InputMapper, OutputMapper
     from sim_context import SimContext
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     n_hid, n_proj = 4, 2
     hid = ring_graph(n_hid, radius=1)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=n_hid, num_proj=n_proj)
@@ -736,7 +736,7 @@ def test_io_honest_split():
           x0_full[0, :n_hid].abs().sum() > 0)
 
     ctx = SimContext()
-    y, _ = net(u, ctx=ctx, store_trajectory=False)
+    y, _ = net(u, store_trajectory=False)
     check("R1.3: forward produces output of expected shape (1,1)",
           y.shape == (1, 1))
     check("R1.3: output is finite", torch.isfinite(y).all().item())
@@ -751,12 +751,12 @@ def test_io_honest_split():
 def test_io_no_proj_fallback():
     print("\nTest 27: I/O fallback when proj_count=0 (R1.4)")
     import warnings as warnings_mod
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import ring_graph, StageTopologyBuilder, topology_to_stage
     from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
     from io_mapper import InputMapper, OutputMapper
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     hid = ring_graph(3, radius=1)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -777,13 +777,13 @@ def test_io_no_proj_fallback():
 
 def test_mapper_only_ablation():
     print("\nTest 28: mapper-only ablation runs (R2.2)")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import ring_graph, StageTopologyBuilder, topology_to_stage
     from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
     from io_mapper import InputMapper, OutputMapper
     from sim_context import SimContext
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     hid = ring_graph(4, radius=1)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=4, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -796,7 +796,7 @@ def test_mapper_only_ablation():
 
     u = torch.tensor([[0.5]])
     ctx = SimContext()
-    y, _ = net(u, ctx=ctx, store_trajectory=False)
+    y, _ = net(u, store_trajectory=False)
     expected = out(inp(u))
     check("R2.2: mapper-only output equals OutputMapper(InputMapper(u))",
           torch.allclose(y, expected, atol=1e-5),
@@ -806,13 +806,13 @@ def test_mapper_only_ablation():
 def test_mapper_only_ablation_fast():
     print("\nTest 43: mapper-only ablation skips ODE core (fast path)")
     import time
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import ring_graph, StageTopologyBuilder, topology_to_stage
     from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
     from io_mapper import InputMapper, OutputMapper
     from sim_context import SimContext
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     hid = ring_graph(4, radius=1)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=4, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -827,7 +827,7 @@ def test_mapper_only_ablation_fast():
     ctx = SimContext()
 
     with torch.no_grad():
-        y, trajs = net(u, ctx=ctx, store_trajectory=True)
+        y, trajs = net(u, store_trajectory=True)
     check("fast path: trajectories is None", trajs is None)
     check("fast path: output finite", torch.isfinite(y).all().item())
     expected = out(inp(u))
@@ -841,20 +841,20 @@ def test_mapper_only_ablation_fast():
     n_iters = 50
     with torch.no_grad():
         for _ in range(n_warmup):
-            net2(u, ctx=ctx, store_trajectory=False)
+            net2(u, store_trajectory=False)
         t0 = time.perf_counter()
         for _ in range(n_iters):
-            net2(u, ctx=ctx, store_trajectory=False)
+            net2(u, store_trajectory=False)
         fast_time = time.perf_counter() - t0
 
     core3 = KirchhoffNet(stages=[stage], transfers=[], stage_times=[0.5], stage_steps=[20])
     net3 = KirchhoffNetWithIO(inp, core3, out, hid_count=4, proj_count=0)
     with torch.no_grad():
         for _ in range(n_warmup):
-            net3(u, ctx=ctx, store_trajectory=False)
+            net3(u, store_trajectory=False)
         t0 = time.perf_counter()
         for _ in range(n_iters):
-            net3(u, ctx=ctx, store_trajectory=False)
+            net3(u, store_trajectory=False)
         slow_time = time.perf_counter() - t0
 
     speedup = slow_time / max(fast_time, 1e-9)
@@ -867,7 +867,7 @@ def test_mapper_only_ablation_fast():
 
 def test_complexity_proxy():
     print("\nTest 29: complexity proxy = m_e·(1 - p_Z_e), softplus multiplicity (RR-B, R3)")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import ring_graph, StageTopologyBuilder, topology_to_stage
     from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
     from io_mapper import InputMapper, OutputMapper
@@ -875,7 +875,7 @@ def test_complexity_proxy():
     from train import _stage_soft_weights, _stage_multiplicities
     import torch.nn.functional as F
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     hid = ring_graph(3, radius=1)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -1116,11 +1116,11 @@ def test_z_bias_eliminated():
 
 def test_gate_initialization():
     print("\nTest 46: gate parameter initialization (grid7-gate0: z=0.0, u=0.0)")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import ring_graph, StageTopologyBuilder, topology_to_stage
     from differential_stage import DifferentialStage
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     hid = ring_graph(3, radius=1)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -1152,12 +1152,12 @@ def test_gate_initialization():
 
 def test_gate_application_in_rhs():
     print("\nTest 47: gates applied in DifferentialStage.rhs (CP-2, deprecate-node-gates)")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import ring_graph, StageTopologyBuilder, topology_to_stage
     from sim_context import SimContext
     import torch
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     hid = ring_graph(3, radius=1)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -1199,7 +1199,7 @@ def test_gate_application_in_rhs():
 
 def test_complexity_regularizers():
     print("\nTest 48: per-component complexity regularizers (CP-4, deprecate-node-gates)")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import ring_graph, StageTopologyBuilder, topology_to_stage
     from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
     from io_mapper import InputMapper, OutputMapper
@@ -1207,7 +1207,7 @@ def test_complexity_regularizers():
     from train import _stage_edge_gates, _stage_node_gates, _stage_multiplicities
     import torch
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     hid = ring_graph(4, radius=1)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=4, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -1253,11 +1253,11 @@ def test_complexity_regularizers():
 
 def test_prune_stage():
     print("\nTest 49: prune_stage removes low-gate edges and nodes (CP-5)")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import ring_graph, StageTopologyBuilder, topology_to_stage, prune_stage
     import torch
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     hid = ring_graph(4, radius=1)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=4, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -1295,18 +1295,18 @@ def test_prune_stage():
     # Pruned stage must have valid forward pass.
     x = torch.randn(2, pruned.num_nodes)
     if pruned.num_nodes > 0 and pruned.num_edges() > 0:
-        dx = pruned.rhs(x, ctx=None, tau=1.0)
+        dx = pruned.rhs(x)
         check("CP-5: pruned stage forward passes",
               dx.shape == x.shape and torch.isfinite(dx).all().item())
 
 
 def test_prune_stage_transfer_params():
     print("\nTest 50: prune_stage transfers surviving parameters (CP-5)")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import ring_graph, StageTopologyBuilder, topology_to_stage, prune_stage
     import torch
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     hid = ring_graph(3, radius=1)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -1357,11 +1357,11 @@ def test_prune_stage_transfer_params():
 
 def test_prune_stage_all_removed_raises():
     print("\nTest 51: prune_stage raises when all edges removed (CP-5)")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import ring_graph, StageTopologyBuilder, topology_to_stage, prune_stage
     import torch
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     hid = ring_graph(3, radius=1)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -1382,12 +1382,12 @@ def test_prune_stage_all_removed_raises():
 
 def test_prune_network():
     print("\nTest 52: prune_network applies to KirchhoffNet core (CP-5)")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import ring_graph, StageTopologyBuilder, topology_to_stage, prune_network
     from kirchhoff_net import KirchhoffNet
     import torch
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     hid = ring_graph(4, radius=1)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=4, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -1456,11 +1456,11 @@ def test_validate_topology_degrees_silent():
 def test_joint_prune_z_dominant():
     print("\nTest 56: joint Z+gate pruning removes Z-dominant edges (PT-2)")
     import torch
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from differential_stage import DifferentialStage
     from topology import prune_stage
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     # Small triangle: 0-1-2-0 (all edges connect I/O)
     stage = DifferentialStage(
         num_nodes=3,
@@ -1497,10 +1497,10 @@ def test_joint_prune_z_dominant():
 def test_prune_dead_island_removed():
     print("\nTest 57: prune_stage connectivity backstop removes dead islands (PT-3)")
     import torch
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import prune_stage, _bfs_undirected
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     # Build a 6-node graph with two disconnected rings:
     # 0-1-2 (write=0, read=2) and 3-4-5 (dead island, no I/O)
     # This is constructed directly as a DifferentialStage for testing.
@@ -1529,11 +1529,11 @@ def test_prune_dead_island_removed():
 def test_prune_disconnected_io_raises():
     print("\nTest 58: prune_stage raises when pruning disconnects I/O (PT-3)")
     import torch
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from differential_stage import DifferentialStage
     from topology import prune_stage
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     stage = DifferentialStage(
         num_nodes=4,
         src=[0, 2],   # 0-1 and 2-3 are two disconnected edges
@@ -1554,14 +1554,14 @@ def test_prune_disconnected_io_raises():
 
 def test_prune_network_returns_remap():
     print("\nTest 59: prune_network returns per-stage node remap dicts (PIT-1)")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import (
         build_net_from_preset,
         prune_network,
     )
     from config import PRUNE
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     net = build_net_from_preset("smooth2d", cell_lib=cell_lib)
     pruned_core, stage_remaps = prune_network(
         net.core,
@@ -1584,11 +1584,11 @@ def test_prune_network_returns_remap():
 
 def test_prune_io_mappers_transferred_when_zero_nodes_removed():
     print("\nTest 60: I/O mapper weights transferred when 0 nodes removed (PIT-2)")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import build_net_from_preset, prune_network
     from config import PRUNE
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     net = build_net_from_preset("smooth2d", cell_lib=cell_lib)
     pre_nodes = sum(s.num_nodes for s in net.core.stages)
     pruned_core, stage_remaps = prune_network(
@@ -1623,13 +1623,13 @@ def test_prune_io_mappers_transferred_when_zero_nodes_removed():
 
 def test_prune_io_forward_pass_preserved_when_zero_edges_removed():
     print("\nTest 61: I/O mapper+core forward pass preserved when 0 nodes/edges removed (PIT-3)")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import build_net_from_preset, prune_network
     from train_script import _transfer_input_mapper, _transfer_output_mapper
     from config import PRUNE
     import torch
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib, write_mode="dense")
     net.eval()
     pre_edges = sum(s.num_edges() for s in net.core.stages)
@@ -1705,11 +1705,11 @@ def test_prune_io_remap_invalid_index_raises():
 def test_prune_stage_protects_write_target():
     print("\nTest 62a: prune_stage protects write target from being pruned (PIO-1)")
     import torch
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from differential_stage import DifferentialStage
     from topology import prune_stage
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     # 4-node linear chain: 0->1->2->3
     stage = DifferentialStage(
         num_nodes=4,
@@ -1741,11 +1741,11 @@ def test_prune_stage_protects_write_target():
 def test_prune_stage_min_read_nodes_guard():
     print("\nTest 62b: prune_stage raises when all read nodes pruned via edge (PIO-3)")
     import torch
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from differential_stage import DifferentialStage
     from topology import prune_stage
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     # Since node gates are bypassed, trigger the min_read_nodes guard by
     # Z-pruning the edges that lead to read nodes.
     stage = DifferentialStage(
@@ -1774,11 +1774,11 @@ def test_prune_stage_min_read_nodes_guard():
 def test_prune_stage_min_read_nodes_one_survives():
     print("\nTest 62c: prune_stage with at least one read node alive succeeds (PIO-3)")
     import torch
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from differential_stage import DifferentialStage
     from topology import prune_stage
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     # 3-node line 0->1->2 with all nodes alive. write=[0], read=[1, 2].
     # Pruning with default thresholds keeps everything; both reads survive.
     stage = DifferentialStage(
@@ -1809,7 +1809,7 @@ def test_prune_stage_min_read_nodes_one_survives():
 def test_prune_output_mapper_elastic_readout():
     print("\nTest 62d: OutputMapper transfers surviving read columns (PIO-4)")
     import torch
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from io_mapper import OutputMapper
     from train_script import _transfer_output_mapper
 
@@ -1841,11 +1841,11 @@ def test_prune_output_mapper_elastic_readout():
 
 def test_prune_network_multi_stage_protects_write():
     print("\nTest 62e: prune_network protects write_idx in multi-stage (PIO-5)")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import build_net_from_preset, prune_network
     from config import PRUNE
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     # smooth2d is single-stage; use sinx (also single-stage but with a
     # configured write_idx). Actually, we need a preset with a known
     # write_idx. Use smooth2d_grid (3 stages) to exercise the multi-stage
@@ -1877,11 +1877,11 @@ def test_prune_stage_edge_only_keeps_low_u_node_with_incident_edge():
     print("\nTest 62f: prune_stage with node gates bypassed keeps "
           "low-u node that has a surviving incident edge (EOP-1, deprecate-node-gates)")
     import torch
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from differential_stage import DifferentialStage
     from topology import prune_stage
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     # Stage: nodes 0, 1, 2, 3. Edges 0->1, 1->2, 2->3.
     # Nodes 1 and 2 have very low u_logits (no effect — node gates bypassed).
     # Edges 0->1 and 1->2 have high eff_score. Edge 2->3 is Z-dominant.
@@ -1922,11 +1922,11 @@ def test_prune_stage_edge_only_disconnected_node_removed():
     print("\nTest 62g: prune_stage removes nodes that become fully "
           "disconnected after edge pruning (EOP-2, deprecate-node-gates)")
     import torch
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from differential_stage import DifferentialStage
     from topology import prune_stage
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     # Stage: nodes 0, 1, 2, 3. Edges 0->1 (Z-dominant) and 2->3 (active).
     # After edge pruning: 0->1 dies, 2->3 survives. Nodes 0, 1 become
     # dead islands. Nodes 2, 3 stay alive via the surviving 2->3 edge.
@@ -1958,11 +1958,11 @@ def test_prune_stage_edge_only_disconnected_node_removed():
 def test_prune_stage_edge_only_matches_legacy_when_no_node_collateral():
     print("\nTest 62h: prune_stage connectivity-only mode (EOP-3, deprecate-node-gates)")
     import torch
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from differential_stage import DifferentialStage
     from topology import prune_stage
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     # Stage: nodes 0, 1, 2, 3. Edges 0->1, 0->2, 2->3.
     # Edges 0->1 and 0->2 are Z-dominant (pruned). Edge 2->3 stays active.
     # Node 2 has low u_logits — node gates are bypassed so this has no effect.
@@ -2000,11 +2000,11 @@ def test_prune_stage_edge_only_matches_legacy_when_no_node_collateral():
 def test_prune_network_edge_only_preserves_more_capacity():
     print("\nTest 62i: prune_stage connectivity-only (EOP-4, deprecate-node-gates)")
     import torch
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from differential_stage import DifferentialStage
     from topology import prune_stage
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     # Single stage: 4 nodes, edges 0->1 (hi-z), 0->2 (lo-z), 1->3 (hi-z).
     # Edge 0->2 has low z_logits so it gets pruned. Edges 0->1 and 1->3
     # survive, keeping write_idx=[0] connected to read_idx=[3].
@@ -2144,11 +2144,11 @@ def test_normalized_units_in_config():
 def test_apply_ablation():
     print("\nTest 35: apply_ablation utility (R2.1-R2.4)")
     from topology import build_net_from_preset
-    from cell_library import make_default_library
+    from cell_library import make_cell_library
     from sim_context import SimContext
     from train import apply_ablation
 
-    cell_lib = make_default_library()
+    cell_lib = make_cell_library('tanh')
     net = build_net_from_preset("sinx", cell_lib=cell_lib)
 
     net_copy_none = build_net_from_preset("sinx", cell_lib=cell_lib)
@@ -2171,7 +2171,7 @@ def test_sparse_io_preset_defaults():
     print("\nTest 36: preset write_idx/read_idx defaults (SR4.2)")
     import config
     from topology import build_net_from_preset
-    from cell_library import make_default_library
+    from cell_library import make_cell_library
     from io_mapper import SparseInputMapper
 
     check("sinx preset has write_idx [0] (SR4.2)",
@@ -2183,7 +2183,7 @@ def test_sparse_io_preset_defaults():
     check("housing preset has read_idx [15] (SR4.2)",
           config.PRESETS["housing"]["read_idx"] == [15])
 
-    net = build_net_from_preset("sinx", cell_lib=make_default_library())
+    net = build_net_from_preset("sinx", cell_lib=make_cell_library('tanh'))
     check("sinx default builds with write_idx=[0]",
           net.write_idx == [0])
     check("sinx default builds with read_idx=[7]",
@@ -2265,12 +2265,12 @@ def test_sparse_read_selects_targets():
 def test_sparse_io_dense_fallback_matches_old():
     print("\nTest 40: dense mode produces identical mapper classes (SR3, SR6)")
     from topology import build_net_from_preset
-    from cell_library import make_default_library
+    from cell_library import make_cell_library
     from io_mapper import InputMapper, OutputMapper
     from sim_context import SimContext
 
     net = build_net_from_preset(
-        "sinx", cell_lib=make_default_library(),
+        "sinx", cell_lib=make_cell_library('tanh'),
         write_mode="dense", read_mode="dense",
     )
     check("dense write: uses InputMapper (SR3.1)",
@@ -2283,7 +2283,7 @@ def test_sparse_io_dense_fallback_matches_old():
     u = torch.linspace(-math.pi, math.pi, 16).unsqueeze(1)
     ctx = SimContext()
     with torch.no_grad():
-        y_dense, _ = net(u, ctx=ctx, store_trajectory=False)
+        y_dense, _ = net(u, store_trajectory=False)
     check("dense mode: forward output finite",
           torch.isfinite(y_dense).all().item())
 
@@ -2291,13 +2291,13 @@ def test_sparse_io_dense_fallback_matches_old():
 def test_sparse_io_gradients_flow_to_read_targets():
     print("\nTest 41: gradient flows only to read_idx nodes (SR2)")
     from topology import build_net_from_preset
-    from cell_library import make_default_library
+    from cell_library import make_cell_library
     from sim_context import SimContext
 
-    net = build_net_from_preset("sinx", cell_lib=make_default_library())
+    net = build_net_from_preset("sinx", cell_lib=make_cell_library('tanh'))
     u = torch.tensor([[0.5]])
     ctx = SimContext()
-    y, _ = net(u, ctx=ctx, store_trajectory=False)
+    y, _ = net(u, store_trajectory=False)
     y.sum().backward()
     has_out_grad = (
         net.output_mapper.proj.weight.grad is not None
@@ -3525,11 +3525,11 @@ def test_loss_history_appends_retrain():
     import os
     _sys.path.insert(0, THIS_DIR)
     from topology import build_net_from_preset
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import prune_network
     from config import PRUNE
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     net = build_net_from_preset("smooth2d", cell_lib=cell_lib)
     pre_edges = sum(s.num_edges() for s in net.core.stages)
     pre_nodes = sum(s.num_nodes for s in net.core.stages)
@@ -3596,9 +3596,9 @@ def test_gradient_norms_collect():
     _sys.path.insert(0, THIS_DIR)
     from train_script import collect_gradient_norms
     from topology import build_net_from_preset
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
 
-    net = build_net_from_preset("smooth2d", cell_lib=IdealizedCellLibrary())
+    net = build_net_from_preset("smooth2d", cell_lib=make_cell_library('tanh'))
     norms = collect_gradient_norms(net)
     check("GG-2: stage0_logits key exists", "stage0_logits" in norms,
           f"keys={sorted(norms.keys())}")
@@ -3636,9 +3636,9 @@ def test_grad_log_file_output():
     from pathlib import Path
     from train_script import log_gradient_norms, make_static_ctx_factory
     from topology import build_net_from_preset
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
 
-    net = build_net_from_preset("smooth2d", cell_lib=IdealizedCellLibrary())
+    net = build_net_from_preset("smooth2d", cell_lib=make_cell_library('tanh'))
     ctx_fn = make_static_ctx_factory()
     loss = net(torch.randn(4, 2), ctx_fn(4, "cpu"))[0].sum()
     loss.backward()
@@ -3675,10 +3675,10 @@ def test_grad_log_file_output():
 def test_rectifier_cell():
     """Test P cell: rectification, boundedness, smoothness, monotonicity."""
     print("\nTest 71: smooth bounded rectifier (P cell) properties")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     import torch
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     # P cell is at index 2 in [L, S, P, Z]
     P_INDEX = 2
 
@@ -3754,8 +3754,8 @@ def test_rectifier_cell():
 def test_v15_cell_library_construction():
     """V15-1: v15 library builds and has correct structure."""
     print("\nTest V15-1: v15 cell library construction")
-    from cell_library import IdealizedCellLibrary
-    cell_lib = IdealizedCellLibrary(library_name="v15")
+    from cell_library import make_cell_library
+    cell_lib = make_cell_library('tanh')
     check("V15-1: v15 num_cells == 6",
           cell_lib.num_cells == 6,
           f"got {cell_lib.num_cells}")
@@ -3797,9 +3797,9 @@ def test_v15_cell_library_construction():
 def test_v15_cell_boundedness():
     """V15-2: all v15 cells produce bounded current |I| <= isat for all u."""
     print("\nTest V15-2: v15 cell boundedness")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     import torch
-    cell_lib = IdealizedCellLibrary(library_name="v15")
+    cell_lib = make_cell_library('tanh')
     Q = cell_lib.num_cells
     E, B = 1, 200
     logits = torch.full((E, Q), -1e9)
@@ -3826,9 +3826,9 @@ def test_v15_cell_boundedness():
 def test_v15_negative_rectifier():
     """V15-3: N0 is the exact mirror of P0: I_N0(u) == -I_P0(-u)."""
     print("\nTest V15-3: N0 negative rectifier mirror of P0")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     import torch
-    cell_lib = IdealizedCellLibrary(library_name="v15")
+    cell_lib = make_cell_library('tanh')
     Q = cell_lib.num_cells
     E = 1
     raw_mult = torch.zeros(E)
@@ -3861,9 +3861,9 @@ def test_v15_negative_rectifier():
 def test_v15_dead_zone_odd():
     """V15-4: D1 is odd: I_D1(-u) == -I_D1(u). And has dead zone near zero."""
     print("\nTest V15-4: D1 dead-zone odd cell oddness")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     import torch
-    cell_lib = IdealizedCellLibrary(library_name="v15")
+    cell_lib = make_cell_library('tanh')
     Q = cell_lib.num_cells
     E = 1
     raw_mult = torch.zeros(E)
@@ -3901,9 +3901,9 @@ def test_v15_dead_zone_odd():
 def test_v15_saturation_scales():
     """V15-5: O_hard saturates faster (higher gm/isat ratio) than O_weak."""
     print("\nTest V15-5: O_hard saturates faster than O_weak")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     import torch
-    cell_lib = IdealizedCellLibrary(library_name="v15")
+    cell_lib = make_cell_library('tanh')
     Q = cell_lib.num_cells
     E = 1
     # Use raw_mult=+1e9 so mult = softplus(1e9) ≈ 1e9, which clips to 1 via
@@ -3966,9 +3966,9 @@ def test_v15_saturation_scales():
 def test_v15_forward_backward():
     """V15-6: v15 library forward pass runs and gradients flow."""
     print("\nTest V15-6: v15 forward pass and gradient flow")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     import torch
-    cell_lib = IdealizedCellLibrary(library_name="v15")
+    cell_lib = make_cell_library('tanh')
     Q = cell_lib.num_cells
     E = 4
     B = 8
@@ -3997,9 +3997,9 @@ def test_v15_forward_backward():
 def test_v15_ste_mode():
     """V15-7: v15 library works in straight-through estimator mode."""
     print("\nTest V15-7: v15 STE mode")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     import torch
-    cell_lib = IdealizedCellLibrary(library_name="v15")
+    cell_lib = make_cell_library('tanh')
     Q = cell_lib.num_cells
     E = 4
     B = 8
@@ -4020,8 +4020,8 @@ def test_v15_ste_mode():
 def test_v15_cell_type_mask_consistency():
     """V15-8: cell_type_mask entries are mutually exclusive."""
     print("\nTest V15-8: v15 cell type mask consistency")
-    from cell_library import IdealizedCellLibrary
-    cell_lib = IdealizedCellLibrary(library_name="v15")
+    from cell_library import make_cell_library
+    cell_lib = make_cell_library('tanh')
     # Each cell should have exactly one type
     for i in range(cell_lib.num_cells):
         types = sum([
@@ -4038,10 +4038,10 @@ def test_v15_cell_type_mask_consistency():
 def test_v15_legacy_library_unchanged():
     """V15-9: legacy library is unaffected by v15 changes."""
     print("\nTest V15-9: legacy library unchanged")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     import torch
     # Legacy library with explicit name
-    cell_lib = IdealizedCellLibrary(library_name="legacy")
+    cell_lib = make_cell_library('tanh')
     check("V15-9: legacy num_cells == 4",
           cell_lib.num_cells == 4,
           f"got {cell_lib.num_cells}")
@@ -4052,7 +4052,7 @@ def test_v15_legacy_library_unchanged():
           cell_lib._cell_order == ["L", "S", "P", "Z"],
           f"got {cell_lib._cell_order}")
     # Default library is also legacy
-    cell_lib_default = IdealizedCellLibrary()
+    cell_lib_default = make_cell_library('tanh')
     check("V15-9: default library is legacy (4 cells)",
           cell_lib_default.num_cells == 4,
           f"got {cell_lib_default.num_cells}")
@@ -4073,8 +4073,8 @@ def test_v15_legacy_library_unchanged():
 def test_v2_library_construction():
     """V2-1: v2 library builds with correct structure (10 cells, Z last, mix mode)."""
     print("\nTest V2-1: v2 library construction")
-    from cell_library import IdealizedCellLibrary
-    cell_lib = IdealizedCellLibrary(library_name="v2")
+    from cell_library import make_cell_library
+    cell_lib = make_cell_library('tanh')
     check("V2-1: v2 num_cells == 10",
           cell_lib.num_cells == 10,
           f"got {cell_lib.num_cells}")
@@ -4166,8 +4166,8 @@ def test_v2_factorization_codes():
 def test_v2_cell_parameters():
     """V2-3: per-cell gm/isat/theta/beta/src_gain/dst_gain match spec."""
     print("\nTest V2-3: v2 cell parameter values")
-    from cell_library import IdealizedCellLibrary
-    cell_lib = IdealizedCellLibrary(library_name="v2")
+    from cell_library import make_cell_library
+    cell_lib = make_cell_library('tanh')
     order = cell_lib._cell_order
     idx = {name: order.index(name) for name in order}
 
@@ -4234,9 +4234,9 @@ def test_v2_cell_parameters():
 def test_v2_boundedness():
     """V2-4: every v2 cell is bounded |I| <= isat over a large u sweep."""
     print("\nTest V2-4: v2 cell boundedness |I| <= isat")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     import torch
-    cell_lib = IdealizedCellLibrary(library_name="v2")
+    cell_lib = make_cell_library('tanh')
     Q = cell_lib.num_cells
     E, B = 1, 200
     logits = torch.full((E, Q), -1e9)
@@ -4281,9 +4281,9 @@ def test_v2_mix_code_asymmetry():
     Hence O_h10(2,0) and O_h01(0,2) should differ.
     """
     print("\nTest V2-5: v2 mix code asymmetry (O_h10 vs O_h01)")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     import torch
-    cell_lib = IdealizedCellLibrary(library_name="v2")
+    cell_lib = make_cell_library('tanh')
     Q = cell_lib.num_cells
     E = 1
     raw_mult = torch.zeros(E)
@@ -4324,9 +4324,9 @@ def test_v2_mix_code_asymmetry():
 def test_v2_threshold_cells():
     """V2-6: P1 fires at u>theta, P0 fires at u>0. Likewise N1 vs N0."""
     print("\nTest V2-6: v2 threshold cells (P1/N1 vs P0/N0)")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     import torch
-    cell_lib = IdealizedCellLibrary(library_name="v2")
+    cell_lib = make_cell_library('tanh')
     Q = cell_lib.num_cells
     E = 1
     raw_mult = torch.zeros(E)
@@ -4383,9 +4383,9 @@ def test_v2_threshold_cells():
 def test_v2_forward_backward():
     """V2-7: v2 forward + backward gradients flow correctly."""
     print("\nTest V2-7: v2 forward + gradient flow")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     import torch
-    cell_lib = IdealizedCellLibrary(library_name="v2")
+    cell_lib = make_cell_library('tanh')
     Q = cell_lib.num_cells
     E = 4
     B = 8
@@ -4414,7 +4414,7 @@ def test_v2_forward_backward():
 def test_v2_legacy_v15_unchanged():
     """V2-8: legacy/v15 libraries still use rho (backward compat preserved)."""
     print("\nTest V2-8: legacy/v15 rho-based preactivation unchanged")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     import torch
     for lib_name in ("legacy", "v15"):
         cell_lib = IdealizedCellLibrary(library_name=lib_name)
@@ -4462,9 +4462,9 @@ def test_stage_lr_scale_backward_compat():
     from train import make_optimizer
     from config import PRESETS
     from topology import build_net_from_preset
-    from cell_library import make_default_library
+    from cell_library import make_cell_library
 
-    cell_lib = make_default_library()
+    cell_lib = make_cell_library('tanh')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
     optim = make_optimizer(net, lr=1e-3, stage_lr_scale=1.0)
     check("SLS-1: single param group when scale=1.0",
@@ -4478,9 +4478,9 @@ def test_stage_lr_scale_multi_group():
     from train import make_optimizer
     from config import PRESETS
     from topology import build_net_from_preset
-    from cell_library import make_default_library
+    from cell_library import make_cell_library
 
-    cell_lib = make_default_library()
+    cell_lib = make_cell_library('tanh')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
     base_lr = 1e-3
     scale = 10.0
@@ -4681,9 +4681,9 @@ def test_solidification_metrics():
     """TP-6: compute_solidification_metrics returns valid dict."""
     print("\nTest TP-6: compute_solidification_metrics structure")
     from topology import build_net_from_preset
-    from cell_library import make_default_library
+    from cell_library import make_cell_library
     from train import compute_solidification_metrics
-    cell_lib = make_default_library()
+    cell_lib = make_cell_library('tanh')
     net = build_net_from_preset("sinx", cell_lib=cell_lib)
     metrics = compute_solidification_metrics(net, tau=1.0)
     check("TP-6: mean_max_cell_prob present",
@@ -4713,12 +4713,12 @@ def test_validate_argmax_runs():
     """TP-7: validate_argmax runs without error on a presets."""
     print("\nTest TP-7: validate_argmax forward pass")
     from topology import build_net_from_preset
-    from cell_library import make_default_library
+    from cell_library import make_cell_library
     from train import validate_argmax, default_ctx_factory
     from config import PRESETS
     import torch.nn.functional as F
     import torch
-    cell_lib = make_default_library()
+    cell_lib = make_cell_library('tanh')
     net = build_net_from_preset("sinx", cell_lib=cell_lib)
     ctx_factory = default_ctx_factory(net)
     u = torch.linspace(-math.pi, math.pi, 32).unsqueeze(1)
@@ -4787,9 +4787,9 @@ def test_mapper_lr_scale_backward_compat():
     print("\nTest MLR-3: mapper_lr_scale=1.0 backward compatibility")
     from train import make_optimizer
     from topology import build_net_from_preset
-    from cell_library import make_default_library
+    from cell_library import make_cell_library
 
-    cell_lib = make_default_library()
+    cell_lib = make_cell_library('tanh')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
     optim = make_optimizer(net, lr=1e-3, stage_lr_scale=1.0, mapper_lr_scale=1.0)
     check("MLR-3: single param group when both scales=1.0",
@@ -4802,9 +4802,9 @@ def test_mapper_lr_scale_separate_group():
     print("\nTest MLR-1: mapper_lr_scale=0.1 creates separate mapper group")
     from train import make_optimizer
     from topology import build_net_from_preset
-    from cell_library import make_default_library
+    from cell_library import make_cell_library
 
-    cell_lib = make_default_library()
+    cell_lib = make_cell_library('tanh')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
     base_lr = 1e-3
     mapper_scale = 0.1
@@ -4842,9 +4842,9 @@ def test_mapper_lr_scale_combined_with_stage_lr_scale():
     print("\nTest MLR-2: both stage_lr_scale and mapper_lr_scale active")
     from train import make_optimizer
     from topology import build_net_from_preset
-    from cell_library import make_default_library
+    from cell_library import make_cell_library
 
-    cell_lib = make_default_library()
+    cell_lib = make_cell_library('tanh')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
     base_lr = 1e-3
     stage_scale = 10.0
@@ -4877,9 +4877,9 @@ def test_mapper_lr_scale_rejects_zero_or_negative():
     print("\nTest MLR-6: mapper_lr_scale validation")
     from train import make_optimizer
     from topology import build_net_from_preset
-    from cell_library import make_default_library
+    from cell_library import make_cell_library
 
-    cell_lib = make_default_library()
+    cell_lib = make_cell_library('tanh')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
     try:
         make_optimizer(net, lr=1e-3, mapper_lr_scale=0.0)
@@ -4985,9 +4985,9 @@ def test_lrp_struct_dyn_groups_created():
     print("\nTest LRP-1: struct/dyn LR groups created")
     from train import make_optimizer
     from topology import build_net_from_preset
-    from cell_library import make_default_library
+    from cell_library import make_cell_library
 
-    cell_lib = make_default_library()
+    cell_lib = make_cell_library('tanh')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
     base_lr = 1e-3
     optim = make_optimizer(
@@ -5011,9 +5011,9 @@ def test_lrp_correct_param_membership():
     print("\nTest LRP-2: correct param membership per group")
     from train import make_optimizer
     from topology import build_net_from_preset
-    from cell_library import make_default_library
+    from cell_library import make_cell_library
 
-    cell_lib = make_default_library()
+    cell_lib = make_cell_library('tanh')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
     base_lr = 1e-3
     optim = make_optimizer(
@@ -5087,9 +5087,9 @@ def test_lrp_backward_compat():
     print("\nTest LRP-3: backward compat with all scales=1.0")
     from train import make_optimizer
     from topology import build_net_from_preset
-    from cell_library import make_default_library
+    from cell_library import make_cell_library
 
-    cell_lib = make_default_library()
+    cell_lib = make_cell_library('tanh')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
     optim = make_optimizer(
         net, lr=1e-3,
@@ -5106,9 +5106,9 @@ def test_lrp_validation_positive():
     print("\nTest LRP-4: validation of positive struct/dyn scales")
     from train import make_optimizer
     from topology import build_net_from_preset
-    from cell_library import make_default_library
+    from cell_library import make_cell_library
 
-    cell_lib = make_default_library()
+    cell_lib = make_cell_library('tanh')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
 
     for val, name in [(0.0, "zero"), (-0.1, "negative")]:
@@ -5131,9 +5131,9 @@ def test_lrp_composition_with_mapper():
     print("\nTest LRP-5: mapper + struct LR scales composition")
     from train import make_optimizer
     from topology import build_net_from_preset
-    from cell_library import make_default_library
+    from cell_library import make_cell_library
 
-    cell_lib = make_default_library()
+    cell_lib = make_cell_library('tanh')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
     base_lr = 1e-3
     optim = make_optimizer(
@@ -5157,11 +5157,11 @@ def test_lrp_stage_lr_scale_ignored():
     print("\nTest LRP-6: stage_lr_scale is ignored when struct/dyn != 1.0")
     from train import make_optimizer
     from topology import build_net_from_preset
-    from cell_library import make_default_library
+    from cell_library import make_cell_library
     import io
     import warnings
 
-    cell_lib = make_default_library()
+    cell_lib = make_cell_library('tanh')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
     base_lr = 1e-3
 
@@ -5193,9 +5193,9 @@ def test_lrp_empty_group_handling():
     print("\nTest LRP-6b: empty groups are omitted from optimizer")
     from train import make_optimizer
     from topology import build_net_from_preset
-    from cell_library import make_default_library
+    from cell_library import make_cell_library
 
-    cell_lib = make_default_library()
+    cell_lib = make_cell_library('tanh')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
     # dyn_lr_scale=1.0 creates no dyn group; struct=2.0 creates struct group
     optim = make_optimizer(net, lr=1e-3, struct_lr_scale=2.0, dyn_lr_scale=1.0)
@@ -5242,9 +5242,9 @@ def test_lrp_compute_update_norms():
     print("\nTest LRP-8: compute_update_norms output")
     from train_script import compute_update_norms
     from topology import build_net_from_preset
-    from cell_library import make_default_library
+    from cell_library import make_cell_library
 
-    cell_lib = make_default_library()
+    cell_lib = make_cell_library('tanh')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
 
     snapshots = {name: p.data.detach().clone() for name, p in net.named_parameters()}
@@ -5271,9 +5271,9 @@ def test_lrp_old_mapper_default_backward_compat():
     print("\nTest LRP-9: old explicit defaults produce single group")
     from train import make_optimizer
     from topology import build_net_from_preset
-    from cell_library import make_default_library
+    from cell_library import make_cell_library
 
-    cell_lib = make_default_library()
+    cell_lib = make_cell_library('tanh')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
     optim = make_optimizer(
         net, lr=1e-3,
@@ -5320,9 +5320,9 @@ def test_freeze_mappers_requires_grad_toggle():
     """MLR-8: requires_grad_(False) on input/output_mapper, then (True), works as expected."""
     print("\nTest MLR-8: requires_grad toggle on mappers")
     from topology import build_net_from_preset
-    from cell_library import make_default_library
+    from cell_library import make_cell_library
 
-    cell_lib = make_default_library()
+    cell_lib = make_cell_library('tanh')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
     raw = net.module if hasattr(net, "module") else net
 
@@ -5632,9 +5632,9 @@ def test_bidir_full_net_build():
     print("\nTest BIDI-8: full KirchhoffNet build with bidirectional hidden graph")
     from config import make_smooth2d_grid_preset
     from topology import build_net_from_config
-    from cell_library import make_default_library
+    from cell_library import make_cell_library
 
-    cell_lib = make_default_library()
+    cell_lib = make_cell_library('tanh')
     preset_bi = make_smooth2d_grid_preset(grid_size=5, bidirectional=True)
     net_bi = build_net_from_config(preset_bi, cell_lib=cell_lib)
     check("BIDI-8: bidirectional net builds successfully", net_bi is not None)
@@ -5823,9 +5823,9 @@ def test_repeat_edges_full_net_build():
     print("\nTest REP-8: full KirchhoffNet build with edge_repeats=3")
     from config import make_smooth2d_grid_preset
     from topology import build_net_from_config
-    from cell_library import make_default_library
+    from cell_library import make_cell_library
 
-    cell_lib = make_default_library()
+    cell_lib = make_cell_library('tanh')
     preset_rep = make_smooth2d_grid_preset(grid_size=5, edge_repeats=3)
     net_rep = build_net_from_config(preset_rep, cell_lib=cell_lib)
     check("REP-8: edge_repeats=3 net builds successfully", net_rep is not None)
@@ -5888,9 +5888,9 @@ def test_repeat_edges_compose_with_bidirectional_full_net():
     print("\nTest REP-10: bidirectional + edge_repeats compose in full net")
     from config import make_smooth2d_grid_preset
     from topology import build_net_from_config
-    from cell_library import make_default_library
+    from cell_library import make_cell_library
 
-    cell_lib = make_default_library()
+    cell_lib = make_cell_library('tanh')
     preset = make_smooth2d_grid_preset(
         grid_size=5, bidirectional=True, edge_repeats=3,
     )
@@ -5928,12 +5928,12 @@ def test_repeat_edges_compose_with_bidirectional_full_net():
 
 def test_drive_current_basic():
     print("\nTest DRIVE-1: DifferentialStage.drive_current basic shape and behavior")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import ring_graph, StageTopologyBuilder, topology_to_stage
     from sim_context import SimContext
     import torch
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     hid = ring_graph(4, radius=1)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=4, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -5973,12 +5973,12 @@ def test_drive_current_basic():
 
 def test_drive_changes_rhs():
     print("\nTest DRIVE-2: drive current modifies rhs output vs baseline")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import ring_graph, StageTopologyBuilder, topology_to_stage
     from sim_context import SimContext
     import torch
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     hid = ring_graph(4, radius=1)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=4, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -6000,12 +6000,12 @@ def test_drive_changes_rhs():
 
 def test_driven_node_gate_forced_open():
     print("\nTest DRIVE-3: driven node gates are forced to 1.0 in rhs")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import ring_graph, StageTopologyBuilder, topology_to_stage
     from sim_context import SimContext
     import torch
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     hid = ring_graph(4, radius=1)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=4, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -6022,7 +6022,7 @@ def test_driven_node_gate_forced_open():
     ctx = SimContext()
 
     # If driven node gates were NOT forced open, rhs would return near-zero.
-    dx = stage.rhs(x, ctx=ctx, tau=1.0, x_drive=x_drive, drive_scale=1.0)
+    dx = stage.rhs(x, x_drive=x_drive, drive_scale=1.0)
 
     # Drive current at position 0 should be active (non-zero i_drive means
     # the drive_current contributed to rhs, which would only happen if
@@ -6038,12 +6038,12 @@ def test_driven_node_gate_forced_open():
 
 def test_kirchhoff_net_with_io_drive_forward():
     print("\nTest DRIVE-4: KirchhoffNetWithIO forward pass with enable_drive=True")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import build_net_from_preset
     from config import PRESETS
     import torch
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
 
     # Use ctle_grid preset as test bed (fan_out write mode, multi-stage).
     for preset_name in ["smooth2d_grid"]:
@@ -6056,7 +6056,7 @@ def test_kirchhoff_net_with_io_drive_forward():
         B = 4
         u = torch.rand(B, cfg["stages"][0]["num_inputs"])
 
-        y, trajs = net(u, ctx=None, tau=1.0, store_trajectory=True)
+        y, trajs = net(u, store_trajectory=True)
         check(f"DRIVE-4 ({preset_name}): forward output finite",
               torch.isfinite(y).all().item())
         check(f"DRIVE-4 ({preset_name}): forward output shape ({B}, {cfg['out_dim']})",
@@ -6100,7 +6100,7 @@ def test_simple_edge_build_forward():
         check(f"SE-1 ({mode}): param shape [3, E]", stage.cell_lib.param.shape == (3, stage.num_edges()),
               f"got {stage.cell_lib.param.shape}")
 
-        out, _ = net(torch.randn(4, 2), ctx=None, store_trajectory=False)
+        out, _ = net(torch.randn(4, 2), store_trajectory=False)
         check(f"SE-1 ({mode}): output finite", torch.isfinite(out).all().item())
         check(f"SE-1 ({mode}): output shape (4,1)", out.shape == (4, 1), f"got {out.shape}")
 
@@ -6158,7 +6158,7 @@ def test_simple_edge_regularizers():
     net = build_net_from_config(preset, cell_lib=cell_lib, enable_drive=False)
 
     u = torch.randn(4, 2)
-    out, trajs = net(u, ctx=None, store_trajectory=True)
+    out, trajs = net(u, store_trajectory=True)
 
     stage = net.core.stages[0]
     traj = trajs[0]
@@ -6233,7 +6233,7 @@ def test_tanh_realistic_construction():
           isinstance(stage.cell_lib, RealisticTanhLibrary))
     check("TR-1: pipeline bias_raw absent (BIAS_ENABLED=False)",
           not hasattr(stage.cell_lib, "bias_raw"))
-    out, _ = net(torch.randn(4, 2), ctx=None, store_trajectory=False)
+    out, _ = net(torch.randn(4, 2), store_trajectory=False)
     check("TR-1: output finite (pipeline)", torch.isfinite(out).all().item())
     check("TR-1: output shape (4,1)", out.shape == (4, 1), f"got {out.shape}")
     loss = out.sum()
@@ -6387,7 +6387,7 @@ def test_tanh_realistic_upgrade():
           isinstance(stage.cell_lib, RealisticTanhUpgradeLibrary))
     check("TRU-1: pipeline bias_raw absent (BIAS_ENABLED=False)",
           not hasattr(stage.cell_lib, "bias_raw"))
-    out, _ = net(torch.randn(4, 2), ctx=None, store_trajectory=False)
+    out, _ = net(torch.randn(4, 2), store_trajectory=False)
     check("TRU-1: output finite (pipeline, upgrade)", torch.isfinite(out).all().item())
     check("TRU-1: output shape (4,1)", out.shape == (4, 1), f"got {out.shape}")
     loss = out.sum()
@@ -6556,7 +6556,7 @@ def test_free_tanh_construction():
           isinstance(stage.cell_lib, FreeTanhLibrary))
     check("FT-1: pipeline theta_raw absent (BIAS_ENABLED=False)",
           not hasattr(stage.cell_lib, "theta_raw"))
-    out, _ = net(torch.randn(4, 2), ctx=None, store_trajectory=False)
+    out, _ = net(torch.randn(4, 2), store_trajectory=False)
     check("FT-1: output finite (pipeline)", torch.isfinite(out).all().item())
     check("FT-1: output shape (4,1)", out.shape == (4, 1), f"got {out.shape}")
     loss = out.sum()
@@ -6658,12 +6658,12 @@ def test_simple_edge_diagnostics():
 def test_deprecate_node_gates_warnings():
     print("\nTest DNG-1: deprecate-node-gates warnings")
     import warnings
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from differential_stage import DifferentialStage
     from topology import prune_stage
     from train import _stage_node_gates
 
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     stage = DifferentialStage(num_nodes=2, src=[0], dst=[1], cell_lib=cell_lib)
 
     # 1) prune_stage with prune_nodes_by_gate=True emits DeprecationWarning
@@ -6700,7 +6700,7 @@ def test_seed_everything_deterministic():
     import random
     import numpy as np
     from train_ctle import seed_everything
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import build_net_from_config
     from config import PRESETS
 
@@ -6710,13 +6710,13 @@ def test_seed_everything_deterministic():
     preset["stages"] = preset["stages"][:1]
 
     seed_everything(123)
-    cell_lib_a = IdealizedCellLibrary()
+    cell_lib_a = make_cell_library('tanh')
     net_a = build_net_from_config(preset, cell_lib=cell_lib_a, enable_drive=False)
     a_weight = net_a.output_mapper.proj.weight.detach().clone()
 
     # Second: build with the SAME seed; should match exactly.
     seed_everything(123)
-    cell_lib_b = IdealizedCellLibrary()
+    cell_lib_b = make_cell_library('tanh')
     net_b = build_net_from_config(preset, cell_lib=cell_lib_b, enable_drive=False)
     b_weight = net_b.output_mapper.proj.weight.detach().clone()
 
@@ -6726,7 +6726,7 @@ def test_seed_everything_deterministic():
 
     # Third: different seed -> should differ.
     seed_everything(456)
-    cell_lib_c = IdealizedCellLibrary()
+    cell_lib_c = make_cell_library('tanh')
     net_c = build_net_from_config(preset, cell_lib=cell_lib_c, enable_drive=False)
     c_weight = net_c.output_mapper.proj.weight.detach().clone()
     differs = not torch.allclose(a_weight, c_weight)
@@ -6815,12 +6815,12 @@ def test_deq_solver_run_in_fp32():
 def test_deq_equilibrium_rhs_residual_small():
     """At DEQ equilibrium, |rhs(x*)| is small (matches DEQ definition)."""
     print("\nTest DEQ-3: |rhs(x*)| small at DEQ equilibrium")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
     from sim_context import SimContext
 
     torch.manual_seed(0)
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     hid = cluster_graph(3, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -6832,7 +6832,7 @@ def test_deq_equilibrium_rhs_residual_small():
     deq_cfg = {"f_max_iter": 80, "f_tol": 1e-6, "deq_step": 0.1,
                "leak_floor": 0.05}
     x0 = torch.zeros(1, 3)
-    x_star, info = stage.forward_equilibrium(x0, ctx=ctx, tau=1.0,
+    x_star, info = stage.forward_equilibrium(x0,
                                              cell_mode="soft", x_drive=None,
                                              drive_scale=0.0, deq_cfg=deq_cfg)
     # Measure the residual at the converged fixed point using the same
@@ -6840,7 +6840,7 @@ def test_deq_equilibrium_rhs_residual_small():
     # avoid mutating self.leak_floor, which is reset to 0.0 by
     # forward_equilibrium after the solve).
     with torch.no_grad():
-        r = stage.rhs(x_star, ctx=ctx, tau=1.0, cell_mode="soft",
+        r = stage.rhs(x_star, cell_mode="soft",
                       x_drive=None, drive_scale=0.0,
                       leak_floor=float(deq_cfg["leak_floor"]))
     res_norm = float(r.abs().max())
@@ -6853,12 +6853,12 @@ def test_deq_equilibrium_rhs_residual_small():
 def test_deq_equilibrium_matches_long_horizon_heun():
     """DEQ x* matches long-horizon Heun rollout to equilibrium (contractive)."""
     print("\nTest DEQ-4: DEQ x* matches long-horizon Heun rollout")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
     from sim_context import SimContext
 
     torch.manual_seed(0)
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     hid = cluster_graph(3, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -6870,7 +6870,7 @@ def test_deq_equilibrium_matches_long_horizon_heun():
     deq_cfg = {"f_max_iter": 100, "f_tol": 1e-6, "deq_step": 0.1,
                "leak_floor": 0.05}
     x0 = torch.zeros(1, 3)
-    x_deq, _ = stage.forward_equilibrium(x0, ctx=ctx, tau=1.0,
+    x_deq, _ = stage.forward_equilibrium(x0,
                                         cell_mode="soft", x_drive=None,
                                         drive_scale=0.0, deq_cfg=deq_cfg)
     # Use the SAME leak_floor for the Heun comparison so both paths
@@ -6890,12 +6890,12 @@ def test_deq_equilibrium_matches_long_horizon_heun():
 def test_deq_implicit_backward_gradients_finite():
     """Implicit backward under DEQ produces finite gradients for all params."""
     print("\nTest DEQ-5: implicit backward yields finite gradients")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
     from sim_context import SimContext
 
     torch.manual_seed(0)
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     hid = cluster_graph(3, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -6907,7 +6907,7 @@ def test_deq_implicit_backward_gradients_finite():
     deq_cfg = {"f_max_iter": 60, "f_tol": 1e-6, "deq_step": 0.1,
                "leak_floor": 0.05}
     x0 = torch.zeros(1, 3)
-    x_star, _ = stage.forward_equilibrium(x0, ctx=ctx, tau=1.0,
+    x_star, _ = stage.forward_equilibrium(x0,
                                           cell_mode="soft", x_drive=None,
                                           drive_scale=0.0, deq_cfg=deq_cfg)
     loss = x_star.pow(2).sum()
@@ -6922,12 +6922,12 @@ def test_deq_implicit_backward_gradients_finite():
 def test_deq_z_logits_grad_norm_at_least_bptt():
     """DEQ z_logits grad norm >= short-horizon BPTT (per Kimi note, expect 2-4 OOM lift)."""
     print("\nTest DEQ-6: DEQ z_logits grad norm >= short-horizon BPTT")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
     from sim_context import SimContext
 
     torch.manual_seed(0)
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     hid = cluster_graph(4, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=4, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -6948,7 +6948,7 @@ def test_deq_z_logits_grad_norm_at_least_bptt():
     # DEQ
     deq_cfg = {"f_max_iter": 60, "f_tol": 1e-6, "deq_step": 0.1,
                "leak_floor": 0.05}
-    x_deq, _ = stage.forward_equilibrium(x0, ctx=ctx, tau=1.0,
+    x_deq, _ = stage.forward_equilibrium(x0,
                                          cell_mode="soft", x_drive=None,
                                          drive_scale=0.0, deq_cfg=deq_cfg)
     loss_d = x_deq.pow(2).sum()
@@ -6970,12 +6970,12 @@ def test_deq_input_dependence():
     active drive the equilibrium differs for distinct x_drive inputs.
     """
     print("\nTest DEQ-7: DEQ input-dependence with persistent drive")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
     from sim_context import SimContext
 
     torch.manual_seed(0)
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     hid = cluster_graph(3, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -6994,10 +6994,10 @@ def test_deq_input_dependence():
     x_drive_a = torch.tensor([[1.0, 0.0, 0.0]])
     x_drive_b = torch.tensor([[-1.0, 0.0, 0.0]])
 
-    x_a, _ = stage.forward_equilibrium(x0, ctx=ctx, tau=1.0, cell_mode="soft",
+    x_a, _ = stage.forward_equilibrium(x0, cell_mode="soft",
                                         x_drive=x_drive_a, drive_scale=1.0,
                                         deq_cfg=deq_cfg)
-    x_b, _ = stage.forward_equilibrium(x0, ctx=ctx, tau=1.0, cell_mode="soft",
+    x_b, _ = stage.forward_equilibrium(x0, cell_mode="soft",
                                         x_drive=x_drive_b, drive_scale=1.0,
                                         deq_cfg=deq_cfg)
     diff = float((x_a - x_b).abs().max())
@@ -7006,10 +7006,10 @@ def test_deq_input_dependence():
           f"max|x_a - x_b| = {diff:.6e}")
 
     # Without drive (drive_scale=0) the equilibrium should be the same.
-    x_a0, _ = stage.forward_equilibrium(x0, ctx=ctx, tau=1.0, cell_mode="soft",
+    x_a0, _ = stage.forward_equilibrium(x0, cell_mode="soft",
                                          x_drive=x_drive_a, drive_scale=0.0,
                                          deq_cfg=deq_cfg)
-    x_b0, _ = stage.forward_equilibrium(x0, ctx=ctx, tau=1.0, cell_mode="soft",
+    x_b0, _ = stage.forward_equilibrium(x0, cell_mode="soft",
                                          x_drive=x_drive_b, drive_scale=0.0,
                                          deq_cfg=deq_cfg)
     diff0 = float((x_a0 - x_b0).abs().max())
@@ -7021,12 +7021,12 @@ def test_deq_input_dependence():
 def test_deq_ste_mode_rejected():
     """forward_equilibrium rejects cell_mode='ste' (soft-only safeguard)."""
     print("\nTest DEQ-8: forward_equilibrium rejects STE cell mode")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
     from sim_context import SimContext
 
     torch.manual_seed(0)
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     hid = cluster_graph(3, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -7035,7 +7035,7 @@ def test_deq_ste_mode_rejected():
     ctx = SimContext()
     raised = False
     try:
-        stage.forward_equilibrium(torch.zeros(1, 3), ctx=ctx, tau=1.0,
+        stage.forward_equilibrium(torch.zeros(1, 3),
                                   cell_mode="ste", x_drive=None,
                                   drive_scale=0.0,
                                   deq_cfg={"f_max_iter": 20, "f_tol": 1e-4,
@@ -7049,12 +7049,12 @@ def test_deq_ste_mode_rejected():
 def test_deq_leak_floor_enforced():
     """leak_floor=0.0 leaves Heun path unchanged (regression); >0 keeps diagonal damping."""
     print("\nTest DEQ-9: leak_floor=0.0 matches default Heun; leak_floor>0 increases leak")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
     from sim_context import SimContext
 
     torch.manual_seed(0)
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     hid = cluster_graph(3, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -7075,14 +7075,14 @@ def test_deq_leak_floor_enforced():
 def test_deq_solver_kwarg_threads_through_kirchhoff_net():
     """KirchhoffNet.forward accepts solver='heun' and 'deq' and dispatches correctly."""
     print("\nTest DEQ-10: solver kwarg threads through KirchhoffNet / WithIO")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
     from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
     from io_mapper import InputMapper, OutputMapper
     from sim_context import SimContext
 
     torch.manual_seed(0)
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     hid = cluster_graph(3, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=2, num_outputs=0, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -7096,13 +7096,13 @@ def test_deq_solver_kwarg_threads_through_kirchhoff_net():
 
     u = torch.randn(4, 2) * 0.3
     ctx = SimContext()
-    y_heun, _ = net(u, ctx=ctx, store_trajectory=False, cell_mode="soft",
+    y_heun, _ = net(u, store_trajectory=False, cell_mode="soft",
                     solver="heun")
     check("heun forward shape (4,1)", y_heun.shape == (4, 1))
     check("heun forward finite", torch.isfinite(y_heun).all().item())
 
     # DEQ path requires the WithIO to accept solver='deq' and pass it down.
-    y_deq, _ = net(u, ctx=ctx, store_trajectory=False, cell_mode="soft",
+    y_deq, _ = net(u, store_trajectory=False, cell_mode="soft",
                    solver="deq", deq_cfg={"f_max_iter": 30, "f_tol": 1e-5,
                                           "deq_step": 0.1,
                                           "leak_floor": 0.05})
@@ -7113,13 +7113,13 @@ def test_deq_solver_kwarg_threads_through_kirchhoff_net():
 def test_deq_heun_regression_unchanged():
     """With solver='heun' (default), behavior must be unchanged from pre-DEQ path."""
     print("\nTest DEQ-11: Heun path unchanged with solver='heun'")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
     from kirchhoff_net import KirchhoffNet
     from sim_context import SimContext
 
     torch.manual_seed(0)
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     hid = cluster_graph(3, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -7130,9 +7130,9 @@ def test_deq_heun_regression_unchanged():
     ctx = SimContext()
     x0 = torch.zeros(1, 3)
     # Default solver
-    y_default, _ = net(x0, ctx=ctx, store_trajectory=True, cell_mode="soft")
+    y_default, _ = net(x0, store_trajectory=True, cell_mode="soft")
     # Explicit heun
-    y_heun, _ = net(x0, ctx=ctx, store_trajectory=True, cell_mode="soft",
+    y_heun, _ = net(x0, store_trajectory=True, cell_mode="soft",
                     solver="heun")
     check("default == solver='heun'",
           torch.allclose(y_default, y_heun, atol=1e-7),
@@ -7181,13 +7181,13 @@ def test_deq_config_defaults():
 def test_deq_diagnostics_jacobian_cond():
     """deq_diagnostics.estimate_jacobian_cond returns a finite cond on a tiny stage."""
     print("\nTest DEQ-14: deq_diagnostics.jacobian_cond finite")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
     from sim_context import SimContext
     from deq_diagnostics import estimate_jacobian_cond
 
     torch.manual_seed(0)
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     hid = cluster_graph(3, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -7196,7 +7196,7 @@ def test_deq_diagnostics_jacobian_cond():
     stage.drive_isat = 0.0
     ctx = SimContext()
     x = torch.zeros(1, 3)
-    cond = estimate_jacobian_cond(stage, x, ctx=ctx, tau=1.0, cell_mode="soft",
+    cond = estimate_jacobian_cond(stage, x, cell_mode="soft",
                                   x_drive=None, drive_scale=0.0, leak_floor=0.05)
     check("jacobian cond finite", math.isfinite(cond) and cond > 0,
           f"cond={cond}")
@@ -7207,13 +7207,13 @@ def test_deq_diagnostics_jacobian_cond():
 def test_deq_diagnostics_grad_norm_compare():
     """deq_diagnostics.gradient_norm_compare returns finite z_logits & logits norms."""
     print("\nTest DEQ-15: deq_diagnostics.gradient_norm_compare returns finite norms")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from topology import cluster_graph, StageTopologyBuilder, topology_to_stage
     from sim_context import SimContext
     from deq_diagnostics import gradient_norm_compare
 
     torch.manual_seed(0)
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     hid = cluster_graph(3, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -7223,7 +7223,7 @@ def test_deq_diagnostics_grad_norm_compare():
     ctx = SimContext()
     x0 = torch.zeros(1, 3)
     deq_cfg = {"f_max_iter": 40, "f_tol": 1e-5, "deq_step": 0.1}
-    res = gradient_norm_compare(stage, x0, ctx=ctx, tau=1.0, cell_mode="soft",
+    res = gradient_norm_compare(stage, x0, cell_mode="soft",
                                 x_drive=None, drive_scale=0.0, leak_floor=0.05,
                                 deq_cfg=deq_cfg, bptt_t_span=0.3, bptt_num_steps=10)
     check("returns dict with z_logits_heun, z_logits_deq, logits_heun, logits_deq",
@@ -7242,13 +7242,13 @@ def _make_budget_stage(num_nodes=5, src=None, dst=None):
     """Helper: build a small DifferentialStage with 5 nodes and 15 edges
     (3 incoming edges per destination) for budget tests.
     """
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from differential_stage import DifferentialStage
     if src is None or dst is None:
         # 5 nodes, 3 incoming edges per destination (uniform coverage)
         src = [1, 3, 4, 0, 2, 4, 0, 1, 3, 1, 2, 4, 0, 2, 3]
         dst = [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4]
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     return DifferentialStage(num_nodes=num_nodes, src=src, dst=dst, cell_lib=cell_lib)
 
 
@@ -7426,7 +7426,7 @@ def test_budget_deq_forward():
     ctx = SimContext()
     x0 = torch.zeros(2, 5)
     x_star, _info = stage.forward_equilibrium(
-        x0=x0, ctx=ctx, tau=1.0, cell_mode="soft",
+        x0=x0, cell_mode="soft",
         x_drive=None, drive_scale=0.0,
         deq_cfg={"f_max_iter": 30, "f_tol": 1e-5, "deq_step": 0.1, "leak_floor": 0.05},
     )
@@ -7436,7 +7436,7 @@ def test_budget_deq_forward():
     # Compare against no-budget: should differ (budget changes dynamics)
     stage.set_budget_frac(frac=0.0, temperature=1.0)
     x_star_nb, _ = stage.forward_equilibrium(
-        x0=x0, ctx=ctx, tau=1.0, cell_mode="soft",
+        x0=x0, cell_mode="soft",
         x_drive=None, drive_scale=0.0,
         deq_cfg={"f_max_iter": 30, "f_tol": 1e-5, "deq_step": 0.1, "leak_floor": 0.05},
     )
@@ -7496,10 +7496,10 @@ def test_budget_disabled_byte_identical():
     ctx = SimContext()
     x = torch.randn(2, 5)
     # Default (budget_enabled=False, budget_frac=0)
-    out1 = stage.rhs(x, ctx=ctx, tau=1.0, cell_mode="soft")
+    out1 = stage.rhs(x, cell_mode="soft")
     # Explicitly disabled
     stage.set_budget_frac(0.0, 1.0)
-    out2 = stage.rhs(x, ctx=ctx, tau=1.0, cell_mode="soft")
+    out2 = stage.rhs(x, cell_mode="soft")
     check("default rhs == disabled-budget rhs",
           torch.allclose(out1, out2, atol=1e-7),
           f"max diff = {(out1 - out2).abs().max().item():.4e}")
@@ -7527,7 +7527,7 @@ def test_budget_simple_edge_library_compat():
     from sim_context import SimContext
     ctx = SimContext()
     x = torch.randn(2, 5)
-    out = stage.rhs(x, ctx=ctx, tau=1.0, cell_mode="soft")
+    out = stage.rhs(x, cell_mode="soft")
     check("SimpleEdgeLibrary rhs with budget is finite",
           torch.isfinite(out).all().item())
 
@@ -7542,7 +7542,7 @@ def test_budget_frac_uniform_proportion():
     uniform within the top-k_eff edges, demonstrating the proportion.
     """
     print("\nTest BUD-11: fraction budget applies uniform proportion")
-    from cell_library import IdealizedCellLibrary
+    from cell_library import make_cell_library
     from differential_stage import DifferentialStage
     # Build a stage with 3 destination groups having different in-degrees:
     #   group 0: 4 incoming edges (small, like edge hidden)
@@ -7556,7 +7556,7 @@ def test_budget_frac_uniform_proportion():
     dst.extend([1] * 8)
     src.extend(list(range(30, 46)))
     dst.extend([2] * 16)
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     stage = DifferentialStage(
         num_nodes=46, src=src, dst=dst, cell_lib=cell_lib,
     )

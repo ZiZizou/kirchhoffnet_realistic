@@ -40,9 +40,9 @@ class SimContext:
             (e.g. +0.05 ≈ +5% global gm drift). Applied as gm *= exp(shift).
         global_isat_shift: Scalar log-multiplicative shift on cell isat.
             Applied as isat *= exp(shift).
-        edge_mismatch: Optional [num_edges, num_cells] log-multiplicative
+        edge_mismatch: Optional [num_edges] log-multiplicative
             mismatch tensor applied to gm. Pass None to disable.
-        edge_isat_mismatch: Optional [num_edges, num_cells]
+        edge_isat_mismatch: Optional [num_edges]
             log-multiplicative mismatch tensor applied to isat.
             Pass None to disable.
     """
@@ -98,7 +98,6 @@ class SimContext:
 
 def sample_random_context(
     num_edges: int,
-    num_cells: int,
     *,
     temp_choices: list[float] | None = None,
     gain_shift_std: float | None = None,
@@ -160,23 +159,11 @@ def sample_random_context(
     else:
         temp = float(VARIATION["temp_c_default"])
     mismatch = (
-        torch.randn(
-            num_edges,
-            num_cells,
-            dtype=dtype,
-            device=device,
-            generator=generator,
-        )
+        torch.randn(num_edges, dtype=dtype, device=device, generator=generator)
         * mismatch_std
     )
     isat_mismatch = (
-        torch.randn(
-            num_edges,
-            num_cells,
-            dtype=dtype,
-            device=device,
-            generator=generator,
-        )
+        torch.randn(num_edges, dtype=dtype, device=device, generator=generator)
         * isat_mismatch_std
         if isat_mismatch_std > 0.0
         else None

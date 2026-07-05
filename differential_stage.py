@@ -3,7 +3,7 @@
 Per-node dynamics:
     C_eff * dx_j/dt = sum_in I_edge - sum_out I_edge - leak_j * x_j - clip_j(x_j)
 
-Edge currents are computed by an IdealizedCellLibrary.
+Edge currents are computed by a per-edge device library.
 Heun integration (predictor-corrector, 2nd order) is used for fixed-step
 BPTT. The stage returns both the final state and the full trajectory so
 that regularizers can be evaluated along the path.
@@ -11,9 +11,7 @@ that regularizers can be evaluated along the path.
 Deep Equilibrium (DEQ) forward path (deq-core-prototype plan): the stage
 exposes ``forward_equilibrium`` which solves ``rhs(x*)=0`` via the
 :mod:`deq_solver` adapter and returns implicit gradients. Selected by
-passing ``solver='deq'`` to ``forward``. The DEQ path enforces a soft-only
-``cell_mode`` and a minimum-leak floor to keep the fixed-point map
-contractive.
+passing ``solver='deq'`` to ``forward``.
 """
 
 from __future__ import annotations
@@ -33,18 +31,9 @@ from config import (
 )
 from cell_library import (
     FreeTanhLibrary,
-    IdealizedCellLibrary,
     RealisticTanhLibrary,
     RealisticTanhUpgradeLibrary,
     SimpleEdgeLibrary,
-)
-
-
-_SIMPLE_DEVICE_TYPES = (
-    SimpleEdgeLibrary,
-    RealisticTanhLibrary,
-    RealisticTanhUpgradeLibrary,
-    FreeTanhLibrary,
 )
 
 
@@ -58,13 +47,11 @@ class DifferentialStage(nn.Module):
         num_nodes: Number of differential nodes in this stage's internal state.
         src: List of source node ids (length E).
         dst: List of destination node ids (length E).
-        cell_lib: IdealizedCellLibrary used to compute edge currents.
+        cell_lib: Edge device library used to compute edge currents.
         c_eff: Effective node capacitance (default from config).
         x_max: Differential rail limit (default from config).
         clip_current: Soft rail clip current magnitude (default from config).
         clip_softness: Soft rail clip transition width (default from config).
-        logits_z_bias: Initial bias toward Z (disabled) cell, applied to
-            logits[:, z_index] in __init__.
         write_idx: Indices of hidden nodes that receive persistent bounded
             drive current. When provided, a drive source is created with
             learnable per-node conductance ``raw_drive_g``. ``None`` disables
@@ -78,12 +65,11 @@ class DifferentialStage(nn.Module):
         num_nodes: int,
         src: list[int],
         dst: list[int],
-        cell_lib: IdealizedCellLibrary | SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary,
+        cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary,
         c_eff: float | None = None,
         x_max: float | None = None,
         clip_current: float | None = None,
         clip_softness: float | None = None,
-        logits_z_bias: float | None = None,
         write_idx: list[int] | None = None,
         drive_isat: float | None = None,
     ) -> None:
@@ -123,20 +109,6 @@ class DifferentialStage(nn.Module):
             self._has_drive = False
             self.drive_isat = 0.0
 
-        E = len(src)
-        self._is_simple = isinstance(cell_lib, _SIMPLE_DEVICE_TYPES)
-
-        if self._is_simple:
-            self.logits = None
-            self.raw_mult = None
-        else:
-            Q = cell_lib.num_cells
-            self.logits = nn.Parameter(torch.zeros(E, Q))
-            with torch.no_grad():
-                self.logits[:, cell_lib.z_index] = (
-                    INIT["logits_z_bias"] if logits_z_bias is None else float(logits_z_bias)
-                )
-            self.raw_mult = nn.Parameter(torch.full((E,), float(INIT["raw_mult_init"])))
         self.raw_leak = nn.Parameter(torch.full((num_nodes,), float(INIT["raw_leak_init"])))
 
         # Minimum effective leak (deq-core-prototype plan). Defaults to 0.0 so
@@ -151,7 +123,7 @@ class DifferentialStage(nn.Module):
         # Initialized to a large positive value so all edges/nodes are active at start.
         z_init = float(INIT.get("z_logit_init", 5.0))
         u_init = float(INIT.get("u_logit_init", 5.0))
-        self.z_logits = nn.Parameter(torch.full((E,), z_init))
+        self.z_logits = nn.Parameter(torch.full((len(src),), z_init))
         # DEPRECATED (deprecate-node-gates): u_logits is no longer used in the
         # forward pass (see ``rhs``) or in any regularizer; nodes are pruned
         # only by connectivity. The parameter is retained for backward
@@ -341,11 +313,6 @@ class DifferentialStage(nn.Module):
         )
         return gate
 
-    @property
-    def is_simple_device(self) -> bool:
-        """Check if this stage uses a SimpleEdgeLibrary."""
-        return self._is_simple
-
     def drive_current(
         self, x: torch.Tensor, x_drive: torch.Tensor | None, drive_scale: float
     ) -> torch.Tensor:
@@ -359,45 +326,23 @@ class DifferentialStage(nn.Module):
         out[:, self._drive_idx] = i
         return out.to(dtype=x.dtype)
 
-    def rhs(self, x: torch.Tensor, ctx, tau: float = 1.0, cell_mode: str = "soft",
+    def rhs(self, x: torch.Tensor,
             x_drive: torch.Tensor | None = None, drive_scale: float = 0.0,
             leak_floor: float | None = None) -> torch.Tensor:
         """Compute dx/dt at state x. x: [batch, num_nodes].
 
-        Gate application (CP-2):
-        - Node gate: DEPRECATED (deprecate-node-gates). The previous
-          ``x * sigmoid(u_logits)`` masking is bypassed: node voltages are
-          passed through unchanged. Nodes are now pruned only by
-          connectivity (the prune_stage dead-island purge removes nodes
-          that become fully disconnected from I/O). The ``u_logits``
-          parameter is retained for checkpoint compat but is unused here.
+        Gate application:
         - Edge gate: i_edge *= sigmoid(z_logits) — multiplies the edge current
           after cell-library evaluation. When z_e -> 0 the edge contributes
-          zero current regardless of cell type.
-
-        ``cell_mode`` (four-phase-redesign/Phase 2a): forwarded to
-        ``cell_lib.forward`` to control the cell-selection mode. ``'soft'``
-        uses a softmax mixture (default). ``'ste'`` uses one cell per edge
-        in the forward pass with straight-through soft gradients.
+          zero current.
         """
-        # DEPRECATED (deprecate-node-gates): node mask is all-ones; u_logits
-        # is not used here. The previous driven-node force-open logic is no
-        # longer needed because the mask is already identity.
-        node_mask = torch.ones(self.num_nodes, device=x.device, dtype=x.dtype)
-        x_gated = x * node_mask.unsqueeze(0)  # [B, N]
-
-        x_src = x_gated[:, self.src]
-        x_dst = x_gated[:, self.dst]
+        x_src = x[:, self.src]
+        x_dst = x[:, self.dst]
 
         i_edge = self.cell_lib(
             x_src=x_src,
             x_dst=x_dst,
-            logits=self.logits,
-            raw_mult=self.raw_mult,
             x_max=self.x_max,
-            ctx=ctx,
-            tau=tau,
-            cell_mode=cell_mode,
         )
 
         # Edge gate: multiply each edge's current by its gate.
@@ -446,12 +391,9 @@ class DifferentialStage(nn.Module):
     def forward(
         self,
         x0: torch.Tensor,
-        ctx,
         t_span: float | None = None,
         num_steps: int | None = None,
-        tau: float | None = None,
         store_trajectory: bool = True,
-        cell_mode: str = "soft",
         x_drive: torch.Tensor | None = None,
         drive_scale: float = 0.0,
         solver: str = "heun",
@@ -464,8 +406,7 @@ class DifferentialStage(nn.Module):
         solver : str
             ``"heun"`` (default) uses the 2nd-order Heun predictor-corrector
             over ``num_steps``. ``"deq"`` solves ``rhs(x*) = 0`` via
-            :func:`deq_solver.solve_equilibrium` and returns implicit
-            gradients. The DEQ path requires ``cell_mode='soft'``.
+            :func:`deq_solver.solve_equilibrium` and returns implicit gradients.
         deq_cfg : dict or None
             Optional overrides for the DEQ solver. ``None`` uses defaults from
             ``config.DEQ``. Recognized keys: ``backend``, ``f_solver``,
@@ -483,20 +424,17 @@ class DifferentialStage(nn.Module):
         if solver == "heun":
             self.last_deq_info = None
             return self._forward_heun(
-                x0=x0, ctx=ctx, t_span=t_span, num_steps=num_steps, tau=tau,
-                store_trajectory=store_trajectory, cell_mode=cell_mode,
+                x0=x0, t_span=t_span, num_steps=num_steps,
+                store_trajectory=store_trajectory,
                 x_drive=x_drive, drive_scale=drive_scale,
             )
         if solver == "deq":
             x_star, _info = self.forward_equilibrium(
-                x0=x0, ctx=ctx, tau=tau, cell_mode=cell_mode,
+                x0=x0,
                 x_drive=x_drive, drive_scale=drive_scale,
                 deq_cfg=deq_cfg,
             )
             self.last_deq_info = dict(_info)
-            # Build a 1-timepoint synthetic trajectory [B, N, 1] so downstream
-            # regularizers (which expect a [B, N, T+1] traj) work without a
-            # special case. Only meaningful when store_trajectory=True.
             traj = x_star.unsqueeze(-1) if store_trajectory else None
             return x_star, traj
         raise ValueError(f"DifferentialStage.forward: unknown solver={solver!r}")
@@ -504,29 +442,23 @@ class DifferentialStage(nn.Module):
     def _forward_heun(
         self,
         x0: torch.Tensor,
-        ctx,
         t_span: float | None,
         num_steps: int | None,
-        tau: float | None,
         store_trajectory: bool,
-        cell_mode: str,
         x_drive: torch.Tensor | None,
         drive_scale: float,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         t_span = float(t_span if t_span is not None else SOLVER["t_span"])
         num_steps = int(num_steps if num_steps is not None else SOLVER["num_steps"])
-        tau = float(tau if tau is not None else 1.0)
         dt = t_span / float(num_steps)
 
         x = x0
         traj_chunks = [x] if store_trajectory else None
 
         for _ in range(num_steps):
-            k1 = self.rhs(x, ctx=ctx, tau=tau, cell_mode=cell_mode,
-                          x_drive=x_drive, drive_scale=drive_scale)
+            k1 = self.rhs(x, x_drive=x_drive, drive_scale=drive_scale)
             x_pred = x + dt * k1
-            k2 = self.rhs(x_pred, ctx=ctx, tau=tau, cell_mode=cell_mode,
-                          x_drive=x_drive, drive_scale=drive_scale)
+            k2 = self.rhs(x_pred, x_drive=x_drive, drive_scale=drive_scale)
             x = x + 0.5 * dt * (k1 + k2)
             if store_trajectory:
                 traj_chunks.append(x)
@@ -537,9 +469,6 @@ class DifferentialStage(nn.Module):
     def forward_equilibrium(
         self,
         x0: torch.Tensor,
-        ctx,
-        tau: float | None = None,
-        cell_mode: str = "soft",
         x_drive: torch.Tensor | None = None,
         drive_scale: float = 0.0,
         deq_cfg: dict | None = None,
@@ -548,24 +477,13 @@ class DifferentialStage(nn.Module):
 
         The damped fixed-point map is ``Phi(x) = x + dt * rhs(x)`` where
         ``dt = deq_cfg['deq_step']`` (defaulting to ``config.DEQ['deq_step']``).
-        Returns ``(x_star, info)``. The DEQ path enforces:
-
-        - ``cell_mode='soft'`` (raises ``ValueError`` otherwise). STE and
-          hard argmax break implicit differentiation.
-        - ``leak_floor >= 0`` applied via :meth:`set_leak_floor` so the
-          fixed-point map has positive diagonal damping (contractivity).
-        - The ``leak_floor`` value is captured by the ``phi`` closure so the
-          backward pass (re-evaluated by torchdeq's IFT) uses the same
-          leak_floor as the forward solve.
-        - Solver runs in fp32; autocast is disabled by the solver adapter.
+        Returns ``(x_star, info)``. The DEQ path applies a positive
+        ``leak_floor`` so the fixed-point map has positive diagonal damping
+        (contractivity). The ``leak_floor`` value is captured by the ``phi``
+        closure so the backward pass (re-evaluated by torchdeq's IFT) uses
+        the same leak_floor as the forward solve. Solver runs in fp32;
+        autocast is disabled by the solver adapter.
         """
-        if cell_mode != "soft":
-            raise ValueError(
-                f"DifferentialStage.forward_equilibrium: cell_mode must be 'soft' "
-                f"under DEQ (got {cell_mode!r}). STE / hard argmax break implicit "
-                f"differentiation."
-            )
-
         from deq_solver import solve_equilibrium
 
         cfg = dict(DEQ)
@@ -573,12 +491,11 @@ class DifferentialStage(nn.Module):
             cfg.update(deq_cfg)
         lf = float(cfg.get("leak_floor", 0.0))
         dt = float(cfg.get("deq_step", 0.1))
-        tau = float(tau if tau is not None else 1.0)
 
         self.set_leak_floor(lf)
         try:
             def phi(x):
-                return x + dt * self.rhs(x, ctx=ctx, tau=tau, cell_mode="soft",
+                return x + dt * self.rhs(x,
                                         x_drive=x_drive, drive_scale=drive_scale,
                                         leak_floor=lf)
 
@@ -588,8 +505,6 @@ class DifferentialStage(nn.Module):
                 "rel_residual": info.get("rel_residual"),
                 "deq_step": dt,
                 "leak_floor": lf,
-                "tau": tau,
-                "cell_mode": "soft",
             }
             # Cast to the stage's parameter dtype so AMP/GradScaler and downstream
             # regularizers behave like the Heun path.
@@ -653,8 +568,6 @@ class DifferentialStage(nn.Module):
 
     def parameter_breakdown(self) -> dict:
         """Return parameter counts including gate parameters (for diagnostics)."""
-        logits_n = int(self.logits.numel()) if self.logits is not None else 0
-        raw_mult_n = int(self.raw_mult.numel()) if self.raw_mult is not None else 0
         if isinstance(self.cell_lib, SimpleEdgeLibrary):
             device_n = int(self.cell_lib.param.numel())
         elif isinstance(self.cell_lib, RealisticTanhLibrary):
@@ -682,16 +595,12 @@ class DifferentialStage(nn.Module):
         else:
             device_n = 0
         return {
-            "logits": logits_n,
-            "raw_mult": raw_mult_n,
             "raw_leak": int(self.raw_leak.numel()),
             "z_logits": int(self.z_logits.numel()),
             "u_logits": int(self.u_logits.numel()),
             "device_param": device_n,
             "total": (
-                logits_n
-                + raw_mult_n
-                + int(self.raw_leak.numel())
+                int(self.raw_leak.numel())
                 + int(self.z_logits.numel())
                 + int(self.u_logits.numel())
                 + device_n

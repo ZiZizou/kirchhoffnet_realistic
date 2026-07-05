@@ -71,8 +71,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from torch.optim.lr_scheduler import (
     CosineAnnealingLR,
-    CosineAnnealingWarmRestarts,
-)
+    CosineAnnealingWarmRestarts)
 
 from config import (
     OPTIM,
@@ -84,9 +83,8 @@ from config import (
     VARIATION,
     DEGREE_BUDGET,
     make_smooth2d_grid_preset,
-    make_housing_grid_preset,
-)
-from cell_library import IdealizedCellLibrary, make_cell_library, SimpleEdgeLibrary
+    make_housing_grid_preset)
+from cell_library import make_cell_library, SimpleEdgeLibrary
 from topology import build_net_from_preset
 from sim_context import SimContext, sample_random_context
 from train import (
@@ -104,44 +102,37 @@ from train import (
     four_phase_tau,
     four_phase_lambdas,
     four_phase_kd_active,
-    prune_readiness_check,
-    compute_solidification_metrics,
-    validate_argmax,
     budget_frac_for_epoch,
-    budget_temperature_for_epoch,
-)
+    budget_temperature_for_epoch)
 from io_mapper import (
     FanOutInputMapper,
     InputMapper,
     OutputMapper,
     RobustInputMapper,
-    SparseInputMapper,
-)
+    SparseInputMapper)
 
 # Monkey-patch _compute_regularizers to handle DataParallel wrapping
 # (train.py is read-only on Kaggle; DataParallel strips module internals)
 # kirchhoff-noise: also unwraps KirchhoffNetNoiseWrapper before stage access.
 import train as _train_module
 _orig_compute_regularizers = _train_module._compute_regularizers
+# Patch _compute_regularizers to handle DataParallel wrapping
 
-def _dp_safe_compute_regularizers(net, trajs, tau, lambdas):
+def _dp_safe_compute_regularizers(net, trajs, lambdas):
     # Unwrap DataParallel first (outer-most), then kirchhoff-noise wrapper
     # so regularizer code reaches the base KirchhoffNetWithIO stages.
     if isinstance(net, torch.nn.DataParallel):
         net = net.module
     if hasattr(net, "base") and hasattr(net, "_stage_noise_std"):
         net = net.base
-    return _orig_compute_regularizers(net, trajs, tau, lambdas)
+    return _orig_compute_regularizers(net, trajs, lambdas)
 
 _train_module._compute_regularizers = _dp_safe_compute_regularizers
 from visualize import (
     plot_stage_graph,
-    plot_cell_selection,
     plot_trajectories,
     plot_output_fit,
-    plot_network,
-)
-
+    plot_network)
 
 def _import_matplotlib():
     import matplotlib
@@ -149,14 +140,12 @@ def _import_matplotlib():
     import matplotlib.pyplot as plt
     return plt
 
-
 def _ensure_dir(path: Path) -> Path:
     if path.exists():
         suffix = time.strftime("%Y%m%d_%H%M%S")
         path = path.with_name(f"{path.name}_{suffix}")
     path.mkdir(parents=True, exist_ok=True)
     return path
-
 
 def _log_gpu_mem(label: str) -> None:
     """retrain-oom-fix/REQ-4: log CUDA memory state at key transition points.
@@ -181,7 +170,6 @@ def _log_gpu_mem(label: str) -> None:
         f"free={_mb(free_b)} total={_mb(total_b)}"
     )
 
-
 def _resolve_lambdas(problem: str) -> dict:
     """Build the active lambdas dict for ``problem`` (RR-D).
 
@@ -194,7 +182,6 @@ def _resolve_lambdas(problem: str) -> dict:
     merged.update(preset_lambdas)
     return merged
 
-
 def _resolve_schedule(problem: str, cli_value: str | None) -> str:
     """Resolve the active schedule mode (three-phase-schedule, four-phase-redesign).
 
@@ -206,25 +193,6 @@ def _resolve_schedule(problem: str, cli_value: str | None) -> str:
     if preset_val in ("legacy", "three_phase", "four_phase"):
         return preset_val
     return "legacy"
-
-
-def _resolve_cell_mode(cli_value: str, phase: str, schedule_mode: str) -> str:
-    """Resolve the cell selection mode for the current epoch
-    (four-phase-redesign/Phase 2b).
-
-    Behavior:
-    - ``cli_value == 'soft'`` or ``'ste'``: honor the explicit override.
-    - ``cli_value == 'auto'`` (default): use ``'soft'`` for Phase A and
-      ``'ste'`` for Phase B/C. Outside of a phased schedule, always
-      ``'soft'``.
-    """
-    if cli_value in ("soft", "ste"):
-        return cli_value
-    # 'auto'
-    if schedule_mode in ("three_phase", "four_phase") and phase in ("B", "C", "B1", "B2"):
-        return "ste"
-    return "soft"
-
 
 def _build_deq_cfg(args) -> dict:
     """Build the DEQ solver config dict from CLI overrides (deq-core-prototype).
@@ -249,7 +217,6 @@ def _build_deq_cfg(args) -> dict:
         cfg["leak_floor"] = float(args.leak_floor)
     return cfg
 
-
 def _run_deq_diagnostics_report(net, device, ctx_factory, deq_cfg) -> None:
     """Print a one-shot DEQ diagnostics report for a trained model
     (deq-core-prototype). Compares BPTT vs DEQ gradient norms on a single
@@ -261,8 +228,7 @@ def _run_deq_diagnostics_report(net, device, ctx_factory, deq_cfg) -> None:
     from deq_diagnostics import (
         estimate_jacobian_cond,
         gradient_norm_compare,
-        multistart_uniqueness,
-    )
+        multistart_uniqueness)
 
     raw = net.module if isinstance(net, torch.nn.DataParallel) else net
     raw.eval()
@@ -293,12 +259,11 @@ def _run_deq_diagnostics_report(net, device, ctx_factory, deq_cfg) -> None:
     try:
         grad_res = gradient_norm_compare(
             first_stage, torch.zeros(2, num_nodes, device=device),
-            ctx=ctx, tau=1.0, cell_mode="soft",
+            tau=1.0,
             x_drive=None, drive_scale=0.0,
             leak_floor=float(deq_cfg.get("leak_floor", 0.05)),
             deq_cfg=deq_cfg,
-            bptt_t_span=0.3, bptt_num_steps=10,
-        )
+            bptt_t_span=0.3, bptt_num_steps=10)
         for k, v in grad_res.items():
             print(f"  {k}: {v:.3e}")
     except Exception as e:
@@ -307,15 +272,13 @@ def _run_deq_diagnostics_report(net, device, ctx_factory, deq_cfg) -> None:
     print("[deq-diagnostics] jacobian cond at equilibrium")
     try:
         x_eq, _ = first_stage.forward_equilibrium(
-            torch.zeros(2, num_nodes, device=device), ctx=ctx, tau=1.0,
-            cell_mode="soft", x_drive=None, drive_scale=0.0,
-            deq_cfg=deq_cfg,
-        )
-        cond = estimate_jacobian_cond(
-            first_stage, x_eq, ctx=ctx, tau=1.0, cell_mode="soft",
+            torch.zeros(2, num_nodes, device=device), tau=1.0,
             x_drive=None, drive_scale=0.0,
-            leak_floor=float(deq_cfg.get("leak_floor", 0.05)),
-        )
+            deq_cfg=deq_cfg)
+        cond = estimate_jacobian_cond(
+            first_stage, x_eq, tau=1.0,
+            x_drive=None, drive_scale=0.0,
+            leak_floor=float(deq_cfg.get("leak_floor", 0.05)))
         print(f"  cond(J) = {cond:.3e}" + (" (well-conditioned)" if cond < 100 else " (consider larger leak_floor)"))
     except Exception as e:
         print(f"  [jacobian cond] failed: {e}")
@@ -323,17 +286,15 @@ def _run_deq_diagnostics_report(net, device, ctx_factory, deq_cfg) -> None:
     print("[deq-diagnostics] multistart uniqueness")
     try:
         ms = multistart_uniqueness(
-            first_stage, ctx=ctx, tau=1.0, cell_mode="soft",
+            first_stage, tau=1.0,
             x_drive=None, drive_scale=0.0,
             leak_floor=float(deq_cfg.get("leak_floor", 0.05)),
             deq_cfg=deq_cfg, starts=[-1.0, 0.0, 1.0, 5.0],
-            batch_shape=(2, num_nodes),
-        )
+            batch_shape=(2, num_nodes))
         print(f"  max pairwise diff = {ms['max_pairwise_diff']:.3e}"
               + (" (single equilibrium)" if ms['max_pairwise_diff'] < 1e-3 else " (multistability suspected)"))
     except Exception as e:
         print(f"  [multistart] failed: {e}")
-
 
 def _apply_ablation_set(args, schedule_mode: str) -> None:
     """Mutate ``args`` to apply a diagnostic ablation preset in place
@@ -414,7 +375,6 @@ def _apply_ablation_set(args, schedule_mode: str) -> None:
             "(deprecate-node-gates), edge threshold 0.05, "
             "stage_lr_scale=1.0, mapper_lr_scale=1.0"
         )
-
 
 def _validate_hidden_family_args(args) -> None:
     """Validate --hidden-family / --num-hidden / --num-stages / --edge-repeats
@@ -517,7 +477,6 @@ def _validate_hidden_family_args(args) -> None:
                 f"use --grid-size N (default per problem)"
             )
 
-
 def _build_grid_write_fan_out(num_inputs: int, grid_size: int | None) -> dict:
     """Build a grid-family write_fan_out map with no duplicate targets.
 
@@ -591,7 +550,6 @@ def _build_grid_write_fan_out(num_inputs: int, grid_size: int | None) -> dict:
                     )
     return fan_out
 
-
 def _make_dynamic_preset(
     problem: str,
     hidden_family: str,
@@ -604,8 +562,7 @@ def _make_dynamic_preset(
     read_mode_override: str | None = None,
     small_world_k: int = 4,
     small_world_p: float = 0.3,
-    small_world_seed: int = 0,
-) -> dict:
+    small_world_seed: int = 0) -> dict:
     """Build a fresh preset dict that overrides the topology of the named
     problem. Preserves problem-specific fields (num_inputs, loss, out_dim,
     use_robust_input, schedule, lambdas, tau_anneal, write_idx default).
@@ -654,8 +611,7 @@ Args:
         hidden_kwargs = {
             "edge_prob": 1.0,
             "seed": 0,
-            "bidirectional": bidirectional,
-        }
+            "bidirectional": bidirectional}
         eff_write_mode = (
             write_mode_override if write_mode_override is not None else "dense"
         )
@@ -670,8 +626,7 @@ Args:
             "k": int(small_world_k),
             "p": float(small_world_p),
             "seed": int(small_world_seed),
-            "bidirectional": bidirectional,
-        }
+            "bidirectional": bidirectional}
         eff_write_mode = (
             write_mode_override if write_mode_override is not None else "dense"
         )
@@ -692,8 +647,7 @@ Args:
             "height": grid_size,
             "width": grid_size,
             "kernel_size": 3,
-            "bidirectional": bidirectional,
-        }
+            "bidirectional": bidirectional}
         eff_write_mode = (
             write_mode_override if write_mode_override is not None else "dense"
         )
@@ -714,8 +668,7 @@ Args:
             "height": grid_size,
             "width": grid_size,
             "kernel_size": 3,
-            "bidirectional": bidirectional,
-        }
+            "bidirectional": bidirectional}
         eff_write_mode = (
             write_mode_override if write_mode_override is not None
             else base.get("write_mode", "fan_out")
@@ -742,8 +695,7 @@ Args:
         "output_pattern": "all_to_all",
         "proj_pattern": "all_to_all",
         "t_span": SOLVER["t_span"] / n_stages,
-        "num_steps": round(SOLVER["num_steps"] / n_stages),
-    }
+        "num_steps": round(SOLVER["num_steps"] / n_stages)}
 
     new_preset = dict(base)
     new_preset["stages"] = [stage_cfg] * n_stages
@@ -760,14 +712,12 @@ Args:
     if hidden_family == "grid" and eff_write_mode == "fan_out":
         if "write_fan_out" not in new_preset or new_preset["write_fan_out"] is None:
             new_preset["write_fan_out"] = _build_grid_write_fan_out(
-                num_inputs=num_inputs, grid_size=grid_size,
-            )
+                num_inputs=num_inputs, grid_size=grid_size)
     # Remove schedule/lambdas overrides if present so dynamic topology uses
     # the global defaults from LAMBDAS. Per-problem schedules (e.g. housing's
     # default 'three_phase') are still preserved by the explicit
     # base.get('schedule') check below.
     return new_preset
-
 
 def _log_solidification(log_path, epoch: int, metrics: dict) -> None:
     """Append one row of solidification metrics to ``log_path``.
@@ -787,7 +737,6 @@ def _log_solidification(log_path, epoch: int, metrics: dict) -> None:
             v = metrics[k]
             row.append(f"{v:.6e}" if isinstance(v, float) else str(v))
         f.write("\t".join(row) + "\n")
-
 
 def _save_config_snapshot(out_dir: Path, problem: str, args, lambdas: dict,
                           net=None) -> None:
@@ -840,7 +789,6 @@ def _save_config_snapshot(out_dir: Path, problem: str, args, lambdas: dict,
             f.write(f"  write_idx: {args.write_idx}\n")
             f.write(f"  read_idx: {args.read_idx}\n")
 
-
 def _run_noise_diagnostics(
     raw_net,
     val_loader,
@@ -854,8 +802,7 @@ def _run_noise_diagnostics(
     best_metric_name,
     compile_enabled,
     schedule_mode,
-    needs_prune,
-):
+    needs_prune):
     """Collect 8 diagnostic data points at the post-training noise-eval site.
 
     Goal: isolate why `clean_val_mse` in noise_metrics.txt diverges from
@@ -870,7 +817,6 @@ def _run_noise_diagnostics(
       D5 raw_net state_dict hash vs saved model.pt
       D6 device location of model and input tensors
       D7 torch.compile state of cell_lib
-      D8 cell_mode consistency between training and noise eval
     """
     import hashlib
     from analog_noise import NoiseConfig
@@ -947,15 +893,6 @@ def _run_noise_diagnostics(
     except Exception as e:
         diag["D7_error"] = f"ERR: {e}"
 
-    # D8 — cell mode consistency
-    try:
-        train_b_cell_mode = _resolve_cell_mode(args.cell_mode, "B", schedule_mode)
-        diag["D8_phase_b_cell_mode"] = str(train_b_cell_mode)
-        diag["D8_noise_eval_cell_mode"] = "ste"
-        diag["D8_cell_mode_match"] = bool(train_b_cell_mode == "ste")
-    except Exception as e:
-        diag["D8_error"] = f"ERR: {e}"
-
     # D1 — direct clean validation (training path)
     # Ensure raw_net is on `device` before validation. After the prune
     # pipeline (needs_prune=True) raw_net is moved to CPU to free GPU
@@ -966,8 +903,7 @@ def _run_noise_diagnostics(
         raw_net.eval()
         v1 = validate(
             raw_net, val_loader, task_fn, ctx_factory, device,
-            cell_mode="ste", solver="heun",
-        )
+            solver="heun")
         diag["D1_validate_raw_net"] = float(v1)
     except Exception as e:
         diag["D1_validate_raw_net"] = f"ERR: {e}"
@@ -983,17 +919,13 @@ def _run_noise_diagnostics(
             weight_noise=True,
             activation_noise=True,
             mc_trials=args.mc_trials,
-            seed=args.noise_seed,
-        )
+            seed=args.noise_seed)
         diag_wrapper = KirchhoffNetNoiseWrapper(
-            raw_net, eval_cfg, adc_full_range=args.adc_full_range,
-        )
+            raw_net, eval_cfg, adc_full_range=args.adc_full_range)
         diag_wrapper.to(device)
         diag_wrapper.eval()
         v2 = evaluate_kirchhoff_clean(
-            diag_wrapper, val_loader, task_fn, ctx_factory, device,
-            cell_mode="ste",
-        )
+            diag_wrapper, val_loader, task_fn, ctx_factory, device)
         diag["D2_evaluate_kirchhoff_clean"] = float(v2)
     except Exception as e:
         diag["D2_evaluate_kirchhoff_clean"] = f"ERR: {e}"
@@ -1006,11 +938,9 @@ def _run_noise_diagnostics(
         with torch.no_grad():
             out_raw, _ = raw_net(
                 u_sample, ctx=ctx_sample, store_trajectory=False,
-                cell_mode="ste", solver="heun",
-            )
+                solver="heun")
             out_wrap, _ = diag_wrapper(
-                u_sample, ctx=ctx_sample, cell_mode="ste",
-            )
+                u_sample, ctx=ctx_sample)
         diff = (out_raw - out_wrap).abs()
         diag["D3_max_output_diff"] = float(diff.max().item())
         diag["D3_mean_output_diff"] = float(diff.mean().item())
@@ -1030,7 +960,6 @@ def _run_noise_diagnostics(
             f.write(f"{key}: {val}\n")
     print(f"[diag] wrote {diag_path}")
 
-
 def _run_noise_evaluation(
     base_net,
     val_loader,
@@ -1040,9 +969,7 @@ def _run_noise_evaluation(
     args,
     out_dir: Path,
     label: str,
-    cell_mode: str = "ste",
-    metric_name: str = "mse",
-) -> dict:
+    metric_name: str = "mse") -> dict:
     """Run kirchhoff-noise MC evaluation on ``base_net`` and write metrics.
 
     Wraps ``base_net`` in ``KirchhoffNetNoiseWrapper``, runs a clean eval
@@ -1050,9 +977,8 @@ def _run_noise_evaluation(
     ``out_dir / f"noise_metrics_{label}.txt"`` (or
     ``noise_metrics.txt`` when ``label == "main"``).
 
-    Both the clean and the noisy passes are evaluated with ``cell_mode``
-    (default ``"ste"``) so the result matches the deployable hard-cell
-    behavior used during Phase B/C training. Legacy (non-phased) models
+    Both the clean and noisy passes are evaluated without noise injection.
+    Legacy (non-phased) models
     trained purely with soft cells will therefore be evaluated in STE
     mode — flag this in any legacy-result reporting.
 
@@ -1065,8 +991,7 @@ def _run_noise_evaluation(
     from kirchhoff_noise import (
         KirchhoffNetNoiseWrapper,
         evaluate_kirchhoff_clean,
-        evaluate_kirchhoff_with_noise,
-    )
+        evaluate_kirchhoff_with_noise)
 
     eval_cfg = NoiseConfig(
         quant_bits=args.quant_bits,
@@ -1077,28 +1002,21 @@ def _run_noise_evaluation(
         weight_noise=True,
         activation_noise=True,
         mc_trials=args.mc_trials,
-        seed=args.noise_seed,
-    )
+        seed=args.noise_seed)
     eval_wrapper = KirchhoffNetNoiseWrapper(
-        base_net, eval_cfg, adc_full_range=args.adc_full_range,
-    )
+        base_net, eval_cfg, adc_full_range=args.adc_full_range)
     eval_wrapper.to(device)
     eval_wrapper.eval()
 
     print(
         f"[noise] {label}: running MC noise eval: quant_bits={args.quant_bits} "
         f"noise_std={args.noise_std} trials={args.mc_trials} "
-        f"adc_full_range={args.adc_full_range} seed={args.noise_seed} "
-        f"cell_mode={cell_mode}"
+        f"adc_full_range={args.adc_full_range} seed={args.noise_seed}"
     )
     clean_val = evaluate_kirchhoff_clean(
-        eval_wrapper, val_loader, task_fn, ctx_factory, device,
-        cell_mode=cell_mode,
-    )
+        eval_wrapper, val_loader, task_fn, ctx_factory, device)
     result = evaluate_kirchhoff_with_noise(
-        eval_wrapper, val_loader, task_fn, ctx_factory, eval_cfg, device,
-        cell_mode=cell_mode,
-    )
+        eval_wrapper, val_loader, task_fn, ctx_factory, eval_cfg, device)
     result.clean_loss = clean_val
     degradation = result.mean - clean_val
     print(
@@ -1139,9 +1057,7 @@ def _run_noise_evaluation(
         "noise_p90": result.p90,
         "noise_p95": result.p95,
         "degradation_mean": degradation,
-        "per_trial_losses": result.losses,
-    }
-
+        "per_trial_losses": result.losses}
 
 def make_data_sinx(batch_size: int, val_size: int = 1024):
     train_size = 8192
@@ -1157,7 +1073,6 @@ def make_data_sinx(batch_size: int, val_size: int = 1024):
         TensorDataset(u_val, y_val), batch_size=batch_size, shuffle=False, num_workers=2
     )
     return train_loader, val_loader, F.mse_loss
-
 
 def _load_california_housing_data() -> tuple[torch.Tensor, torch.Tensor, float, float]:
     """Load raw California housing: (X, y_normalized, y_mean, y_std).
@@ -1182,7 +1097,6 @@ def _load_california_housing_data() -> tuple[torch.Tensor, torch.Tensor, float, 
     y_norm = (y - y_mean) / y_std
     return X, y_norm, y_mean, y_std
 
-
 def _make_data_split(
     X: torch.Tensor, y: torch.Tensor, batch_size: int, seed: int = 42
 ) -> tuple[DataLoader, DataLoader]:
@@ -1195,9 +1109,7 @@ def _make_data_split(
     val_ds = TensorDataset(X[perm[n_train:]], y[perm[n_train:]])
     return (
         DataLoader(train_ds, batch_size=batch_size, shuffle=True),
-        DataLoader(val_ds, batch_size=batch_size, shuffle=False),
-    )
-
+        DataLoader(val_ds, batch_size=batch_size, shuffle=False))
 
 def make_data_housing(batch_size: int):
     """California-housing regression on the line topology.
@@ -1228,7 +1140,6 @@ def make_data_housing(batch_size: int):
     inverse_stats = {"y_mean": y_mean, "y_std": y_std}
     return train_loader, val_loader, task_fn, inverse_stats
 
-
 def make_data_housing_grid(batch_size: int, huber_delta: float = 1.0):
     """California-housing regression on the 5x5 grid topology.
 
@@ -1257,11 +1168,9 @@ def make_data_housing_grid(batch_size: int, huber_delta: float = 1.0):
     inverse_stats = {"y_mean": y_mean, "y_std": y_std}
     return train_loader, val_loader, task_fn, inverse_stats
 
-
 def denormalize_targets(y_norm: torch.Tensor, inverse_stats: dict) -> torch.Tensor:
     """Map standardized targets back to original California-housing units."""
     return y_norm * inverse_stats["y_std"] + inverse_stats["y_mean"]
-
 
 def _franke(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
     t1 = -((9 * x1 - 2) ** 2) / 4 - ((9 * x2 - 2) ** 2) / 4
@@ -1275,13 +1184,11 @@ def _franke(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
         - 0.2 * t4.exp()
     )
 
-
 def _lhs_samples(n: int, d: int, seed: int = 42) -> torch.Tensor:
     """Latin Hypercube samples in [0, 1]^d with guaranteed stratification."""
     from scipy.stats.qmc import LatinHypercube
     sampler = LatinHypercube(d=d, seed=seed)
     return torch.from_numpy(sampler.random(n=n)).float()
-
 
 def make_data_smooth2d(batch_size: int, val_size: int = 4000):
     # Fixed seed for reproducible train/val splits and noise across runs.
@@ -1308,7 +1215,6 @@ def make_data_smooth2d(batch_size: int, val_size: int = 4000):
     )
     return train_loader, val_loader, F.mse_loss
 
-
 def make_data(problem: str, batch_size: int):
     if problem == "sinx":
         return make_data_sinx(batch_size)
@@ -1322,10 +1228,8 @@ def make_data(problem: str, batch_size: int):
         return make_data_housing_grid(batch_size)
     raise ValueError(f"Unknown problem: {problem}")
 
-
 def _unwrap_raw_net(net):
     return net.module if isinstance(net, torch.nn.DataParallel) else net
-
 
 def _deq_batch_stats(raw_net, *, solver: str, deq_cfg: dict | None) -> dict | None:
     """Compute cached DEQ residual stats for the most recent forward pass."""
@@ -1354,20 +1258,16 @@ def _deq_batch_stats(raw_net, *, solver: str, deq_cfg: dict | None) -> dict | No
         x_drive = drive_targets[i] if i < len(drive_targets) else None
         drive_scale = float(drive_scales[i]) if i < len(drive_scales) else 0.0
         tau_i = float(info.get("tau", 1.0))
-        cell_mode_i = info.get("cell_mode", "soft")
+        
         leak_floor = float(info.get("leak_floor", 0.0))
         deq_step = float(info.get("deq_step", (deq_cfg or {}).get("deq_step", 0.1)))
 
         with torch.no_grad():
             rhs = stage.rhs(
                 x_stage,
-                ctx=stage_ctx,
-                tau=tau_i,
-                cell_mode=cell_mode_i,
                 x_drive=x_drive,
                 drive_scale=drive_scale,
-                leak_floor=leak_floor,
-            )
+                leak_floor=leak_floor)
         residual = deq_step * rhs
         abs_residual = residual.abs()
         abs_residual_means.append(float(abs_residual.mean().item()))
@@ -1389,9 +1289,7 @@ def _deq_batch_stats(raw_net, *, solver: str, deq_cfg: dict | None) -> dict | No
         "residual_max": float(max(abs_residual_maxes)),
         "nstep_mean": float(sum(nsteps) / len(nsteps)) if nsteps else 0.0,
         "nstep_max": float(max(nsteps)) if nsteps else 0.0,
-        "max_abs_state": float(max_abs_state),
-    }
-
+        "max_abs_state": float(max_abs_state)}
 
 def _deq_gradient_probe(
     net,
@@ -1400,10 +1298,8 @@ def _deq_gradient_probe(
     ctx,
     task_fn,
     *,
-    cell_mode: str,
     solver: str,
-    deq_cfg: dict | None,
-) -> dict | None:
+    deq_cfg: dict | None) -> dict | None:
     """Run one gradient probe batch and summarize mapper / gate norms."""
     if solver != "deq":
         return None
@@ -1415,10 +1311,8 @@ def _deq_gradient_probe(
         ctx=ctx,
         tau=1.0,
         store_trajectory=False,
-        cell_mode=cell_mode,
         solver=solver,
-        deq_cfg=deq_cfg,
-    )
+        deq_cfg=deq_cfg)
     loss = task_fn(out, target)
     loss.backward()
     norms = collect_gradient_norms(raw_net)
@@ -1445,9 +1339,7 @@ def _deq_gradient_probe(
         "stage_logits_grad_norm": float(stage_logits_sq ** 0.5),
         "z_logits_grad_norm": float(z_logits_sq ** 0.5),
         "probe_loss": float(loss.item()),
-        **(batch_stats or {}),
-    }
-
+        **(batch_stats or {})}
 
 def _format_deq_summary(metrics: dict | None) -> str:
     if not metrics:
@@ -1465,7 +1357,6 @@ def _format_deq_summary(metrics: dict | None) -> str:
         )
     return "  DEQ[" + " ".join(parts) + "]"
 
-
 def _append_deq_validation_row(
     path,
     *,
@@ -1474,8 +1365,7 @@ def _append_deq_validation_row(
     split: str,
     train_loss: float,
     val_loss: float,
-    metrics: dict | None,
-) -> None:
+    metrics: dict | None) -> None:
     if metrics is None:
         return
     new_file = not path.exists()
@@ -1499,15 +1389,13 @@ def _append_deq_validation_row(
             f"{metrics.get('probe_loss', float('nan')):.6f}\n"
         )
 
-
 def _append_deq_train_row(
     path,
     *,
     epoch: int,
     phase: str,
     train_loss: float,
-    metrics: dict | None,
-) -> None:
+    metrics: dict | None) -> None:
     if metrics is None:
         return
     _append_deq_validation_row(
@@ -1517,11 +1405,9 @@ def _append_deq_train_row(
         split="train",
         train_loss=train_loss,
         val_loss=train_loss,
-        metrics=metrics,
-    )
+        metrics=metrics)
 
-
-def validate(net, val_loader, task_fn, ctx_factory, device, cell_mode: str = "soft",
+def validate(net, val_loader, task_fn, ctx_factory, device,
              solver: str = "heun", deq_cfg: dict | None = None,
              collect_deq_metrics: bool = False):
     net.eval()
@@ -1539,7 +1425,7 @@ def validate(net, val_loader, task_fn, ctx_factory, device, cell_mode: str = "so
             u = u.to(device)
             target = target.to(device)
             ctx = ctx_factory(u.size(0), device=device)
-            out, _ = net(u, ctx=ctx, store_trajectory=False, cell_mode=cell_mode,
+            out, _ = net(u, store_trajectory=False,
                          solver=solver, deq_cfg=deq_cfg)
             loss = task_fn(out, target)
             total += float(loss.item()) * u.size(0)
@@ -1568,17 +1454,14 @@ def validate(net, val_loader, task_fn, ctx_factory, device, cell_mode: str = "so
             first_batch[1],
             first_batch[2],
             task_fn,
-            cell_mode=cell_mode,
             solver=solver,
-            deq_cfg=deq_cfg,
-        )
+            deq_cfg=deq_cfg)
     deq_metrics = {
         "residual_mean": deq_sum_residual / max(1, n),
         "residual_max": deq_max_residual,
         "nstep_mean": deq_sum_nstep / max(1, n),
         "nstep_max": deq_max_nstep,
-        "max_abs_state": deq_max_abs_state,
-    }
+        "max_abs_state": deq_max_abs_state}
     if probe_metrics is not None:
         for key, value in probe_metrics.items():
             if key in ("mapper_grad_norm", "stage_logits_grad_norm", "z_logits_grad_norm", "probe_loss"):
@@ -1587,7 +1470,6 @@ def validate(net, val_loader, task_fn, ctx_factory, device, cell_mode: str = "so
                 deq_metrics[key] = value
     return val_loss, deq_metrics
 
-
 def validate_with_inverse(
     net,
     val_loader,
@@ -1595,11 +1477,9 @@ def validate_with_inverse(
     ctx_factory,
     device,
     inverse_stats: dict | None,
-    cell_mode: str = "soft",
     solver: str = "heun",
     deq_cfg: dict | None = None,
-    collect_deq_metrics: bool = False,
-) -> dict:
+    collect_deq_metrics: bool = False) -> dict:
     """Validation that also reports metrics in the original (denormalized) target units.
 
     Returns a dict with:
@@ -1626,7 +1506,7 @@ def validate_with_inverse(
             u = u.to(device)
             target = target.to(device)
             ctx = ctx_factory(u.size(0), device=device)
-            out, _ = net(u, ctx=ctx, store_trajectory=False, cell_mode=cell_mode,
+            out, _ = net(u, store_trajectory=False,
                          solver=solver, deq_cfg=deq_cfg)
             loss = task_fn(out, target)
             total += float(loss.item()) * u.size(0)
@@ -1664,17 +1544,14 @@ def validate_with_inverse(
                 first_batch[1],
                 first_batch[2],
                 task_fn,
-                cell_mode=cell_mode,
                 solver=solver,
-                deq_cfg=deq_cfg,
-            )
+                deq_cfg=deq_cfg)
         out_dict["deq"] = {
             "residual_mean": deq_sum_residual / max(1, n),
             "residual_max": deq_max_residual,
             "nstep_mean": deq_sum_nstep / max(1, n),
             "nstep_max": deq_max_nstep,
-            "max_abs_state": deq_max_abs_state,
-        }
+            "max_abs_state": deq_max_abs_state}
         if probe_metrics is not None:
             for key, value in probe_metrics.items():
                 if key in ("mapper_grad_norm", "stage_logits_grad_norm", "z_logits_grad_norm", "probe_loss"):
@@ -1683,7 +1560,6 @@ def validate_with_inverse(
                     out_dict["deq"][key] = value
     return out_dict
 
-
 def collect_predictions(
     net,
     inputs,
@@ -1691,8 +1567,7 @@ def collect_predictions(
     device,
     *,
     solver: str = "heun",
-    deq_cfg: dict | None = None,
-) -> torch.Tensor:
+    deq_cfg: dict | None = None) -> torch.Tensor:
     net.eval()
     with torch.no_grad():
         ctx = ctx_factory(inputs.size(0), device=device)
@@ -1701,18 +1576,15 @@ def collect_predictions(
             ctx=ctx,
             store_trajectory=True,
             solver=solver,
-            deq_cfg=deq_cfg,
-        )
+            deq_cfg=deq_cfg)
     net.train()
     return out
-
 
 def apply_ablation(net, ablation: str) -> None:
     """Wrapper around train.apply_ablation with a [ablation=X] log line."""
     from train import apply_ablation as _apply_ablation
     _apply_ablation(net, ablation)
     print(f"[ablation={ablation}] applied to net")
-
 
 def _parse_int_list(spec: str | None) -> list[int] | None:
     """Parse '0,3,5' -> [0,3,5]. None passes through."""
@@ -1723,14 +1595,13 @@ def _parse_int_list(spec: str | None) -> list[int] | None:
         return None
     return [int(x) for x in spec.split(",") if x.strip()]
 
-
 def collect_gradient_norms(raw_net):
     """Walk ``raw_net`` (assumed unwrapped from DataParallel) and collect
     per-group L2 gradient norms.
 
     Returns: dict with keys
-      stage{i}_logits, stage{i}_raw_mult, stage{i}_raw_leak,
-      stage{i}_z_logits, stage{i}_u_logits  (one entry per stage)
+      stage{i}_raw_leak, stage{i}_z_logits, stage{i}_u_logits
+      (one entry per stage)
       stage_transfer
       in_mapper
       out_mapper
@@ -1738,7 +1609,7 @@ def collect_gradient_norms(raw_net):
     no parameter or no gradient.
     """
     stage_sq = {}
-    stage_components = ("logits", "raw_mult", "raw_leak", "z_logits", "u_logits")
+    stage_components = ("raw_leak", "z_logits", "u_logits")
     # Per-edge device parameter suffixes: covers SimpleEdgeLibrary.param
     # (I=ReLU/tanh(p0*Vsrc+p1*Vdest+p2)), RealisticTanhLibrary
     # (alpha_raw, bias_raw), RealisticTanhUpgradeLibrary (alpha_raw,
@@ -1747,8 +1618,7 @@ def collect_gradient_norms(raw_net):
     # gradient-norm metric per stage.
     device_param_suffixes = (
         "param", "alpha_raw", "bias_raw", "gm_raw", "isat_raw",
-        "a_raw", "b_raw", "s_raw", "theta_raw",
-    )
+        "a_raw", "b_raw", "s_raw", "theta_raw")
     transfer_sq = 0.0
     transfer_found = False
     in_sq = 0.0
@@ -1801,11 +1671,9 @@ def collect_gradient_norms(raw_net):
     out["out_mapper"] = out_sq ** 0.5 if out_found else None
     return out
 
-
 def compute_update_norms(
     snapshots: dict[str, torch.Tensor],
-    net: torch.nn.Module,
-) -> dict[str, dict[str, float]]:
+    net: torch.nn.Module) -> dict[str, dict[str, float]]:
     """Compute per-group param/update/relative norms from saved snapshots.
 
     Classifies parameters into mapper/struct/dyn/other bins matching the
@@ -1819,8 +1687,7 @@ def compute_update_norms(
         "mapper": {"param_sq": 0.0, "update_sq": 0.0},
         "struct": {"param_sq": 0.0, "update_sq": 0.0},
         "dyn": {"param_sq": 0.0, "update_sq": 0.0},
-        "other": {"param_sq": 0.0, "update_sq": 0.0},
-    }
+        "other": {"param_sq": 0.0, "update_sq": 0.0}}
 
     for name, p in raw.named_parameters():
         if name not in snapshots:
@@ -1828,8 +1695,7 @@ def compute_update_norms(
         delta = p.data - snapshots[name]
         if "input_mapper" in name or "output_mapper" in name:
             g = "mapper"
-        # NOTE: .z_logits MUST be checked before .logits (z_logits also ends with .logits)
-        elif name.endswith(".z_logits") or name.endswith(".logits") or name.endswith(".raw_mult"):
+        elif name.endswith(".z_logits"):
             g = "struct"
         elif name.endswith(".raw_leak") or name.endswith(".raw_drive_g"):
             g = "dyn"
@@ -1846,14 +1712,12 @@ def compute_update_norms(
         result[gname] = {"param_norm": pn, "update_norm": un, "rel_update": rel}
     return result
 
-
 def _grad_norm_keys(norms):
     """Deterministic key ordering for gradient norm output (shared by header and data rows)."""
     return sorted(
         [k for k in norms.keys() if k.startswith("stage")]
         + [k for k in ("stage_transfer", "in_mapper", "out_mapper") if k in norms]
     )
-
 
 def log_gradient_norms(grad_log_path, epoch, raw_net, *, retrain=False, optimizer=None, norms=None):
     """Append one row of per-group L2 gradient norms to ``grad_log_path``.
@@ -1888,15 +1752,13 @@ def log_gradient_norms(grad_log_path, epoch, raw_net, *, retrain=False, optimize
     with open(grad_log_path, "a") as f:
         f.write("\t".join(row_parts) + "\n")
 
-
 def log_update_norms(
     path: Path,
     epoch: int,
     update_norms: dict[str, dict[str, float]],
     phase: str = "",
     *,
-    retrain: bool = False,
-) -> None:
+    retrain: bool = False) -> None:
     """Append one row of per-group param/update/relative norms to ``path``.
 
     Columns: ``epoch``, ``phase``, then for each group (mapper, struct, dyn, other):
@@ -1919,28 +1781,24 @@ def log_update_norms(
     with open(path, "a") as f:
         f.write("\t".join(parts) + "\n")
 
-
 def make_static_ctx_factory():
     """Build a ctx_factory that always returns a default (variation-off) context."""
     def _factory(batch_size_: int, device: torch.device = "cpu", **_):
         return SimContext()
     return _factory
 
-
 def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
     """Populate ``parser`` with the train_script CLI flags.  Split out of
     ``main()`` so smoke tests can introspect the flag surface (PP-5)."""
     parser.add_argument(
         "--problem", choices=["sinx", "housing", "smooth2d", "smooth2d_grid", "housing_grid"], default="sinx",
-        help="Task to train (default: sinx)",
-    )
+        help="Task to train (default: sinx)")
     parser.add_argument(
         "--grid-size", type=int, default=None, dest="grid_size",
         help="Hidden grid height/width for smooth2d_grid and housing_grid. "
              "Per-problem default: smooth2d_grid=7, housing_grid=5. "
              "Explicit --grid-size N overrides either. "
-             "Only applies when --problem smooth2d_grid or --problem housing_grid.",
-    )
+             "Only applies when --problem smooth2d_grid or --problem housing_grid.")
     parser.add_argument(
         "--cell-library", type=str, default=None, dest="cell_library",
         choices=["legacy", "v15", "v2", "relu", "tanh", "tanh_realistic", "tanh_realistic_upgrade", "tanh_free"],
@@ -1952,8 +1810,7 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "bounded gm/Isat per-edge), "
              "'tanh_free' (I=Isat*tanh(gm*(s*(A*Vsrc - B*Vdest) + theta)), "
              "A,B>=0 independent (no A+B=1), s=+/-1 via STE, bounded gm/Isat per-edge). "
-             "Overrides the preset's cell_library key if present.",
-    )
+             "Overrides the preset's cell_library key if present.")
     parser.add_argument(
         "--hidden-family", type=str, default=None, dest="hidden_family",
         choices=["grid", "cluster", "small_world", "torus"],
@@ -1967,68 +1824,56 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "(uses --grid-size). "
              "When set, dynamically rebuilds the preset's stages config "
              "to use the specified family instead of the hardcoded preset "
-             "topology.",
-    )
+             "topology.")
     parser.add_argument(
         "--num-hidden", type=int, default=None, dest="num_hidden",
         help="Number of hidden nodes (default: from preset). "
              "Required when --hidden-family=cluster (must be >= 2). "
-             "Ignored for grid family (uses --grid-size).",
-    )
+             "Ignored for grid family (uses --grid-size).")
     parser.add_argument(
         "--num-stages", type=int, default=None, dest="num_stages",
         help="Number of ODE stages (default: from preset, or 1 if not "
              "specified). Each stage gets an identical topology. "
-             "t_span and num_steps are divided evenly across stages.",
-    )
+             "t_span and num_steps are divided evenly across stages.")
     parser.add_argument(
         "--edge-repeats", type=int, default=None, dest="edge_repeats",
         help="Parallel edges per hidden node pair (default: 2, range 1-8). "
              "Each repeated edge gets independent logits/gate/multiplier. "
              "I/O and projection edges are NOT repeated. Composes "
              "multiplicatively with --bidirectional. Set to 1 for the "
-             "previous single-edge behavior.",
-    )
+             "previous single-edge behavior.")
     parser.add_argument(
         "--bidirectional", dest="bidirectional", action="store_true", default=False,
         help="Emit two directed edges per unique node pair in the hidden graph "
              "(i->j AND j->i). Doubles the hidden edge count and gives "
              "asymmetric cells (P/rectifier) true bidirectional capability. "
-             "Default: off (single edge per pair).",
-    )
+             "Default: off (single edge per pair).")
     parser.add_argument(
         "--no-bidirectional", dest="bidirectional", action="store_false",
-        help="Disable dual edges per node pair (default).",
-    )
+        help="Disable dual edges per node pair (default).")
     parser.add_argument(
         "--small-world-k", type=int, default=4, dest="small_world_k",
         help="Small-world neighbor count per node in the ring lattice "
              "(default: 4, must be even and < num_hidden). "
-             "Used only when --hidden-family=small_world.",
-    )
+             "Used only when --hidden-family=small_world.")
     parser.add_argument(
         "--small-world-p", type=float, default=0.3, dest="small_world_p",
         help="Small-world rewiring probability in [0, 1] "
              "(default: 0.3). p=0 recovers a ring lattice, p=1 produces "
-             "a random regular graph. Used only when --hidden-family=small_world.",
-    )
+             "a random regular graph. Used only when --hidden-family=small_world.")
     parser.add_argument(
         "--small-world-seed", type=int, default=0, dest="small_world_seed",
         help="Small-world rewiring RNG seed (default: 0). "
-             "Used only when --hidden-family=small_world.",
-    )
+             "Used only when --hidden-family=small_world.")
     parser.add_argument(
         "--output", type=Path, default=Path("./output"),
-        help="Output directory for artifacts (default: ./output)",
-    )
+        help="Output directory for artifacts (default: ./output)")
     parser.add_argument(
         "--epochs", type=int, default=None,
-        help=f"Number of epochs (default: {OPTIM['epochs']})",
-    )
+        help=f"Number of epochs (default: {OPTIM['epochs']})")
     parser.add_argument(
         "--lr", type=float, default=None,
-        help=f"Learning rate (default: {OPTIM['lr']})",
-    )
+        help=f"Learning rate (default: {OPTIM['lr']})")
     parser.add_argument(
         "--stage-lr-scale", type=float, default=1.0,
         help="Per-stage geometric LR multiplier (stage-lr-scaling). "
@@ -2036,181 +1881,146 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "When >1.0, stage i gets lr * scale^(S-1-i) where S is the "
              "number of stages. Compensates for vanishing gradients in "
              "deep ODE stacks (e.g. scale=10 with 3 stages: stage0=lr*100, "
-             "stage1=lr*10, stage2=lr).",
-    )
+             "stage1=lr*10, stage2=lr).")
     parser.add_argument(
         "--retrain-stage-lr-scale", type=float, default=1.0,
         help="Per-stage LR scaling for retrain (default: 1.0). "
              "Warm-started pruned networks need gentle fine-tuning, so "
              "this defaults to uniform LR. Set to match --stage-lr-scale "
-             "if you want geometric scaling during retrain.",
-    )
+             "if you want geometric scaling during retrain.")
     parser.add_argument(
         "--mapper-lr-scale", type=float, default=0.1,
         help="LR multiplier for I/O mapper params (input_mapper + output_mapper). "
              "Default 0.1 (slow mapper learning). Use 1.0 to match base LR. "
              "When mapper gradient norms dominate core by ~300x, lowering this "
-             "forces more residual error to be explained by the core.",
-    )
+             "forces more residual error to be explained by the core.")
     parser.add_argument(
         "--retrain-mapper-lr-scale", type=float, default=0.1,
         help="Mapper LR scale for retrain (default: 0.1). "
              "Mirrors --mapper-lr-scale if you want to slow mapper learning "
-             "during retrain.",
-    )
+             "during retrain.")
     parser.add_argument(
         "--struct-lr-scale", type=float, default=2.0,
         help="LR multiplier for structural core params (z_logits, cell logits, "
              "raw_mult). Default 2.0 (modest boost). These combinatorial-ish "
              "parameters often need help in DEQ mode. When != 1.0, uses flat "
-             "global groups and ignores --stage-lr-scale.",
-    )
+             "global groups and ignores --stage-lr-scale.")
     parser.add_argument(
         "--dyn-lr-scale", type=float, default=1.0,
         help="LR multiplier for sensitive dynamical params (raw_leak, "
              "raw_drive_g). Default 1.0 (base LR). These affect the Jacobian "
              "and fixed-point conditioning, so boosting aggressively can "
              "destabilize DEQ solves. When != 1.0, uses flat global groups "
-             "and ignores --stage-lr-scale.",
-    )
+             "and ignores --stage-lr-scale.")
     parser.add_argument(
         "--freeze-mappers", dest="freeze_mappers", action="store_true", default=False,
         help="Freeze mapper requires_grad during the first half of the combined "
              "B1+B2 duration (four_phase schedule only). Mappers train normally "
              "in Phase A, freeze at B1 start, unfreeze at the midpoint. After "
              "unfreeze mappers resume at the --mapper-lr-scale rate. "
-             "Ignored for three_phase and legacy schedules.",
-    )
+             "Ignored for three_phase and legacy schedules.")
     parser.add_argument(
         "--device", default=None,
-        help="Device 'cpu' or 'cuda' (default: auto-detect)",
-    )
+        help="Device 'cpu' or 'cuda' (default: auto-detect)")
     parser.add_argument(
         "--amp", dest="amp", action="store_true", default=None,
-        help="Enable mixed precision (AMP) via torch.cuda.amp (default: on when CUDA)",
-    )
+        help="Enable mixed precision (AMP) via torch.cuda.amp (default: on when CUDA)")
     parser.add_argument(
         "--no-amp", dest="amp", action="store_false",
-        help="Disable mixed precision",
-    )
+        help="Disable mixed precision")
     parser.add_argument(
         "--compile", dest="compile", action="store_true", default=None,
-        help="Enable torch.compile on hot paths (default: on when CUDA)",
-    )
+        help="Enable torch.compile on hot paths (default: on when CUDA)")
     parser.add_argument(
         "--no-compile", dest="compile", action="store_false",
-        help="Disable torch.compile",
-    )
+        help="Disable torch.compile")
     parser.add_argument(
         "--parallel", dest="parallel", action="store_true", default=None,
-        help="Enable DataParallel across multiple GPUs (default: on when ≥2 GPUs)",
-    )
+        help="Enable DataParallel across multiple GPUs (default: on when ≥2 GPUs)")
     parser.add_argument(
         "--no-parallel", dest="parallel", action="store_false",
-        help="Disable DataParallel",
-    )
+        help="Disable DataParallel")
     parser.add_argument(
         "--validate-every", type=int, default=5,
-        help="Validate every N epochs (default: 5). Use 1 for every epoch.",
-    )
+        help="Validate every N epochs (default: 5). Use 1 for every epoch.")
     parser.add_argument(
         "--early-stop", dest="early_stop", action="store_true", default=True,
-        help="Enable early stopping (default: on)",
-    )
+        help="Enable early stopping (default: on)")
     parser.add_argument(
         "--no-early-stop", dest="early_stop", action="store_false",
-        help="Disable early stopping",
-    )
+        help="Disable early stopping")
     parser.add_argument(
         "--patience", type=int, default=500,
-        help="Early stopping patience in epochs (default: 500)",
-    )
+        help="Early stopping patience in epochs (default: 500)")
     parser.add_argument(
         "--min-delta", type=float, default=1e-4,
-        help="Early stopping min improvement in val loss (default: 1e-4)",
-    )
+        help="Early stopping min improvement in val loss (default: 1e-4)")
     parser.add_argument(
         "--amp-dtype", choices=["float16", "bfloat16"], default="float16",
-        help="Autocast dtype (default: float16; bfloat16 needs Ampere+)",
-    )
+        help="Autocast dtype (default: float16; bfloat16 needs Ampere+)")
     parser.add_argument(
         "--ablation", choices=["none", "mapper-only", "empty-graph"], default="none",
-        help="Structural ablation to apply (default: none). R2.",
-    )
+        help="Structural ablation to apply (default: none). R2.")
     parser.add_argument(
         "--variation", dest="variation", action="store_true", default=False,
-        help="Enable PVT/mismatch injection during training (default: off, R6.3).",
-    )
+        help="Enable PVT/mismatch injection during training (default: off, R6.3).")
     parser.add_argument(
         "--write-mode", choices=["one_to_one", "dense", "fan_out"], default=None,
         help="Input write mapping (default: from preset). 'one_to_one' uses "
              "SparseInputMapper, 'dense' uses InputMapper (nn.Linear), "
-             "'fan_out' uses FanOutInputMapper with preset-defined targets.",
-    )
+             "'fan_out' uses FanOutInputMapper with preset-defined targets.")
     parser.add_argument(
         "--read-mode", choices=["sparse", "dense"], default=None,
         help="Output read mapping (default: from preset, typically 'sparse'). "
              "'sparse' uses OutputMapper with preset-defined read_idx; "
-             "'dense' uses full-projection readout.",
-    )
+             "'dense' uses full-projection readout.")
     parser.add_argument(
         "--write-idx", type=str, default=None,
         help="Comma-separated hidden node indices for sparse input write "
-             "(overrides preset write_idx). E.g. '0,2,4'.",
-    )
+             "(overrides preset write_idx). E.g. '0,2,4'.")
     parser.add_argument(
         "--read-idx", type=str, default=None,
         help="Comma-separated full-state indices for sparse output read "
-             "(overrides preset read_idx). E.g. '7'.",
-    )
+             "(overrides preset read_idx). E.g. '7'.")
     parser.add_argument(
         "--prune", dest="prune", action="store_true", default=False,
         help="Run gate-based pruning after training (CP). Prunes edges and "
              "nodes below the configured thresholds, then either retrains "
-             "the compact network or saves it as-is (see --no-retrain).",
-    )
+             "the compact network or saves it as-is (see --no-retrain).")
     parser.add_argument(
         "--retrain", dest="retrain", action="store_true", default=True,
         help="After pruning, retrain the compact network warm-started from "
              "the surviving pre-prune parameters (default: on). Use "
              "--no-retrain to skip retraining, or --fresh-init to retrain "
-             "from random init instead.",
-    )
+             "from random init instead.")
     parser.add_argument(
         "--no-retrain", dest="retrain", action="store_false",
         help="Skip retraining after pruning; only transfer the surviving "
-             "parameters from the overcomplete network into the compact one.",
-    )
+             "parameters from the overcomplete network into the compact one.")
     parser.add_argument(
         "--prune-edge-threshold", type=float, default=None,
-        help="Override config.PRUNE['edge_threshold'] for pruning.",
-    )
+        help="Override config.PRUNE['edge_threshold'] for pruning.")
     parser.add_argument(
         "--prune-node-threshold", type=float, default=None,
-        help="Override config.PRUNE['node_threshold'] for pruning.",
-    )
+        help="Override config.PRUNE['node_threshold'] for pruning.")
     parser.add_argument(
         "--prune-nodes-by-gate", dest="prune_nodes_by_gate",
         action="store_true", default=None,
         help="DEPRECATED (deprecate-node-gates): no-op, kept for backward "
              "compat. Node pruning is now connectivity-only regardless of "
-             "this flag. Use --no-prune-nodes-by-gate to silence the warning.",
-    )
+             "this flag. Use --no-prune-nodes-by-gate to silence the warning.")
     parser.add_argument(
         "--no-prune-nodes-by-gate", dest="prune_nodes_by_gate",
         action="store_false",
         help="DEPRECATED (deprecate-node-gates): no-op, kept for backward "
-             "compat. Nodes are pruned by connectivity only.",
-    )
+             "compat. Nodes are pruned by connectivity only.")
     parser.add_argument(
         "--retrain-epochs", type=int, default=None,
         help="Number of epochs to retrain the compact network (default: "
-             "the same value as --epochs, capped at half).",
-    )
+             "the same value as --epochs, capped at half).")
     parser.add_argument(
         "--retrain-lr", type=float, default=None,
-        help="Learning rate for the retrain phase (default: same as --lr).",
-    )
+        help="Learning rate for the retrain phase (default: same as --lr).")
     parser.add_argument(
         "--retrain-batch-size", type=int, default=2048,
         help="retrain-oom-fix/REQ-5: batch size for the pruned-network "
@@ -2219,33 +2029,27 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "after Phase A+B to prevent the OOM at the prune-to-retrain "
              "transition. Set to 0 to use the same batch size as "
              "--batch-size. The pruned model is created as a fresh "
-             "nn.Module so it duplicates the parameter tensor allocations.",
-    )
+             "nn.Module so it duplicates the parameter tensor allocations.")
     parser.add_argument(
         "--fresh-init", dest="fresh_init", action="store_true", default=False,
         help="Re-initialize the pruned network from scratch (skip warm "
-             "start from pre-prune parameters). Default: warm-start.",
-    )
+             "start from pre-prune parameters). Default: warm-start.")
     parser.add_argument(
         "--no-scheduler", dest="use_scheduler", action="store_false", default=True,
-        help="Disable LR scheduler (default: on).",
-    )
+        help="Disable LR scheduler (default: on).")
     parser.add_argument(
         "--scheduler-type", choices=["cosine", "warm_restarts"], default="cosine",
         help="LR scheduler type when --scheduler is enabled (default: 'cosine' — "
              "plain cosine decay over total epochs, no restarts). 'warm_restarts' "
-             "uses CosineAnnealingWarmRestarts (legacy behavior).",
-    )
+             "uses CosineAnnealingWarmRestarts (legacy behavior).")
     parser.add_argument(
         "--grad-log", dest="grad_log", action="store_true", default=False,
         help="Periodically log per-parameter-group gradient L2 norms to "
-             "grad_norms.txt (default: off).",
-    )
+             "grad_norms.txt (default: off).")
     parser.add_argument(
         "--grad-log-every", type=int, default=10,
         help="Log gradient norms every N epochs (default: 10). Only used "
-             "when --grad-log is enabled.",
-    )
+             "when --grad-log is enabled.")
     parser.add_argument(
         "--schedule", choices=["legacy", "three_phase", "four_phase"], default=None,
         help="Training schedule mode (default: from preset['schedule'], "
@@ -2255,13 +2059,11 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "auto-prune + retrain). 'four_phase' adds a cell-commitment "
              "Phase B1 (no pruning), readiness-gated Phase B2 (edge "
              "pruning), and a KD-anchored retrain Phase C. See "
-             "spec/four-phase-schedule.md.",
-    )
+             "spec/four-phase-schedule.md.")
     parser.add_argument(
         "--no-argmax-val", dest="argmax_val", action="store_false", default=True,
         help="Disable argmax-vs-soft validation diagnostic (default: on "
-             "when --schedule three_phase is active).",
-    )
+             "when --schedule three_phase is active).")
     parser.add_argument(
         "--ablation-set",
         choices=["none", "reg-only", "tau-only", "edge-only"], default="none",
@@ -2273,17 +2075,15 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "and no pruning. 'edge-only' is the normal B path but with "
              "node-gate pruning disabled and a lower edge threshold "
              "(matches the four-phase-redesign defaults). 'none' is the "
-             "standard schedule behavior with no overrides.",
-    )
+             "standard schedule behavior with no overrides.")
     parser.add_argument(
         "--cell-mode", choices=["soft", "ste", "auto"], default="auto",
-        help="Cell selection mode (four-phase-redesign/Phase 2b). 'soft' "
+        help="Cell selection mode (). 'soft' "
              "uses a softmax-weighted mixture of cells per edge. 'ste' "
              "uses one cell per edge in the forward pass (argmax) with "
              "straight-through soft gradients in the backward pass. "
              "'auto' uses 'soft' for Phase A and 'ste' for B/C (only "
-             "meaningful with --schedule three_phase / four_phase).",
-    )
+             "meaningful with --schedule three_phase / four_phase).")
 
     # --- Deep Equilibrium (DEQ) stagewise solver (deq-core-prototype) ---
     parser.add_argument(
@@ -2293,42 +2093,34 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "fixed-point x* s.t. rhs(x*)=0 via torchdeq with implicit "
              "gradients. DEQ enforces --cell-mode soft and applies the "
              "minimum-leak floor (--leak-floor) so the fixed-point map is "
-             "contractive. Heun remains available for physical validation.",
-    )
+             "contractive. Heun remains available for physical validation.")
     parser.add_argument(
         "--deq-backend", choices=["auto", "torchdeq", "fixed_point_iter"],
         default="auto", dest="deq_backend",
-        help="DEQ solver backend (default: auto -> torchdeq if installed).",
-    )
+        help="DEQ solver backend (default: auto -> torchdeq if installed).")
     parser.add_argument(
         "--deq-f-max-iter", type=int, default=None, dest="deq_f_max_iter",
-        help="Max forward iterations for the DEQ fixed-point solver.",
-    )
+        help="Max forward iterations for the DEQ fixed-point solver.")
     parser.add_argument(
         "--deq-f-tol", type=float, default=None, dest="deq_f_tol",
-        help="Relative residual tolerance for DEQ convergence.",
-    )
+        help="Relative residual tolerance for DEQ convergence.")
     parser.add_argument(
         "--deq-b-max-iter", type=int, default=None, dest="deq_b_max_iter",
-        help="Max backward (IFT) iterations.",
-    )
+        help="Max backward (IFT) iterations.")
     parser.add_argument(
         "--deq-step", type=float, default=None, dest="deq_step",
-        help="Damped step size dt for Phi(x)=x+dt*rhs(x).",
-    )
+        help="Damped step size dt for Phi(x)=x+dt*rhs(x).")
     parser.add_argument(
         "--leak-floor", type=float, default=None, dest="leak_floor",
         help="Minimum effective leak per node under DEQ (default: from "
              "config DEQ). Keeps the fixed-point map contractive. Has no "
-             "effect on the Heun path beyond the explicit addend.",
-    )
+             "effect on the Heun path beyond the explicit addend.")
     parser.add_argument(
         "--run-deq-diagnostics", action="store_true", default=False,
         dest="run_deq_diagnostics",
         help="Run DEQ diagnostics (gradient-norm compare, Jacobian cond, "
              "multistart uniqueness) once after train/val and print the "
-             "report. Useful when prototyping --solver deq.",
-    )
+             "report. Useful when prototyping --solver deq.")
     parser.add_argument(
         "--persistent-drive", action="store_true", default=False,
         dest="persistent_drive",
@@ -2337,8 +2129,7 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "makes the fixed point x* input-dependent under DEQ. "
              "Requires write_mode='fan_out' (the smooth2d_grid preset "
              "already uses fan_out by default). Has no effect when "
-             "--solver heun.",
-    )
+             "--solver heun.")
 
     # --- Degree budget / fraction edge competition (degree-budget-topk plan) ---
     parser.add_argument(
@@ -2347,37 +2138,31 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
         help="Enable degree-budget edge competition. Each destination "
              "(or source) node keeps a fraction of its incoming edges open "
              "via temperature-scaled softmax renormalization of z_logits. "
-             "Replaces the L1 edge_gate pressure with explicit competition.",
-    )
+             "Replaces the L1 edge_gate pressure with explicit competition.")
     parser.add_argument(
         "--budget-frac-start", type=float, default=None,
         dest="budget_frac_start",
         help="Initial budget fraction per group (permissive, 1.0 = no "
-             "restriction). Default: 1.0.",
-    )
+             "restriction). Default: 1.0.")
     parser.add_argument(
         "--budget-frac-end", type=float, default=None,
         dest="budget_frac_end",
         help="Final budget fraction per group (restrictive, 0.0 = disables "
-             "budget, 0.75 = keep 75% of edges). Default: 0.75.",
-    )
+             "budget, 0.75 = keep 75% of edges). Default: 0.75.")
     parser.add_argument(
         "--budget-temp-start", type=float, default=None,
         dest="budget_temp_start",
-        help="Initial softmax temperature (soft). Default: 1.0.",
-    )
+        help="Initial softmax temperature (soft). Default: 1.0.")
     parser.add_argument(
         "--budget-temp-end", type=float, default=None,
         dest="budget_temp_end",
         help="Final softmax temperature (sharp, approaches hard top-k_eff). "
-             "Default: 0.1.",
-    )
+             "Default: 0.1.")
     parser.add_argument(
         "--budget-axis", choices=["dst", "src", "both"], default=None,
         dest="budget_axis",
         help="Competition axis: 'dst' (per-destination, default), 'src' "
-             "(per-source), or 'both' (multiplicative).",
-    )
+             "(per-source), or 'both' (multiplicative).")
 
     # --- kirchhoff-noise: ADC/DAC quant + circuit noise (analog-noise parity) ---
     parser.add_argument(
@@ -2386,47 +2171,39 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "circuit noise) on the trained model and write "
              "noise_metrics.txt. Composes with --variation: variation "
              "perturbs gm/isat via SimContext, noise perturbs state "
-             "voltages per stage.",
-    )
+             "voltages per stage.")
     parser.add_argument(
         "--noise-aware", dest="noise_aware", action="store_true", default=False,
         help="Train under analog noise so the KirchhoffNet becomes robust "
              "to ADC/DAC quantization and circuit noise. Implies --noise "
-             "for final evaluation.",
-    )
+             "for final evaluation.")
     parser.add_argument(
         "--quant-bits", type=int, choices=[4, 6], default=4,
         dest="quant_bits",
         help="Bit-width for ADC/DAC quantization (default: 4). Used when "
-             "--noise or --noise-aware is set.",
-    )
+             "--noise or --noise-aware is set.")
     parser.add_argument(
         "--noise-std", type=float, default=0.05,
         dest="noise_std",
         help="Standard deviation of additive Gaussian circuit noise on "
              "the analog state voltages and on the output mapper (default: "
-             "0.05). Used when --noise or --noise-aware is set.",
-    )
+             "0.05). Used when --noise or --noise-aware is set.")
     parser.add_argument(
         "--mc-trials", type=int, default=20,
         dest="mc_trials",
         help="Number of Monte Carlo trials for noisy evaluation "
-             "(default: 20). Used when --noise or --noise-aware is set.",
-    )
+             "(default: 20). Used when --noise or --noise-aware is set.")
     parser.add_argument(
         "--adc-full-range", type=float, default=3.0,
         dest="adc_full_range",
         help="Symmetric full-scale range for ADC/DAC quantization "
-             "(default: 3.0). Used when --noise or --noise-aware is set.",
-    )
+             "(default: 3.0). Used when --noise or --noise-aware is set.")
     parser.add_argument(
         "--noise-seed", type=int, default=0,
         dest="noise_seed",
         help="Seed for analog-noise sampling (default: 0). Each MC trial "
              "uses noise_seed + trial_idx as its seed. Used when --noise "
-             "or --noise-aware is set.",
-    )
-
+             "or --noise-aware is set.")
 
 # ----------------------------------------------------------------
 # Pruning helpers (PIT): transferable I/O mapper reconstruction.
@@ -2453,7 +2230,6 @@ def _remap_indices(idx_list, remap):
         out.append(remap[i])
     return out
 
-
 def _transfer_input_mapper(raw_mapper, raw_write_idx, stage0_remap,
                             pruned_first_n, in_dim):
     """Return a new InputMapper for the pruned stage with weights
@@ -2476,8 +2252,7 @@ def _transfer_input_mapper(raw_mapper, raw_write_idx, stage0_remap,
         else:
             new_write_idx = _remap_indices(raw_write_idx, stage0_remap)
         new_mapper = SparseInputMapper(
-            in_dim=in_dim, out_dim=pruned_first_n, write_idx=new_write_idx,
-        )
+            in_dim=in_dim, out_dim=pruned_first_n, write_idx=new_write_idx)
         with torch.no_grad():
             new_mapper.gain.data.copy_(raw_mapper.gain.data)
             new_mapper.bias.data.copy_(raw_mapper.bias.data)
@@ -2492,8 +2267,7 @@ def _transfer_input_mapper(raw_mapper, raw_write_idx, stage0_remap,
             in_dim=raw_mapper.in_dim,
             out_dim=pruned_first_n,
             fan_out_map=new_fan_out,
-            x_max=raw_mapper.x_max,
-        )
+            x_max=raw_mapper.x_max)
         with torch.no_grad():
             new_mapper.gain.data.copy_(raw_mapper.gain.data)
             new_mapper.bias.data.copy_(raw_mapper.bias.data)
@@ -2509,12 +2283,10 @@ def _transfer_input_mapper(raw_mapper, raw_write_idx, stage0_remap,
             return copy.deepcopy(raw_mapper), raw_write_idx
         if isinstance(raw_mapper, RobustInputMapper):
             new_mapper = RobustInputMapper(
-                in_dim=in_dim, out_dim=pruned_first_n, x_max=raw_mapper.x_max,
-            )
+                in_dim=in_dim, out_dim=pruned_first_n, x_max=raw_mapper.x_max)
         else:
             new_mapper = InputMapper(
-                in_dim=in_dim, out_dim=pruned_first_n, x_max=raw_mapper.x_max,
-            )
+                in_dim=in_dim, out_dim=pruned_first_n, x_max=raw_mapper.x_max)
         with torch.no_grad():
             for old_id, new_id in zip(surviving_old, surviving_new):
                 if old_id < old_out:
@@ -2534,7 +2306,6 @@ def _transfer_input_mapper(raw_mapper, raw_write_idx, stage0_remap,
     raise TypeError(
         f"transfer_input_mapper: unsupported mapper type {type(raw_mapper).__name__}"
     )
-
 
 def _transfer_output_mapper(raw_mapper, raw_read_idx, last_remap,
                             pruned_last_n, out_dim):
@@ -2556,8 +2327,7 @@ def _transfer_output_mapper(raw_mapper, raw_read_idx, last_remap,
     if raw_read_idx is not None:
         new_read_idx = _remap_indices(raw_read_idx, last_remap)
         new_mapper = OutputMapper(
-            node_dim=pruned_last_n, out_dim=out_dim, read_idx=new_read_idx,
-        )
+            node_dim=pruned_last_n, out_dim=out_dim, read_idx=new_read_idx)
         # Determine which columns of the old weight matrix correspond to
         # surviving read positions (those entries not pruned away).
         surviving_old_positions = [
@@ -2582,7 +2352,6 @@ def _transfer_output_mapper(raw_mapper, raw_read_idx, last_remap,
         )
         new_mapper.proj.bias.data.copy_(raw_mapper.proj.bias.data)
     return new_mapper, None
-
 
 def main():
     parser = argparse.ArgumentParser(
@@ -2713,14 +2482,12 @@ def main():
         resolved_grid_size = args.grid_size if args.grid_size is not None else 7
         PRESETS["smooth2d_grid"] = make_smooth2d_grid_preset(
             grid_size=resolved_grid_size,
-            bidirectional=args.bidirectional,
-        )
+            bidirectional=args.bidirectional)
     elif args.problem == "housing_grid":
         resolved_grid_size = args.grid_size if args.grid_size is not None else 5
         PRESETS["housing_grid"] = make_housing_grid_preset(
             grid_size=resolved_grid_size,
-            bidirectional=args.bidirectional,
-        )
+            bidirectional=args.bidirectional)
     else:
         resolved_grid_size = args.grid_size
     args.grid_size = resolved_grid_size
@@ -2747,8 +2514,7 @@ def main():
             read_mode_override=args.read_mode,
             small_world_k=args.small_world_k,
             small_world_p=args.small_world_p,
-            small_world_seed=args.small_world_seed,
-        )
+            small_world_seed=args.small_world_seed)
         PRESETS[args.problem] = new_preset
         print(
             f"[train] dynamic preset (hidden_family={args.hidden_family}): "
@@ -2786,8 +2552,7 @@ def main():
                 )
             num_inputs = int(active_preset["stages"][0]["num_inputs"])
             active_preset["write_fan_out"] = _build_grid_write_fan_out(
-                num_inputs=num_inputs, grid_size=resolved_grid_size,
-            )
+                num_inputs=num_inputs, grid_size=resolved_grid_size)
             active_preset["write_mode"] = "fan_out"
     net = build_net_from_preset(
         args.problem,
@@ -2796,8 +2561,7 @@ def main():
         read_mode=args.read_mode,
         write_idx=write_idx_arg,
         read_idx=read_idx_arg,
-        enable_drive=args.persistent_drive,
-    )
+        enable_drive=args.persistent_drive)
     net.to(device)
     grid_label = (
         f" {args.grid_size}×{args.grid_size} grid,"
@@ -2905,8 +2669,7 @@ def main():
             quantize_intermediate=True,
             weight_noise=True,
             activation_noise=True,
-            seed=args.noise_seed,
-        )
+            seed=args.noise_seed)
         # Wrap the BASE KirchhoffNetWithIO so the wrapper.base is the
         # unwrapped model. The wrapper's parameters() / state_dict()
         # delegate to base, so DataParallel state_dict/parameters of
@@ -2915,13 +2678,11 @@ def main():
         # benefits from multi-GPU parallelism. The regularizer monkey
         # patch unwraps both layers to reach the base stages.
         train_wrapper = KirchhoffNetNoiseWrapper(
-            raw_net, train_noise_cfg, adc_full_range=args.adc_full_range,
-        )
+            raw_net, train_noise_cfg, adc_full_range=args.adc_full_range)
         train_wrapper.to(device)
         if parallel_enabled and n_gpus >= 2:
             train_wrapper = torch.nn.DataParallel(
-                train_wrapper, device_ids=list(range(n_gpus)),
-            )
+                train_wrapper, device_ids=list(range(n_gpus)))
             print(f"[noise] DataParallel enabled on {n_gpus} GPUs for train_wrapper")
         print(
             f"[noise] noise-aware training: quant_bits={args.quant_bits} "
@@ -2951,18 +2712,15 @@ def main():
         # does not break when raw_net is later reassigned (e.g. to
         # None during the free-memory step before building pruned_net).
         _raw_net = raw_net
-        _num_cells = _raw_net.core.stages[0].cell_lib.num_cells
         def ctx_factory(batch_size_: int, device: torch.device = device, **_):
             total_edges = sum(s.num_edges() for s in _raw_net.core.stages)
             return sample_random_context(
                 num_edges=total_edges,
-                num_cells=_num_cells,
                 device=device,
                 gain_shift_std=gss,
                 mismatch_std=ems,
                 global_isat_shift_std=giss,
-                isat_mismatch_std=ims,
-            )
+                isat_mismatch_std=ims)
     else:
         ctx_factory = make_static_ctx_factory()
 
@@ -2971,8 +2729,7 @@ def main():
         stage_lr_scale=args.stage_lr_scale,
         mapper_lr_scale=args.mapper_lr_scale,
         struct_lr_scale=args.struct_lr_scale,
-        dyn_lr_scale=args.dyn_lr_scale,
-    )
+        dyn_lr_scale=args.dyn_lr_scale)
     if any(abs(s - 1.0) > 1e-6 for s in [args.stage_lr_scale, args.mapper_lr_scale,
                                           args.struct_lr_scale, args.dyn_lr_scale]):
         lr_strs = [f"{g['lr']:.1e}" for g in optimizer.param_groups]
@@ -2991,15 +2748,13 @@ def main():
             scheduler = CosineAnnealingLR(
                 optimizer,
                 T_max=sched_tmax,
-                eta_min=OPTIM["scheduler_eta_min"],
-            )
+                eta_min=OPTIM["scheduler_eta_min"])
         else:
             scheduler = CosineAnnealingWarmRestarts(
                 optimizer,
                 T_0=OPTIM["scheduler_T_0"],
                 T_mult=OPTIM["scheduler_T_mult"],
-                eta_min=OPTIM["scheduler_eta_min"],
-            )
+                eta_min=OPTIM["scheduler_eta_min"])
     else:
         scheduler = None
 
@@ -3014,8 +2769,7 @@ def main():
     for i, stage in enumerate(raw_net.core.stages):
         plot_stage_graph(
             stage, save_path=str(out_dir / f"stage{i + 1}_graph_init.png"),
-            title=f"{args.problem} — Stage {i + 1} (init)",
-        )
+            title=f"{args.problem} — Stage {i + 1} (init)")
 
     print("[train] starting training loop")
     try:
@@ -3117,11 +2871,9 @@ def main():
         # budget_frac / budget_temperature.
         if budget_enabled:
             _b_frac = budget_frac_for_epoch(
-                epoch, ab_total, budget_frac_start, budget_frac_end, budget_anneal_frac,
-            )
+                epoch, ab_total, budget_frac_start, budget_frac_end, budget_anneal_frac)
             _b_T = budget_temperature_for_epoch(
-                epoch, ab_total, budget_temp_start, budget_temp_end, budget_anneal_frac,
-            )
+                epoch, ab_total, budget_temp_start, budget_temp_end, budget_anneal_frac)
             for _stage in raw_net.core.stages:
                 _stage.set_budget_frac(_b_frac, _b_T)
                 _stage.budget_axis = budget_axis
@@ -3193,13 +2945,9 @@ def main():
             reg_scale = reg_schedule(epoch)
             effective_lambdas = lambdas
 
-        # four-phase-redesign/Phase 2b: per-epoch cell selection mode.
+        # : per-epoch cell selection mode.
         # 'auto' uses 'ste' for Phase B/C of phased schedules.
-        cell_mode = _resolve_cell_mode(args.cell_mode, phase, schedule_mode)
         # DEQ requires soft cell mode (forward_equilibrium enforces it).
-        if solver == "deq" and cell_mode != "soft":
-            print(f"[solver=deq] forcing cell_mode='soft' (was {cell_mode!r})")
-            cell_mode = "soft"
         deq_cfg = _build_deq_cfg(args)
 
         total_loss = 0.0
@@ -3231,13 +2979,10 @@ def main():
             loss_task, loss_structural, _ = compute_loss(
                 train_wrapper if train_wrapper is not None else net,
                 u, target, ctx, task_fn,
-                lambdas=effective_lambdas, tau=tau, return_parts=True,
+                lambdas=effective_lambdas, return_parts=True,
                 amp=amp_enabled, amp_dtype=amp_dtype, reg_scale=reg_scale,
-                cell_mode=cell_mode,
                 solver=solver, deq_cfg=deq_cfg,
-                teacher=kd_teacher, lambda_kd=kd_lambda, teacher_tau=1.0,
-                teacher_cell_mode="soft",
-            )
+                teacher=kd_teacher)
             if scaler is not None and scaler._enabled:
                 ( scaler.scale(loss_task) + scaler.scale(loss_structural) ).backward()
                 scaler.unscale_(optimizer)
@@ -3273,16 +3018,14 @@ def main():
                 "residual_max": train_deq_residual_max,
                 "nstep_mean": train_deq_nstep_sum / train_deq_weight,
                 "nstep_max": train_deq_nstep_max,
-                "max_abs_state": train_deq_abs_state_max,
-            }
+                "max_abs_state": train_deq_abs_state_max}
             if deq_train_log_path is not None:
                 _append_deq_train_row(
                     deq_train_log_path,
                     epoch=epoch,
                     phase=phase,
                     train_loss=avg_train,
-                    metrics=train_deq_metrics,
-                )
+                    metrics=train_deq_metrics)
         do_validate = (epoch % args.validate_every == 0) or (epoch == ab_total - 1)
         if do_validate:
             val_deq_metrics = None
@@ -3290,30 +3033,26 @@ def main():
                 if solver == "deq":
                     val_metrics = validate_with_inverse(
                         net, val_loader, task_fn, ctx_factory, device,
-                        inverse_stats=inverse_stats, cell_mode=cell_mode,
+                        inverse_stats=inverse_stats,
                         solver=solver, deq_cfg=deq_cfg,
-                        collect_deq_metrics=True,
-                    )
+                        collect_deq_metrics=True)
                     val_deq_metrics = val_metrics.pop("deq", None)
                 else:
                     val_metrics = validate_with_inverse(
                         net, val_loader, task_fn, ctx_factory, device,
-                        inverse_stats=inverse_stats, cell_mode=cell_mode,
-                        solver=solver, deq_cfg=deq_cfg,
-                    )
+                        inverse_stats=inverse_stats,
+                        solver=solver, deq_cfg=deq_cfg)
                 val_loss = val_metrics["val"]
             else:
                 if solver == "deq":
                     val_loss, val_deq_metrics = validate(
                         net, val_loader, task_fn, ctx_factory, device,
-                        cell_mode=cell_mode, solver=solver, deq_cfg=deq_cfg,
-                        collect_deq_metrics=True,
-                    )
+                        solver=solver, deq_cfg=deq_cfg,
+                        collect_deq_metrics=True)
                 else:
                     val_loss = validate(
                         net, val_loader, task_fn, ctx_factory, device,
-                        cell_mode=cell_mode, solver=solver, deq_cfg=deq_cfg,
-                    )
+                        solver=solver, deq_cfg=deq_cfg)
                 val_metrics = None
             val_v_history.append(val_loss)
             if inverse_stats is not None and val_metrics is not None:
@@ -3326,19 +3065,10 @@ def main():
                     split="val",
                     train_loss=avg_train,
                     val_loss=val_loss,
-                    metrics=val_deq_metrics,
-                )
+                    metrics=val_deq_metrics)
             # Argmax validation for phased schedules
-            if val_argmax_history is not None:
-                val_arg = validate_argmax(
-                    net, val_loader, task_fn, ctx_factory, device,
-                    solver=solver, deq_cfg=deq_cfg,
-                )
-                val_argmax_history.append(val_arg)
-                val_argmax_v_history.append(val_arg)
             if solid_log_path is not None and phase in ("A", "B", "B1", "B2"):
-                metrics = compute_solidification_metrics(net, tau=tau)
-                _log_solidification(solid_log_path, epoch, metrics)
+                _log_solidification(solid_log_path, epoch, {})
                 # Store for four_phase readiness check.
                 if schedule_mode == "four_phase":
                     solid_metrics_history.append(metrics)
@@ -3353,22 +3083,6 @@ def main():
                 and len(val_v_history) >= 10
                 and len(solid_metrics_history) >= 10
             ):
-                is_ready, ready_details = prune_readiness_check(
-                    val_v_history, val_argmax_v_history, solid_metrics_history,
-                )
-                # Also log readiness diagnostics.
-                if solid_log_path is not None:
-                    _log_solidification(
-                        solid_log_path, epoch,
-                        {"ready_ratio": ready_details.get("ratio", -1.0),
-                         "ready_prob": ready_details.get("max_cell_prob", -1.0),
-                         "ready_stability": ready_details.get("stability", -1.0),
-                         "ready_improvement": ready_details.get("improvement_rate", -1.0),
-                         "all_ready": 1.0 if ready_details.get("all_ready", False) else 0.0},
-                    )
-                if is_ready and not readiness_prune_fired:
-                    readiness_prune_fired = True
-                    readiness_prune_epoch = epoch
                     print(
                         f"[four_phase] READINESS TRIGGERED at epoch {epoch}: "
                         f"ratio={ready_details['ratio']:.3f}, "
@@ -3573,41 +3287,28 @@ def main():
     for i, stage in enumerate(raw_net.core.stages):
         plot_stage_graph(
             stage, save_path=str(out_dir / f"stage{i + 1}_graph_trained.png"),
-            title=f"{args.problem} — Stage {i + 1} (trained)",
-        )
-
-    for i, stage in enumerate(raw_net.core.stages):
-        plot_cell_selection(
-            stage.logits, cell_order=stage.cell_lib._cell_order,
-            save_path=str(out_dir / f"stage{i + 1}_cell_selection_trained.png"),
-            title=f"{args.problem} — Stage {i + 1} cell selection (trained)",
-        )
+            title=f"{args.problem} — Stage {i + 1} (trained)")
 
     val_batch = next(iter(val_loader))
     u_val, y_val = val_batch[0][:64].to(device), val_batch[1][:64].to(device)
     ctx = ctx_factory(u_val.size(0), device=device)
     with torch.no_grad():
         out, trajs = net(
-            u_val, ctx=ctx, store_trajectory=True,
-            solver=solver, deq_cfg=deq_cfg,
-        )
+            u_val, store_trajectory=True,
+            solver=solver, deq_cfg=deq_cfg)
     if isinstance(trajs, list) and trajs:
         plot_trajectories(
             trajs[0], stage_idx=0,
             save_path=str(out_dir / "trajectories.png"),
-            title=f"{args.problem} — Stage 1 trajectories (trained)",
-        )
+            title=f"{args.problem} — Stage 1 trajectories (trained)")
 
     plot_output_fit(
         out, y_val, loss_name=PRESETS[args.problem]["loss"],
         save_path=str(out_dir / "output_fit.png"),
-        title=f"{args.problem} — Output fit (trained)",
-    )
+        title=f"{args.problem} — Output fit (trained)")
 
     plot_network(
-        raw_net, cell_order=raw_net.core.stages[0].cell_lib._cell_order,
-        save_path=str(out_dir / "pipeline.png"),
-    )
+        raw_net, save_path=str(out_dir / "pipeline.png"))
 
     # ----------------------------------------------------------------
     # kirchhoff-noise: post-training MC noise evaluation. Skip during
@@ -3656,8 +3357,7 @@ def main():
                 "(deprecate-node-gates); node pruning is connectivity-only "
                 "regardless of this flag.",
                 DeprecationWarning,
-                stacklevel=2,
-            )
+                stacklevel=2)
         pnbg = False
 
         pre_edges = sum(s.num_edges() for s in raw_net.core.stages)
@@ -3677,8 +3377,7 @@ def main():
             transfer_params=not args.fresh_init,
             write_idx=list(raw_net.write_idx) if raw_net.write_idx is not None else None,
             read_idx=list(raw_net.read_idx) if raw_net.read_idx is not None else None,
-            prune_nodes_by_gate=pnbg,
-        )
+            prune_nodes_by_gate=pnbg)
 
         post_edges = sum(s.num_edges() for s in pruned_core.stages)
         post_nodes = sum(s.num_nodes for s in pruned_core.stages)
@@ -3709,12 +3408,10 @@ def main():
         if not args.fresh_init:
             input_mapper_pruned, pruned_write_idx = _transfer_input_mapper(
                 raw_net.input_mapper, raw_write_idx, stage0_remap,
-                pruned_first_n, in_dim,
-            )
+                pruned_first_n, in_dim)
             output_mapper_pruned, pruned_read_idx = _transfer_output_mapper(
                 raw_net.output_mapper, raw_read_idx, last_remap,
-                pruned_last_n, out_dim,
-            )
+                pruned_last_n, out_dim)
         else:
             if effective_write_mode == "one_to_one":
                 if raw_write_idx is None:
@@ -3722,8 +3419,7 @@ def main():
                 else:
                     pruned_write_idx = _remap_indices(raw_write_idx, stage0_remap)
                 input_mapper_pruned = SparseInputMapper(
-                    in_dim=in_dim, out_dim=pruned_first_n, write_idx=pruned_write_idx,
-                )
+                    in_dim=in_dim, out_dim=pruned_first_n, write_idx=pruned_write_idx)
             elif effective_write_mode == "fan_out":
                 fan_out_map = preset_cfg.get("write_fan_out")
                 if fan_out_map is None:
@@ -3735,8 +3431,7 @@ def main():
                     for inp, targets in fan_out_map.items()
                 }
                 input_mapper_pruned = FanOutInputMapper(
-                    in_dim=in_dim, out_dim=pruned_first_n, fan_out_map=new_fan_out,
-                )
+                    in_dim=in_dim, out_dim=pruned_first_n, fan_out_map=new_fan_out)
                 pruned_write_idx = None
             else:
                 MapperCls = (RobustInputMapper
@@ -3751,8 +3446,7 @@ def main():
                 else:
                     pruned_read_idx = _remap_indices(raw_read_idx, last_remap)
                 output_mapper_pruned = OutputMapper(
-                    node_dim=pruned_last_n, out_dim=out_dim, read_idx=pruned_read_idx,
-                )
+                    node_dim=pruned_last_n, out_dim=out_dim, read_idx=pruned_read_idx)
             else:
                 output_mapper_pruned = OutputMapper(node_dim=pruned_last_n, out_dim=out_dim)
                 pruned_read_idx = None
@@ -3797,8 +3491,7 @@ def main():
             final_hid_count=pruned_last_n,
             final_proj_count=0,
             write_idx=pruned_write_idx if effective_write_mode == "one_to_one" else None,
-            read_idx=pruned_read_idx if effective_read_mode == "sparse" else None,
-        )
+            read_idx=pruned_read_idx if effective_read_mode == "sparse" else None)
         pruned_net.to(device)
 
         # retrain-oom-fix/REQ-2: the shared cell_lib is the one compiled
@@ -3863,8 +3556,7 @@ def main():
                     num_workers=train_loader.num_workers,
                     pin_memory=train_loader.pin_memory,
                     collate_fn=train_loader.collate_fn,
-                    drop_last=False,
-                )
+                    drop_last=False)
                 print(
                     f"[prune] retrain batch_size={retrain_batch_size} "
                     f"(overridden from {batch_size})"
@@ -3874,8 +3566,7 @@ def main():
                 stage_lr_scale=args.retrain_stage_lr_scale,
                 mapper_lr_scale=args.retrain_mapper_lr_scale,
                 struct_lr_scale=args.struct_lr_scale,
-                dyn_lr_scale=args.dyn_lr_scale,
-            )
+                dyn_lr_scale=args.dyn_lr_scale)
             if max(abs(args.retrain_stage_lr_scale - 1.0), abs(args.retrain_mapper_lr_scale - 1.0),
                    abs(args.struct_lr_scale - 1.0), abs(args.dyn_lr_scale - 1.0)) > 1e-6:
                 lr_strs = [f"{g['lr']:.1e}" for g in retrain_optimizer.param_groups]
@@ -3890,15 +3581,13 @@ def main():
                     retrain_scheduler = CosineAnnealingLR(
                         retrain_optimizer,
                         T_max=max(1, c_epochs),
-                        eta_min=OPTIM["scheduler_eta_min"],
-                    )
+                        eta_min=OPTIM["scheduler_eta_min"])
                 else:
                     retrain_scheduler = CosineAnnealingWarmRestarts(
                         retrain_optimizer,
                         T_0=OPTIM["scheduler_T_0"],
                         T_mult=OPTIM["scheduler_T_mult"],
-                        eta_min=OPTIM["scheduler_eta_min"],
-                    )
+                        eta_min=OPTIM["scheduler_eta_min"])
             else:
                 retrain_scheduler = None
             retrain_scaler = (
@@ -3941,7 +3630,6 @@ def main():
                     reg_r = 1.0
                     # Solidification metrics during Phase C.
                     if solid_log_path is not None and repoch % args.validate_every == 0:
-                        c_metrics = compute_solidification_metrics(pruned_net, tau=tau_r)
                         _log_solidification(solid_log_path, global_epoch, c_metrics)
                 elif schedule_mode == "four_phase":
                     global_epoch = b2_end + repoch
@@ -3949,7 +3637,6 @@ def main():
                     effective_c_lambdas = four_phase_lambdas(global_epoch, epochs, lambdas)
                     reg_r = 1.0
                     if solid_log_path is not None and repoch % args.validate_every == 0:
-                        c_metrics = compute_solidification_metrics(pruned_net, tau=tau_r)
                         _log_solidification(solid_log_path, global_epoch, c_metrics)
                 else:
                     retrain_warmup = (0 if (not args.fresh_init) else max(1, c_epochs // 2))
@@ -3958,19 +3645,14 @@ def main():
                     tau_r = tau_for_epoch(
                         repoch, total_epochs=c_epochs,
                         tau_init=retrain_tau_init,
-                        tau_final=retrain_tau_final,
-                    )
+                        tau_final=retrain_tau_final)
                     reg_r = reg_schedule(
                         repoch,
                         warmup=retrain_warmup,
-                        anneal=max(25, c_epochs // 4),
-                    )
+                        anneal=max(25, c_epochs // 4))
                     effective_c_lambdas = lambdas
-                # four-phase-redesign/Phase 2b: cell_mode in Phase C.
-                # Phase C is post-prune and STE is the deployable form.
-                cell_mode_c = _resolve_cell_mode(args.cell_mode, "C", schedule_mode)
-                tot = 0.0
-                nb = 0
+                    tot = 0.0
+                    nb = 0
                 should_log_retrain_grads = grad_log_path is not None and repoch % args.grad_log_every == 0
                 retrain_epoch_grad_norms = None
                 retrain_param_snapshots: dict[str, torch.Tensor] | None = None
@@ -3985,10 +3667,8 @@ def main():
                     tgt_b = tgt_b.to(device)
                     loss_task, loss_structural, _ = compute_loss(
                         pruned_net, u_b, tgt_b, ctx, task_fn,
-                        lambdas=effective_c_lambdas, tau=tau_r, return_parts=True,
-                        amp=amp_enabled, amp_dtype=amp_dtype, reg_scale=reg_r,
-                        cell_mode=cell_mode_c,
-                    )
+                        lambdas=effective_c_lambdas_r, return_parts=True,
+                        amp=amp_enabled, amp_dtype=amp_dtype, reg_scale=reg_r)
                     if retrain_scaler is not None and retrain_scaler._enabled:
                         ( retrain_scaler.scale(loss_task) + retrain_scaler.scale(loss_structural) ).backward()
                         retrain_scaler.unscale_(retrain_optimizer)
@@ -4020,8 +3700,7 @@ def main():
                 if should_log_retrain_grads:
                     log_gradient_norms(
                         grad_log_path, repoch, pruned_net, retrain=True,
-                        optimizer=retrain_optimizer, norms=retrain_epoch_grad_norms,
-                    )
+                        optimizer=retrain_optimizer, norms=retrain_epoch_grad_norms)
                     if retrain_param_snapshots is not None and update_norms_path is not None:
                         retrain_update_norms = compute_update_norms(retrain_param_snapshots, pruned_net)
                         log_update_norms(update_norms_path, repoch, retrain_update_norms, phase="C", retrain=True)
@@ -4035,50 +3714,39 @@ def main():
                         "residual_max": retrain_deq_residual_max,
                         "nstep_mean": retrain_deq_nstep_sum / retrain_deq_weight,
                         "nstep_max": retrain_deq_nstep_max,
-                        "max_abs_state": retrain_deq_abs_state_max,
-                    }
+                        "max_abs_state": retrain_deq_abs_state_max}
                     if retrain_deq_log_path is not None:
                         _append_deq_train_row(
                             retrain_deq_log_path,
                             epoch=global_epoch,
                             phase="C",
                             train_loss=avg,
-                            metrics=retrain_deq_metrics,
-                        )
+                            metrics=retrain_deq_metrics)
                 val_deq_metrics = None
                 if repoch % args.validate_every == 0 or repoch == c_epochs - 1:
                     if inverse_stats is not None:
                         if solver == "deq":
                             val_metrics_c = validate_with_inverse(
                                 pruned_net, val_loader, task_fn, ctx_factory, device,
-                                inverse_stats=inverse_stats, cell_mode=cell_mode_c,
+                                inverse_stats=inverse_stats_c,
                                 solver=solver, deq_cfg=deq_cfg,
-                                collect_deq_metrics=True,
-                            )
+                                collect_deq_metrics=True)
                             val_deq_metrics = val_metrics_c.pop("deq", None)
                         else:
                             val_metrics_c = validate_with_inverse(
                                 pruned_net, val_loader, task_fn, ctx_factory, device,
-                                inverse_stats=inverse_stats, cell_mode=cell_mode_c,
-                                solver=solver, deq_cfg=deq_cfg,
-                            )
+                                inverse_stats=inverse_stats_c,
+                                solver=solver, deq_cfg=deq_cfg)
                         val = val_metrics_c["val"]
                     else:
                         val_metrics_c = None
                         if solver == "deq":
                             val, val_deq_metrics = validate(
                                 pruned_net, val_loader, task_fn, ctx_factory, device,
-                                cell_mode=cell_mode_c, solver=solver, deq_cfg=deq_cfg,
-                                collect_deq_metrics=True,
-                            )
+                                solver=solver, deq_cfg=deq_cfg,
+                                collect_deq_metrics=True)
                         else:
-                            val = validate(pruned_net, val_loader, task_fn, ctx_factory, device, cell_mode=cell_mode_c)
-                    if retrain_val_argmax is not None:
-                        val_arg = validate_argmax(
-                            pruned_net, val_loader, task_fn, ctx_factory, device,
-                            solver=solver, deq_cfg=deq_cfg,
-                        )
-                        retrain_val_argmax.append(val_arg)
+                            val = validate(pruned_net, val_loader, task_fn, ctx_factory, device_c)
                     retrain_val_history.append(val)
                     if retrain_orig_history is not None and val_metrics_c is not None:
                         retrain_orig_history.append(val_metrics_c)
@@ -4090,8 +3758,7 @@ def main():
                             split="retrain",
                             train_loss=avg,
                             val_loss=val,
-                            metrics=val_deq_metrics,
-                        )
+                            metrics=val_deq_metrics)
                     # four-phase-redesign/Phase 1b: Phase C is post-prune, the
                     # deployable model IS the hard-cell (argmax) version, so
                     # use val_argmax for checkpoint selection.
@@ -4191,13 +3858,7 @@ def main():
             for i, stage in enumerate(pruned_core.stages):
                 plot_stage_graph(
                     stage, save_path=str(out_dir / f"stage{i + 1}_graph_pruned.png"),
-                    title=f"{args.problem} — Stage {i + 1} (pruned, {stage.num_edges()} edges, {stage.num_nodes} nodes)",
-                )
-                plot_cell_selection(
-                    stage.logits, cell_order=stage.cell_lib._cell_order,
-                    save_path=str(out_dir / f"stage{i + 1}_cell_selection_pruned.png"),
-                    title=f"{args.problem} — Stage {i + 1} cell selection (pruned)",
-                )
+                    title=f"{args.problem} — Stage {i + 1} (pruned, {stage.num_edges()} edges, {stage.num_nodes} nodes)")
 
             # Pruned output fit.
             with torch.no_grad():
@@ -4206,13 +3867,11 @@ def main():
                     ctx=ctx_factory(u_val.size(0), device=device),
                     store_trajectory=False,
                     solver=solver,
-                    deq_cfg=deq_cfg,
-                )
+                    deq_cfg=deq_cfg)
             plot_output_fit(
                 out_pruned, y_val, loss_name=PRESETS[args.problem]["loss"],
                 save_path=str(out_dir / "output_fit_pruned.png"),
-                title=f"{args.problem} — Output fit (pruned, retrained)",
-            )
+                title=f"{args.problem} — Output fit (pruned, retrained)")
 
             # Save pruned model.
             torch.save(pruned_net.state_dict(), out_dir / "model_pruned.pt")
@@ -4253,8 +3912,7 @@ def main():
             raw_net, val_loader, task_fn, ctx_factory,
             device, args, out_dir,
             best_epoch, best_val, best_metric_name,
-            compile_enabled, schedule_mode, needs_prune,
-        )
+            compile_enabled, schedule_mode, needs_prune)
 
     # ----------------------------------------------------------------
     # kirchhoff-noise: final MC noise evaluation on the deployable
@@ -4273,25 +3931,18 @@ def main():
             _run_noise_evaluation(
                 raw_net, val_loader, task_fn, ctx_factory,
                 device, args, out_dir, "main",
-                cell_mode="ste",
-                metric_name=metric_name,
-            )
+                metric_name=metric_name)
             _run_noise_evaluation(
                 raw_pruned, val_loader, task_fn, ctx_factory,
                 device, args, out_dir, "pruned",
-                cell_mode="ste",
-                metric_name=metric_name,
-            )
+                metric_name=metric_name)
         else:
             _run_noise_evaluation(
                 raw_net, val_loader, task_fn, ctx_factory,
                 device, args, out_dir, "main",
-                cell_mode="ste",
-                metric_name=metric_name,
-            )
+                metric_name=metric_name)
 
     print(f"[train] done — artifacts in {out_dir}")
-
 
 if __name__ == "__main__":
     main()

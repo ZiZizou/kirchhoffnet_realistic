@@ -27,7 +27,6 @@ from config import PRESETS
 from differential_stage import DifferentialStage
 from cell_library import (
     FreeTanhLibrary,
-    IdealizedCellLibrary,
     RealisticTanhLibrary,
     RealisticTanhUpgradeLibrary,
     SimpleEdgeLibrary,
@@ -824,12 +823,7 @@ def prune_stage(
     if _budget_enabled:
         _bg = stage._compute_budget_gate().detach().cpu()
         z = z * _bg
-    if getattr(stage.cell_lib, 'has_z_cell', True):
-        w_logits = stage.logits.detach().cpu()
-        p_z = torch.softmax(w_logits, dim=-1)[:, stage.cell_lib.z_index]  # [E]
-        eff_score = (1.0 - p_z) * z  # [E]
-    else:
-        eff_score = z  # no Z cell: gate alone determines activity
+    eff_score = z  # gate alone determines activity (no Z cell)
 
     keep_edge = eff_score > edge_threshold
     # DEPRECATED (deprecate-node-gates): prune_nodes_by_gate is ignored.
@@ -1040,9 +1034,6 @@ def prune_stage(
                     new_stage.cell_lib.theta_raw.data.copy_(
                         stage.cell_lib.theta_raw.data[edge_idx_old].cpu()
                     )
-            else:
-                new_stage.logits.data.copy_(stage.logits.data[edge_idx_old].cpu())
-                new_stage.raw_mult.data.copy_(stage.raw_mult.data[edge_idx_old].cpu())
             old_z_logits = stage.z_logits.data[edge_idx_old].cpu()
             if _budget_enabled:
                 # Rescale z_logits so that σ(z_new) = σ(z_old) * budget_gate_old.
@@ -1204,7 +1195,7 @@ def validate_topology(topo: SparseTopology, max_hidden_density: float = 0.5) -> 
 
 def topology_to_stage(
     topo: SparseTopology,
-    cell_lib: IdealizedCellLibrary | SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary,
+    cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary,
     c_eff: float | None = None,
     x_max: float | None = None,
     clip_current: float | None = None,
@@ -1281,7 +1272,7 @@ def topology_to_stage(
 
 def build_net_from_preset(
     preset_name: str,
-    cell_lib: IdealizedCellLibrary | SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary,
+    cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary,
     write_mode: str | None = None,
     read_mode: str | None = None,
     write_idx: list[int] | None = None,
@@ -1315,7 +1306,7 @@ def build_net_from_preset(
 
 def build_net_from_config(
     cfg: dict,
-    cell_lib: IdealizedCellLibrary | SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary,
+    cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary,
     enable_drive: bool = False,
 ):
     """Build a KirchhoffNetWithIO from a full config dict."""

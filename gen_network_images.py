@@ -7,19 +7,18 @@ sys.path.insert(0, '/home/annaik/Documents/ASPDAC_2026/kirchhoff_redesign/ideal'
 
 import os
 import torch
-from cell_library import IdealizedCellLibrary
-from topology import build_net_from_preset, MultiStageTopology, topology_to_stage
+from cell_library import make_cell_library
+from topology import build_net_from_preset, MultiStageTopology
 from sim_context import SimContext
 from visualize import (
     plot_sparse_topology,
     plot_stage_graph,
     plot_multi_stage_topology,
     plot_trajectories,
-    plot_cell_selection,
     plot_output_fit,
     plot_network,
 )
-from config import PRESETS, CELL_ORDER
+from config import PRESETS
 
 OUT_DIR = '/home/annaik/Documents/ASPDAC_2026/kirchhoff_redesign/ideal/network_visualization'
 os.makedirs(OUT_DIR, exist_ok=True)
@@ -27,7 +26,7 @@ os.makedirs(OUT_DIR, exist_ok=True)
 
 def gen_for_preset(name: str) -> None:
     print(f'\n{"=" * 60}\n  Preset: {name}\n{"=" * 60}')
-    cell_lib = IdealizedCellLibrary()
+    cell_lib = make_cell_library('tanh')
     net = build_net_from_preset(name, cell_lib=cell_lib)
 
     # 1. SparseTopology of each stage (raw graph with I/O nodes)
@@ -50,16 +49,7 @@ def gen_for_preset(name: str) -> None:
     plot_multi_stage_topology(multi_topo, save_path=path, title=f'{name} — Multi-stage topology')
     print(f'  saved {path}')
 
-    # 4. Cell-type selection heatmap per stage
-    for i, stage in enumerate(net.core.stages):
-        path = os.path.join(OUT_DIR, f'{name}_stage{i + 1}_cell_selection.png')
-        plot_cell_selection(
-            stage.logits, cell_order=CELL_ORDER,
-            save_path=path, title=f'{name} — Stage {i + 1} cell-type selection',
-        )
-        print(f'  saved {path}')
-
-    # 5. Forward pass + trajectory + output fit
+    # 4. Forward pass + trajectory + output fit
     n_in = PRESETS[name]['stages'][0]['num_inputs']
     batch_size = 64
     u = torch.randn(batch_size, n_in)
@@ -75,7 +65,7 @@ def gen_for_preset(name: str) -> None:
                               title=f'{name} — Stage {i + 1} trajectories')
             print(f'  saved {path}')
 
-    # 6. Fit plot
+    # 5. Fit plot
     if name == 'sinx':
         y_true = torch.sin(u)
     elif name == 'xor':
@@ -99,9 +89,9 @@ def gen_for_preset(name: str) -> None:
                     title=f'{name} — Output fit ({PRESETS[name]["loss"]})')
     print(f'  saved {path}')
 
-    # 7. Full pipeline
+    # 6. Full pipeline
     path = os.path.join(OUT_DIR, f'{name}_pipeline.png')
-    plot_network(net, cell_order=CELL_ORDER, save_path=path)
+    plot_network(net, save_path=path)
     print(f'  saved {path}')
 
     print(f'  done: {name}  ({net!r})')

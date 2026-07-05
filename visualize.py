@@ -38,13 +38,7 @@ _NODE_COLORS = {
     "output": "tab:red",
 }
 
-_CELL_COLORS = {
-    "L": "tab:purple", "S": "tab:brown", "P": "tab:green", "Z": "lightgray",
-    "O_weak": "tab:blue", "O_hard": "tab:red", "P0": "tab:green", "N0": "tab:orange", "D1": "tab:cyan",
-    "O_w11": "tab:blue", "O_h11": "tab:red", "O_h10": "tab:pink", "O_h01": "tab:olive",
-    "P1": "tab:green", "N1": "tab:orange",
-}
-_CELL_COLOR_DEFAULT = "tab:gray"
+
 
 
 def _ensure_matplotlib():
@@ -121,9 +115,7 @@ def plot_sparse_topology(
     Nodes are colored by kind (input/hidden/proj/output) and edges by type
     (input/hidden/proj/output) when show_edge_types=True.
 
-    When a DifferentialStage is provided via ``stage``, core edges (hidden+proj)
-    are colored by dominant cell type (L/S/Z) and their width is scaled by
-    multiplicity × (1 - p_Z).  Input/output edges remain dashed.
+    Input/output edges remain dashed.
 
     Returns (fig, ax).
     """
@@ -133,34 +125,13 @@ def plot_sparse_topology(
     G = nx.DiGraph()
     G.add_nodes_from(range(topo.num_nodes))
 
-    # Resolve cell-type info for core edges when a stage is provided
-    if stage is not None:
-        cell_lib = stage.cell_lib
-        cell_order = cell_lib._cell_order
-        z_index = cell_lib.z_index
-        probs = torch.softmax(stage.logits.detach(), dim=-1)  # [E_core, Q]
-        dominant = probs.argmax(dim=-1)  # [E_core]
-        mult = torch.nn.functional.softplus(stage.raw_mult.detach())  # [E_core]
-        p_z = probs[:, z_index]  # [E_core]
-        cell_colors_core = [_CELL_COLORS[cell_order[idx]] for idx in dominant.cpu().numpy()]
-        widths_core = (0.5 + 2.0 * torch.clamp(mult * (1.0 - p_z), max=3.0)).cpu().numpy()
-    else:
-        cell_colors_core = None
-        widths_core = None
-
     edge_colors = []
     edge_styles = []
     edge_widths = []
-    core_idx = 0
     for s, d, t in zip(topo.src, topo.dst, topo.edge_type):
         G.add_edge(s, d)
-        if t in ("hidden", "proj") and stage is not None and cell_colors_core is not None:
-            c = cell_colors_core[core_idx]
-            ew = float(widths_core[core_idx])
-            core_idx += 1
-        else:
-            c = _NODE_COLORS.get(t, "gray")
-            ew = 1.0
+        c = _NODE_COLORS.get(t, "gray")
+        ew = 1.0
         edge_colors.append(c)
         edge_styles.append("-" if t in ("hidden", "proj") else "--")
         edge_widths.append(ew)
@@ -201,21 +172,6 @@ def plot_sparse_topology(
     ax.axis("off")
     ax.legend(loc="upper right", fontsize=8, framealpha=0.85)
     leg = ax.get_legend()
-
-    # Add cell-type swatches to legend when stage is provided
-    if stage is not None:
-        cell_order = stage.cell_lib._cell_order
-        cell_handles = [
-            plt.Line2D([0], [0], color=_CELL_COLORS[cn], linewidth=3, label=cn)
-            for cn in cell_order
-        ]
-        existing_handles = leg.legend_handles if leg is not None else []
-        existing_labels = [t.get_text() for t in (leg.get_texts() if leg is not None else [])]
-        ax.legend(
-            handles=list(existing_handles) + cell_handles,
-            labels=list(existing_labels) + cell_order,
-            loc="upper right", fontsize=8, framealpha=0.85,
-        )
 
     _save(fig, save_path)
     return fig, ax
@@ -364,52 +320,6 @@ def plot_trajectories(
 
 # ---------- cell library selection ----------
 
-def plot_cell_selection(
-    logits: torch.Tensor,
-    cell_order: list[str] | None = None,
-    ax=None,
-    title: str | None = None,
-    save_path: str | None = None,
-):
-    """Heatmap of cell-type selection probabilities across edges.
-
-    Args:
-        logits: Tensor of shape [num_edges, num_cells]. Softmax is applied
-            with temperature 1.0 (raw probabilities, not annealed).
-        cell_order: List of cell names. If None, imports CELL_ORDER from config.
-    """
-    plt = _ensure_matplotlib()
-
-    if cell_order is None:
-        from config import CELL_ORDER
-        cell_order = CELL_ORDER
-
-    if logits.dim() != 2:
-        raise ValueError(f"logits must be [edges, cells], got {tuple(logits.shape)}")
-    if logits.shape[1] != len(cell_order):
-        raise ValueError(
-            f"logits has {logits.shape[1]} columns but cell_order has {len(cell_order)} entries"
-        )
-
-    probs = torch.softmax(logits.detach().cpu(), dim=1).numpy()
-
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(6, max(3, 0.25 * probs.shape[0])))
-    else:
-        fig = ax.figure
-
-    im = ax.imshow(probs, aspect="auto", cmap="viridis", vmin=0.0, vmax=1.0)
-    ax.set_xticks(range(len(cell_order)))
-    ax.set_xticklabels(cell_order)
-    ax.set_xlabel("cell type")
-    ax.set_ylabel("edge index")
-    ax.set_title(title or "Per-edge cell-type probabilities (softmax)")
-    fig.colorbar(im, ax=ax, label="P(cell | edge)")
-
-    _save(fig, save_path)
-    return fig, ax
-
-
 # ---------- output fit ----------
 
 def plot_output_fit(
@@ -464,7 +374,6 @@ def plot_output_fit(
 
 def plot_network(
     net: "KirchhoffNetWithIO",
-    cell_order: list[str] | None = None,
     figsize: tuple[float, float] | None = None,
     save_path: str | None = None,
 ):

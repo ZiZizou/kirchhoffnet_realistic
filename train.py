@@ -2,18 +2,13 @@
 
 The loss combines:
   - task loss (MSE / BCE / MAE / residual+solution)
-  - sparsity regularizer: pushes edges toward Z cell (cell-selection)
   - edge_gate regularizer (CP): Σ_e σ(z_logits) — active edge count proxy
-  - node_gate regularizer (CP): Σ_j σ(u_logits) — active hidden node count proxy
-  - power regularizer (CP): Σ_e z_e·m_e·Σ_q w_q·gm_q — static power proxy
-  - capacitance regularizer (CP): C_eff·Σ_j u_j — capacitance area proxy
-   - rail regularizer: ReLU² quadratic barrier for trajectory excursions beyond x_max
-  - entropy bonus: -Σ w·log(w) of softmax distribution over cell types
+  - power regularizer (CP): Σ_e z_e·m_e·gm_e — static power proxy
+  - rail regularizer: ReLU² quadratic barrier for trajectory excursions beyond x_max
 
-Training loop injects random SimContext per iteration, anneals tau, and
-clips gradients to norm 5.0. Regularizers are scheduled with a staged
-warm-up: ``[0, W)`` → off, ``[W, W+A)`` → linear anneal from 0 to full
-value, ``[W+A, ∞)`` → full value (RR-A + CP).
+Regularizers are scheduled with a staged warm-up: ``[0, W)`` → off,
+``[W, W+A)`` → linear anneal from 0 to full value,
+``[W+A, ∞)`` → full value (RR-A + CP).
 """
 
 from __future__ import annotations
@@ -59,10 +54,6 @@ __all__ = [
     "phase_for_epoch_four",
     "four_phase_tau",
     "four_phase_lambdas",
-    "four_phase_kd_active",
-    "prune_readiness_check",
-    "compute_solidification_metrics",
-    "validate_argmax",
     "make_optimizer",
     "apply_ablation",
     "train_epoch",
@@ -72,20 +63,6 @@ __all__ = [
 
 
 # ---------- regularizers ----------
-
-def _stage_soft_weights(stage) -> torch.Tensor:
-    if stage.logits is None:
-        E = stage.num_edges()
-        return torch.ones(E, 1, device=stage.z_logits.device, dtype=stage.z_logits.dtype)
-    return F.softmax(stage.logits, dim=-1)
-
-
-def _stage_multiplicities(stage) -> torch.Tensor:
-    if stage.raw_mult is None:
-        E = stage.num_edges()
-        return torch.ones(E, device=stage.z_logits.device, dtype=stage.z_logits.dtype)
-    return F.softplus(stage.raw_mult)
-
 
 def _stage_edge_gates(stage) -> torch.Tensor:
     """Edge gate values z_e = σ(z_logits), shape [E]."""
@@ -128,85 +105,30 @@ def _stage_rail_loss(stage, traj: torch.Tensor) -> torch.Tensor:
 def _compute_regularizers(
     net: KirchhoffNetWithIO | KirchhoffNet,
     trajs: list[torch.Tensor],
-    tau: float,
     lambdas: dict,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
-    """Shared regularizer computation: sparsity, edge_gate, power, rail, entropy.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Shared regularizer computation: edge_gate, power, rail.
 
-    DEPRECATED (deprecate-node-gates): the ``node_gate`` and ``capacitance``
-    regularizers are no longer accumulated. Both return zero tensors
-    (preserved in the return tuple for backward compatibility with callers
-    that read ``parts["node_gate"]`` / ``parts["capacitance"]``). The
-    corresponding ``lambdas["node_gate"]`` and ``lambdas["capacitance"]``
-    entries are kept at 0.0 across all configs.
+    Complexity terms:
+      - edge_gate   : Σ_e σ(z_logits)                  (active edge count)
 
-    The remaining complexity terms decompose the previous single ``complexity``
-    proxy into per-component hardware terms:
-      - edge_gate   : Σ_e σ(z_logits)                       (active edge count)
-      - power       : Σ_e z_e · m_e · Σ_q w_q · gm_q       (static power proxy)
-
-    The cell-selection sparsity ``Σ w[:, :z_idx]`` is preserved (pushes
-    individual edges toward the zero-current Z cell as a fine-grained
-    selection, distinct from the edge gate which is a coarse on/off).
-
-    Returns ``(loss_sparsity, loss_edge_gate, loss_node_gate, loss_power,
-    loss_capacitance, loss_rail, entropy_bonus, lambda_entropy)``. The
-    ``loss_node_gate`` and ``loss_capacitance`` entries are always zero.
+    Returns ``(loss_edge_gate, loss_power, loss_rail)``.
     """
     stages = net.core.stages if isinstance(net, KirchhoffNetWithIO) else net.stages
-    loss_sparsity = loss_edge_gate = loss_node_gate = loss_power = loss_capacitance = loss_rail = entropy_bonus = trajs[0].new_zeros(())
+    loss_edge_gate = loss_rail = trajs[0].new_zeros(())
     for stage, traj in zip(stages, trajs):
-        w = _stage_soft_weights(stage)
-        mult = _stage_multiplicities(stage)
         z = _stage_edge_gates(stage)
-        z_idx = stage.cell_lib.z_index
 
-        # Cell-selection sparsity: push toward Z cell.
-        loss_sparsity = loss_sparsity + w[:, :z_idx].sum()
-
-        # Edge gate penalty: soft count of active edges.
         loss_edge_gate = loss_edge_gate + z.sum()
-
-        # Static power proxy: z_e · m_e · weighted gm sum per edge.
-        # gm values per cell come from the shared cell library.
-        gm_per_cell = stage.cell_lib.gm_values()  # [Q]
-        effective_gm = (w * gm_per_cell.unsqueeze(0)).sum(dim=-1)  # [E]
-        loss_power = loss_power + (z * mult * effective_gm).sum()
-
-        # DEPRECATED (deprecate-node-gates): node_gate and capacitance
-        # regularizers are no longer accumulated — both ``loss_node_gate``
-        # and ``loss_capacitance`` stay at the initial zero tensor. Node
-        # pruning is connectivity-only; the C_eff·Σu proxy would be a
-        # constant per stage and thus useless as a regularizer.
-
         loss_rail = loss_rail + _stage_rail_loss(stage, traj)
 
-        if stage.logits is not None:
-            weights_tau = F.softmax(stage.logits / tau, dim=-1)
-            entropy = -(weights_tau * torch.log(weights_tau + 1e-10)).sum(dim=-1).mean()
-            entropy_bonus = entropy_bonus + entropy
-
-    lambda_entropy = float(lambdas.get("entropy", 0.0)) * tau
-    return (
-        loss_sparsity,
-        loss_edge_gate,
-        loss_node_gate,
-        loss_power,
-        loss_capacitance,
-        loss_rail,
-        entropy_bonus,
-        lambda_entropy,
-    )
+    return (loss_edge_gate, loss_rail)
 
 
 # ---------- regularizer warm-up schedule (RR-A + CP) ----------
 
 _REG_KEYS = (
-    "sparsity",
     "edge_gate",
-    "node_gate",
-    "power",
-    "capacitance",
 )
 
 
@@ -220,12 +142,9 @@ def reg_schedule(epoch: int, *, warmup: int | None = None, anneal: int | None = 
     Defaults: ``warmup = OPTIM["reg_warmup_epochs"] = 50``,
     ``anneal = OPTIM["reg_anneal_epochs"] = 50``.
 
-    Note (fix-z-death): ``rail`` is NOT in ``_REG_KEYS``. The rail regularizer
-    is a safety voltage clamp on differential node states (clamps x_j to
-    ±x_max via soft sigmoid), not a structural complexity regularizer. Gating
-    it behind a warm-up schedule caused catastrophic loss explosion in the
-    retrain phase (0.29→1.37) when the ramp kicked in at retrain epoch 75.
-    Rail is now applied at full strength at every epoch.
+    Note: ``rail`` is NOT in ``_REG_KEYS``. The rail regularizer is a safety
+    voltage clamp on differential node states (clamps x_j to ±x_max via
+    soft sigmoid), not a structural complexity regularizer.
     """
     if warmup is None:
         warmup = int(OPTIM.get("reg_warmup_epochs", 50))
@@ -239,10 +158,8 @@ def reg_schedule(epoch: int, *, warmup: int | None = None, anneal: int | None = 
 
 
 def apply_reg_schedule(lambdas: dict, epoch: int, **kw) -> dict:
-    """Return a copy of ``lambdas`` with sparsity/edge_gate/node_gate/
-    power/capacitance scaled by ``reg_schedule(epoch)``. ``rail`` and
-    ``entropy`` are left untouched (rail is always active; entropy has
-    its own τ-scaling)."""
+    """Return a copy of ``lambdas`` with ``edge_gate`` scaled by
+    ``reg_schedule(epoch)``. ``rail`` is left untouched."""
     scale = reg_schedule(epoch, **kw)
     out = dict(lambdas)
     for k in _REG_KEYS:
@@ -587,284 +504,7 @@ def four_phase_kd_active(
 
 # ---------- readiness-based prune trigger (four-phase-redesign) ----------
 
-def prune_readiness_check(
-    val_soft_history: list[float],
-    val_argmax_history: list[float],
-    solidification_metrics: list[dict],
-    schedule_cfg: dict | None = None,
-    min_readings: int = 10,
-) -> tuple[bool, dict]:
-    """Evaluate whether the network is ready for pruning
-    (four-phase-redesign/Phase 3d).
 
-    ALL four conditions must be satisfied (AND-logic):
-
-    1. **Ratio**: ``val_argmax / val_soft < readiness_ratio_max``
-       (hard model close to soft model).
-    2. **Probability**: ``mean_max_cell_prob > readiness_prob_min``
-       (cells are mostly committed to a single type).
-    3. **Stability**: std(frac_sigma_z_below_0.1) over the most recent
-       ``readiness_window`` readings < readiness_stability_max
-       (gate fractions have stopped moving).
-    4. **Improvement**: val_argmax improvement rate over the last
-       ``readiness_window`` readings < readiness_improvement_min
-       (no longer improving rapidly).
-
-    If there are fewer than ``min_readings`` in the histories, returns
-    (False, {...}) with an explanation.
-
-    Args:
-        val_soft_history: Recent soft-validation losses (most recent last).
-        val_argmax_history: Recent argmax-validation losses (most recent
-            last). May be shorter than val_soft_history if argmax validation
-            was not computed every epoch.
-        solidification_metrics: Recent dicts from
-            ``compute_solidification_metrics`` (most recent last). Must
-            contain keys ``mean_max_cell_prob`` and
-            ``frac_sigma_z_below_0.1``.
-        schedule_cfg: A ``SCHEDULE_FOUR_PHASE`` dict. Default reads the
-            module-level ``SCHEDULE_FOUR_PHASE``.
-        min_readings: Minimum number of readings required before computing
-            readiness. Default 10.
-
-    Returns:
-        ``(ready, details)`` where ``ready`` is True iff all conditions
-        are met, and ``details`` is a dict with keys ``ratio``,
-        ``max_cell_prob``, ``stability``, ``improvement_rate``,
-        ``all_ready``, and the individual boolean checks.
-    """
-    if schedule_cfg is None:
-        schedule_cfg = SCHEDULE_FOUR_PHASE
-
-    ratio_max = float(schedule_cfg.get("readiness_ratio_max", 1.2))
-    prob_min = float(schedule_cfg.get("readiness_prob_min", 0.85))
-    stability_max = float(schedule_cfg.get("readiness_stability_max", 0.02))
-    improvement_min = float(schedule_cfg.get("readiness_improvement_min", 1e-4))
-    window = int(schedule_cfg.get("readiness_window", 10))
-
-    details: dict = {
-        "ratio": None,
-        "max_cell_prob": None,
-        "stability": None,
-        "improvement_rate": None,
-        "ready_ratio": False,
-        "ready_prob": False,
-        "ready_stability": False,
-        "ready_improvement": False,
-        "all_ready": False,
-        "note": "",
-    }
-
-    # Need enough readings for any condition.
-    n_val = len(val_argmax_history)
-    n_soft = len(val_soft_history)
-    n_solid = len(solidification_metrics)
-    if n_val < min_readings or n_soft < min_readings or n_solid < min_readings:
-        details["note"] = (
-            f"too few readings: val={n_val}, soft={n_soft}, solid={n_solid} "
-            f"(need ≥{min_readings})"
-        )
-        return False, details
-
-    # Condition 1: ratio check
-    recent_val = val_argmax_history[-window:]
-    recent_soft = val_soft_history[-window:]
-    ratios = [v / max(s, 1e-10) for v, s in zip(recent_val, recent_soft)]
-    mean_ratio = sum(ratios) / len(ratios)
-    details["ratio"] = mean_ratio
-    details["ready_ratio"] = mean_ratio < ratio_max
-
-    # Condition 2: max cell probability
-    recent_probs = [
-        m.get("mean_max_cell_prob", 0.0) for m in solidification_metrics[-window:]
-    ]
-    mean_prob = sum(recent_probs) / len(recent_probs)
-    details["max_cell_prob"] = mean_prob
-    details["ready_prob"] = mean_prob > prob_min
-
-    # Condition 3: gate stability
-    recent_gate_fracs = [
-        m.get("frac_sigma_z_below_0.1", 0.0) for m in solidification_metrics[-window:]
-    ]
-    if len(recent_gate_fracs) >= 2:
-        import statistics
-        gate_stability = statistics.stdev(recent_gate_fracs)
-    else:
-        gate_stability = 1.0  # not stable with < 2 readings
-    details["stability"] = gate_stability
-    details["ready_stability"] = gate_stability < stability_max
-
-    # Condition 4: improvement rate (val_argmax)
-    recent_val_for_rate = val_argmax_history[-window:]
-    if len(recent_val_for_rate) >= 2:
-        n_points = len(recent_val_for_rate)
-        x_vals = list(range(n_points))
-        # Simple linear fit slope: cov(x,y) / var(x)
-        x_mean = sum(x_vals) / n_points
-        y_mean = sum(recent_val_for_rate) / n_points
-        cov = sum(
-            (x_vals[i] - x_mean) * (recent_val_for_rate[i] - y_mean)
-            for i in range(n_points)
-        )
-        var_x = sum((x - x_mean) ** 2 for x in x_vals)
-        if var_x > 0:
-            improvement_rate = cov / var_x
-        else:
-            improvement_rate = 0.0
-    else:
-        improvement_rate = float("inf")
-    details["improvement_rate"] = improvement_rate
-    # Negative slope = loss is decreasing (improving). We check that the
-    # abs improvement rate is below the threshold (i.e. no longer improving
-    # rapidly). A positive slope means loss is increasing.
-    details["ready_improvement"] = abs(improvement_rate) < improvement_min
-
-    details["all_ready"] = (
-        details["ready_ratio"]
-        and details["ready_prob"]
-        and details["ready_stability"]
-        and details["ready_improvement"]
-    )
-
-    return details["all_ready"], details
-
-
-# ---------- solidification monitoring (three-phase-schedule plan) ----------
-
-def compute_solidification_metrics(
-    net: KirchhoffNetWithIO | KirchhoffNet,
-    tau: float = 1.0,
-) -> dict:
-    """Compute edge/node solidification metrics across all stages.
-
-    Returns a dict of Python floats (safe to log to a text file):
-      - ``mean_max_cell_prob``: mean over all edges of max(softmax(logits/τ)).
-        1.0 = fully discrete cell selection; ~0.25 (1/4 cells) = uniform.
-      - ``mean_pZ``: mean over all edges of softmax(logits/τ)[:, z_index].
-        Probability mass on the zero-current Z cell.
-      - ``mean_sigma_z``: mean over all edges of σ(z_logits). Average edge
-        gate openness (0..1).
-      - ``frac_sigma_z_below_01/005/001``: fraction of edge gates with
-        σ(z_logits) below the listed threshold. Measures how many edges
-        are effectively off (eligible for pruning).
-      - ``mean_sigma_u``: **VESTIGIAL** (deprecate-node-gates): mean over
-        all nodes of σ(u_logits). Node gates are no longer used in the
-        forward pass, regularizers, or pruning — this metric reflects the
-        stale ``u_logits`` parameter values (which receive no gradient
-        pressure) and should not be interpreted as meaningful.
-      - ``num_edges``, ``num_nodes``: total counts across all stages.
-      - ``tau``: the tau value used (echoed for the log file).
-    """
-    stages = net.core.stages if isinstance(net, KirchhoffNetWithIO) else net.stages
-
-    max_probs_list = []
-    p_z_list = []
-    sigma_z_list = []
-    sigma_u_list = []
-    total_edges = 0
-    total_nodes = 0
-
-    for stage in stages:
-        n_edges = int(stage.logits.shape[0]) if stage.logits is not None else stage.num_edges()
-        n_nodes = int(stage.u_logits.shape[0]) if hasattr(stage, "u_logits") and stage.u_logits.numel() > 0 else 0
-        if n_edges == 0:
-            total_nodes += n_nodes
-            continue
-
-        sigma_z = torch.sigmoid(stage.z_logits)
-        sigma_z_list.append(sigma_z.detach())
-
-        if stage.logits is not None:
-            weights = F.softmax(stage.logits / float(tau), dim=-1)
-            max_probs, _ = weights.max(dim=-1)
-            p_z = weights[:, stage.cell_lib.z_index]
-            max_probs_list.append(max_probs.detach())
-            p_z_list.append(p_z.detach())
-        sigma_z_list.append(sigma_z.detach())
-
-        if n_nodes > 0:
-            sigma_u_list.append(torch.sigmoid(stage.u_logits).detach())
-            total_nodes += n_nodes
-        total_edges += n_edges
-
-    out = {"tau": float(tau), "num_edges": total_edges, "num_nodes": total_nodes}
-    if max_probs_list:
-        all_max = torch.cat(max_probs_list)
-        all_pz = torch.cat(p_z_list)
-        all_sz = torch.cat(sigma_z_list)
-        out["mean_max_cell_prob"] = float(all_max.mean().item())
-        out["mean_pZ"] = float(all_pz.mean().item())
-        out["mean_sigma_z"] = float(all_sz.mean().item())
-        out["frac_sigma_z_below_0.1"] = float((all_sz < 0.1).float().mean().item())
-        out["frac_sigma_z_below_0.05"] = float((all_sz < 0.05).float().mean().item())
-        out["frac_sigma_z_below_0.01"] = float((all_sz < 0.01).float().mean().item())
-    else:
-        out["mean_max_cell_prob"] = 0.0
-        out["mean_pZ"] = 0.0
-        out["mean_sigma_z"] = 0.0
-        out["frac_sigma_z_below_0.1"] = 0.0
-        out["frac_sigma_z_below_0.05"] = 0.0
-        out["frac_sigma_z_below_0.01"] = 0.0
-
-    if sigma_u_list:
-        all_su = torch.cat(sigma_u_list)
-        out["mean_sigma_u"] = float(all_su.mean().item())
-    else:
-        out["mean_sigma_u"] = 0.0
-
-    return out
-
-
-# ---------- argmax validation (three-phase-schedule plan) ----------
-
-def validate_argmax(
-    net,
-    val_loader,
-    task_fn,
-    ctx_factory,
-    device,
-    *,
-    argmax_tau: float = 0.001,
-    solver: str = "heun",
-    deq_cfg: dict | None = None,
-) -> float:
-    """Validation loss with effectively-argmax cell selection (τ→0).
-
-    Runs the validation loop a second time using ``argmax_tau`` (very small,
-    so softmax(logits/τ) becomes a one-hot vector at the argmax index) and
-    returns the corresponding task loss. Compare against the normal soft-τ
-    validation loss:
-
-      gap = val_argmax - val_soft
-
-    A small gap means the network's cell selection is effectively
-    solidified; a large gap means it still relies on blurry cell mixtures
-    regardless of what τ reports.
-
-    The original tau is preserved by re-running the forward pass with a
-    different tau value; no in-place mutation of network parameters.
-    """
-    net.eval()
-    total = 0.0
-    n = 0
-    with torch.no_grad():
-        for u, target in val_loader:
-            u = u.to(device)
-            target = target.to(device)
-            ctx = ctx_factory(u.size(0), device=device)
-            out, _ = net(
-                u,
-                ctx=ctx,
-                tau=argmax_tau,
-                store_trajectory=False,
-                solver=solver,
-                deq_cfg=deq_cfg,
-            )
-            loss = task_fn(out, target)
-            total += float(loss.item()) * u.size(0)
-            n += u.size(0)
-    net.train()
-    return total / max(1, n)
 
 
 def compute_loss(
@@ -874,41 +514,21 @@ def compute_loss(
     ctx: SimContext,
     task_fn,
     lambdas: dict | None = None,
-    tau: float = 1.0,
     return_parts: bool = False,
     amp: bool = False,
     amp_dtype: torch.dtype = torch.float16,
     reg_scale: float = 1.0,
-    cell_mode: str = "soft",
-    teacher: KirchhoffNetWithIO | KirchhoffNet | None = None,
-    lambda_kd: float = 0.0,
-    teacher_tau: float = 1.0,
-    teacher_cell_mode: str = "soft",
     solver: str = "heun",
     deq_cfg: dict | None = None,
 ):
-    """Compute total loss = task + regularizers + entropy bonus.
+    """Compute total loss = task + regularizers.
 
     If net is a KirchhoffNetWithIO, x0 is the raw input u. If it is a plain
     KirchhoffNet, x0 is the already-bounded initial differential state.
 
-    ``reg_scale`` (RR-A) is a multiplicative factor on sparsity/complexity/
-    rail: pass ``reg_schedule(epoch)`` from the training loop to implement
-    staged warm-up. Defaults to 1.0 (no warm-up).
-
-    ``cell_mode`` (four-phase-redesign/Phase 2a): forwarded to the
-    network forward pass. ``'soft'`` is the standard mixture; ``'ste'``
-    uses one cell per edge in the forward pass with straight-through
-    soft gradients.
-
-    ``teacher`` / ``lambda_kd`` (four-phase-redesign/Phase 3c): when a
-    teacher network is provided, an additional KD loss
-    ``lambda_kd * MSE(y_student, y_teacher)`` is added to the data-side
-    loss. Teacher is run with ``torch.no_grad()`` and uses
-    ``teacher_cell_mode`` / ``teacher_tau`` (defaults: soft / 1.0). The
-    KD loss is a data-side term so it lives in ``total_task`` (gets
-    DataParallel averaging like the task loss) rather than in
-    ``structural`` (which is not averaged).
+    ``reg_scale`` is a multiplicative factor on edge_gate / rail: pass
+    ``reg_schedule(epoch)`` from the training loop to implement staged
+    warm-up. Defaults to 1.0 (no warm-up).
 
     If `amp` is True, wraps forward+loss in torch.cuda.amp.autocast for
     mixed-precision training. Caller is responsible for GradScaler.
@@ -921,31 +541,13 @@ def compute_loss(
     )
     with autocast_ctx:
         if isinstance(net, KirchhoffNetWithIO):
-            out, trajs = net(x0, ctx=ctx, tau=tau, store_trajectory=True,
-                             cell_mode=cell_mode,
+            out, trajs = net(x0, ctx=ctx, store_trajectory=True,
                              solver=solver, deq_cfg=deq_cfg)
         else:
-            out, trajs = net(x0, ctx=ctx, tau=tau, store_trajectory=True,
-                             cell_mode=cell_mode,
+            out, trajs = net(x0, ctx=ctx, store_trajectory=True,
                              solver=solver, deq_cfg=deq_cfg)
 
         loss_task = task_fn(out, target)
-
-        # four-phase-redesign/Phase 3c: teacher distillation. Compute
-        # y_teacher in no_grad mode with its own tau/cell_mode and add
-        # MSE to the data-side loss.
-        loss_kd = loss_task.new_zeros(())
-        if teacher is not None and lambda_kd > 0.0:
-            with torch.no_grad():
-                if isinstance(teacher, KirchhoffNetWithIO):
-                    y_teacher, _ = teacher(x0, ctx=ctx, tau=teacher_tau,
-                                           store_trajectory=False,
-                                           cell_mode=teacher_cell_mode)
-                else:
-                    y_teacher, _ = teacher(x0, ctx=ctx, tau=teacher_tau,
-                                           store_trajectory=False,
-                                           cell_mode=teacher_cell_mode)
-            loss_kd = F.mse_loss(out, y_teacher.detach())
 
         if trajs is None:
             zero = loss_task.new_zeros((), requires_grad=True)
@@ -953,55 +555,19 @@ def compute_loss(
                 return loss_task, zero, {"task": float(loss_task.item())}
             return loss_task, zero
 
-        (
-            loss_sparsity,
-            loss_edge_gate,
-            loss_node_gate,
-            loss_power,
-            loss_capacitance,
-            loss_rail,
-            entropy_bonus,
-            lambda_entropy,
-        ) = _compute_regularizers(net, trajs, tau, lambdas)
+        loss_edge_gate, loss_rail = _compute_regularizers(net, trajs, lambdas)
 
-        # Split the loss into two pieces so that DataParallel averages
-        # ONLY the data-dependent pieces (task + rail + KD) and does NOT
-        # halve the structural regularizers (sparsity/edge_gate/
-        # node_gate/power/capacitance/entropy) which depend only on
-        # `net.module`'s parameters and have no business being
-        # averaged across replicas.  The caller is expected to call
-        # `backward()` on `total_task + structural` (a single combined
-        # backward call to remain compatible with torch.compile, which
-        # forbids retain_graph=True on the first of two backward calls).
-        total_task = (
-            loss_task
-            + float(lambdas.get("rail", 0.0)) * loss_rail
-            + float(lambda_kd) * loss_kd
-        )
-        structural = (
-            + reg_scale * float(lambdas.get("sparsity", 0.0)) * loss_sparsity
-            + reg_scale * float(lambdas.get("edge_gate", 0.0)) * loss_edge_gate
-            + reg_scale * float(lambdas.get("node_gate", 0.0)) * loss_node_gate
-            + reg_scale * float(lambdas.get("power", 0.0)) * loss_power
-            + reg_scale * float(lambdas.get("capacitance", 0.0)) * loss_capacitance
-            - lambda_entropy * entropy_bonus
-        )
+        total_task = loss_task + float(lambdas.get("rail", 0.0)) * loss_rail
+        structural = reg_scale * float(lambdas.get("edge_gate", 0.0)) * loss_edge_gate
 
     if return_parts:
         parts = {
             "task": float(loss_task.item()) if torch.is_tensor(loss_task) else float(loss_task),
-            "sparsity": float(loss_sparsity.item()),
             "edge_gate": float(loss_edge_gate.item()),
-            "node_gate": float(loss_node_gate.item()),
-            "power": float(loss_power.item()),
-            "capacitance": float(loss_capacitance.item()),
             "rail": float(loss_rail.item()),
-            "entropy": float(entropy_bonus.item()),
             "reg_scale": float(reg_scale),
             "total": float((total_task + structural).item()),
         }
-        if teacher is not None and lambda_kd > 0.0:
-            parts["kd"] = float(loss_kd.item())
         return total_task, structural, parts
     return total_task, structural
 
@@ -1049,19 +615,16 @@ def compute_solver_loss(
     A: torch.Tensor,
     ctx: SimContext,
     lambdas: dict | None = None,
-    tau: float = 1.0,
     return_parts: bool = False,
     amp: bool = False,
     amp_dtype: torch.dtype = torch.float16,
     reg_scale: float = 1.0,
 ):
-    """Solver loss = residual + 0.1 * solution + all regularizers (incl. entropy).
+    """Solver loss = residual + 0.1 * solution + regularizers.
 
-    Same regularizer set as compute_loss (sparsity, edge_gate, node_gate,
-    power, capacitance, rail, entropy). Task loss is the residual plus a
-    small direct solution error to stabilize early training. ``reg_scale``
-    (RR-A) applies the staged warm-up factor to all regularizers except
-    entropy.
+    Same regularizer set as compute_loss (edge_gate, rail). Task loss is the
+    residual plus a small direct solution error to stabilize early training.
+    ``reg_scale`` applies the staged warm-up factor.
 
     If `amp` is True, wraps forward+loss in torch.cuda.amp.autocast for
     mixed-precision training. Caller is responsible for GradScaler.
@@ -1073,7 +636,7 @@ def compute_solver_loss(
         torch.amp.autocast("cuda", dtype=amp_dtype) if amp else _NullContext()
     )
     with autocast_ctx:
-        out, trajs = net(b, ctx=ctx, tau=tau, store_trajectory=True)
+        out, trajs = net(b, ctx=ctx, store_trajectory=True)
 
         loss_res = residual_loss(out, b, A)
         loss_sol = solution_loss(out, x_star)
@@ -1088,45 +651,21 @@ def compute_solver_loss(
                 }
             return loss_task, loss_task.new_zeros(())
 
-        (
-            loss_sparsity,
-            loss_edge_gate,
-            loss_node_gate,
-            loss_power,
-            loss_capacitance,
-            loss_rail,
-            entropy_bonus,
-            lambda_entropy,
-        ) = _compute_regularizers(net, trajs, tau, lambdas)
+        loss_edge_gate, loss_rail = _compute_regularizers(net, trajs, lambdas)
 
-        # Same split as compute_loss: rail flows through DP, structural
-        # regularizers accumulate directly on `net.module` to avoid
-        # being halved by DataParallel averaging.
         total_task = (
             loss_task
             + float(lambdas.get("rail", 0.0)) * loss_rail
         )
-        structural = (
-            + reg_scale * float(lambdas.get("sparsity", 0.0)) * loss_sparsity
-            + reg_scale * float(lambdas.get("edge_gate", 0.0)) * loss_edge_gate
-            + reg_scale * float(lambdas.get("node_gate", 0.0)) * loss_node_gate
-            + reg_scale * float(lambdas.get("power", 0.0)) * loss_power
-            + reg_scale * float(lambdas.get("capacitance", 0.0)) * loss_capacitance
-            - lambda_entropy * entropy_bonus
-        )
+        structural = reg_scale * float(lambdas.get("edge_gate", 0.0)) * loss_edge_gate
 
     if return_parts:
         parts = {
             "task": float(loss_task.item()),
             "residual": float(loss_res.item()),
             "solution": float(loss_sol.item()),
-            "sparsity": float(loss_sparsity.item()),
             "edge_gate": float(loss_edge_gate.item()),
-            "node_gate": float(loss_node_gate.item()),
-            "power": float(loss_power.item()),
-            "capacitance": float(loss_capacitance.item()),
             "rail": float(loss_rail.item()),
-            "entropy": float(entropy_bonus.item()),
             "reg_scale": float(reg_scale),
             "total": float((total_task + structural).item()),
         }
@@ -1316,10 +855,9 @@ def make_optimizer(
             When ``<1.0``, mappers learn more slowly — useful when mapper
             gradient norms dominate core by ~300×.
         struct_lr_scale: Multiplier on base LR for structural core params
-            (``z_logits``, ``logits``, ``raw_mult``). Default 1.0 (no
-            change). Use >1.0 (e.g. 2.0) to boost learning of gates and
-            cell assignments. When != 1.0, uses flat global groups and
-            ignores ``stage_lr_scale``.
+            (``z_logits``). Default 1.0 (no change). Use >1.0 (e.g. 2.0)
+            to boost learning of edge gates. When != 1.0, uses flat global
+            groups and ignores ``stage_lr_scale``.
         dyn_lr_scale: Multiplier on base LR for sensitive dynamical params
             (``raw_leak``, ``raw_drive_g``). Default 1.0 (no change). Use
             <1.0 to protect solver stability. When != 1.0, uses flat global
@@ -1362,8 +900,7 @@ def make_optimizer(
         for name, p in raw.named_parameters():
             if "input_mapper" in name or "output_mapper" in name:
                 mapper_params.append(p)
-            # NOTE: .z_logits MUST be checked before .logits (z_logits also ends with .logits)
-            elif name.endswith(".z_logits") or name.endswith(".logits") or name.endswith(".raw_mult"):
+            elif name.endswith(".z_logits"):
                 struct_params.append(p)
             elif name.endswith(".raw_leak") or name.endswith(".raw_drive_g"):
                 dyn_params.append(p)
@@ -1444,10 +981,6 @@ def apply_ablation(net, ablation: str) -> None:
         for stage in net.core.stages:
             stage.src = stage.src.new_zeros(0)
             stage.dst = stage.dst.new_zeros(0)
-            if stage.logits is not None:
-                stage.logits = nn.Parameter(stage.logits.new_zeros(0, stage.logits.shape[-1]))
-            if stage.raw_mult is not None:
-                stage.raw_mult = nn.Parameter(stage.raw_mult.new_zeros(0))
             cell_lib = getattr(stage, 'cell_lib', None)
             if isinstance(cell_lib, SimpleEdgeLibrary):
                 stage.cell_lib.param = nn.Parameter(stage.cell_lib.param.new_zeros(3, 0))
@@ -1492,22 +1025,15 @@ def train_epoch(
     log_every: int = 0,
     scaler: torch.amp.GradScaler | None = None,
     amp: bool = False,
-    cell_mode: str = "soft",
 ):
     """Run one training epoch. ctx_factory(batch_size, num_edges_total, device) -> SimContext.
 
     `loader` is an iterable of (u, target) batches. For our DifferentialStage
     the relevant edge count is the sum across all stages.
 
-    Regularizers (sparsity/rail/complexity) are scheduled with
-    :func:`reg_schedule` so the network learns freely in the first
-    ``reg_warmup_epochs`` and the penalties anneal in linearly over the
-    next ``reg_anneal_epochs`` (RR-A).
-
-    ``cell_mode`` (four-phase-redesign/Phase 2a): forwarded to
-    ``compute_loss``. ``'soft'`` uses softmax-weighted cell mixtures;
-    ``'ste'`` uses one cell per edge in the forward pass with
-    straight-through soft gradients.
+    Regularizers are scheduled with :func:`reg_schedule` so the network
+    learns freely in the first ``reg_warmup_epochs`` and the penalties
+    anneal in linearly over the next ``reg_anneal_epochs``.
 
     If `scaler` is provided, uses AMP with `scaler.scale(loss).backward()`,
     `scaler.step(optimizer)`, `scaler.update()`. Otherwise standard
@@ -1525,9 +1051,8 @@ def train_epoch(
         ctx = ctx_factory(u.size(0), device=u.device)
         optimizer.zero_grad()
         loss_task, loss_structural, parts = compute_loss(
-            net, u, target, ctx, task_fn, lambdas=lambdas, tau=tau,
+            net, u, target, ctx, task_fn, lambdas=lambdas,
             return_parts=True, amp=amp, reg_scale=reg_scale,
-            cell_mode=cell_mode,
         )
         if scaler is not None:
             ( scaler.scale(loss_task) + scaler.scale(loss_structural) ).backward()
@@ -1563,7 +1088,6 @@ def default_ctx_factory(net: KirchhoffNetWithIO):
         total_edges = sum(s.num_edges() for s in net.core.stages)
         return sample_random_context(
             num_edges=total_edges,
-            num_cells=net.core.stages[0].cell_lib.num_cells,
             device=device,
             **{
                 "gain_shift_std": VARIATION["global_gain_shift_std"],

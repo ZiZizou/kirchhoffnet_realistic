@@ -75,10 +75,7 @@ class KirchhoffNet(nn.Module):
     def forward(
         self,
         x0: torch.Tensor,
-        ctx,
-        tau: float | None = None,
         store_trajectory: bool = False,
-        cell_mode: str = "soft",
         drive_targets: list[torch.Tensor] | None = None,
         drive_scales: list[float] | None = None,
         solver: str = "heun",
@@ -90,25 +87,14 @@ class KirchhoffNet(nn.Module):
         all_trajs = []
         stage_outputs = []
         stage_infos = []
-        stage_ctxs = []
         for i, stage in enumerate(self.stages):
-            tau_i = 1.0 if tau is None else tau
-            if ctx is None:
-                stage_ctx = None
-            else:
-                start = self._edge_offsets[i]
-                end = self._edge_offsets[i + 1]
-                stage_ctx = ctx.slice_edges(start, end)
             x_drive_i = None if drive_targets is None else drive_targets[i]
             drive_scale_i = 0.0 if drive_scales is None else drive_scales[i]
             x, traj = stage(
                 x0=x,
-                ctx=stage_ctx,
                 t_span=self.stage_times[i],
                 num_steps=self.stage_steps[i],
-                tau=tau_i,
                 store_trajectory=store_trajectory,
-                cell_mode=cell_mode,
                 x_drive=x_drive_i,
                 drive_scale=drive_scale_i,
                 solver=solver,
@@ -116,14 +102,10 @@ class KirchhoffNet(nn.Module):
             )
             stage_outputs.append(x.detach())
             stage_infos.append(dict(getattr(stage, "last_deq_info", {}) or {}))
-            stage_ctxs.append(stage_ctx)
             if store_trajectory and traj is not None:
                 all_trajs.append(traj)
             # kirchhoff-noise: per-stage additive Gaussian noise on the state
             # vector (thermal/IR-drop modeling on the analog voltage rails).
-            # One fresh sample per stage; frozen across all Heun substeps
-            # within that stage (NOT resampled inside rhs()) to preserve
-            # the deterministic-ODE assumption of the Heun integrator.
             if stage_noise_std > 0.0:
                 if stage_noise_generator is not None:
                     noise = torch.empty_like(x)
@@ -136,7 +118,6 @@ class KirchhoffNet(nn.Module):
                 x = self.transfers[i](x)
         self.last_stage_outputs = stage_outputs
         self.last_stage_infos = stage_infos
-        self.last_stage_ctxs = stage_ctxs
         self.last_drive_targets = drive_targets
         self.last_drive_scales = list(drive_scales) if drive_scales is not None else None
         self.last_solver = solver
@@ -145,19 +126,11 @@ class KirchhoffNet(nn.Module):
     def parameter_breakdown(self) -> dict:
         """Return parameter counts per component for the regularizer / loss."""
         out = {
-            "logits_per_stage": [],
-            "raw_mult_per_stage": [],
             "raw_leak_per_stage": [],
-            "total_logits": 0,
-            "total_raw_mult": 0,
             "total_raw_leak": 0,
         }
         for s in self.stages:
-            out["logits_per_stage"].append(int(s.logits.numel()))
-            out["raw_mult_per_stage"].append(int(s.raw_mult.numel()))
             out["raw_leak_per_stage"].append(int(s.raw_leak.numel()))
-            out["total_logits"] += int(s.logits.numel())
-            out["total_raw_mult"] += int(s.raw_mult.numel())
             out["total_raw_leak"] += int(s.raw_leak.numel())
         return out
 
@@ -298,10 +271,7 @@ class KirchhoffNetWithIO(nn.Module):
     def forward(
         self,
         u: torch.Tensor,
-        ctx,
-        tau: float | None = None,
         store_trajectory: bool = False,
-        cell_mode: str = "soft",
         solver: str = "heun",
         deq_cfg: dict | None = None,
         stage_noise_std: float = 0.0,
@@ -331,8 +301,7 @@ class KirchhoffNetWithIO(nn.Module):
             x_final, trajs = x0_full, None
         else:
             x_final, trajs = self.core(
-                x0_full, ctx=ctx, tau=tau, store_trajectory=store_trajectory,
-                cell_mode=cell_mode,
+                x0_full, store_trajectory=store_trajectory,
                 drive_targets=drive_targets,
                 drive_scales=self.drive_scales if self.enable_drive else None,
                 solver=solver,

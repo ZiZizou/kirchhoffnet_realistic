@@ -597,8 +597,7 @@ def cells_to_tensor_dict(library_name: str = "legacy"):
       - ``v2`` library: emits ``src_gain`` and ``dst_gain`` (per-cell mix
         coefficients; preactivation u = src_gain * x_src - dst_gain * x_dst).
 
-    ``IdealizedCellLibrary`` auto-detects which set is present via buffer
-    introspection.
+    The library auto-detects which set is present via buffer introspection.
     """
     import torch
     lib = CELL_LIBRARIES[library_name]

@@ -543,7 +543,9 @@ def _make_dynamic_preset(
     read_mode_override: str | None = None,
     small_world_k: int = 4,
     small_world_p: float = 0.3,
-    small_world_seed: int = 0) -> dict:
+    small_world_seed: int = 0,
+    leak_mode: str | None = None,
+    leak_constant: float | None = None) -> dict:
     """Build a fresh preset dict that overrides the topology of the named
     problem. Preserves problem-specific fields (num_inputs, loss, out_dim,
     use_robust_input, schedule, lambdas, tau_anneal, write_idx default).
@@ -680,6 +682,13 @@ Args:
         if "write_fan_out" not in new_preset or new_preset["write_fan_out"] is None:
             new_preset["write_fan_out"] = _build_grid_write_fan_out(
                 num_inputs=num_inputs, grid_size=grid_size)
+    # Leak mode: forward to build_net_from_config via preset dict.
+    # Only set when caller explicitly differs from defaults, so existing
+    # checkpoint compatibility is preserved.
+    if leak_mode is not None and leak_mode != "programmable":
+        new_preset["leak_mode"] = leak_mode
+    if leak_constant is not None:
+        new_preset["leak_constant"] = leak_constant
     # Remove schedule/lambdas overrides if present so dynamic topology uses
     # the global defaults from LAMBDAS. Per-problem schedules (e.g. housing's
     # default 'three_phase') are still preserved by the explicit
@@ -2095,6 +2104,20 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "Requires write_mode='fan_out' (the smooth2d_grid preset "
              "already uses fan_out by default). Has no effect when "
              "--solver heun.")
+    parser.add_argument(
+        "--leak", choices=["programmable", "non-programmable"],
+        default="programmable", dest="leak",
+        help="Stage leak mode (default: programmable). 'programmable' "
+             "creates a learnable per-node raw_leak parameter. "
+             "'non-programmable' uses a fixed scalar leak_constant "
+             "for all nodes, saving parameters and eliminating leak "
+             "gradients. See also --leak-constant.")
+    parser.add_argument(
+        "--leak-constant", type=float, default=None, dest="leak_constant",
+        help="Fixed leak value when --leak non-programmable (default: "
+             "config INIT['leak_constant'] = 0.0486, which matches "
+             "softplus(raw_leak_init=-3.0)). Ignored when --leak "
+             "programmable.")
 
     # --- Degree budget / fraction edge competition (degree-budget-topk plan) ---
     parser.add_argument(
@@ -2447,12 +2470,16 @@ def main():
         resolved_grid_size = args.grid_size if args.grid_size is not None else 7
         PRESETS["smooth2d_grid"] = make_smooth2d_grid_preset(
             grid_size=resolved_grid_size,
-            bidirectional=args.bidirectional)
+            bidirectional=args.bidirectional,
+            leak_mode=args.leak,
+            leak_constant=args.leak_constant)
     elif args.problem == "housing_grid":
         resolved_grid_size = args.grid_size if args.grid_size is not None else 5
         PRESETS["housing_grid"] = make_housing_grid_preset(
             grid_size=resolved_grid_size,
-            bidirectional=args.bidirectional)
+            bidirectional=args.bidirectional,
+            leak_mode=args.leak,
+            leak_constant=args.leak_constant)
     else:
         resolved_grid_size = args.grid_size
     args.grid_size = resolved_grid_size
@@ -2479,7 +2506,9 @@ def main():
             read_mode_override=args.read_mode,
             small_world_k=args.small_world_k,
             small_world_p=args.small_world_p,
-            small_world_seed=args.small_world_seed)
+            small_world_seed=args.small_world_seed,
+            leak_mode=args.leak,
+            leak_constant=args.leak_constant)
         PRESETS[args.problem] = new_preset
         print(
             f"[train] dynamic preset (hidden_family={args.hidden_family}): "
@@ -2526,7 +2555,9 @@ def main():
         read_mode=args.read_mode,
         write_idx=write_idx_arg,
         read_idx=read_idx_arg,
-        enable_drive=args.persistent_drive)
+        enable_drive=args.persistent_drive,
+        leak_mode=args.leak,
+        leak_constant=args.leak_constant)
     net.to(device)
     grid_label = (
         f" {args.grid_size}×{args.grid_size} grid,"

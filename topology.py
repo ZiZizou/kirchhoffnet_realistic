@@ -715,6 +715,8 @@ def prune_stage(
     protected_nodes: set[int] | None = None,
     min_read_nodes: int = 1,
     prune_nodes_by_gate: bool = False,
+    leak_mode: str = "programmable",
+    leak_constant: float | None = None,
 ) -> tuple["DifferentialStage", dict[int, int]]:
     """Rebuild a DifferentialStage with edges and nodes removed.
 
@@ -965,6 +967,8 @@ def prune_stage(
         clip_current=stage.clip_current,
         clip_softness=stage.clip_softness,
         write_idx=new_write_idx,
+        leak_mode=leak_mode,
+        leak_constant=leak_constant,
     )
 
     if transfer_params:
@@ -1010,7 +1014,8 @@ def prune_stage(
                 old_z_logits = torch.logit(combined)
             new_stage.z_logits.data.copy_(old_z_logits)
         with torch.no_grad():
-            new_stage.raw_leak.data.copy_(stage.raw_leak.data[node_idx_old].cpu())
+            if hasattr(stage, 'raw_leak') and hasattr(new_stage, 'raw_leak'):
+                new_stage.raw_leak.data.copy_(stage.raw_leak.data[node_idx_old].cpu())
             new_stage.u_logits.data.copy_(stage.u_logits.data[node_idx_old].cpu())
         # Transfer raw_drive_g for surviving driven nodes.
         if new_write_idx is not None and hasattr(stage, 'raw_drive_g'):
@@ -1165,6 +1170,8 @@ def topology_to_stage(
     clip_current: float | None = None,
     clip_softness: float | None = None,
     write_idx: list[int] | None = None,
+    leak_mode: str = "programmable",
+    leak_constant: float | None = None,
 ) -> tuple[DifferentialStage, list[int], dict[int, int]]:
     """Convert a SparseTopology into a DifferentialStage.
 
@@ -1176,6 +1183,11 @@ def topology_to_stage(
             coordinates) that should receive persistent drive current.
             These indices map directly to the first hid_count positions
             of the compact state vector.
+        leak_mode: ``"programmable"`` (default) or ``"non-programmable"``.
+            Controls whether the stage has a learnable per-node ``raw_leak``
+            or a fixed constant.
+        leak_constant: Fixed leak value when ``leak_mode="non-programmable"``.
+            ``None`` uses ``config.INIT["leak_constant"]``.
 
     Returns:
         stage: DifferentialStage
@@ -1228,6 +1240,8 @@ def topology_to_stage(
         clip_current=clip_current,
         clip_softness=clip_softness,
         write_idx=write_idx,
+        leak_mode=leak_mode,
+        leak_constant=leak_constant,
     )
     return stage, active_nodes, id_map
 
@@ -1242,6 +1256,8 @@ def build_net_from_preset(
     write_idx: list[int] | None = None,
     read_idx: list[int] | None = None,
     enable_drive: bool = False,
+    leak_mode: str = "programmable",
+    leak_constant: float | None = None,
 ):
     """Build a full KirchhoffNetWithIO from a config.PRESETS entry.
 
@@ -1253,6 +1269,7 @@ def build_net_from_preset(
     * read_mode:   "sparse" | "dense".  When ``None`` (default), use the
                    preset's ``read_mode`` if present, else ``"sparse"``.
     * write_idx / read_idx: explicit index lists override preset values.
+    * leak_mode / leak_constant: forwarded to :func:`topology_to_stage`.
     """
     if preset_name not in PRESETS:
         raise KeyError(f"Unknown preset: {preset_name!r}. Available: {list(PRESETS)}")
@@ -1265,15 +1282,29 @@ def build_net_from_preset(
         cfg["write_idx"] = list(write_idx)
     if read_idx is not None:
         cfg["read_idx"] = list(read_idx)
-    return build_net_from_config(cfg, cell_lib=cell_lib, enable_drive=enable_drive)
+    return build_net_from_config(
+        cfg, cell_lib=cell_lib, enable_drive=enable_drive,
+        leak_mode=leak_mode, leak_constant=leak_constant,
+    )
 
 
 def build_net_from_config(
     cfg: dict,
     cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary,
     enable_drive: bool = False,
+    leak_mode: str | None = None,
+    leak_constant: float | None = None,
 ):
-    """Build a KirchhoffNetWithIO from a full config dict."""
+    """Build a KirchhoffNetWithIO from a full config dict.
+
+    ``leak_mode`` and ``leak_constant`` can be specified either explicitly or
+    via the ``cfg`` dict (``cfg['leak_mode']`` / ``cfg['leak_constant']``).
+    Explicit kwargs take precedence.
+    """
+    if leak_mode is None:
+        leak_mode = cfg.get("leak_mode", "programmable")
+    if leak_constant is None:
+        leak_constant = cfg.get("leak_constant", None)
     from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
     from io_mapper import (
         InputMapper,
@@ -1357,6 +1388,7 @@ def build_net_from_config(
     for stage_idx, topo in enumerate(multi.stages):
         stage, active_nodes, id_map = topology_to_stage(
             topo, cell_lib=cell_lib, write_idx=write_idx_arg if enable_drive else None,
+            leak_mode=leak_mode, leak_constant=leak_constant,
         )
         stage_modules.append(stage)
         stage_times.append(float(stages_cfg[stage_idx].get("t_span", 0.5)))

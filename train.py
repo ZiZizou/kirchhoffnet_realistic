@@ -1006,7 +1006,8 @@ def apply_ablation(net, ablation: str) -> None:
                     )
                 if hasattr(stage.cell_lib, "theta_raw"):
                     stage.cell_lib.theta_raw = nn.Parameter(stage.cell_lib.theta_raw.new_zeros(0))
-            stage.raw_leak = nn.Parameter(stage.raw_leak.new_zeros(stage.num_nodes))
+            if hasattr(stage, "raw_leak"):
+                stage.raw_leak = nn.Parameter(stage.raw_leak.new_zeros(stage.num_nodes))
             stage.z_logits = nn.Parameter(stage.z_logits.new_zeros(0))
         return
     raise ValueError(f"Unknown ablation: {ablation!r}")

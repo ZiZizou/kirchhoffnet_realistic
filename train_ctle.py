@@ -146,7 +146,9 @@ def make_ctle_preset(
     q75_input: bool = False,
     edge_repeats: int = 2,
     nodes_per_target: int = 0,
-    readout_offset: int = 0) -> dict:
+    readout_offset: int = 0,
+    leak_mode: str = "programmable",
+    leak_constant: float | None = None) -> dict:
     """Build a 4-spec → 7-logit CTLE KirchhoffNet preset for the grid family.
 
     ``family='grid'`` (default, backward compatible):
@@ -184,6 +186,11 @@ def make_ctle_preset(
             many state nodes per target. Auto-sizes the network.
         readout_offset: Starting state index for the first target's window
             (only used when ``nodes_per_target > 0``).
+        leak_mode: ``"programmable"`` (default) or ``"non-programmable"``.
+            Stored in the preset dict so :func:`build_net_from_config` can
+            thread it through to :class:`DifferentialStage`.
+        leak_constant: Fixed leak value used when ``leak_mode="non-programmable"``.
+            Stored in the preset dict.
     """
     if edge_repeats < 1 or edge_repeats > 8:
         raise ValueError(f"edge_repeats must be in [1, 8], got {edge_repeats}")
@@ -277,6 +284,10 @@ def make_ctle_preset(
         preset["grouped_readout"] = {
             "nodes_per_target": nodes_per_target,
             "offset": readout_offset}
+    if leak_mode != "programmable" or leak_constant is not None:
+        preset["leak_mode"] = leak_mode
+        if leak_constant is not None:
+            preset["leak_constant"] = leak_constant
     return preset
 
 def make_ctle_grid_preset(
@@ -288,7 +299,9 @@ def make_ctle_grid_preset(
     q75_input: bool = False,
     edge_repeats: int = 2,
     nodes_per_target: int = 0,
-    readout_offset: int = 0) -> dict:
+    readout_offset: int = 0,
+    leak_mode: str = "programmable",
+    leak_constant: float | None = None) -> dict:
     """Backward-compatible thin wrapper for the grid CTLE preset.
 
     Equivalent to ``make_ctle_preset(family='grid', grid_size=grid_size, ...)``.
@@ -301,6 +314,8 @@ def make_ctle_grid_preset(
         write_mode=write_mode,
         bidirectional=bidirectional,
         q75_input=q75_input,
+        leak_mode=leak_mode,
+        leak_constant=leak_constant,
         edge_repeats=edge_repeats,
         nodes_per_target=nodes_per_target,
         readout_offset=readout_offset)

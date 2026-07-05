@@ -130,8 +130,9 @@ class KirchhoffNet(nn.Module):
             "total_raw_leak": 0,
         }
         for s in self.stages:
-            out["raw_leak_per_stage"].append(int(s.raw_leak.numel()))
-            out["total_raw_leak"] += int(s.raw_leak.numel())
+            n = int(s.raw_leak.numel()) if hasattr(s, "raw_leak") else 0
+            out["raw_leak_per_stage"].append(n)
+            out["total_raw_leak"] += n
         return out
 
 

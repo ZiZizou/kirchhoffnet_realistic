@@ -338,11 +338,15 @@ def test_gradient_flow():
     has_grads = {
         "logits": stage.logits.grad is not None and torch.isfinite(stage.logits.grad).all().item(),
         "raw_mult": stage.raw_mult.grad is not None and torch.isfinite(stage.raw_mult.grad).all().item(),
-        "raw_leak": stage.raw_leak.grad is not None and torch.isfinite(stage.raw_leak.grad).all().item(),
+        "raw_leak": (hasattr(stage, "raw_leak") and stage.raw_leak.grad is not None
+                     and torch.isfinite(stage.raw_leak.grad).all().item()),
     }
     check("grads flow to logits", has_grads["logits"])
     check("grads flow to raw_mult", has_grads["raw_mult"])
-    check("grads flow to raw_leak", has_grads["raw_leak"])
+    if hasattr(stage, "raw_leak"):
+        check("grads flow to raw_leak", has_grads["raw_leak"])
+    else:
+        check("grads flow to raw_leak", True, "stage has no raw_leak (non-programmable)")
 
 
 def test_compute_loss_finite():
@@ -1319,11 +1323,12 @@ def test_prune_stage_transfer_params():
         # Set unique z_logits for surviving edges
         stage.z_logits.data[1] = 3.0
         stage.z_logits.data[2] = 4.0
-        # Set unique raw_leak for nodes 0, 1, 2
-        stage.raw_leak.data.fill_(-3.0)
-        stage.raw_leak.data[0] = 0.0
-        stage.raw_leak.data[1] = 1.0
-        stage.raw_leak.data[2] = 2.0
+        # Set unique raw_leak for nodes 0, 1, 2 (programmable mode only)
+        if hasattr(stage, "raw_leak"):
+            stage.raw_leak.data.fill_(-3.0)
+            stage.raw_leak.data[0] = 0.0
+            stage.raw_leak.data[1] = 1.0
+            stage.raw_leak.data[2] = 2.0
         # Set unique u_logits for surviving nodes
         stage.u_logits.data[0] = 0.5
         stage.u_logits.data[1] = 1.5
@@ -1340,11 +1345,12 @@ def test_prune_stage_transfer_params():
               abs(float(pruned.z_logits[0].item()) - 3.0) < 1e-5)
         check("CP-5: transferred z_logits match (edge 2)",
               abs(float(pruned.z_logits[1].item()) - 4.0) < 1e-5)
-    if pruned.num_nodes >= 3:
+    if pruned.num_nodes >= 3 and hasattr(pruned, "raw_leak"):
         check("CP-5: transferred raw_leak matches (node 0)",
               abs(float(pruned.raw_leak[0].item()) - 0.0) < 1e-5)
         check("CP-5: transferred raw_leak matches (node 1)",
               abs(float(pruned.raw_leak[1].item()) - 1.0) < 1e-5)
+    if pruned.num_nodes >= 3:
         check("CP-5: transferred u_logits match (node 0)",
               abs(float(pruned.u_logits[0].item()) - 0.5) < 1e-5)
         check("CP-5: transferred u_logits match (node 1)",
@@ -3068,6 +3074,8 @@ def main():
     test_deq_solver_run_in_fp32()                # DEQ-2:  fp32 / AMP safety
     test_deq_multistart_uniqueness_on_contractive()  # DEQ-12
     test_deq_leak_floor_enforced()               # DEQ-9:  leak_floor safeguard
+    test_leak_non_programmable()                  # LMC-1: non-prog leak mode
+    test_leak_non_programmable_prune_transfer()   # LMC-2: prune raw_leak transfer
     test_deq_equilibrium_rhs_residual_small()    # DEQ-3:  residual at equilibrium
     test_deq_equilibrium_matches_long_horizon_heun()  # DEQ-4: vs Heun rollout
     test_deq_implicit_backward_gradients_finite()    # DEQ-5: implicit grads
@@ -5051,8 +5059,12 @@ def test_lrp_correct_param_membership():
     check("LRP-2: struct group has raw_mult params",
           any("raw_mult" in n for n in struct_params),
           f"struct_params={struct_params}")
-    check("LRP-2: dyn group has raw_leak params",
-          any("raw_leak" in n for n in dyn_params),
+    has_raw_leak_param = any(
+        "raw_leak" in n for n, _ in net.named_parameters()
+    )
+    check("LRP-2: dyn group has raw_leak params (if any present)",
+          (any("raw_leak" in n for n in dyn_params)
+           if has_raw_leak_param else True),
           f"dyn_params={dyn_params}")
     # raw_drive_g is optional — only present with persistent drive.
     has_drive = any("raw_drive_g" in n for n, _ in net.named_parameters())
@@ -6078,7 +6090,8 @@ def test_simple_edge_build_forward():
         check(f"SE-1 ({mode}) deprecate-node-gates: u_logits has no grad (bypassed in rhs)",
               stage.u_logits.grad is None,
               f"got grad={stage.u_logits.grad}")
-        check(f"SE-1 ({mode}): grad on raw_leak", stage.raw_leak.grad is not None)
+        if hasattr(stage, "raw_leak"):
+            check(f"SE-1 ({mode}): grad on raw_leak", stage.raw_leak.grad is not None)
 
 
 def test_simple_edge_prune():
@@ -6207,7 +6220,8 @@ def test_tanh_realistic_construction():
     loss.backward()
     check("TR-1: grad on alpha_raw (pipeline)", stage.cell_lib.alpha_raw.grad is not None)
     check("TR-1: grad on z_logits", stage.z_logits.grad is not None)
-    check("TR-1: grad on raw_leak", stage.raw_leak.grad is not None)
+    if hasattr(stage, "raw_leak"):
+        check("TR-1: grad on raw_leak", stage.raw_leak.grad is not None)
     check("TR-1 deprecate-node-gates: u_logits no grad",
           stage.u_logits.grad is None, f"got {stage.u_logits.grad}")
 
@@ -6363,7 +6377,8 @@ def test_tanh_realistic_upgrade():
     check("TRU-1: grad gm_raw (pipeline)", stage.cell_lib.gm_raw.grad is not None)
     check("TRU-1: grad isat_raw (pipeline)", stage.cell_lib.isat_raw.grad is not None)
     check("TRU-1: grad z_logits (upgrade)", stage.z_logits.grad is not None)
-    check("TRU-1: grad raw_leak (upgrade)", stage.raw_leak.grad is not None)
+    if hasattr(stage, "raw_leak"):
+        check("TRU-1: grad raw_leak (upgrade)", stage.raw_leak.grad is not None)
     check("TRU-1 deprecate-node-gates: u_logits no grad (upgrade)",
           stage.u_logits.grad is None, f"got {stage.u_logits.grad}")
 
@@ -6534,7 +6549,8 @@ def test_free_tanh_construction():
     check("FT-1: grad gm_raw (pipeline)", stage.cell_lib.gm_raw.grad is not None)
     check("FT-1: grad isat_raw (pipeline)", stage.cell_lib.isat_raw.grad is not None)
     check("FT-1: grad z_logits", stage.z_logits.grad is not None)
-    check("FT-1: grad raw_leak", stage.raw_leak.grad is not None)
+    if hasattr(stage, "raw_leak"):
+        check("FT-1: grad raw_leak", stage.raw_leak.grad is not None)
     check("FT-1 deprecate-node-gates: u_logits no grad",
           stage.u_logits.grad is None, f"got {stage.u_logits.grad}")
 
@@ -6880,6 +6896,8 @@ def test_deq_implicit_backward_gradients_finite():
     loss = x_star.pow(2).sum()
     loss.backward()
     for name in ("logits", "raw_mult", "raw_leak", "z_logits"):
+        if not hasattr(stage, name):
+            continue
         p = getattr(stage, name)
         ok = p.grad is not None and torch.isfinite(p.grad).all().item()
         check(f"grad finite: {name}", ok,
@@ -7015,7 +7033,7 @@ def test_deq_ste_mode_rejected():
 
 def test_deq_leak_floor_enforced():
     """leak_floor=0.0 leaves Heun path unchanged (regression); >0 keeps diagonal damping."""
-    print("\nTest DEQ-9: leak_floor=0.0 matches default Heun; leak_floor>0 increases leak")
+    print("\nTest DEQ-9: leak_floor=0.0 matches default Heun; leak_floor>0 keeps diagonal damping")
     from cell_library import make_cell_library
     from topology import StageTopologyBuilder, topology_to_stage
     from sim_context import SimContext
@@ -7037,6 +7055,143 @@ def test_deq_leak_floor_enforced():
     check("leak_floor=0.5 increases leak (3 * (0.5 + softplus(-3)) > leak_default)",
           leak_floored > leak_default,
           f"leak_floored={leak_floored:.4f} vs default={leak_default:.4f}")
+
+
+def test_leak_non_programmable():
+    """leak_mode='non-programmable' creates no raw_leak param and uses fixed scalar leak."""
+    print("\nTest LMC-1: leak_mode='non-programmable' (fixed constant leak)")
+    from cell_library import make_cell_library
+    from topology import StageTopologyBuilder, topology_to_stage, ring_graph
+    from differential_stage import DifferentialStage
+    from config import INIT
+
+    torch.manual_seed(0)
+    cell_lib = make_cell_library('tanh')
+
+    # (a) programmable (default): raw_leak exists, leak_floor=0.0 -> leak=softplus(-3)
+    hid = ring_graph(3, radius=1)
+    builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
+    topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
+                         proj_pattern="all_to_all")
+    stage_prog, _, _ = topology_to_stage(topo, cell_lib=cell_lib)
+    check("LMC-1a: programmable stage has raw_leak", hasattr(stage_prog, "raw_leak"))
+    leak_prog = stage_prog._effective_leak(num_nodes=3, leak_floor=0.0).detach()
+    expected_prog = float(torch.nn.functional.softplus(stage_prog.raw_leak.detach()).sum())
+    check("LMC-1b: programmable _effective_leak matches softplus(raw_leak)",
+          abs(float(leak_prog.sum()) - expected_prog) < 1e-5,
+          f"got {float(leak_prog.sum()):.4f}, expected {expected_prog:.4f}")
+
+    # (b) non-programmable: no raw_leak, leak_floor=0.0 -> leak=leak_constant
+    cell_lib_b = make_cell_library('tanh')
+    stage_fix = DifferentialStage(
+        num_nodes=3, src=[0, 1], dst=[1, 2], cell_lib=cell_lib_b,
+        leak_mode="non-programmable",
+    )
+    check("LMC-1c: non-programmable stage has NO raw_leak",
+          not hasattr(stage_fix, "raw_leak"))
+    check("LMC-1d: non-programmable stage has leak_constant",
+          hasattr(stage_fix, "leak_constant"))
+    expected_default = float(INIT["leak_constant"])
+    check("LMC-1e: leak_constant default matches INIT['leak_constant']",
+          stage_fix.leak_constant == expected_default,
+          f"got {stage_fix.leak_constant}, expected {expected_default}")
+
+    leak_fix = stage_fix._effective_leak(num_nodes=3, leak_floor=0.0).detach()
+    check("LMC-1f: non-prog _effective_leak = leak_constant (uniform across nodes)",
+          torch.allclose(leak_fix, torch.full((3,), expected_default)),
+          f"got {leak_fix.tolist()}")
+
+    # (c) non-programmable + leak_floor>0 -> leak = leak_constant + leak_floor
+    leak_fix_floored = stage_fix._effective_leak(num_nodes=3, leak_floor=0.5).detach()
+    check("LMC-1g: non-prog + leak_floor=0.5 adds floor",
+          torch.allclose(leak_fix_floored, torch.full((3,), expected_default + 0.5)),
+          f"got {leak_fix_floored.tolist()}")
+
+    # (d) custom leak_constant
+    cell_lib_c = make_cell_library('tanh')
+    stage_custom = DifferentialStage(
+        num_nodes=3, src=[0, 1], dst=[1, 2], cell_lib=cell_lib_c,
+        leak_mode="non-programmable", leak_constant=0.123,
+    )
+    leak_custom = stage_custom._effective_leak(num_nodes=3, leak_floor=0.0).detach()
+    check("LMC-1h: custom leak_constant=0.123 honored",
+          torch.allclose(leak_custom, torch.full((3,), 0.123)),
+          f"got {leak_custom.tolist()}")
+
+    # (e) parameter_breakdown omits raw_leak when non-programmable
+    bd_prog = stage_prog.parameter_breakdown()
+    bd_fix = stage_fix.parameter_breakdown()
+    check("LMC-1i: programmable breakdown includes raw_leak",
+          "raw_leak" in bd_prog and bd_prog["raw_leak"] == 3)
+    check("LMC-1j: non-programmable breakdown has raw_leak=0",
+          "raw_leak" in bd_fix and bd_fix["raw_leak"] == 0,
+          f"got {bd_fix}")
+
+    # (f) forward pass runs without error and produces finite output
+    x0 = torch.zeros(2, 3)
+    x_final, traj = stage_fix.forward(x0, t_span=0.5, num_steps=10)
+    check("LMC-1k: non-prog forward produces finite output",
+          torch.isfinite(x_final).all().item())
+
+    # (g) gradient on a loss should NOT include leak gradients (no leak param)
+    x0_g = torch.zeros(2, 3, requires_grad=False)
+    x_final_g, _ = stage_fix.forward(x0_g, t_span=0.5, num_steps=10)
+    loss = x_final_g.pow(2).sum()
+    loss.backward()
+    # stage_fix has no raw_leak; no params related to leak should have grad.
+    # Check that .leak_constant exists but has no grad (it's a Python float).
+    check("LMC-1l: non-prog leak_constant has no grad",
+          not hasattr(stage_fix.leak_constant, "grad") or stage_fix.leak_constant.grad is None)
+
+    # (h) invalid leak_mode raises
+    try:
+        DifferentialStage(
+            num_nodes=2, src=[0], dst=[1], cell_lib=make_cell_library('tanh'),
+            leak_mode="garbage",
+        )
+        check("LMC-1m: invalid leak_mode raises ValueError", False, "no error")
+    except ValueError:
+        check("LMC-1m: invalid leak_mode raises ValueError", True)
+
+
+def test_leak_non_programmable_prune_transfer():
+    """prune_stage skips raw_leak transfer when neither old nor new stage has raw_leak."""
+    print("\nTest LMC-2: prune_stage skips raw_leak transfer in non-prog mode")
+    from topology import prune_stage, topology_to_stage
+    from topology import ring_graph, StageTopologyBuilder
+    from cell_library import make_cell_library
+
+    torch.manual_seed(0)
+    cell_lib = make_cell_library('tanh')
+
+    # Build stages via topology_to_stage (handles edge-count consistency)
+    hid = ring_graph(4, radius=1)
+    builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=4, num_proj=0)
+    topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
+                         proj_pattern="all_to_all")
+
+    stage_prog, _, _ = topology_to_stage(topo, cell_lib=cell_lib)
+    with torch.no_grad():
+        stage_prog.z_logits.fill_(5.0)
+
+    pruned_prog, _ = prune_stage(stage_prog, edge_threshold=0.0)
+    check("LMC-2a: pruned programmable stage has raw_leak",
+          hasattr(pruned_prog, "raw_leak"))
+
+    # Non-programmable variant via topology_to_stage (only way to get correct edge count)
+    stage_fix, _, _ = topology_to_stage(
+        topo, cell_lib=make_cell_library('tanh'),
+        leak_mode="non-programmable", leak_constant=0.05,
+    )
+    with torch.no_grad():
+        stage_fix.z_logits.fill_(5.0)
+
+    pruned_fix, _ = prune_stage(
+        stage_fix, edge_threshold=0.0,
+        leak_mode="non-programmable", leak_constant=0.05,
+    )
+    check("LMC-2b: pruned non-prog stage has NO raw_leak",
+          not hasattr(pruned_fix, "raw_leak"))
 
 
 def test_deq_solver_kwarg_threads_through_kirchhoff_net():

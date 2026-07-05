@@ -554,6 +554,7 @@ INIT = {
     "logits_z_bias": 0.0,
     "raw_mult_init": 0.0,
     "raw_leak_init": -3.0,
+    "leak_constant": 0.0486,  # softplus(-3.0), fixed leak when --leak non-programmable
     "gain_scale": 1.0,
     "z_logit_init": 0.0,
     "u_logit_init": 0.0,
@@ -747,6 +748,8 @@ def make_smooth2d_grid_preset(
     num_proj: int = 3,
     bidirectional: bool = False,
     edge_repeats: int = 2,
+    leak_mode: str = "programmable",
+    leak_constant: float | None = None,
 ) -> dict:
     """Dynamically build the smooth2d_grid preset dict for any square grid size.
 
@@ -809,7 +812,7 @@ def make_smooth2d_grid_preset(
     else:
         read_idx = list(range(num_hidden, num_hidden + num_proj))
 
-    return {
+    preset = {
         "stages": [_stage_cfg] * n_stages,
         "use_robust_input": False,
         "loss": "mse",
@@ -828,6 +831,11 @@ def make_smooth2d_grid_preset(
         },
         "tau_anneal": True,
     }
+    if leak_mode != "programmable" or leak_constant is not None:
+        preset["leak_mode"] = leak_mode
+        if leak_constant is not None:
+            preset["leak_constant"] = leak_constant
+    return preset
 
 
 # Static default: 7×7 grid (49 hidden nodes), 3 stages, 3 proj nodes.
@@ -844,6 +852,8 @@ def make_housing_grid_preset(
     num_proj: int = 3,
     bidirectional: bool = False,
     edge_repeats: int = 2,
+    leak_mode: str = "programmable",
+    leak_constant: float | None = None,
 ) -> dict:
     """Build the housing_grid preset dict for any square grid size.
 
@@ -901,7 +911,7 @@ def make_housing_grid_preset(
     else:
         read_idx = list(range(num_hidden, num_hidden + num_proj))
 
-    return {
+    preset = {
         "stages": [_stage_cfg] * n_stages,
         "use_robust_input": False,
         "loss": "huber",
@@ -919,6 +929,11 @@ def make_housing_grid_preset(
         },
         "tau_anneal": True,
     }
+    if leak_mode != "programmable" or leak_constant is not None:
+        preset["leak_mode"] = leak_mode
+        if leak_constant is not None:
+            preset["leak_constant"] = leak_constant
+    return preset
 
 
 # Static default: 5x5 grid, 3 stages, 3 proj nodes (mirrors smooth2d_grid).

@@ -58,6 +58,14 @@ class DifferentialStage(nn.Module):
             drive for this stage.
         drive_isat: Saturation current for the bounded drive source. When
             ``None``, uses ``config.DRIVE["drive_isat"]``.
+        leak_mode: ``"programmable"`` (default) creates a learnable per-node
+            ``raw_leak`` parameter. ``"non-programmable"`` uses a fixed scalar
+            ``leak_constant`` (see ``leak_constant``) for all nodes, saving
+            parameters and eliminating leak gradients.
+        leak_constant: Fixed leak value used when ``leak_mode="non-programmable"``.
+            When ``None``, defaults to ``config.INIT["leak_constant"]``
+            (0.0486, matching ``softplus(raw_leak_init)``). Ignored when
+            ``leak_mode="programmable"``.
     """
 
     def __init__(
@@ -72,10 +80,15 @@ class DifferentialStage(nn.Module):
         clip_softness: float | None = None,
         write_idx: list[int] | None = None,
         drive_isat: float | None = None,
+        leak_mode: str = "programmable",
+        leak_constant: float | None = None,
     ) -> None:
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.cell_lib = cell_lib
+        if leak_mode not in ("programmable", "non-programmable"):
+            raise ValueError(f"leak_mode must be 'programmable' or 'non-programmable', got {leak_mode!r}")
+        self.leak_mode = leak_mode
 
         self.c_eff = float(c_eff if c_eff is not None else PHYS["C_eff"])
         self.x_max = float(x_max if x_max is not None else PHYS["x_max"])
@@ -109,7 +122,10 @@ class DifferentialStage(nn.Module):
             self._has_drive = False
             self.drive_isat = 0.0
 
-        self.raw_leak = nn.Parameter(torch.full((num_nodes,), float(INIT["raw_leak_init"])))
+        if self.leak_mode == "programmable":
+            self.raw_leak = nn.Parameter(torch.full((num_nodes,), float(INIT["raw_leak_init"])))
+        else:
+            self.leak_constant = float(leak_constant if leak_constant is not None else INIT["leak_constant"])
 
         # Minimum effective leak (deq-core-prototype plan). Defaults to 0.0 so
         # the Heun path is byte-for-byte unchanged. Under DEQ this is set to a
@@ -193,14 +209,20 @@ class DifferentialStage(nn.Module):
 
     def _effective_leak(self, num_nodes: int | None = None,
                         leak_floor: float | None = None) -> torch.Tensor:
-        """Return the per-node effective leak (leak_floor + softplus(raw_leak))."""
+        """Return the per-node effective leak.
+        
+        Programmable: ``leak_floor + softplus(raw_leak)`` (per-node).
+        Non-programmable: ``leak_floor + leak_constant`` (scalar, same for all nodes).
+        """
         if num_nodes is None:
             num_nodes = self.num_nodes
         lf = self.leak_floor if leak_floor is None else float(leak_floor)
-        base = F.softplus(self.raw_leak)
-        if lf == 0.0:
-            return base
-        return lf + base
+        if self.leak_mode == "programmable":
+            base = F.softplus(self.raw_leak)
+            return base if lf == 0.0 else lf + base
+        else:
+            l = lf + self.leak_constant
+            return torch.full((num_nodes,), l, dtype=torch.float32)
 
     def _compute_budget_gate(self) -> torch.Tensor:
         """Compute the per-destination (or per-source) competitive budget gate.
@@ -594,13 +616,14 @@ class DifferentialStage(nn.Module):
                 device_n += int(self.cell_lib.theta_raw.numel())
         else:
             device_n = 0
+        raw_leak_n = int(self.raw_leak.numel()) if hasattr(self, "raw_leak") else 0
         return {
-            "raw_leak": int(self.raw_leak.numel()),
+            "raw_leak": raw_leak_n,
             "z_logits": int(self.z_logits.numel()),
             "u_logits": int(self.u_logits.numel()),
             "device_param": device_n,
             "total": (
-                int(self.raw_leak.numel())
+                raw_leak_n
                 + int(self.z_logits.numel())
                 + int(self.u_logits.numel())
                 + device_n

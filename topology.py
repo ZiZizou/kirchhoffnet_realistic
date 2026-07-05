@@ -1493,6 +1493,8 @@ def build_net_from_config(
     # write_idx_arg and read_idx_arg are in pre-compact (user-facing)
     # coordinates, but the stage's src/dst are in compact (post-remap)
     # coordinates. Remap via first_id_map before calling validate.
+    # StageTopologyBuilder offsets hidden node IDs by num_inputs (in_dim),
+    # so user-facing hidden index h corresponds to topology node (h + in_dim).
     # Skip when grouped readout is active: read_idx covers all state nodes and
     # the >1-hop write→read constraint cannot be satisfied across the whole
     # state. GroupedOutputMapper handles its own node selection.
@@ -1503,12 +1505,12 @@ def build_net_from_config(
             if hidden_read_idx:
                 first_stage = stage_modules[0]
                 compact_write = [
-                    first_id_map[w] for w in write_idx_arg
-                    if w in first_id_map
+                    first_id_map[w + in_dim] for w in write_idx_arg
+                    if (w + in_dim) in first_id_map
                 ]
                 compact_read = [
-                    first_id_map[r] for r in hidden_read_idx
-                    if r in first_id_map
+                    first_id_map[r + in_dim] for r in hidden_read_idx
+                    if (r + in_dim) in first_id_map
                 ]
                 if compact_write and compact_read:
                     validate_topology_degrees(

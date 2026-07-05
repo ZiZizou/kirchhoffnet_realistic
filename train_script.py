@@ -463,14 +463,20 @@ def _build_grid_write_fan_out(num_inputs: int, grid_size: int | None) -> dict:
 
     Each input gets a unique hidden grid node as a write target. Targets
     are unique across inputs (FanOutInputMapper rejects duplicates).
-    We avoid the grid's center column to keep write->read >1 hop when
-    the preset's read_idx is the center column (e.g. housing_grid,
-    smooth2d_grid). For 2 inputs we use the spatial left/right column
-    pattern from ``make_smooth2d_grid_preset``; for more inputs we
-    sweep through outer columns left-to-right, picking a unique row
-    per input so all targets are distinct. If outer columns are
-    exhausted, we fall back to the center column (sacrificing the >1
-    hop guarantee rather than failing).
+
+    To keep write->read >1 hop when the preset's read_idx is the center
+    column (e.g. housing_grid, smooth2d_grid), we preferentially place
+    write targets in the two end columns (col 0 and col ``grid_size-1``),
+    which are at least 2 columns away from the center column when
+    ``grid_size >= 5``. For ``grid_size < 5`` the end columns may be
+    closer to the center; the ``>1 hop`` validation in
+    ``build_net_from_config`` will reject the resulting topology only
+    when read targets exist in the conflicting columns. Outer columns
+    (those adjacent to center) and finally the center column itself
+    are used as fallbacks when the end columns are exhausted, in which
+    case the topology may not satisfy ``>1 hop`` and the caller is
+    expected to either drop ``--persistent-drive`` or supply an
+    explicit ``--read-idx`` matching the allowed topology.
     """
     if grid_size is None or grid_size < 2:
         grid_size = 2
@@ -482,53 +488,38 @@ def _build_grid_write_fan_out(num_inputs: int, grid_size: int | None) -> dict:
             f"unique target per input)"
         )
     center_col = grid_size // 2
-    outer_cols = [c for c in range(grid_size) if c != center_col]
-    if num_inputs == 2 and grid_size >= 4:
-        # Mirror make_smooth2d_grid_preset's spatial pattern.
-        col_for_input = [0, grid_size - 1]
-    else:
-        col_for_input = [outer_cols[i % len(outer_cols)] for i in range(num_inputs)]
+    end_cols = [0, grid_size - 1]
+    # Round-robin across the two end columns to maximize horizontal spread.
+    col_for_input = [end_cols[i % len(end_cols)] for i in range(num_inputs)]
+    # Try, in priority order: assigned end column, the other end column,
+    # remaining outer columns, then the center column.
+    other_outer_cols = [
+        c for c in range(grid_size)
+        if c not in end_cols and c != center_col
+    ]
     fan_out: dict[int, list[int]] = {}
     used: set[int] = set()
-    center_used = False
     for i in range(num_inputs):
         col = col_for_input[i]
-        for r in range(grid_size):
-            node = r * grid_size + col
-            if node not in used:
-                fan_out[i] = [node]
-                used.add(node)
+        cols_to_try = list(dict.fromkeys(
+            [col] + [c for c in end_cols if c != col] + other_outer_cols + [center_col]
+        ))
+        placed = False
+        for try_col in cols_to_try:
+            for r in range(grid_size):
+                node = r * grid_size + try_col
+                if node not in used:
+                    fan_out[i] = [node]
+                    used.add(node)
+                    placed = True
+                    break
+            if placed:
                 break
-        else:
-            # Outer column exhausted; fall back to center column.
-            if not center_used and center_col != col_for_input[0]:
-                # Place this input in the center column's first unused row.
-                for r in range(grid_size):
-                    node = r * grid_size + center_col
-                    if node not in used:
-                        fan_out[i] = [node]
-                        used.add(node)
-                        center_used = True
-                        break
-                else:
-                    raise RuntimeError(
-                        "Internal error: no unused grid node found "
-                        f"(num_inputs={num_inputs}, grid_size={grid_size})"
-                    )
-            else:
-                # All outer + center column slots used; scan all nodes.
-                found = False
-                for node in range(total_nodes):
-                    if node not in used:
-                        fan_out[i] = [node]
-                        used.add(node)
-                        found = True
-                        break
-                if not found:
-                    raise RuntimeError(
-                        "Internal error: no unused grid node found "
-                        f"(num_inputs={num_inputs}, grid_size={grid_size})"
-                    )
+        if not placed:
+            raise RuntimeError(
+                f"Internal error: no unused grid node found for input {i} "
+                f"after exhausting {cols_to_try}"
+            )
     return fan_out
 
 def _make_dynamic_preset(

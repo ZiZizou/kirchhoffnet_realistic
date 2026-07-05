@@ -42,6 +42,9 @@ def main():
     test_persistent_drive_auto_fan_out()
     test_persistent_drive_sparse_proj()
     test_amp_dtype_fix()
+    test_fan_out_torus_bug_fix()
+    test_write_fan_out_cli()
+    test_write_fan_out_validation()
     test_mlp_benchmark()
     test_mlp_benchmark_tanh()
     test_v15_cell_parameters_preset_smooth2d_grid()
@@ -780,6 +783,137 @@ def test_amp_dtype_fix():
         x.index_copy_(-1, m._write_index, half_projected.to(dtype=x.dtype))
     check("ProjectedSparseInputMapper AMP scatter works", x.dtype == torch.float32)
     check("ProjectedSparseInputMapper output finite", torch.isfinite(x).all().item())
+
+
+def test_fan_out_torus_bug_fix():
+    print("\nTest FO-torus: --write-mode fan_out + torus family auto-generates write_fan_out")
+    from config import PRESETS
+    from topology import build_net_from_preset
+    from cell_library import make_cell_library
+    from train_script import _make_dynamic_preset
+
+    cell_lib = make_cell_library('tanh')
+
+    # Build a torus preset with fan_out mode — the bug was that
+    # _make_dynamic_preset only generated write_fan_out for 'grid' family,
+    # not for 'torus'. With the fix, torus also gets auto-generated fan_out.
+    cfg = _make_dynamic_preset(
+        problem="smooth2d", hidden_family="torus", num_hidden=25,
+        num_stages=3, edge_repeats=1, grid_size=5, bidirectional=False,
+        write_mode_override="fan_out",
+    )
+    check("torus+fan_out: write_fan_out auto-generated",
+          cfg.get("write_fan_out") is not None)
+    check("torus+fan_out: write_fan_out has one entry per input",
+          len(cfg["write_fan_out"]) == cfg["stages"][0]["num_inputs"])
+
+    PRESETS["smooth2d_torus_fan_out_test"] = cfg
+    try:
+        # Use read_idx far from auto-generated writes to satisfy topology validation.
+        net = build_net_from_preset(
+            "smooth2d_torus_fan_out_test",
+            cell_lib=cell_lib,
+            write_mode="fan_out",
+            read_idx=[12, 18],
+            enable_drive=True,  # also exercises the persistent-drive block
+            drive_mode="fan_out",
+        )
+        from io_mapper import FanOutInputMapper
+        check("builds successfully with fan_out + persistent-drive",
+              isinstance(net.input_mapper, FanOutInputMapper))
+        check("drive_mappers created (3 stages)",
+              net.drive_mappers is not None and len(net.drive_mappers) == 3)
+        y, _ = net(torch.rand(4, 2))
+        check("forward output is finite",
+              torch.isfinite(y).all().item())
+    finally:
+        PRESETS.pop("smooth2d_torus_fan_out_test", None)
+
+
+def test_write_fan_out_cli():
+    print("\nTest FO-cli: --write-fan-out JSON injects custom fan_out_map")
+    import json
+    from config import PRESETS
+    from topology import build_net_from_preset
+    from cell_library import make_cell_library
+    from train_script import _make_dynamic_preset
+
+    cell_lib = make_cell_library('tanh')
+
+    # Simulate the CLI flow: user passes --write-fan-out JSON, which is parsed
+    # and injected into the active preset dict before build_net_from_preset.
+    cfg = _make_dynamic_preset(
+        problem="smooth2d", hidden_family="torus", num_hidden=25,
+        num_stages=3, edge_repeats=1, grid_size=5, bidirectional=False,
+        write_mode_override="fan_out",
+    )
+
+    # Step 1: parse the CLI arg as the train_script does
+    cli_arg = '{"0": [2, 12], "1": [7, 17]}'
+    raw = json.loads(cli_arg)
+    fan_out_map = {int(k): [int(vv) for vv in v] for k, v in raw.items()}
+    cfg["write_fan_out"] = fan_out_map
+
+    # Step 2: validation
+    num_inputs = int(cfg["stages"][0]["num_inputs"])
+    all_targets = [t for tgts in fan_out_map.values() for t in tgts]
+    check("write_fan_out validation: no duplicate targets",
+          len(all_targets) == len(set(all_targets)))
+    check("write_fan_out validation: all keys in [0, num_inputs)",
+          all(k < num_inputs for k in fan_out_map))
+    check("write_fan_out has correct content",
+          fan_out_map == {0: [2, 12], 1: [7, 17]})
+
+    PRESETS["smooth2d_torus_fan_out_cli_test"] = cfg
+    try:
+        net = build_net_from_preset(
+            "smooth2d_torus_fan_out_cli_test",
+            cell_lib=cell_lib,
+            write_mode="fan_out",
+            read_idx=[0, 15, 4, 19],
+            enable_drive=True,
+            drive_mode="fan_out",
+        )
+        from io_mapper import FanOutInputMapper
+        check("input_mapper is FanOutInputMapper",
+              isinstance(net.input_mapper, FanOutInputMapper))
+        check("input_mapper uses the custom fan_out_map",
+              net.input_mapper.fan_out_map == {0: [2, 12], 1: [7, 17]})
+        check("drive_mappers use the custom fan_out_map",
+              net.drive_mappers[0].fan_out_map == {0: [2, 12], 1: [7, 17]})
+        check("write_idx derived from fan_out targets",
+              set(net.write_idx) == {2, 7, 12, 17})
+        y, _ = net(torch.rand(4, 2))
+        check("forward output is finite",
+              torch.isfinite(y).all().item())
+    finally:
+        PRESETS.pop("smooth2d_torus_fan_out_cli_test", None)
+
+
+def test_write_fan_out_validation():
+    print("\nTest FO-cli-validate: --write-fan-out rejects invalid JSON")
+    import json
+    cfg = {"stages": [{"num_inputs": 2}]}
+
+    # Test invalid JSON
+    try:
+        json.loads("not json")
+        check("invalid JSON raises", False)
+    except json.JSONDecodeError:
+        check("invalid JSON raises", True)
+
+    # Test duplicate targets
+    raw = '{"0": [2, 5], "1": [5, 7]}'
+    parsed = {int(k): [int(v) for v in v] for k, v in json.loads(raw).items()}
+    all_targets = [t for tgts in parsed.values() for t in tgts]
+    check("duplicate targets detected",
+          len(all_targets) != len(set(all_targets)))
+
+    # Test input key out of range
+    raw = '{"3": [2, 5]}'
+    parsed = {int(k): [int(v) for v in v] for k, v in json.loads(raw).items()}
+    check("input key out of range detected",
+          any(k >= cfg["stages"][0]["num_inputs"] for k in parsed))
 
 
 def test_mlp_benchmark():

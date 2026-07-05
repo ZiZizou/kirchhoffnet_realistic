@@ -25,6 +25,7 @@ top of the global ``LAMBDAS`` dict before each epoch.
 """
 
 import argparse
+import json
 import os
 import sys
 import copy
@@ -663,14 +664,14 @@ Args:
     new_preset["write_mode"] = eff_write_mode
     new_preset["read_idx"] = read_idx
     new_preset["read_mode"] = eff_read_mode
-    # Grid-family fan_out generation: when write_mode='fan_out', every
-    # write target list must be present (build_net_from_config requires it).
-    # When the base preset already has write_fan_out (e.g. smooth2d_grid),
-    # keep it. Otherwise generate a deterministic fan-out mapping that
-    # distributes inputs across the grid without duplicate target nodes
-    # (FanOutInputMapper requires each hidden node to be written by at
-    # most one input).
-    if hidden_family == "grid" and eff_write_mode == "fan_out":
+    # Fan-out generation: when write_mode='fan_out', every write target
+    # list must be present (build_net_from_config requires it). When the
+    # base preset already has write_fan_out (e.g. smooth2d_grid), keep it.
+    # Otherwise generate a deterministic fan-out mapping that distributes
+    # inputs across the grid without duplicate target nodes (FanOutInputMapper
+    # requires each hidden node to be written by at most one input).
+    # Works for both grid and torus families since node IDs follow row*grid_size+col.
+    if eff_write_mode == "fan_out":
         if "write_fan_out" not in new_preset or new_preset["write_fan_out"] is None:
             new_preset["write_fan_out"] = _build_grid_write_fan_out(
                 num_inputs=num_inputs, grid_size=grid_size)
@@ -2112,6 +2113,13 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "inputs into every driven node (matches ProjectedSparseInputMapper). "
              "Default: 'fan_out'.")
     parser.add_argument(
+        "--write-fan-out", type=str, default=None, dest="write_fan_out",
+        help="JSON dict for --write-mode fan_out specifying the input->target "
+             "mapping, e.g. '{\"0\": [2, 12], \"1\": [7, 17]}' means input 0 "
+             "drives nodes 2 and 12, input 1 drives nodes 7 and 17. Overrides "
+             "any preset write_fan_out and any auto-generated fan-out. "
+             "Ignored unless --write-mode fan_out.")
+    parser.add_argument(
         "--leak", choices=["programmable", "non-programmable"],
         default="programmable", dest="leak",
         help="Stage leak mode (default: programmable). 'programmable' "
@@ -2557,9 +2565,54 @@ def main():
             f"bidirectional={args.bidirectional} "
             f"write_mode={new_preset['write_mode']} read_mode={new_preset['read_mode']}"
         )
+    # Resolve write_fan_out: explicit CLI override > auto-generate (any family).
+    # Done before persistent-drive so it's independent of that flag.
+    active_preset = PRESETS.get(args.problem)
+    if active_preset is None:
+        raise ValueError(f"Unknown problem: {args.problem!r}")
+    if args.write_fan_out is not None:
+        try:
+            raw = json.loads(args.write_fan_out)
+            fan_out_map = {int(k): [int(vv) for vv in v] for k, v in raw.items()}
+            # Sanity checks: keys must be >=0, values lists of non-negative ints.
+            for k, v in fan_out_map.items():
+                if k < 0 or any(x < 0 for x in v):
+                    raise ValueError(
+                        f"--write-fan-out: indices must be non-negative, got {k}->{v}"
+                    )
+            num_inputs = int(active_preset["stages"][0]["num_inputs"])
+            if any(k >= num_inputs for k in fan_out_map):
+                raise ValueError(
+                    f"--write-fan-out: input key {max(fan_out_map)} >= num_inputs={num_inputs}"
+                )
+            # FanOutInputMapper requires each hidden node to be written by at most one input.
+            all_targets = [t for tgts in fan_out_map.values() for t in tgts]
+            if len(all_targets) != len(set(all_targets)):
+                dupes = [t for t in all_targets if all_targets.count(t) > 1]
+                raise ValueError(
+                    f"--write-fan-out: duplicate target nodes {set(dupes)}; "
+                    f"FanOutInputMapper requires each node to be written by at most one input"
+                )
+            active_preset["write_fan_out"] = fan_out_map
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid --write-fan-out JSON: {e}")
+    elif args.write_mode == "fan_out" and not active_preset.get("write_fan_out"):
+        # Auto-generate fan-out for any family (grid, torus, small_world).
+        # _build_grid_write_fan_out works for torus too (same node layout).
+        if resolved_grid_size is None:
+            raise ValueError(
+                f"--write-mode fan_out with no --write-fan-out and no grid-size "
+                f"resolved (problem={args.problem!r}). "
+                f"Either supply --write-fan-out JSON or specify --hidden-family grid/torus "
+                f"with --grid-size N."
+            )
+        num_inputs = int(active_preset["stages"][0]["num_inputs"])
+        active_preset["write_fan_out"] = _build_grid_write_fan_out(
+            num_inputs=num_inputs, grid_size=resolved_grid_size)
+
     # Persistent drive: supports fan_out, sparse_proj, and one_to_one modes.
-    # For sparse_proj/one_to_one, the driven nodes come from --write-idx.
-    # For fan_out, auto-generate write_fan_out if missing (legacy grid behavior).
+    # write_fan_out is already resolved above; for sparse_proj/one_to_one the
+    # driven nodes come from --write-idx (handled by build_net_from_config).
     if args.persistent_drive:
         if args.write_mode is not None and args.write_mode not in (
                 "fan_out", "sparse_proj", "one_to_one"):
@@ -2568,35 +2621,6 @@ def main():
                 "'sparse_proj', or 'one_to_one' "
                 f"(got --write-mode {args.write_mode!r})"
             )
-        if args.write_mode in (None, "sparse_proj", "one_to_one"):
-            if args.write_mode is None:
-                args.write_mode = "fan_out"
-            # For sparse_proj/one_to_one: nothing to auto-generate here.
-            # build_net_from_config in topology.py handles drive mappers
-            # directly from the explicit write_idx list.
-            if args.write_mode == "fan_out":
-                # Ensure write_fan_out exists in the active preset. Some
-                # base presets (e.g. housing_grid) declare write_mode='dense'
-                # and therefore omit write_fan_out. --persistent-drive forces
-                # write_mode='fan_out', so generate a deterministic fan-out
-                # mapping consistent with the grid-family convention used by
-                # _make_dynamic_preset and make_smooth2d_grid_preset.
-                active_preset = PRESETS.get(args.problem)
-                if active_preset is None:
-                    raise ValueError(
-                        f"--persistent-drive: unknown problem {args.problem!r}"
-                    )
-                if not active_preset.get("write_fan_out"):
-                    if resolved_grid_size is None:
-                        raise ValueError(
-                            f"--persistent-drive requires a grid-family topology with "
-                            f"a known grid size (problem={args.problem!r}, "
-                            f"grid_size=None). Use --hidden-family grid --grid-size N."
-                        )
-                    num_inputs = int(active_preset["stages"][0]["num_inputs"])
-                    active_preset["write_fan_out"] = _build_grid_write_fan_out(
-                        num_inputs=num_inputs, grid_size=resolved_grid_size)
-                    active_preset["write_mode"] = "fan_out"
     net = build_net_from_preset(
         args.problem,
         cell_lib=cell_lib,

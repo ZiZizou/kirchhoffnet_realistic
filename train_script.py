@@ -110,6 +110,8 @@ from io_mapper import (
     InputMapper,
     OutputMapper,
     ProjectedSparseInputMapper,
+    ResidualTanhInputMapper,
+    ResidualTanhOutputMapper,
     RobustInputMapper,
     SparseInputMapper)
 
@@ -2365,6 +2367,41 @@ def _transfer_input_mapper(raw_mapper, raw_write_idx, stage0_remap,
                 new_mapper.log_scale.data.copy_(raw_mapper.log_scale.data)
         return new_mapper, raw_write_idx
 
+    if isinstance(raw_mapper, ResidualTanhInputMapper):
+        old_out = raw_mapper.encoder.out_dim
+        surviving_old = sorted(stage0_remap.keys())
+        surviving_new = [stage0_remap[o] for o in surviving_old]
+        is_identity = (old_out == pruned_first_n and
+                       surviving_new == list(range(pruned_first_n)))
+        if is_identity:
+            return copy.deepcopy(raw_mapper), raw_write_idx
+        new_mapper = ResidualTanhInputMapper(
+            in_dim=in_dim,
+            hidden_dim=raw_mapper.hidden_dim,
+            out_dim=pruned_first_n,
+            x_max=raw_mapper.x_max)
+        with torch.no_grad():
+            new_lin_w = new_mapper.encoder.W_lin.weight.data
+            old_lin_w = raw_mapper.encoder.W_lin.weight.data
+            new_lin_b = new_mapper.encoder.W_lin.bias.data
+            old_lin_b = raw_mapper.encoder.W_lin.bias.data
+            new_w2 = new_mapper.encoder.W_2.weight.data
+            old_w2 = raw_mapper.encoder.W_2.weight.data
+            for old_id, new_id in zip(surviving_old, surviving_new):
+                if old_id < old_out:
+                    new_lin_w[new_id].copy_(old_lin_w[old_id])
+                    new_lin_b[new_id].copy_(old_lin_b[old_id])
+                    new_w2[new_id].copy_(old_w2[old_id])
+                else:
+                    new_lin_w[new_id].zero_()
+                    new_lin_b[new_id].zero_()
+                    new_w2[new_id].zero_()
+            new_mapper.encoder.W_1.weight.data.copy_(
+                raw_mapper.encoder.W_1.weight.data)
+            new_mapper.encoder.W_1.bias.data.copy_(
+                raw_mapper.encoder.W_1.bias.data)
+        return new_mapper, raw_write_idx
+
     raise TypeError(
         f"transfer_input_mapper: unsupported mapper type {type(raw_mapper).__name__}"
     )
@@ -2386,34 +2423,81 @@ def _transfer_output_mapper(raw_mapper, raw_read_idx, last_remap,
     unchanged, deepcopy. Otherwise, copy ``proj.weight`` columns
     for surviving nodes.
     """
-    if raw_read_idx is not None:
-        new_read_idx = _remap_indices(raw_read_idx, last_remap)
-        new_mapper = OutputMapper(
-            node_dim=pruned_last_n, out_dim=out_dim, read_idx=new_read_idx)
-        # Determine which columns of the old weight matrix correspond to
-        # surviving read positions (those entries not pruned away).
-        surviving_old_positions = [
-            i for i, idx in enumerate(raw_read_idx) if idx in last_remap
-        ]
-        with torch.no_grad():
-            new_mapper.proj.weight.data.copy_(
-                raw_mapper.proj.weight.data[:, surviving_old_positions]
-            )
-            new_mapper.proj.bias.data.copy_(raw_mapper.proj.bias.data)
-        return new_mapper, new_read_idx
+    if isinstance(raw_mapper, OutputMapper):
+        if raw_read_idx is not None:
+            new_read_idx = _remap_indices(raw_read_idx, last_remap)
+            new_mapper = OutputMapper(
+                node_dim=pruned_last_n, out_dim=out_dim, read_idx=new_read_idx)
+            # Determine which columns of the old weight matrix correspond to
+            # surviving read positions (those entries not pruned away).
+            surviving_old_positions = [
+                i for i, idx in enumerate(raw_read_idx) if idx in last_remap
+            ]
+            with torch.no_grad():
+                new_mapper.proj.weight.data.copy_(
+                    raw_mapper.proj.weight.data[:, surviving_old_positions]
+                )
+                new_mapper.proj.bias.data.copy_(raw_mapper.proj.bias.data)
+            return new_mapper, new_read_idx
 
-    old_dim = raw_mapper.proj.in_features
-    if old_dim == pruned_last_n:
-        return copy.deepcopy(raw_mapper), None
-    surviving_old = sorted(last_remap.keys())
-    surviving_new = [last_remap[o] for o in surviving_old]
-    new_mapper = OutputMapper(node_dim=pruned_last_n, out_dim=out_dim)
-    with torch.no_grad():
-        new_mapper.proj.weight.data[:, surviving_new].copy_(
-            raw_mapper.proj.weight.data[:, surviving_old]
-        )
-        new_mapper.proj.bias.data.copy_(raw_mapper.proj.bias.data)
-    return new_mapper, None
+        old_dim = raw_mapper.proj.in_features
+        if old_dim == pruned_last_n:
+            return copy.deepcopy(raw_mapper), None
+        surviving_old = sorted(last_remap.keys())
+        surviving_new = [last_remap[o] for o in surviving_old]
+        new_mapper = OutputMapper(node_dim=pruned_last_n, out_dim=out_dim)
+        with torch.no_grad():
+            new_cols = raw_mapper.proj.weight.data[:, surviving_old]
+            new_mapper.proj.weight.data.index_copy_(
+                1, torch.tensor(surviving_new, dtype=torch.long), new_cols)
+            new_mapper.proj.bias.data.copy_(raw_mapper.proj.bias.data)
+        return new_mapper, None
+
+    if isinstance(raw_mapper, ResidualTanhOutputMapper):
+        if raw_read_idx is not None:
+            new_read_idx = _remap_indices(raw_read_idx, last_remap)
+            new_mapper = ResidualTanhOutputMapper(
+                in_dim=pruned_last_n,
+                hidden_dim=raw_mapper.hidden_dim,
+                out_dim=out_dim,
+                read_idx=new_read_idx)
+            surviving_old_positions = [
+                i for i, idx in enumerate(raw_read_idx) if idx in last_remap
+            ]
+            with torch.no_grad():
+                new_mapper.encoder.W_lin.weight.data.copy_(
+                    raw_mapper.encoder.W_lin.weight.data[:, surviving_old_positions]
+                )
+                new_mapper.encoder.W_lin.bias.data.copy_(
+                    raw_mapper.encoder.W_lin.bias.data)
+                new_mapper.encoder.W_1.weight.data.copy_(
+                    raw_mapper.encoder.W_1.weight.data[:, surviving_old_positions]
+                )
+                new_mapper.encoder.W_2.weight.data.copy_(
+                    raw_mapper.encoder.W_2.weight.data)
+            return new_mapper, new_read_idx
+
+        old_dim = raw_mapper.encoder.in_dim
+        if old_dim == pruned_last_n:
+            return copy.deepcopy(raw_mapper), None
+        surviving_old = sorted(last_remap.keys())
+        surviving_new = [last_remap[o] for o in surviving_old]
+        new_mapper = ResidualTanhOutputMapper(
+            in_dim=pruned_last_n,
+            hidden_dim=raw_mapper.hidden_dim,
+            out_dim=out_dim)
+        with torch.no_grad():
+            new_lin_cols = raw_mapper.encoder.W_lin.weight.data[:, surviving_old]
+            new_mapper.encoder.W_lin.weight.data.index_copy_(
+                1, torch.tensor(surviving_new, dtype=torch.long), new_lin_cols)
+            new_mapper.encoder.W_lin.bias.data.copy_(
+                raw_mapper.encoder.W_lin.bias.data)
+            new_w1_cols = raw_mapper.encoder.W_1.weight.data[:, surviving_old]
+            new_mapper.encoder.W_1.weight.data.index_copy_(
+                1, torch.tensor(surviving_new, dtype=torch.long), new_w1_cols)
+            new_mapper.encoder.W_2.weight.data.copy_(
+                raw_mapper.encoder.W_2.weight.data)
+        return new_mapper, None
 
 def main():
     parser = argparse.ArgumentParser(

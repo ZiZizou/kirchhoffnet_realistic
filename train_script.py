@@ -1586,12 +1586,13 @@ def collect_gradient_norms(raw_net):
     # Per-edge device parameter suffixes: covers SimpleEdgeLibrary.param
     # (I=ReLU/tanh(p0*Vsrc+p1*Vdest+p2)), RealisticTanhLibrary
     # (alpha_raw, bias_raw), RealisticTanhUpgradeLibrary (alpha_raw,
-    # gm_raw, isat_raw, bias_raw), and FreeTanhLibrary (a_raw, b_raw, s_raw,
-    # gm_raw, isat_raw, theta_raw). All contribute to the same `device_param`
-    # gradient-norm metric per stage.
+    # gm_raw, isat_raw, bias_raw), FreeTanhLibrary (a_raw, b_raw, s_raw,
+    # gm_raw, isat_raw, theta_raw), and AntiParallelFreeTanhLibrary
+    # (kappa_raw, gm_raw, isat_raw, theta_raw). All contribute to the same
+    # `device_param` gradient-norm metric per stage.
     device_param_suffixes = (
         "param", "alpha_raw", "bias_raw", "gm_raw", "isat_raw",
-        "a_raw", "b_raw", "s_raw", "theta_raw")
+        "a_raw", "b_raw", "s_raw", "theta_raw", "kappa_raw")
     transfer_sq = 0.0
     transfer_found = False
     in_sq = 0.0
@@ -1774,7 +1775,7 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "Only applies when --problem smooth2d_grid or --problem housing_grid.")
     parser.add_argument(
         "--cell-library", type=str, default=None, dest="cell_library",
-        choices=["legacy", "v15", "v2", "relu", "tanh", "tanh_realistic", "tanh_realistic_upgrade", "tanh_free"],
+        choices=["legacy", "v15", "v2", "relu", "tanh", "tanh_realistic", "tanh_realistic_upgrade", "tanh_free", "tanh_anti"],
         help="Cell library: 'legacy' (L,S,P,Z, default), 'v15' (O_weak,O_hard,P0,N0,D1,Z), "
              "'v2' (mix-code/bias-code bounded library), "
              "'relu' (I=ReLU(p0*Vsrc+p1*Vdest+p2)), 'tanh' (I=tanh(p0*Vsrc+p1*Vdest+p2)), "
@@ -1782,7 +1783,10 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "'tanh_realistic_upgrade' (I=Isat*tanh(gm*(A*Vsrc - B*Vdest) + C), "
              "bounded gm/Isat per-edge), "
              "'tanh_free' (I=Isat*tanh(gm*(s*(A*Vsrc - B*Vdest) + theta)), "
-             "A,B>=0 independent (no A+B=1), s=+/-1 via STE, bounded gm/Isat per-edge). "
+             "A,B>=0 independent (no A+B=1), s=+/-1 via STE, bounded gm/Isat per-edge), "
+             "'tanh_anti' (I=Isat*tanh(gm*relu(kappa*(Vsrc-Vdst)-theta)), "
+             "rectified differential OTA slice for antiparallel edge fabrics, "
+             "i>=0 and exactly zero at Vsrc=Vdst). "
              "Overrides the preset's cell_library key if present.")
     parser.add_argument(
         "--hidden-family", type=str, default=None, dest="hidden_family",

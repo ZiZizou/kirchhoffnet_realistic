@@ -259,6 +259,7 @@ CELL_LIBRARIES = {
     "tanh_realistic": {"cells": {}, "cell_order": ["S"], "device": "tanh_realistic", "BIAS_ENABLED": False},
     "tanh_realistic_upgrade": {"cells": {}, "cell_order": ["S"], "device": "tanh_realistic_upgrade", "BIAS_ENABLED": False},
     "tanh_free": {"cells": {}, "cell_order": ["S"], "device": "tanh_free", "BIAS_ENABLED": False},
+    "tanh_anti": {"cells": {}, "cell_order": ["S"], "device": "tanh_anti", "THETA_ENABLED": False},
 }
 
 # tanh_realistic_upgrade defaults: per-edge gm and Isat use bounded
@@ -269,6 +270,18 @@ TANH_REALISTIC_GM_MIN = 0.01
 TANH_REALISTIC_GM_MAX = 10.0
 TANH_REALISTIC_ISAT_MIN = 0.01
 TANH_REALISTIC_ISAT_MAX = 10.0
+
+# tanh_anti defaults: per-edge differential gain kappa, transconductance gm,
+# saturation current Isat, and optional turn-on threshold theta use bounded
+# sigmoid parameterizations. Used by AntiParallelFreeTanhLibrary (rectified
+# OTA slice: i = Isat * tanh(gm * relu(kappa * (Vsrc - Vdst) - theta))).
+ANTI_PARALLEL_KAPPA_MIN = 0.25
+ANTI_PARALLEL_KAPPA_MAX = 2.0
+ANTI_PARALLEL_GM_MIN = 0.25
+ANTI_PARALLEL_GM_MAX = 4.0
+ANTI_PARALLEL_ISAT_MIN = 1e-3
+ANTI_PARALLEL_ISAT_MAX = 1.0
+ANTI_PARALLEL_THETA_MAX = 1.0
 
 # Legacy globals for backward compatibility.
 CELL_LIBRARY = _CELL_LIBRARY_LEGACY["cells"]

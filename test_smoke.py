@@ -3120,6 +3120,7 @@ def main():
     test_kirchhoff_noise_clean_eval()            # kirchhoff-noise: clean eval
     test_kirchhoff_noise_mc_eval()               # kirchhoff-noise: MC eval
 
+    test_anti_parallel_basic()                   # APT-1..11: AntiParallelFreeTanhLibrary
 
     print()
     print("=" * 60)
@@ -7960,6 +7961,144 @@ def test_friedman3_benchmark():
         check("Friedman3 first training step loss finite",
               bool(torch.isfinite(loss).item()))
         break
+
+
+def test_anti_parallel_basic():
+    print("\nTest anti-parallel-rectified: AntiParallelFreeTanhLibrary (APT-1..11)")
+    from cell_library import AntiParallelFreeTanhLibrary, make_cell_library
+    from config import (
+        ANTI_PARALLEL_KAPPA_MIN, ANTI_PARALLEL_KAPPA_MAX,
+        ANTI_PARALLEL_GM_MIN, ANTI_PARALLEL_GM_MAX,
+        ANTI_PARALLEL_ISAT_MIN, ANTI_PARALLEL_ISAT_MAX,
+        ANTI_PARALLEL_THETA_MAX,
+    )
+    torch.manual_seed(0)
+
+    # APT-1: factory registration & forward shape
+    lib = make_cell_library("tanh_anti", num_edges=4)
+    check("APT-1: factory returns AntiParallelFreeTanhLibrary",
+          isinstance(lib, AntiParallelFreeTanhLibrary))
+    x_src = torch.randn(2, 4)
+    x_dst = torch.randn(2, 4)
+    y = lib(x_src, x_dst, 3.0)
+    check("APT-1: forward shape is [B, E]", tuple(y.shape) == (2, 4))
+    check("APT-1: output dtype matches input", y.dtype == x_src.dtype)
+    check("APT-1: output is finite", bool(torch.isfinite(y).all().item()))
+
+    # APT-2: zero current at Vsrc = Vdst (theta_enabled=False default)
+    x = torch.tensor([[0.5, 1.0, 2.0, -0.7]])
+    y_same = lib(x, x, 3.0)
+    check("APT-2: zero current at Vsrc=Vdst (theta disabled)",
+          bool((y_same.abs().max().item() < 1e-6)))
+
+    # APT-2b: zero at Vsrc=Vdst also with theta_enabled (init theta_raw=0 → theta=theta_max*0.5)
+    lib_th = make_cell_library("tanh_anti", num_edges=4)
+    lib_th._theta_enabled = True
+    lib_th.theta_raw = torch.nn.Parameter(torch.zeros(4))
+    y_same_th = lib_th(x, x, 3.0)
+    check("APT-2b: zero current at Vsrc=Vdst (theta=theta_max*0.5 init)",
+          bool((y_same_th.abs().max().item() < 1e-6)))
+
+    # APT-3: nonnegative current for arbitrary inputs
+    x_src = torch.randn(8, 4) * 1.5
+    x_dst = torch.randn(8, 4) * 1.5
+    y = lib(x_src, x_dst, 3.0)
+    check("APT-3: output is nonnegative for arbitrary inputs",
+          bool((y >= -1e-6).all().item()))
+
+    # APT-4: gradient flow to all params
+    x_src = torch.randn(4, 4)
+    x_dst = torch.randn(4, 4)
+    y = lib(x_src, x_dst, 3.0).sum()
+    y.backward()
+    grad_norms = {n: p.grad.abs().sum().item() for n, p in lib.named_parameters()}
+    check("APT-4: kappa_raw receives gradient",
+          grad_norms.get("kappa_raw", 0.0) > 0.0)
+    check("APT-4: gm_raw receives gradient",
+          grad_norms.get("gm_raw", 0.0) > 0.0)
+    check("APT-4: isat_raw receives gradient",
+          grad_norms.get("isat_raw", 0.0) > 0.0)
+    check("APT-4: no theta_raw when theta_enabled=False",
+          "theta_raw" not in grad_norms)
+
+    # APT-5: compliance gating at x_max
+    x_at_max = torch.full((4, 4), 3.0)
+    x_src_clamp = torch.randn(4, 4)
+    y_max = lib(x_src_clamp, x_at_max, 3.0)
+    check("APT-5: compliance gating drives current to 0 at x_max",
+          bool((y_max.abs() < 1e-3).all().item()))
+
+    # APT-6: theta_enabled toggle
+    lib_no_th = AntiParallelFreeTanhLibrary(num_edges=3, theta_enabled=False)
+    lib_yes_th = AntiParallelFreeTanhLibrary(num_edges=3, theta_enabled=True)
+    check("APT-6: theta_enabled=False → no theta_raw param",
+          not hasattr(lib_no_th, "theta_raw"))
+    check("APT-6: theta_enabled=True → has theta_raw param",
+          hasattr(lib_yes_th, "theta_raw"))
+    check("APT-6: theta_enabled default is False (from factory)",
+          not make_cell_library("tanh_anti", num_edges=1)._theta_enabled)
+
+    # APT-7: theta_enabled=True with high theta reduces current
+    lib_high = AntiParallelFreeTanhLibrary(num_edges=2, theta_enabled=True)
+    with torch.no_grad():
+        lib_high.theta_raw.data.fill_(10.0)  # sigma(10) ≈ 1, so theta ≈ theta_max
+    x_src = torch.tensor([[0.1, 0.1]])
+    x_dst = torch.tensor([[0.0, 0.0]])
+    y_high = lib_high(x_src, x_dst, 3.0)
+    check("APT-7: high theta reduces current to ~0",
+          bool((y_high.abs() < 1e-3).all().item()))
+
+    # APT-8: use_isat_normalization toggle
+    lib_norm = AntiParallelFreeTanhLibrary(num_edges=3, use_isat_normalization=True)
+    x_src = torch.randn(4, 3)
+    x_dst = torch.randn(4, 3)
+    y_norm = lib_norm(x_src, x_dst, 3.0)
+    check("APT-8: isat-normalized forward is finite and nonnegative",
+          bool((y_norm >= 0).all().item() and torch.isfinite(y_norm).all().item()))
+
+    # APT-9: kappa bounds respected
+    lib_k = AntiParallelFreeTanhLibrary(num_edges=5, kappa_min=0.5, kappa_max=1.5)
+    with torch.no_grad():
+        lib_k.kappa_raw.data.fill_(100.0)  # sigma(100) ≈ 1 → kappa ≈ kappa_max
+    check("APT-9: kappa_max bound respected (kappa_raw=∞ → kappa→kappa_max)",
+          abs(lib_k.kappa_min + (lib_k.kappa_max - lib_k.kappa_min) * 1.0
+              - lib_k.kappa_max) < 1e-5)
+    with torch.no_grad():
+        lib_k.kappa_raw.data.fill_(-100.0)  # sigma(-100) ≈ 0 → kappa ≈ kappa_min
+    check("APT-9: kappa_min bound respected (kappa_raw=-∞ → kappa→kappa_min)",
+          abs(lib_k.kappa_min + (lib_k.kappa_max - lib_k.kappa_min) * 0.0
+              - lib_k.kappa_min) < 1e-5)
+
+    # APT-10: Isat bounds + clamp_min(1e-6)
+    lib_i = AntiParallelFreeTanhLibrary(num_edges=3, isat_min=0.1, isat_max=0.5)
+    with torch.no_grad():
+        lib_i.isat_raw.data.fill_(100.0)  # isat → isat_max
+    sigma = torch.sigmoid(lib_i.isat_raw)
+    isat_val = (lib_i.isat_min + (lib_i.isat_max - lib_i.isat_min) * sigma).clamp_min(1e-6)
+    check("APT-10: isat at upper bound is below isat_max",
+          bool((isat_val <= lib_i.isat_max + 1e-6).all().item()))
+    with torch.no_grad():
+        lib_i.isat_raw.data.fill_(-100.0)  # isat → isat_min
+    sigma = torch.sigmoid(lib_i.isat_raw)
+    isat_val = (lib_i.isat_min + (lib_i.isat_max - lib_i.isat_min) * sigma).clamp_min(1e-6)
+    check("APT-10: isat at lower bound is >= clamp_min(1e-6)",
+          bool((isat_val >= 1e-6).all().item()))
+
+    # APT-11: Antiparallel pair — two libs on same pair, asymmetric net
+    lib_fwd = AntiParallelFreeTanhLibrary(num_edges=2)
+    lib_rev = AntiParallelFreeTanhLibrary(num_edges=2)
+    x_src = torch.tensor([[1.0, 0.5], [-0.5, 2.0]])
+    x_dst = torch.tensor([[0.0, 1.0], [1.0, -1.0]])
+    y_fwd = lib_fwd(x_src, x_dst, 3.0)
+    y_rev = lib_rev(x_dst, x_src, 3.0)
+    check("APT-11: forward branch zero when Vsrc<Vdst (idx 0,1 of row 0)",
+          y_fwd[0, 1].abs().item() < 1e-6)
+    check("APT-11: reverse branch zero when Vdst<Vsrc (idx 0 of row 0)",
+          y_rev[0, 0].abs().item() < 1e-6)
+    net = y_fwd - y_rev
+    check("APT-11: net (fwd - rev) is asymmetric across edges",
+          bool((net[0, 0] - net[0, 1]).abs().item() > 1e-6
+               or (net[1, 0] - net[1, 1]).abs().item() > 1e-6))
 
 
 if __name__ == "__main__":

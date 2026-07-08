@@ -30,6 +30,7 @@ from config import (
     SOLVER,
 )
 from cell_library import (
+    AntiParallelFreeTanhLibrary,
     FreeTanhLibrary,
     RealisticTanhLibrary,
     RealisticTanhUpgradeLibrary,
@@ -73,7 +74,7 @@ class DifferentialStage(nn.Module):
         num_nodes: int,
         src: list[int],
         dst: list[int],
-        cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary,
+        cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | AntiParallelFreeTanhLibrary,
         c_eff: float | None = None,
         x_max: float | None = None,
         clip_current: float | None = None,
@@ -609,6 +610,14 @@ class DifferentialStage(nn.Module):
                 int(self.cell_lib.a_raw.numel())
                 + int(self.cell_lib.b_raw.numel())
                 + int(self.cell_lib.s_raw.numel())
+                + int(self.cell_lib.gm_raw.numel())
+                + int(self.cell_lib.isat_raw.numel())
+            )
+            if hasattr(self.cell_lib, "theta_raw"):
+                device_n += int(self.cell_lib.theta_raw.numel())
+        elif isinstance(self.cell_lib, AntiParallelFreeTanhLibrary):
+            device_n = (
+                int(self.cell_lib.kappa_raw.numel())
                 + int(self.cell_lib.gm_raw.numel())
                 + int(self.cell_lib.isat_raw.numel())
             )

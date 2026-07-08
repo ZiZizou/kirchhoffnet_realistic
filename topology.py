@@ -26,6 +26,7 @@ import torch.nn as nn
 from config import PRESETS
 from differential_stage import DifferentialStage
 from cell_library import (
+    AntiParallelFreeTanhLibrary,
     FreeTanhLibrary,
     RealisticTanhLibrary,
     RealisticTanhUpgradeLibrary,
@@ -922,11 +923,12 @@ def prune_stage(
         new_write_idx = [node_remap[int(idx)] for idx in stage._drive_idx.tolist()
                          if int(idx) in node_remap] if drive_surviving else None
 
-    is_simple = isinstance(stage.cell_lib, (SimpleEdgeLibrary, RealisticTanhLibrary, RealisticTanhUpgradeLibrary, FreeTanhLibrary))
+    is_simple = isinstance(stage.cell_lib, (SimpleEdgeLibrary, RealisticTanhLibrary, RealisticTanhUpgradeLibrary, FreeTanhLibrary, AntiParallelFreeTanhLibrary))
     is_simple_classic = isinstance(stage.cell_lib, SimpleEdgeLibrary)
     is_realistic = isinstance(stage.cell_lib, RealisticTanhLibrary)
     is_realistic_upgrade = isinstance(stage.cell_lib, RealisticTanhUpgradeLibrary)
     is_free_tanh = isinstance(stage.cell_lib, FreeTanhLibrary)
+    is_anti_parallel = isinstance(stage.cell_lib, AntiParallelFreeTanhLibrary)
     if is_simple_classic:
         new_lib = SimpleEdgeLibrary(num_edges=len(new_src), mode=stage.cell_lib._mode)
     elif is_realistic:
@@ -953,6 +955,20 @@ def prune_stage(
             isat_min=old.isat_min,
             isat_max=old.isat_max,
             bias_enabled=old._bias_enabled,
+        )
+    elif is_anti_parallel:
+        old = stage.cell_lib
+        new_lib = AntiParallelFreeTanhLibrary(
+            num_edges=len(new_src),
+            kappa_min=old.kappa_min,
+            kappa_max=old.kappa_max,
+            gm_min=old.gm_min,
+            gm_max=old.gm_max,
+            isat_min=old.isat_min,
+            isat_max=old.isat_max,
+            theta_max=old.theta_max,
+            theta_enabled=old._theta_enabled,
+            use_isat_normalization=old._use_isat_normalization,
         )
     else:
         new_lib = stage.cell_lib
@@ -995,6 +1011,15 @@ def prune_stage(
                     )
             elif is_free_tanh:
                 for name in ("a_raw", "b_raw", "s_raw", "gm_raw", "isat_raw"):
+                    new_stage.cell_lib.get_parameter(name).data.copy_(
+                        stage.cell_lib.get_parameter(name).data[edge_idx_old].cpu()
+                    )
+                if hasattr(new_stage.cell_lib, "theta_raw") and hasattr(stage.cell_lib, "theta_raw"):
+                    new_stage.cell_lib.theta_raw.data.copy_(
+                        stage.cell_lib.theta_raw.data[edge_idx_old].cpu()
+                    )
+            elif is_anti_parallel:
+                for name in ("kappa_raw", "gm_raw", "isat_raw"):
                     new_stage.cell_lib.get_parameter(name).data.copy_(
                         stage.cell_lib.get_parameter(name).data[edge_idx_old].cpu()
                     )
@@ -1164,7 +1189,7 @@ def validate_topology(topo: SparseTopology, max_hidden_density: float = 0.5) -> 
 
 def topology_to_stage(
     topo: SparseTopology,
-    cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary,
+    cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | AntiParallelFreeTanhLibrary,
     c_eff: float | None = None,
     x_max: float | None = None,
     clip_current: float | None = None,
@@ -1229,6 +1254,19 @@ def topology_to_stage(
             isat_max=cell_lib.isat_max,
             bias_enabled=cell_lib._bias_enabled,
         )
+    elif isinstance(cell_lib, AntiParallelFreeTanhLibrary):
+        cell_lib = AntiParallelFreeTanhLibrary(
+            num_edges=len(remapped_src),
+            kappa_min=cell_lib.kappa_min,
+            kappa_max=cell_lib.kappa_max,
+            gm_min=cell_lib.gm_min,
+            gm_max=cell_lib.gm_max,
+            isat_min=cell_lib.isat_min,
+            isat_max=cell_lib.isat_max,
+            theta_max=cell_lib.theta_max,
+            theta_enabled=cell_lib._theta_enabled,
+            use_isat_normalization=cell_lib._use_isat_normalization,
+        )
 
     stage = DifferentialStage(
         num_nodes=len(active_nodes),
@@ -1250,7 +1288,7 @@ def topology_to_stage(
 
 def build_net_from_preset(
     preset_name: str,
-    cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary,
+    cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | AntiParallelFreeTanhLibrary,
     write_mode: str | None = None,
     read_mode: str | None = None,
     write_idx: list[int] | None = None,
@@ -1300,7 +1338,7 @@ def build_net_from_preset(
 
 def build_net_from_config(
     cfg: dict,
-    cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary,
+    cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | AntiParallelFreeTanhLibrary,
     enable_drive: bool = False,
     drive_mode: str = "fan_out",
     leak_mode: str | None = None,

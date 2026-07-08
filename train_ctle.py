@@ -860,12 +860,13 @@ def collect_gradient_norms(raw_net):
     # Per-edge device parameter suffixes: covers SimpleEdgeLibrary.param
     # (I=ReLU/tanh(p0*Vsrc+p1*Vdest+p2)), RealisticTanhLibrary
     # (alpha_raw, bias_raw), RealisticTanhUpgradeLibrary (alpha_raw,
-    # gm_raw, isat_raw, bias_raw), and FreeTanhLibrary (a_raw, b_raw, s_raw,
-    # gm_raw, isat_raw, theta_raw). All contribute to the same `device_param`
-    # gradient-norm metric per stage.
+    # gm_raw, isat_raw, bias_raw), FreeTanhLibrary (a_raw, b_raw, s_raw,
+    # gm_raw, isat_raw, theta_raw), and AntiParallelFreeTanhLibrary
+    # (kappa_raw, gm_raw, isat_raw, theta_raw). All contribute to the same
+    # `device_param` gradient-norm metric per stage.
     device_param_suffixes = (
         "param", "alpha_raw", "bias_raw", "gm_raw", "isat_raw",
-        "a_raw", "b_raw", "s_raw", "theta_raw")
+        "a_raw", "b_raw", "s_raw", "theta_raw", "kappa_raw")
     transfer_sq = 0.0
     transfer_found = False
     in_sq = 0.0

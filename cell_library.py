@@ -7,6 +7,7 @@ the source and destination node voltages without cell-type selection:
   - RealisticTanhLibrary:  I = tanh(A*Vsrc - B*Vdest + C), A+B=1
   - RealisticTanhUpgradeLibrary:  I = Isat * tanh(gm*(A*Vsrc - B*Vdest) + C)
   - FreeTanhLibrary:  I = Isat * tanh(gm*(s*(A*Vsrc - B*Vdest) + theta))
+  - AntiParallelFreeTanhLibrary:  I = Isat * tanh(gm * relu(kappa*(Vsrc - Vdst) - theta))
 
 All devices are single-cell (no library selection). Compliance gating
 turns the edge off as |x_src| or |x_dst| approaches x_max.
@@ -19,6 +20,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from config import (
+    ANTI_PARALLEL_GM_MAX,
+    ANTI_PARALLEL_GM_MIN,
+    ANTI_PARALLEL_ISAT_MAX,
+    ANTI_PARALLEL_ISAT_MIN,
+    ANTI_PARALLEL_KAPPA_MAX,
+    ANTI_PARALLEL_KAPPA_MIN,
+    ANTI_PARALLEL_THETA_MAX,
     CELL_LIBRARIES,
     PHYS,
     TANH_REALISTIC_GM_MAX,
@@ -34,6 +42,7 @@ __all__ = [
     "RealisticTanhLibrary",
     "RealisticTanhUpgradeLibrary",
     "FreeTanhLibrary",
+    "AntiParallelFreeTanhLibrary",
     "make_cell_library",
 ]
 
@@ -294,20 +303,136 @@ class FreeTanhLibrary(nn.Module):
         pass
 
 
+class AntiParallelFreeTanhLibrary(nn.Module):
+    """Per-edge rectified differential OTA slice for antiparallel edge fabrics.
+
+    Per-edge formula::
+
+        v   = x_src - x_dst
+        q   = relu(kappa * v - theta)
+        i   = Isat * tanh(gm * q)
+
+    Parameterization (all per-edge, shape ``[E]``):
+      - ``kappa_raw`` → kappa = kappa_min + (kappa_max - kappa_min) * sigmoid(kappa_raw)
+        (tied differential gain: A = B = kappa; guarantees common-mode rejection
+        and exact zero current at equal voltages).
+      - ``gm_raw``    → gm = gm_min + (gm_max - gm_min) * sigmoid(gm_raw)
+      - ``isat_raw``  → Isat = clamp_min(isat_min + (isat_max - isat_min) * sigmoid(isat_raw), 1e-6)
+      - ``theta_raw`` → theta = theta_max * sigmoid(theta_raw); only present when
+        ``theta_enabled=True`` (default ``False`` → theta is hardcoded 0,
+        no parameter, no gradient).
+
+    Boundary defaults come from ``config.ANTI_PARALLEL_*`` and can be
+    overridden per-instance via constructor kwargs.
+
+    Antiparallel pairs are realized by the topology layer (each undirected
+    adjacency becomes two directed edges via ``bidirectional=True`` in grid /
+    torus / small_world topology kwargs). The library itself implements a
+    single directed branch with rectified, nonnegative current. At
+    ``x_src = x_dst`` the branch produces exactly zero current (since
+    ``q = relu(-theta) = 0`` when ``theta = 0``).
+
+    Compliance gating (src/dst rail clamp) is applied after the tanh evaluation.
+    """
+
+    def __init__(
+        self,
+        num_edges: int,
+        kappa_min: float | None = None,
+        kappa_max: float | None = None,
+        gm_min: float | None = None,
+        gm_max: float | None = None,
+        isat_min: float | None = None,
+        isat_max: float | None = None,
+        theta_max: float | None = None,
+        theta_enabled: bool = False,
+        use_isat_normalization: bool = False,
+    ) -> None:
+        super().__init__()
+        self.kappa_min = float(kappa_min if kappa_min is not None else ANTI_PARALLEL_KAPPA_MIN)
+        self.kappa_max = float(kappa_max if kappa_max is not None else ANTI_PARALLEL_KAPPA_MAX)
+        self.gm_min = float(gm_min if gm_min is not None else ANTI_PARALLEL_GM_MIN)
+        self.gm_max = float(gm_max if gm_max is not None else ANTI_PARALLEL_GM_MAX)
+        self.isat_min = float(isat_min if isat_min is not None else ANTI_PARALLEL_ISAT_MIN)
+        self.isat_max = float(isat_max if isat_max is not None else ANTI_PARALLEL_ISAT_MAX)
+        self.theta_max = float(theta_max if theta_max is not None else ANTI_PARALLEL_THETA_MAX)
+        if self.kappa_max <= self.kappa_min:
+            raise ValueError(
+                f"AntiParallelFreeTanhLibrary requires kappa_max > kappa_min, "
+                f"got [{self.kappa_min}, {self.kappa_max}]"
+            )
+        if self.gm_max <= self.gm_min:
+            raise ValueError(
+                f"AntiParallelFreeTanhLibrary requires gm_max > gm_min, "
+                f"got [{self.gm_min}, {self.gm_max}]"
+            )
+        if self.isat_max <= self.isat_min:
+            raise ValueError(
+                f"AntiParallelFreeTanhLibrary requires isat_max > isat_min, "
+                f"got [{self.isat_min}, {self.isat_max}]"
+            )
+
+        self._theta_enabled = bool(theta_enabled)
+        self._use_isat_normalization = bool(use_isat_normalization)
+        self.kappa_raw = nn.Parameter(torch.randn(num_edges))
+        self.gm_raw = nn.Parameter(torch.full((num_edges,), -2.3))
+        self.isat_raw = nn.Parameter(torch.full((num_edges,), -2.3))
+        if self._theta_enabled:
+            self.theta_raw = nn.Parameter(torch.zeros(num_edges))
+
+        self._beta_softness = float(PHYS["beta_softness"])
+
+    def forward(
+        self,
+        x_src: torch.Tensor,
+        x_dst: torch.Tensor,
+        x_max: float,
+    ) -> torch.Tensor:
+        kappa = self.kappa_min + (self.kappa_max - self.kappa_min) * torch.sigmoid(self.kappa_raw)  # [E]
+        sig_gm = torch.sigmoid(self.gm_raw)
+        gm = self.gm_min + (self.gm_max - self.gm_min) * sig_gm  # [E]
+        sig_isat = torch.sigmoid(self.isat_raw)
+        isat = (self.isat_min + (self.isat_max - self.isat_min) * sig_isat).clamp_min(1e-6)  # [E]
+        if self._theta_enabled:
+            theta = self.theta_max * torch.sigmoid(self.theta_raw)  # [E]
+        else:
+            theta = torch.zeros_like(kappa)  # [E]
+
+        v = x_src - x_dst  # [B, E]
+        q = F.relu(kappa.unsqueeze(0) * v - theta.unsqueeze(0))  # [B, E]
+
+        if self._use_isat_normalization:
+            u = gm.unsqueeze(0) * q / isat.unsqueeze(0)
+        else:
+            u = gm.unsqueeze(0) * q
+        i_cell = isat.unsqueeze(0) * torch.tanh(u)
+
+        gate_src = torch.sigmoid((x_max - x_src.abs()) / self._beta_softness)
+        gate_dst = torch.sigmoid((x_max - x_dst.abs()) / self._beta_softness)
+        gate = gate_src * gate_dst
+
+        return gate * i_cell
+
+    def compile_forward(self, backend: str = "inductor"):
+        pass
+
+
 def make_cell_library(
     library_name: str, num_edges: int | None = None
-) -> SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary:
+) -> SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | AntiParallelFreeTanhLibrary:
     """Factory: returns the appropriate edge-library class.
 
     ``relu`` / ``tanh`` → ``SimpleEdgeLibrary``.
     ``tanh_realistic`` → ``RealisticTanhLibrary``.
     ``tanh_realistic_upgrade`` → ``RealisticTanhUpgradeLibrary``.
     ``tanh_free`` → ``FreeTanhLibrary``.
+    ``tanh_anti`` → ``AntiParallelFreeTanhLibrary``.
 
     The factory reads ``BIAS_ENABLED`` from the corresponding
     ``CELL_LIBRARIES[library_name]`` entry (default ``False``) and passes
     it to ``RealisticTanhLibrary`` / ``RealisticTanhUpgradeLibrary`` /
-    ``FreeTanhLibrary``.
+    ``FreeTanhLibrary``. For ``tanh_anti``, ``THETA_ENABLED`` is read
+    instead and passed as ``theta_enabled``.
 
     When ``num_edges`` is ``None`` (template), the returned library
     is created with ``num_edges=1`` and must be replaced with a per-stage
@@ -325,8 +450,11 @@ def make_cell_library(
     if library_name == "tanh_free":
         bias_enabled = bool(CELL_LIBRARIES[library_name].get("BIAS_ENABLED", False))
         return FreeTanhLibrary(num_edges=n, bias_enabled=bias_enabled)
+    if library_name == "tanh_anti":
+        theta_enabled = bool(CELL_LIBRARIES[library_name].get("THETA_ENABLED", False))
+        return AntiParallelFreeTanhLibrary(num_edges=n, theta_enabled=theta_enabled)
     raise ValueError(
         f"Unknown cell library: {library_name!r}. "
         f"Available: 'relu', 'tanh', 'tanh_realistic', "
-        f"'tanh_realistic_upgrade', 'tanh_free'."
+        f"'tanh_realistic_upgrade', 'tanh_free', 'tanh_anti'."
     )

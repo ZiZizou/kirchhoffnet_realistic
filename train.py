@@ -31,6 +31,7 @@ from config import (
 from sim_context import SimContext, sample_random_context
 from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
 from cell_library import (
+    AntiParallelFreeTanhLibrary,
     FreeTanhLibrary,
     RealisticTanhLibrary,
     RealisticTanhUpgradeLibrary,
@@ -1010,6 +1011,15 @@ def apply_ablation(net, ablation: str) -> None:
                     stage.cell_lib.bias_raw = nn.Parameter(stage.cell_lib.bias_raw.new_zeros(0))
             elif isinstance(cell_lib, FreeTanhLibrary):
                 for name in ("a_raw", "b_raw", "s_raw", "gm_raw", "isat_raw"):
+                    setattr(
+                        stage.cell_lib,
+                        name,
+                        nn.Parameter(getattr(stage.cell_lib, name).new_zeros(0)),
+                    )
+                if hasattr(stage.cell_lib, "theta_raw"):
+                    stage.cell_lib.theta_raw = nn.Parameter(stage.cell_lib.theta_raw.new_zeros(0))
+            elif isinstance(cell_lib, AntiParallelFreeTanhLibrary):
+                for name in ("kappa_raw", "gm_raw", "isat_raw"):
                     setattr(
                         stage.cell_lib,
                         name,

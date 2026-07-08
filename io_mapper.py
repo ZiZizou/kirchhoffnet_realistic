@@ -52,6 +52,9 @@ __all__ = [
     "FanOutInputMapper",
     "OutputMapper",
     "GroupedOutputMapper",
+    "ResidualTanhEncoder",
+    "ResidualTanhInputMapper",
+    "ResidualTanhOutputMapper",
 ]
 
 
@@ -472,3 +475,150 @@ class GroupedOutputMapper(nn.Module):
             start = self.offset + i * self.nodes_per_target
             out.append(head(x[..., start:start + self.nodes_per_target]))
         return torch.cat(out, dim=-1)
+
+
+class ResidualTanhEncoder(nn.Module):
+    """Residual skip-connection tanh encoder.
+
+    Implements ``y = W_lin @ x + W_2 @ tanh(W_1 @ x + b_1) + b_2``,
+    where ``W_lin`` carries its own bias (``b_2`` is folded into ``W_lin``).
+
+    - ``W_lin``: ``Linear(in_dim, out_dim, bias=True)`` (skip path)
+    - ``W_1``:   ``Linear(in_dim, hidden_dim, bias=True)``
+    - ``W_2``:   ``Linear(hidden_dim, out_dim, bias=False)``
+
+    The ``ablate=True`` forward flag returns only the linear skip term,
+    which is useful for ablation studies that quantify the contribution
+    of the non-linear branch.
+    """
+
+    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int) -> None:
+        super().__init__()
+        self.in_dim = int(in_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.out_dim = int(out_dim)
+        self.W_lin = nn.Linear(in_dim, out_dim, bias=True)
+        self.W_1 = nn.Linear(in_dim, hidden_dim, bias=True)
+        self.W_2 = nn.Linear(hidden_dim, out_dim, bias=False)
+        nn.init.xavier_uniform_(self.W_lin.weight)
+        nn.init.xavier_uniform_(self.W_1.weight)
+        nn.init.xavier_uniform_(self.W_2.weight)
+        with torch.no_grad():
+            self.W_lin.bias.zero_()
+            self.W_1.bias.zero_()
+
+    def forward(self, z: torch.Tensor, ablate: bool = False) -> torch.Tensor:
+        linear = self.W_lin(z)
+        if ablate:
+            return linear
+        return linear + self.W_2(torch.tanh(self.W_1(z)))
+
+    def extra_repr(self) -> str:
+        return f"in_dim={self.in_dim}, hidden_dim={self.hidden_dim}, out_dim={self.out_dim}"
+
+
+class ResidualTanhInputMapper(nn.Module):
+    """Drop-in ``InputMapper`` replacement using ``ResidualTanhEncoder``.
+
+    Computes ``x0 = x_max * tanh(ResidualTanhEncoder(u))`` so the output
+    stays in the ODE rail range ``[-x_max, x_max]``. Used when
+    ``encoder_type='residual_tanh'`` and ``write_mode='dense'``.
+
+    Args:
+        in_dim: Input feature dimension.
+        hidden_dim: Hidden width of the ResidualTanhEncoder tanh branch.
+        out_dim: Output dimension (number of hidden nodes in the first stage).
+        x_max: Rail limit; defaults to ``PHYS['x_max']``.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int,
+        out_dim: int,
+        x_max: float | None = None,
+    ) -> None:
+        super().__init__()
+        self.x_max = float(x_max if x_max is not None else PHYS["x_max"])
+        self.encoder = ResidualTanhEncoder(in_dim, hidden_dim, out_dim)
+        self.in_dim = int(in_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.out_dim = int(out_dim)
+
+    def forward(self, u: torch.Tensor, ablate: bool = False) -> torch.Tensor:
+        return self.x_max * torch.tanh(self.encoder(u, ablate=ablate))
+
+    def extra_repr(self) -> str:
+        return (
+            f"in_dim={self.in_dim}, hidden_dim={self.hidden_dim}, "
+            f"out_dim={self.out_dim}, x_max={self.x_max}"
+        )
+
+
+class ResidualTanhOutputMapper(nn.Module):
+    """Drop-in ``OutputMapper`` replacement using ``ResidualTanhEncoder``.
+
+    Computes ``y = ResidualTanhEncoder(x)`` (no ``x_max`` saturation; the
+    output is unbounded, matching the standard readout contract). Used
+    when ``decoder_type='residual_tanh'``.
+
+    Mirrors ``OutputMapper``'s optional ``read_idx`` semantics: when
+    provided, the mapper applies an Index gather over the full state
+    and feeds the gathered window to the residual tanh encoder. When
+    ``None``, the encoder reads the full state directly.
+
+    Args:
+        in_dim: Full state width (the mapper gathers ``read_idx`` itself).
+        hidden_dim: Hidden width of the ResidualTanhEncoder tanh branch.
+        out_dim: Number of regression targets.
+        read_idx: Optional list of full-state indices to gather before the
+            ResidualTanhEncoder. If ``None``, the full state is read.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int,
+        out_dim: int,
+        read_idx: list[int] | None = None,
+    ) -> None:
+        super().__init__()
+        self.node_dim = int(in_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.out_dim = int(out_dim)
+        if read_idx is None:
+            self.read_idx: list[int] | None = None
+            encoder_in = self.node_dim
+        else:
+            if any(i < 0 or i >= self.node_dim for i in read_idx):
+                raise ValueError(
+                    f"ResidualTanhOutputMapper: read_idx entries must be in "
+                    f"[0, node_dim)={self.node_dim}, got {read_idx}"
+                )
+            self.read_idx = list(read_idx)
+            encoder_in = len(self.read_idx)
+            self.register_buffer(
+                "_read_index",
+                torch.tensor(self.read_idx, dtype=torch.long),
+                persistent=False,
+            )
+        self.encoder = ResidualTanhEncoder(encoder_in, hidden_dim, out_dim)
+        self.in_dim = int(encoder_in)
+
+    def forward(self, x_final: torch.Tensor, ablate: bool = False) -> torch.Tensor:
+        if self.read_idx is None:
+            return self.encoder(x_final, ablate=ablate)
+        if x_final.size(-1) != self.node_dim:
+            raise ValueError(
+                f"ResidualTanhOutputMapper: input last dim={x_final.size(-1)}, "
+                f"expected node_dim={self.node_dim}"
+            )
+        gathered = x_final.index_select(-1, self._read_index.to(x_final.device))
+        return self.encoder(gathered, ablate=ablate)
+
+    def extra_repr(self) -> str:
+        return (
+            f"node_dim={self.node_dim}, in_dim={self.in_dim}, "
+            f"hidden_dim={self.hidden_dim}, out_dim={self.out_dim}, "
+            f"read_idx={self.read_idx}"
+        )

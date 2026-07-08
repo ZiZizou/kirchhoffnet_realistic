@@ -1875,6 +1875,31 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "Mirrors --mapper-lr-scale if you want to slow mapper learning "
              "during retrain.")
     parser.add_argument(
+        "--encoder-type", type=str, default="linear", dest="encoder_type",
+        choices=["linear", "residual_tanh"],
+        help="Input encoder architecture. 'linear' (default) uses the "
+             "standard dense InputMapper (or sparse variants per --write-mode). "
+             "'residual_tanh' adds a residual skip-connection tanh branch "
+             "(ResidualTanhEncoder in_dim->hidden->out_dim, followed by "
+             "x_max*tanh(...)) for non-linear input expressivity. Only "
+             "applied when --write-mode='dense'; sparse modes ignore this flag.")
+    parser.add_argument(
+        "--decoder-type", type=str, default="linear", dest="decoder_type",
+        choices=["linear", "residual_tanh"],
+        help="Output decoder architecture. 'linear' (default) uses the "
+             "standard OutputMapper. 'residual_tanh' replaces it with a "
+             "ResidualTanhOutputMapper (non-linear readout with skip "
+             "connection). Mutually exclusive with --nodes-per-target>0 "
+             "(grouped readout).")
+    parser.add_argument(
+        "--encoder-hidden-dim", type=int, default=64, dest="encoder_hidden_dim",
+        help="Hidden width of the residual tanh branch in the input encoder "
+             "(default: 64). Only used when --encoder-type='residual_tanh'.")
+    parser.add_argument(
+        "--decoder-hidden-dim", type=int, default=64, dest="decoder_hidden_dim",
+        help="Hidden width of the residual tanh branch in the output decoder "
+             "(default: 64). Only used when --decoder-type='residual_tanh'.")
+    parser.add_argument(
         "--struct-lr-scale", type=float, default=2.0,
         help="LR multiplier for structural core params (z_logits, cell logits, "
              "raw_mult). Default 2.0 (modest boost). These combinatorial-ish "
@@ -2632,7 +2657,11 @@ def main():
         enable_drive=args.persistent_drive,
         drive_mode=args.drive_mode,
         leak_mode=args.leak,
-        leak_constant=args.leak_constant)
+        leak_constant=args.leak_constant,
+        encoder_type=args.encoder_type,
+        decoder_type=args.decoder_type,
+        encoder_hidden_dim=args.encoder_hidden_dim,
+        decoder_hidden_dim=args.decoder_hidden_dim)
     net.to(device)
     grid_label = (
         f" {args.grid_size}×{args.grid_size} grid,"

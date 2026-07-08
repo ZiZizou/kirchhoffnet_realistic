@@ -148,7 +148,11 @@ def make_ctle_preset(
     nodes_per_target: int = 0,
     readout_offset: int = 0,
     leak_mode: str = "programmable",
-    leak_constant: float | None = None) -> dict:
+    leak_constant: float | None = None,
+    encoder_type: str = "linear",
+    decoder_type: str = "linear",
+    encoder_hidden_dim: int = 64,
+    decoder_hidden_dim: int = 64) -> dict:
     """Build a 4-spec → 7-logit CTLE KirchhoffNet preset for the grid family.
 
     ``family='grid'`` (default, backward compatible):
@@ -288,6 +292,17 @@ def make_ctle_preset(
         preset["leak_mode"] = leak_mode
         if leak_constant is not None:
             preset["leak_constant"] = leak_constant
+    if encoder_type != "linear":
+        preset["encoder_type"] = encoder_type
+        preset["encoder_hidden_dim"] = int(encoder_hidden_dim)
+    if decoder_type != "linear":
+        if grouped:
+            raise ValueError(
+                "decoder_type='residual_tanh' is incompatible with grouped_readout "
+                "(set nodes_per_target=0 or use --decoder-type=linear)."
+            )
+        preset["decoder_type"] = decoder_type
+        preset["decoder_hidden_dim"] = int(decoder_hidden_dim)
     return preset
 
 def make_ctle_grid_preset(
@@ -301,7 +316,11 @@ def make_ctle_grid_preset(
     nodes_per_target: int = 0,
     readout_offset: int = 0,
     leak_mode: str = "programmable",
-    leak_constant: float | None = None) -> dict:
+    leak_constant: float | None = None,
+    encoder_type: str = "linear",
+    decoder_type: str = "linear",
+    encoder_hidden_dim: int = 64,
+    decoder_hidden_dim: int = 64) -> dict:
     """Backward-compatible thin wrapper for the grid CTLE preset.
 
     Equivalent to ``make_ctle_preset(family='grid', grid_size=grid_size, ...)``.
@@ -318,7 +337,11 @@ def make_ctle_grid_preset(
         leak_constant=leak_constant,
         edge_repeats=edge_repeats,
         nodes_per_target=nodes_per_target,
-        readout_offset=readout_offset)
+        readout_offset=readout_offset,
+        encoder_type=encoder_type,
+        decoder_type=decoder_type,
+        encoder_hidden_dim=encoder_hidden_dim,
+        decoder_hidden_dim=decoder_hidden_dim)
 
 # =============================================================================
 # RegimeAwareMoE (teacher) and adapter

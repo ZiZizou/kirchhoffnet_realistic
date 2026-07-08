@@ -1297,6 +1297,10 @@ def build_net_from_preset(
     drive_mode: str = "fan_out",
     leak_mode: str = "programmable",
     leak_constant: float | None = None,
+    encoder_type: str | None = None,
+    decoder_type: str | None = None,
+    encoder_hidden_dim: int | None = None,
+    decoder_hidden_dim: int | None = None,
 ):
     """Build a full KirchhoffNetWithIO from a config.PRESETS entry.
 
@@ -1317,6 +1321,19 @@ def build_net_from_preset(
                    learned nn.Linear projection matching the input mapper.
                    Only meaningful when enable_drive=True.
     * leak_mode / leak_constant: forwarded to :func:`topology_to_stage`.
+    * encoder_type: "linear" | "residual_tanh". When "residual_tanh",
+                    ``InputMapper`` is replaced by ``ResidualTanhInputMapper``
+                    (dense write mode only). Sparse write modes fall back
+                    to their standard mapper with a warning. Defaults to
+                    "linear" (current behavior).
+    * decoder_type: "linear" | "residual_tanh". When "residual_tanh",
+                    ``OutputMapper`` is replaced by
+                    ``ResidualTanhOutputMapper``. Grouped readout is
+                    mutually exclusive (raises ``ValueError``). Defaults
+                    to "linear".
+    * encoder_hidden_dim / decoder_hidden_dim: hidden width of the
+                    ResidualTanhEncoder tanh branch (default 64). Only
+                    used when the corresponding type is "residual_tanh".
     """
     if preset_name not in PRESETS:
         raise KeyError(f"Unknown preset: {preset_name!r}. Available: {list(PRESETS)}")
@@ -1329,6 +1346,14 @@ def build_net_from_preset(
         cfg["write_idx"] = list(write_idx)
     if read_idx is not None:
         cfg["read_idx"] = list(read_idx)
+    if encoder_type is not None:
+        cfg["encoder_type"] = encoder_type
+    if decoder_type is not None:
+        cfg["decoder_type"] = decoder_type
+    if encoder_hidden_dim is not None:
+        cfg["encoder_hidden_dim"] = int(encoder_hidden_dim)
+    if decoder_hidden_dim is not None:
+        cfg["decoder_hidden_dim"] = int(decoder_hidden_dim)
     return build_net_from_config(
         cfg, cell_lib=cell_lib, enable_drive=enable_drive,
         drive_mode=drive_mode,
@@ -1353,6 +1378,13 @@ def build_net_from_config(
     ``drive_mode`` ("fan_out" | "projection") controls per-stage drive
     mapper architecture when ``enable_drive=True``. See build_net_from_preset
     for details.
+
+    ``encoder_type`` / ``decoder_type`` ("linear" | "residual_tanh")
+    select non-linear encoder/decoder variants built on top of
+    ``io_mapper.ResidualTanhEncoder``. ``encoder_hidden_dim`` and
+    ``decoder_hidden_dim`` control the hidden width of the residual
+    tanh branch (default 64). Defaults are read from the ``cfg`` dict
+    when not supplied via the API.
     """
     if leak_mode is None:
         leak_mode = cfg.get("leak_mode", "programmable")
@@ -1361,6 +1393,18 @@ def build_net_from_config(
     if drive_mode not in ("fan_out", "projection"):
         raise ValueError(
             f"drive_mode must be 'fan_out' or 'projection', got {drive_mode!r}"
+        )
+    encoder_type = cfg.get("encoder_type", "linear")
+    decoder_type = cfg.get("decoder_type", "linear")
+    encoder_hidden_dim = int(cfg.get("encoder_hidden_dim", 64))
+    decoder_hidden_dim = int(cfg.get("decoder_hidden_dim", 64))
+    if encoder_type not in ("linear", "residual_tanh"):
+        raise ValueError(
+            f"encoder_type must be 'linear' or 'residual_tanh', got {encoder_type!r}"
+        )
+    if decoder_type not in ("linear", "residual_tanh"):
+        raise ValueError(
+            f"decoder_type must be 'linear' or 'residual_tanh', got {decoder_type!r}"
         )
     from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
     from io_mapper import (
@@ -1371,6 +1415,8 @@ def build_net_from_config(
         ProjectedSparseInputMapper,
         FanOutInputMapper,
         GroupedOutputMapper,
+        ResidualTanhInputMapper,
+        ResidualTanhOutputMapper,
     )
     from stage_transfer import StageTransfer
 
@@ -1446,7 +1492,14 @@ def build_net_from_config(
         write_idx_arg = list(preset_write_idx)
     else:
         MapperCls = RobustInputMapper if use_robust else InputMapper
-        input_mapper = MapperCls(in_dim=in_dim, out_dim=n_first_hid)
+        if encoder_type == "residual_tanh":
+            input_mapper = ResidualTanhInputMapper(
+                in_dim=in_dim,
+                hidden_dim=encoder_hidden_dim,
+                out_dim=n_first_hid,
+            )
+        else:
+            input_mapper = MapperCls(in_dim=in_dim, out_dim=n_first_hid)
         write_idx_arg = None
         if enable_drive:
             raise ValueError(
@@ -1573,6 +1626,12 @@ def build_net_from_config(
                 f"nodes_per_target={nodes_per_target}); got final_state_dim={final_state_dim}. "
                 f"Increase --num-hidden/--grid-size."
             )
+        if decoder_type == "residual_tanh":
+            raise ValueError(
+                f"decoder_type='residual_tanh' is incompatible with "
+                f"grouped_readout (use the standard linear GroupedOutputMapper "
+                f"or disable grouped readout)."
+            )
         output_mapper = GroupedOutputMapper(
             nodes_per_target=nodes_per_target,
             num_targets=out_dim,
@@ -1595,13 +1654,28 @@ def build_net_from_config(
                 f"got {preset_read_idx}"
             )
         read_idx_arg = list(preset_read_idx)
-        output_mapper = OutputMapper(
-            node_dim=final_state_dim, out_dim=out_dim, read_idx=preset_read_idx
-        )
+        if decoder_type == "residual_tanh":
+            output_mapper = ResidualTanhOutputMapper(
+                in_dim=final_state_dim,
+                hidden_dim=decoder_hidden_dim,
+                out_dim=out_dim,
+                read_idx=preset_read_idx,
+            )
+        else:
+            output_mapper = OutputMapper(
+                node_dim=final_state_dim, out_dim=out_dim, read_idx=preset_read_idx
+            )
     else:
         read_idx_arg = None
         read_dim = len(last_proj) if len(last_proj) > 0 else len(last_hid)
-        output_mapper = OutputMapper(node_dim=read_dim, out_dim=out_dim)
+        if decoder_type == "residual_tanh":
+            output_mapper = ResidualTanhOutputMapper(
+                in_dim=read_dim,
+                hidden_dim=decoder_hidden_dim,
+                out_dim=out_dim,
+            )
+        else:
+            output_mapper = OutputMapper(node_dim=read_dim, out_dim=out_dim)
 
     net = KirchhoffNetWithIO(
         input_mapper,

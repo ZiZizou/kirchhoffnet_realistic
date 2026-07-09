@@ -3109,6 +3109,10 @@ def main():
     test_friedman2_benchmark()                   # MLP benchmark: Friedman #2
     test_friedman3_benchmark()                   # MLP benchmark: Friedman #3
 
+    test_friedman_kirchhoff_data()               # friedman-problems/REQ: data fns
+    test_friedman_kirchhoff_presets()            # friedman-problems/REQ: presets
+    test_friedman_kirchhoff_net_build()          # friedman-problems/REQ: net build+forward
+
     test_weight_quantization()                   # analog-noise: 4/6-bit weight quant
     test_adc_dac_quantization()                  # analog-noise: ADC/DAC full-range quant
     test_circuit_noise()                         # analog-noise: Gaussian std checks
@@ -7961,6 +7965,102 @@ def test_friedman3_benchmark():
         check("Friedman3 first training step loss finite",
               bool(torch.isfinite(loss).item()))
         break
+
+
+def test_friedman_kirchhoff_data():
+    """friedman-problems/REQ: make_data_friedman{N} returns loaders + Huber loss + inverse_stats."""
+    print("\nTest friedman-kirchhoff: data loaders for Friedman 1/2/3")
+    try:
+        import train_script
+    except ImportError as e:
+        check("import train_script", False, f"failed: {e}")
+        return
+    import torch.nn.functional as F
+
+    cases = [
+        ("friedman1", train_script.make_data_friedman1, 10),
+        ("friedman2", train_script.make_data_friedman2, 4),
+        ("friedman3", train_script.make_data_friedman3, 4),
+    ]
+    for problem, fn, expected_in_dim in cases:
+        tr, va, task_fn, inv = fn(batch_size=128, noise_std=0.0, val_size=64)
+        check(f"{problem}: returns 4-tuple (loaders + task_fn + inverse_stats)",
+              tr is not None and va is not None and task_fn is not None and inv is not None)
+        check(f"{problem}: task_fn is F.huber_loss (delta=1.0)",
+              task_fn is F.huber_loss)
+        check(f"{problem}: inverse_stats has y_mean and y_std",
+              "y_mean" in inv and "y_std" in inv)
+        check(f"{problem}: train loader has > 0 batches", len(tr) > 0)
+        check(f"{problem}: val loader has > 0 batches", len(va) > 0)
+        # Check batch shapes
+        for u_b, y_b in tr:
+            check(f"{problem}: input batch has {expected_in_dim} input columns",
+                  u_b.shape[1] == expected_in_dim,
+                  f"got {u_b.shape[1]}, expected {expected_in_dim}")
+            check(f"{problem}: target batch shape (B, 1)", y_b.shape[1] == 1)
+            check(f"{problem}: targets are finite",
+                  bool(torch.isfinite(y_b).all().item()))
+            break
+
+    # Noise injection (Friedman 2 with noise_std=1.0)
+    _, _, _, inv_noise = train_script.make_data_friedman2(
+        batch_size=128, noise_std=1.0, val_size=64,
+    )
+    check("friedman2 w/ noise_std=1.0 produces inverse_stats > 0",
+          inv_noise["y_std"] > 0 and inv_noise["y_mean"] != 0)
+
+
+def test_friedman_kirchhoff_presets():
+    """friedman-problems/REQ: PRESETS dict contains friedman1/2/3 with correct fields."""
+    print("\nTest friedman-kirchhoff: presets registered in config.PRESETS")
+    from config import PRESETS
+    for name, expected_in_dim, expected_grid_size in [
+        ("friedman1", 10, 5),
+        ("friedman2", 4, 4),
+        ("friedman3", 4, 4),
+    ]:
+        check(f"{name} in PRESETS", name in PRESETS)
+        p = PRESETS[name]
+        check(f"{name}: loss='huber'", p.get("loss") == "huber")
+        check(f"{name}: schedule='three_phase'", p.get("schedule") == "three_phase")
+        check(f"{name}: write_mode='sparse_proj'", p.get("write_mode") == "sparse_proj")
+        check(f"{name}: num_inputs={expected_in_dim}",
+              p["stages"][0]["num_inputs"] == expected_in_dim)
+        check(f"{name}: hidden_family='torus'",
+              p["stages"][0]["hidden_family"] == "torus")
+        hk = p["stages"][0]["hidden_kwargs"]
+        check(f"{name}: torus hidden_kwargs height={expected_grid_size}",
+              hk.get("height") == expected_grid_size and hk.get("width") == expected_grid_size,
+              f"got height={hk.get('height')}, width={hk.get('width')}")
+        check(f"{name}: write_idx length >= num_inputs",
+              len(p["write_idx"]) >= p["stages"][0]["num_inputs"])
+
+
+def test_friedman_kirchhoff_net_build():
+    """friedman-problems/REQ: build_net_from_preset succeeds for friedman1/2/3."""
+    print("\nTest friedman-kirchhoff: build KirchhoffNet from friedman presets")
+    try:
+        from topology import build_net_from_preset
+        from cell_library import make_cell_library
+        import train_script
+    except ImportError as e:
+        check("imports", False, f"failed: {e}")
+        return
+    cell_lib = make_cell_library("tanh", num_edges=4)
+    for problem in ["friedman1", "friedman2", "friedman3"]:
+        net = build_net_from_preset(problem, cell_lib)
+        check(f"{problem}: net is not None", net is not None)
+        tr, va, task_fn, _ = train_script.make_data(problem, 32, noise_std=0.0)
+        x, y = next(iter(tr))
+        with torch.no_grad():
+            out = net(x)
+        def _finite(o):
+            if isinstance(o, torch.Tensor):
+                return bool(torch.isfinite(o).all().item())
+            if isinstance(o, (list, tuple)):
+                return all(_finite(t) for t in o)
+            return True
+        check(f"{problem}: forward pass yields finite output", _finite(out))
 
 
 def test_anti_parallel_basic():

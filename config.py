@@ -952,10 +952,103 @@ def make_housing_grid_preset(
 # Static default: 5x5 grid, 3 stages, 3 proj nodes (mirrors smooth2d_grid).
 PRESET_HOUSING_GRID = make_housing_grid_preset(grid_size=5)
 
+
+# Friedman synthetic regression tasks (friedman-problems/REQ).
+# Three canonical Friedman problems (Friedman 1991 MARS paper) on a torus
+# hidden topology with three_phase schedule and Huber loss. All three use
+# sparse write (strided write_idx across the torus grid) so that each input
+# feature lands on a distinct column/region of the grid; this gives the
+# model locality prior rather than broadcasting every input everywhere.
+# The CLI may override any field; this is just the starting point.
+
+def make_friedman1_preset() -> dict:
+    """Friedman #1 preset: 10-dim U(0,1) inputs (5 noisy), 5x5 torus.
+
+    Writes are strided at row 0 (cols 0..4) + row 2 (cols 0..4) so 10 unique
+    cells in the torus. Reads use ``read_mode='dense'`` (full state) because
+    the per-column coverage in the 5x5 torus leaves no hidden node >1 hop
+    from every write node under the kernel=3 neighbor rule.
+    """
+    num_hidden = 25
+    return {
+        "stages": [
+            {
+                "num_inputs": 10,
+                "num_hidden": num_hidden,
+                "num_proj": 0,
+                "num_outputs": 0,
+                "hidden_family": "torus",
+                "hidden_kwargs": {"height": 5, "width": 5, "kernel_size": 3, "bidirectional": False},
+                "input_pattern": "all_to_all",
+                "output_pattern": "all_to_all",
+                "proj_pattern": "all_to_all",
+                "t_span": SOLVER["t_span"],
+                "num_steps": SOLVER["num_steps"],
+            },
+        ],
+        "use_robust_input": False,
+        "loss": "huber",
+        "out_dim": 1,
+        "write_mode": "sparse_proj",
+        "read_mode": "dense",
+        "write_idx": [0, 1, 2, 3, 4, 10, 11, 12, 13, 14],
+        "schedule": "three_phase",
+        "tau_anneal": True,
+    }
+
+
+def make_friedman2_preset() -> dict:
+    """Friedman #2 preset: 4-dim inputs with custom ranges, 4x4 torus.
+
+    Each input lands on a distinct column (stride=4: nodes 0,4,8,12). With
+    4 writes covering all 4 columns, reads use ``read_mode='dense'`` (full
+    state) for the same reason as Friedman #1.
+    """
+    num_hidden = 16
+    return {
+        "stages": [
+            {
+                "num_inputs": 4,
+                "num_hidden": num_hidden,
+                "num_proj": 0,
+                "num_outputs": 0,
+                "hidden_family": "torus",
+                "hidden_kwargs": {"height": 4, "width": 4, "kernel_size": 3, "bidirectional": False},
+                "input_pattern": "all_to_all",
+                "output_pattern": "all_to_all",
+                "proj_pattern": "all_to_all",
+                "t_span": SOLVER["t_span"],
+                "num_steps": SOLVER["num_steps"],
+            },
+        ],
+        "use_robust_input": False,
+        "loss": "huber",
+        "out_dim": 1,
+        "write_mode": "sparse_proj",
+        "read_mode": "dense",
+        "write_idx": [0, 4, 8, 12],
+        "schedule": "three_phase",
+        "tau_anneal": True,
+    }
+
+
+def make_friedman3_preset() -> dict:
+    """Friedman #3 preset: same shape as #2, different target."""
+    return make_friedman2_preset()
+
+
+PRESET_FRIEDMAN1 = make_friedman1_preset()
+PRESET_FRIEDMAN2 = make_friedman2_preset()
+PRESET_FRIEDMAN3 = make_friedman3_preset()
+
+
 PRESETS = {
     "sinx": PRESET_SINX,
     "housing": PRESET_HOUSING,
     "smooth2d": PRESET_SMOOTH2D,
     "smooth2d_grid": PRESET_SMOOTH2D_GRID,
     "housing_grid": PRESET_HOUSING_GRID,
+    "friedman1": PRESET_FRIEDMAN1,
+    "friedman2": PRESET_FRIEDMAN2,
+    "friedman3": PRESET_FRIEDMAN3,
 }

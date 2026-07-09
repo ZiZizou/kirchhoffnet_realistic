@@ -2940,6 +2940,8 @@ def main():
         f"write_idx={list(net.write_idx) if net.write_idx is not None else None} "
         f"read_idx={list(net.read_idx) if net.read_idx is not None else None}"
     )
+    n_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
+    print(f"[train] trainable params: {n_params:,}")
     if args.bidirectional or (args.edge_repeats is not None and args.edge_repeats > 1):
         eff_er = args.edge_repeats if args.edge_repeats is not None else 2
         mult = 2 if args.bidirectional else 1
@@ -3804,6 +3806,8 @@ def main():
             write_idx=pruned_write_idx if effective_write_mode in ("one_to_one", "sparse_proj") else None,
             read_idx=pruned_read_idx if effective_read_mode == "sparse" else None)
         pruned_net.to(device)
+        n_pruned_params = sum(p.numel() for p in pruned_net.parameters() if p.requires_grad)
+        print(f"[prune] retrain trainable params: {n_pruned_params:,}")
 
         # retrain-oom-fix/REQ-2: the shared cell_lib is the one compiled
         # for raw_net (topology.py:788 sets new_lib=stage.cell_lib). The

@@ -27,7 +27,51 @@ from differential_stage import DifferentialStage
 from stage_transfer import StageTransfer
 
 
-__all__ = ["KirchhoffNet", "KirchhoffNetWithIO"]
+__all__ = ["KirchhoffNet", "KirchhoffNetWithIO", "format_parameter_breakdown"]
+
+
+def format_parameter_breakdown(breakdown: dict) -> str:
+    """Render a KirchhoffNetWithIO.parameter_breakdown() dict as aligned text.
+
+    Output example (single-stage friedman2):
+
+        input_mapper:           20
+        output_mapper:        1169
+        drive_mappers:           8
+        stage_0:
+          cell_lib:            320
+          z_logits:             64
+          u_logits:             16
+          raw_leak:             16
+          raw_drive_g:           4
+          ── stage total:      420
+        ───────────────────────
+        total:               1605
+    """
+    groups = breakdown.get("groups", {})
+    per_stage = breakdown.get("per_stage", {})
+    total = breakdown.get("total", 0)
+    label_w = max((len(k) for k in groups), default=0)
+    label_w = max(label_w, 10)
+    stage_label_w = max(
+        (len(k) for k in per_stage), default=0,
+    )
+    stage_label_w = max(stage_label_w, 8)
+    width = max(label_w + 18, stage_label_w + 18, 30)
+    lines: list[str] = []
+    for name in ("input_mapper", "output_mapper", "drive_mappers"):
+        lines.append(f"  {name:<{label_w}}: {groups.get(name, 0):>{width - label_w - 4}}")
+    for stage_key in sorted(per_stage.keys()):
+        lines.append(f"  {stage_key}:")
+        bucket = per_stage[stage_key]
+        for sub_name in ("cell_lib", "z_logits", "u_logits", "raw_leak", "raw_drive_g", "other"):
+            if bucket.get(sub_name, 0):
+                lines.append(f"    {sub_name:<{stage_label_w}}: {bucket[sub_name]:>{width - stage_label_w - 6}}")
+        stage_total = sum(bucket.values())
+        lines.append(f"    {'── stage total:':<{stage_label_w + 2}} {stage_total}")
+    lines.append("  " + "─" * (width - 2))
+    lines.append(f"  {'total:':<{label_w + 2}} {total}")
+    return "\n".join(lines)
 
 
 class KirchhoffNet(nn.Module):
@@ -321,6 +365,77 @@ class KirchhoffNetWithIO(nn.Module):
                 )
         y = self.output_mapper(x_read)
         return y, trajs
+
+    def parameter_breakdown(self) -> dict:
+        """Return trainable-parameter counts grouped by component.
+
+        Walks ``self.named_parameters()`` and buckets each tensor by its
+        fully-qualified name prefix:
+
+          - ``input_mapper.*``
+          - ``output_mapper.*``
+          - ``drive_mappers.*``
+          - ``core.stages.N.z_logits``  (structural)
+          - ``core.stages.N.u_logits``  (structural, deprecated)
+          - ``core.stages.N.raw_leak``  (dynamical)
+          - ``core.stages.N.raw_drive_g``  (dynamical)
+          - ``core.stages.N.cell_lib.*``  (per-edge device params)
+
+        Returns a dict with per-group subtotals, per-stage ``stage_N``
+        subtotals, and a ``total``. Use :func:`format_parameter_breakdown`
+        for a human-readable rendering.
+        """
+        groups = {
+            "input_mapper": 0,
+            "output_mapper": 0,
+            "drive_mappers": 0,
+        }
+        per_stage: dict[str, dict[str, int]] = {}
+        total = 0
+        for name, p in self.named_parameters():
+            if not p.requires_grad:
+                continue
+            n = int(p.numel())
+            total += n
+            if name.startswith("input_mapper"):
+                groups["input_mapper"] += n
+            elif name.startswith("output_mapper"):
+                groups["output_mapper"] += n
+            elif name.startswith("drive_mappers"):
+                groups["drive_mappers"] += n
+            elif name.startswith("core.stages."):
+                parts = name.split(".")
+                if len(parts) < 4:
+                    continue
+                stage_idx = parts[2]
+                tail = ".".join(parts[3:])
+                stage_key = f"stage_{stage_idx}"
+                stage_bucket = per_stage.setdefault(stage_key, {
+                    "cell_lib": 0,
+                    "z_logits": 0,
+                    "u_logits": 0,
+                    "raw_leak": 0,
+                    "raw_drive_g": 0,
+                    "other": 0,
+                })
+                matched = False
+                if tail == "z_logits":
+                    stage_bucket["z_logits"] += n; matched = True
+                elif tail == "u_logits":
+                    stage_bucket["u_logits"] += n; matched = True
+                elif tail == "raw_leak":
+                    stage_bucket["raw_leak"] += n; matched = True
+                elif tail == "raw_drive_g":
+                    stage_bucket["raw_drive_g"] += n; matched = True
+                elif tail.startswith("cell_lib."):
+                    stage_bucket["cell_lib"] += n; matched = True
+                if not matched:
+                    stage_bucket["other"] += n
+        return {
+            "groups": groups,
+            "per_stage": per_stage,
+            "total": total,
+        }
 
     def extra_repr(self) -> str:
         return (

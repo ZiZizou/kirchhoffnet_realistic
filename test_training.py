@@ -49,6 +49,8 @@ def main():
     test_mlp_benchmark_tanh()
     test_v15_cell_parameters_preset_smooth2d_grid()
     test_stage_lr_scale_scheduler_compat()
+    test_parameter_breakdown_aggregates_components()
+    test_edge_repeats_propagation_to_preset()
 
     print()
     print("=" * 60)
@@ -1082,6 +1084,90 @@ def test_stage_lr_scale_scheduler_compat():
     check("SLS-3: group LR ratios preserved after scheduler step",
           all(abs(rb - ra) < 1e-4 for rb, ra in zip(ratios_before, ratios_after)),
           f"ratios before={ratios_before}, after={ratios_after}")
+
+def test_parameter_breakdown_aggregates_components():
+    """PBD-1: KirchhoffNetWithIO.parameter_breakdown() groups params by component
+    and the breakdown total matches the manual sum of named_parameters."""
+    print("\nTest PBD-1: parameter_breakdown aggregates input/output/drive/core")
+    from cell_library import make_cell_library
+    from topology import build_net_from_preset
+    from kirchhoff_net import format_parameter_breakdown
+
+    cell_lib = make_cell_library('tanh')
+    net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
+    bd = net.parameter_breakdown()
+
+    manual_total = sum(p.numel() for p in net.parameters() if p.requires_grad)
+    check("PBD-1: breakdown total matches manual sum",
+          bd["total"] == manual_total,
+          f"breakdown={bd['total']} manual={manual_total}")
+
+    # All three top-level groups exist, even if zero.
+    for k in ("input_mapper", "output_mapper", "drive_mappers"):
+        check(f"PBD-1: groups[{k}] present and >= 0",
+              k in bd["groups"] and bd["groups"][k] >= 0,
+              f"got {bd['groups'].get(k)}")
+
+    # smooth2d_grid has 3 stages (mirrors smooth2d); every stage key present.
+    check("PBD-1: per_stage has 3 stage keys",
+          set(bd["per_stage"].keys()) == {"stage_0", "stage_1", "stage_2"},
+          f"got {sorted(bd['per_stage'].keys())}")
+
+    # Each stage bucket has all expected sub-keys.
+    for sk, bucket in bd["per_stage"].items():
+        for sub in ("cell_lib", "z_logits", "u_logits", "raw_leak",
+                    "raw_drive_g", "other"):
+            check(f"PBD-1: {sk} has {sub} sub-key",
+                  sub in bucket,
+                  f"missing {sub} in {bucket}")
+
+    # cell_lib > 0 for each stage (tanh SimpleEdgeLibrary has 3 params/edge).
+    for sk, bucket in bd["per_stage"].items():
+        check(f"PBD-1: {sk} cell_lib > 0",
+              bucket["cell_lib"] > 0,
+              f"got {bucket['cell_lib']}")
+
+    # format_parameter_breakdown returns a non-empty string with header + total.
+    text = format_parameter_breakdown(bd)
+    check("PBD-1: formatted output is multi-line and contains 'total:'",
+          text.count("\n") >= 3 and "total:" in text,
+          f"got {text!r}")
+
+def test_edge_repeats_propagation_to_preset():
+    """ERP-1: build_net_from_preset honors edge_repeats injected into a preset
+    that did NOT have it set (regression test for the param-log-fix plan)."""
+    print("\nTest ERP-1: edge_repeats propagates into stages of preset")
+    from cell_library import make_cell_library
+    from config import PRESETS
+    from topology import build_net_from_preset
+
+    # Clone the friedman2 preset so we don't mutate the global registry.
+    cfg = {k: (list(v) if isinstance(v, list) else
+               {kk: list(vv) if isinstance(vv, list) else vv for kk, vv in v.items()}
+               if isinstance(v, dict) else v)
+           for k, v in PRESETS["friedman2"].items()}
+    cfg["stages"] = [{k: (list(v) if isinstance(v, list) else
+                          {kk: list(vv) if isinstance(vv, list) else vv for kk, vv in v.items()}
+                          if isinstance(v, dict) else v)
+                      for k, v in stage.items()}
+                     for stage in cfg["stages"]]
+    cfg["stages"][0]["edge_repeats"] = 3
+    PRESETS["__test_friedman2_x3"] = cfg
+    try:
+        cell_lib = make_cell_library('tanh')
+        net = build_net_from_preset("__test_friedman2_x3", cell_lib=cell_lib)
+        # num_edges should be 3 * 64 (single torus edge count) = 192
+        edges = net.core.stages[0].num_edges()
+        check("ERP-1: edge_repeats=3 doubles stage edges",
+              edges == 3 * 64,
+              f"got {edges}")
+        bd = net.parameter_breakdown()
+        # With 3x edges, cell_lib should be ~3x larger than baseline 192.
+        check("ERP-1: breakdown cell_lib reflects 3x edges",
+              bd["per_stage"]["stage_0"]["cell_lib"] == 3 * 64 * 3,
+              f"got {bd['per_stage']['stage_0']['cell_lib']}")
+    finally:
+        del PRESETS["__test_friedman2_x3"]
 
 if __name__ == "__main__":
     main()

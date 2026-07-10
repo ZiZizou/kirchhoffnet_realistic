@@ -168,6 +168,25 @@ def _friedman1(x: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _minmax_normalize_inputs(
+    u_train: torch.Tensor, u_val: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-dim min-max normalize features to [0, 1] using train-set stats.
+
+    Mirrors ``train_script._minmax_normalize_inputs``: stats are computed on
+    the training set only, val is normalized with the same scaler, and the
+    per-dim min/range are returned for downstream input-distribution
+    analysis. Range is clamped to 1e-8 to avoid division by zero when a
+    train-set feature is constant.
+    """
+    u_min = u_train.amin(dim=0, keepdim=True)
+    u_max = u_train.amax(dim=0, keepdim=True)
+    u_range = (u_max - u_min).clamp(min=1e-8)
+    u_train_n = (u_train - u_min) / u_range
+    u_val_n = (u_val - u_min) / u_range
+    return u_train_n, u_val_n, u_min, u_range
+
+
 def make_data_friedman1(batch_size: int, noise_std: float = 1.0, val_size: int = 4000,
                        normalize_inputs: bool = True):
     """Build Friedman #1 train/val loaders with target standardization.
@@ -176,8 +195,10 @@ def make_data_friedman1(batch_size: int, noise_std: float = 1.0, val_size: int =
     random in [0, 1]^10. When ``normalize_inputs=True`` (default), inputs
     are per-dim min-max scaled to [0, 1] using train statistics (no-op for
     this problem but kept for interface consistency). Targets are z-scored
-    using train mean/std; the inverse statistics (y_mean, y_std[, u_min,
-    u_range]) are returned for denormalization.
+    using train mean/std. The returned ``inverse_stats`` carries
+    ``"y_mean"``/``"y_std"`` for target denormalization; when normalized
+    it also carries ``"u_min"``/``"u_range"`` for input-distribution
+    analysis.
     """
     n_train = 20000
     u_train = _lhs_samples(n_train, _FRIEDMAN1_IN_DIM, seed=42)
@@ -191,11 +212,7 @@ def make_data_friedman1(batch_size: int, noise_std: float = 1.0, val_size: int =
         y_train = y_train + noise_std * torch.randn_like(y_train)
 
     if normalize_inputs:
-        u_min = u_train.amin(dim=0, keepdim=True)
-        u_max = u_train.amax(dim=0, keepdim=True)
-        u_range = (u_max - u_min).clamp(min=1e-8)
-        u_train = (u_train - u_min) / u_range
-        u_val = (u_val - u_min) / u_range
+        u_train, u_val, u_min, u_range = _minmax_normalize_inputs(u_train, u_val)
 
     y_mean = float(y_train.mean().item())
     y_std = float(y_train.std().clamp(min=1e-6).item())

@@ -88,6 +88,7 @@ from config import (
     make_housing_grid_preset)
 from cell_library import make_cell_library, SimpleEdgeLibrary
 from topology import build_net_from_preset
+from kirchhoff_net import format_parameter_breakdown
 from sim_context import SimContext, sample_random_context
 from train import (
     compute_loss,
@@ -1243,9 +1244,11 @@ def make_data_friedman1(batch_size: int, noise_std: float = 1.0, val_size: int =
                        normalize_inputs: bool = True):
     """Friedman #1 regression on the 5x5 torus topology.
 
-    Returns ``(train_loader, val_loader, task_fn, inverse_stats)`` where
-    ``task_fn`` is ``F.huber_loss(o, t, delta=1.0)`` and ``inverse_stats``
-    holds ``{"y_mean", "y_std", ("u_min", "u_range")}`` for denormalization.
+    Returns ``(train_loader, val_loader, task_fn, inverse_stats)``. The
+    ``task_fn`` is ``F.huber_loss(o, t, delta=1.0)``. ``inverse_stats``
+    contains ``"y_mean"`` and ``"y_std"`` keys for target denormalization,
+    plus ``"u_min"`` and ``"u_range"`` keys (only present when
+    ``normalize_inputs=True``) for downstream input-distribution analysis.
     Inputs are LHS samples in [0, 1]^10; min-max normalization is a no-op
     for this problem but kept for interface consistency.
     """
@@ -1286,6 +1289,10 @@ def make_data_friedman2(batch_size: int, noise_std: float = 1.0, val_size: int =
     Inputs are LHS samples scaled to per-dim ranges via ``_scale_lhs_to_ranges``,
     then (when ``normalize_inputs=True``) per-dim min-max normalized to [0, 1]
     from training statistics. Set ``normalize_inputs=False`` to ablate.
+    Returns ``(train_loader, val_loader, task_fn, inverse_stats)`` where
+    ``inverse_stats`` carries ``"y_mean"`` and ``"y_std"`` for target
+    denormalization and (when normalized) ``"u_min"``/``"u_range"`` for
+    downstream input-distribution analysis.
     """
     n_train = 20000
     u_train_unit = _lhs_samples(n_train, _FRIEDMAN2_IN_DIM, seed=42)
@@ -1326,6 +1333,10 @@ def make_data_friedman3(batch_size: int, noise_std: float = 1.0, val_size: int =
     Inputs are LHS samples scaled to per-dim ranges via ``_scale_lhs_to_ranges``,
     then (when ``normalize_inputs=True``) per-dim min-max normalized to [0, 1]
     from training statistics. Set ``normalize_inputs=False`` to ablate.
+    Returns ``(train_loader, val_loader, task_fn, inverse_stats)`` where
+    ``inverse_stats`` carries ``"y_mean"`` and ``"y_std"`` for target
+    denormalization and (when normalized) ``"u_min"``/``"u_range"`` for
+    downstream input-distribution analysis.
     """
     n_train = 20000
     u_train_unit = _lhs_samples(n_train, _FRIEDMAN3_IN_DIM, seed=42)
@@ -2945,6 +2956,14 @@ def main():
     active_preset = PRESETS.get(args.problem)
     if active_preset is None:
         raise ValueError(f"Unknown problem: {args.problem!r}")
+    # Propagate --edge-repeats into every stage of the preset so the CLI flag
+    # takes effect even when --hidden-family is NOT specified (the dynamic
+    # preset path above is gated on args.hidden_family). Without this, the
+    # topology builder would default edge_repeats=1 and silently ignore
+    # --edge-repeats for preset-only runs.
+    if args.edge_repeats is not None:
+        for stage in active_preset.get("stages", []):
+            stage["edge_repeats"] = int(args.edge_repeats)
     if args.write_fan_out is not None:
         try:
             raw = json.loads(args.write_fan_out)
@@ -3032,20 +3051,38 @@ def main():
     )
     n_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
     print(f"[train] trainable params: {n_params:,}")
-    if args.bidirectional or (args.edge_repeats is not None and args.edge_repeats > 1):
-        eff_er = args.edge_repeats if args.edge_repeats is not None else 2
-        mult = 2 if args.bidirectional else 1
-        mult *= eff_er
+    breakdown = net.parameter_breakdown()
+    print(f"[train] param breakdown:\n{format_parameter_breakdown(breakdown)}")
+    # Resolve the actually-applied edge_repeats from the preset (post the
+    # CLI-injection step). When multiple stages disagree, fall back to None.
+    actual_er_per_stage = [
+        stage.get("edge_repeats", 1) for stage in active_preset.get("stages", [])
+    ]
+    if actual_er_per_stage:
+        actual_er = actual_er_per_stage[0] if len(set(actual_er_per_stage)) == 1 else None
+    else:
+        actual_er = None
+    eff_er = actual_er if actual_er is not None else 1
+    if args.bidirectional or eff_er > 1 or (
+        args.edge_repeats is not None and args.edge_repeats != eff_er
+    ):
+        mult = (2 if args.bidirectional else 1) * eff_er
+        mismatch = (
+            args.edge_repeats is not None
+            and args.edge_repeats != eff_er
+        )
+        edges_per_stage = [s.num_edges() for s in net.core.stages]
+        suffix = " (CLI flag did NOT match preset)" if mismatch else ""
         if args.bidirectional:
-            edges_per_stage = [s.num_edges() for s in net.core.stages]
             print(
                 f"[train] bidirectional={args.bidirectional} "
                 f"edge_repeats={eff_er}: {edges_per_stage} edges per stage "
-                f"({mult}× single-edge baseline)"
+                f"({mult}× single-edge baseline){suffix}"
             )
         else:
             print(
-                f"[train] edge_repeats={eff_er}: ({mult}× single-edge baseline)"
+                f"[train] edge_repeats={eff_er}: {edges_per_stage} edges per stage "
+                f"({mult}× single-edge baseline){suffix}"
             )
     if args.solver == "deq" and not args.persistent_drive:
         print(

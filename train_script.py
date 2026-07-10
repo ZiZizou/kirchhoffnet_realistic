@@ -1239,12 +1239,15 @@ def _minmax_normalize_inputs(
     return u_train_n, u_val_n, u_min, u_range
 
 
-def make_data_friedman1(batch_size: int, noise_std: float = 1.0, val_size: int = 4000):
+def make_data_friedman1(batch_size: int, noise_std: float = 1.0, val_size: int = 4000,
+                       normalize_inputs: bool = True):
     """Friedman #1 regression on the 5x5 torus topology.
 
     Returns ``(train_loader, val_loader, task_fn, inverse_stats)`` where
     ``task_fn`` is ``F.huber_loss(o, t, delta=1.0)`` and ``inverse_stats``
-    holds ``{"y_mean", "y_std", "u_min", "u_range"}`` for denormalization.
+    holds ``{"y_mean", "y_std", ("u_min", "u_range")}`` for denormalization.
+    Inputs are LHS samples in [0, 1]^10; min-max normalization is a no-op
+    for this problem but kept for interface consistency.
     """
     n_train = 20000
     u_train = _lhs_samples(n_train, _FRIEDMAN1_IN_DIM, seed=42)
@@ -1254,7 +1257,8 @@ def make_data_friedman1(batch_size: int, noise_std: float = 1.0, val_size: int =
     y_val = _friedman1(u_val).unsqueeze(1)
     if noise_std > 0:
         y_train = y_train + noise_std * torch.randn_like(y_train)
-    u_train, u_val, u_min, u_range = _minmax_normalize_inputs(u_train, u_val)
+    if normalize_inputs:
+        u_train, u_val, u_min, u_range = _minmax_normalize_inputs(u_train, u_val)
     y_mean = y_train.mean()
     y_std = y_train.std().clamp(min=1e-6)
     train_loader = DataLoader(
@@ -1268,17 +1272,20 @@ def make_data_friedman1(batch_size: int, noise_std: float = 1.0, val_size: int =
     inverse_stats = {
         "y_mean": float(y_mean.item()),
         "y_std": float(y_std.item()),
-        "u_min": u_min.squeeze(0).tolist(),
-        "u_range": u_range.squeeze(0).tolist(),
     }
+    if normalize_inputs:
+        inverse_stats["u_min"] = u_min.squeeze(0).tolist()
+        inverse_stats["u_range"] = u_range.squeeze(0).tolist()
     return train_loader, val_loader, F.huber_loss, inverse_stats
 
 
-def make_data_friedman2(batch_size: int, noise_std: float = 1.0, val_size: int = 4000):
+def make_data_friedman2(batch_size: int, noise_std: float = 1.0, val_size: int = 4000,
+                       normalize_inputs: bool = True):
     """Friedman #2 regression on the 4x4 torus topology.
 
     Inputs are LHS samples scaled to per-dim ranges via ``_scale_lhs_to_ranges``,
-    then per-dim min-max normalized to [0, 1] from training statistics.
+    then (when ``normalize_inputs=True``) per-dim min-max normalized to [0, 1]
+    from training statistics. Set ``normalize_inputs=False`` to ablate.
     """
     n_train = 20000
     u_train_unit = _lhs_samples(n_train, _FRIEDMAN2_IN_DIM, seed=42)
@@ -1290,7 +1297,8 @@ def make_data_friedman2(batch_size: int, noise_std: float = 1.0, val_size: int =
     y_val = _friedman2(u_val).unsqueeze(1)
     if noise_std > 0:
         y_train = y_train + noise_std * torch.randn_like(y_train)
-    u_train, u_val, u_min, u_range = _minmax_normalize_inputs(u_train, u_val)
+    if normalize_inputs:
+        u_train, u_val, u_min, u_range = _minmax_normalize_inputs(u_train, u_val)
     y_mean = y_train.mean()
     y_std = y_train.std().clamp(min=1e-6)
     train_loader = DataLoader(
@@ -1304,17 +1312,20 @@ def make_data_friedman2(batch_size: int, noise_std: float = 1.0, val_size: int =
     inverse_stats = {
         "y_mean": float(y_mean.item()),
         "y_std": float(y_std.item()),
-        "u_min": u_min.squeeze(0).tolist(),
-        "u_range": u_range.squeeze(0).tolist(),
     }
+    if normalize_inputs:
+        inverse_stats["u_min"] = u_min.squeeze(0).tolist()
+        inverse_stats["u_range"] = u_range.squeeze(0).tolist()
     return train_loader, val_loader, F.huber_loss, inverse_stats
 
 
-def make_data_friedman3(batch_size: int, noise_std: float = 1.0, val_size: int = 4000):
+def make_data_friedman3(batch_size: int, noise_std: float = 1.0, val_size: int = 4000,
+                       normalize_inputs: bool = True):
     """Friedman #3 regression on the 4x4 torus topology (same shape as #2).
 
     Inputs are LHS samples scaled to per-dim ranges via ``_scale_lhs_to_ranges``,
-    then per-dim min-max normalized to [0, 1] from training statistics.
+    then (when ``normalize_inputs=True``) per-dim min-max normalized to [0, 1]
+    from training statistics. Set ``normalize_inputs=False`` to ablate.
     """
     n_train = 20000
     u_train_unit = _lhs_samples(n_train, _FRIEDMAN3_IN_DIM, seed=42)
@@ -1326,7 +1337,8 @@ def make_data_friedman3(batch_size: int, noise_std: float = 1.0, val_size: int =
     y_val = _friedman3(u_val).unsqueeze(1)
     if noise_std > 0:
         y_train = y_train + noise_std * torch.randn_like(y_train)
-    u_train, u_val, u_min, u_range = _minmax_normalize_inputs(u_train, u_val)
+    if normalize_inputs:
+        u_train, u_val, u_min, u_range = _minmax_normalize_inputs(u_train, u_val)
     y_mean = y_train.mean()
     y_std = y_train.std().clamp(min=1e-6)
     train_loader = DataLoader(
@@ -1340,9 +1352,10 @@ def make_data_friedman3(batch_size: int, noise_std: float = 1.0, val_size: int =
     inverse_stats = {
         "y_mean": float(y_mean.item()),
         "y_std": float(y_std.item()),
-        "u_min": u_min.squeeze(0).tolist(),
-        "u_range": u_range.squeeze(0).tolist(),
     }
+    if normalize_inputs:
+        inverse_stats["u_min"] = u_min.squeeze(0).tolist()
+        inverse_stats["u_range"] = u_range.squeeze(0).tolist()
     return train_loader, val_loader, F.huber_loss, inverse_stats
 
 
@@ -1389,12 +1402,17 @@ def make_data_smooth2d(batch_size: int, val_size: int = 4000):
     )
     return train_loader, val_loader, F.mse_loss
 
-def make_data(problem: str, batch_size: int, noise_std: float = 0.0):
+def make_data(problem: str, batch_size: int, noise_std: float = 0.0,
+              normalize_inputs: bool = True):
     """Dispatch to the per-problem data factory.
 
     ``noise_std`` is forwarded only to the friedman problems (which use
     additive Gaussian target noise); other problems keep their existing
     noise conventions (housing/smooth2d have their own noise logic).
+
+    ``normalize_inputs`` is forwarded only to friedman problems; ignored for
+    others. When False, friedman2/3 inputs stay in their raw per-dim ranges
+    (no min-max scaling). friedman1 is a no-op either way.
     """
     if problem == "sinx":
         return make_data_sinx(batch_size)
@@ -1407,11 +1425,14 @@ def make_data(problem: str, batch_size: int, noise_std: float = 0.0):
     if problem == "housing_grid":
         return make_data_housing_grid(batch_size)
     if problem == "friedman1":
-        return make_data_friedman1(batch_size, noise_std=noise_std)
+        return make_data_friedman1(batch_size, noise_std=noise_std,
+                                   normalize_inputs=normalize_inputs)
     if problem == "friedman2":
-        return make_data_friedman2(batch_size, noise_std=noise_std)
+        return make_data_friedman2(batch_size, noise_std=noise_std,
+                                   normalize_inputs=normalize_inputs)
     if problem == "friedman3":
-        return make_data_friedman3(batch_size, noise_std=noise_std)
+        return make_data_friedman3(batch_size, noise_std=noise_std,
+                                   normalize_inputs=normalize_inputs)
     raise ValueError(f"Unknown problem: {problem}")
 
 def _unwrap_raw_net(net):
@@ -2457,6 +2478,15 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "Default: generate random seed at startup. Set to an integer "
              "for fully reproducible runs (note: cuDNN deterministic mode "
              "may slow down training).")
+    parser.add_argument(
+        "--normalize-inputs", dest="normalize_inputs", action="store_true", default=True,
+        help="Per-dim min-max normalize Friedman problem inputs to [0, 1] "
+             "(default: on). Use --no-normalize-inputs to disable for "
+             "ablation studies.")
+    parser.add_argument(
+        "--no-normalize-inputs", dest="normalize_inputs", action="store_false",
+        help="Disable per-dim input normalization (ablation against the "
+             "default normalized mode).")
 
 # ----------------------------------------------------------------
 # Pruning helpers (PIT): transferable I/O mapper reconstruction.
@@ -3040,6 +3070,7 @@ def main():
     data_out = make_data(
         args.problem, batch_size,
         noise_std=args.target_noise_std,
+        normalize_inputs=args.normalize_inputs,
     )
     if len(data_out) == 4:
         train_loader, val_loader, task_fn, inverse_stats = data_out

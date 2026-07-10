@@ -36,6 +36,7 @@ batch_size=OPTIM.batch_size, early stopping with patience=50, min_delta=1e-4.
 
 import argparse
 import math
+import random
 import sys
 import time
 import warnings
@@ -167,12 +168,16 @@ def _friedman1(x: torch.Tensor) -> torch.Tensor:
     )
 
 
-def make_data_friedman1(batch_size: int, noise_std: float = 1.0, val_size: int = 4000):
+def make_data_friedman1(batch_size: int, noise_std: float = 1.0, val_size: int = 4000,
+                       normalize_inputs: bool = True):
     """Build Friedman #1 train/val loaders with target standardization.
 
     Train inputs are LHS samples in [0, 1]^10. Val inputs are uniform
-    random in [0, 1]^10. Targets are z-scored using train mean/std; the
-    inverse statistics (y_mean, y_std) are returned for denormalization.
+    random in [0, 1]^10. When ``normalize_inputs=True`` (default), inputs
+    are per-dim min-max scaled to [0, 1] using train statistics (no-op for
+    this problem but kept for interface consistency). Targets are z-scored
+    using train mean/std; the inverse statistics (y_mean, y_std[, u_min,
+    u_range]) are returned for denormalization.
     """
     n_train = 20000
     u_train = _lhs_samples(n_train, _FRIEDMAN1_IN_DIM, seed=42)
@@ -184,6 +189,13 @@ def make_data_friedman1(batch_size: int, noise_std: float = 1.0, val_size: int =
 
     if noise_std > 0:
         y_train = y_train + noise_std * torch.randn_like(y_train)
+
+    if normalize_inputs:
+        u_min = u_train.amin(dim=0, keepdim=True)
+        u_max = u_train.amax(dim=0, keepdim=True)
+        u_range = (u_max - u_min).clamp(min=1e-8)
+        u_train = (u_train - u_min) / u_range
+        u_val = (u_val - u_min) / u_range
 
     y_mean = float(y_train.mean().item())
     y_std = float(y_train.std().clamp(min=1e-6).item())
@@ -197,6 +209,9 @@ def make_data_friedman1(batch_size: int, noise_std: float = 1.0, val_size: int =
         TensorDataset(u_val, y_val_n), batch_size=batch_size, shuffle=False
     )
     inverse_stats = {"y_mean": y_mean, "y_std": y_std}
+    if normalize_inputs:
+        inverse_stats["u_min"] = u_min.squeeze(0).tolist()
+        inverse_stats["u_range"] = u_range.squeeze(0).tolist()
     return train_loader, val_loader, F.mse_loss, inverse_stats
 
 
@@ -351,6 +366,14 @@ def main():
                              "quantization + circuit noise only, no "
                              "inter-layer converters). Only effective when "
                              "--noise or --noise-aware is set.")
+    parser.add_argument("--normalize-inputs", dest="normalize_inputs",
+                        action="store_true", default=True,
+                        help="Per-dim min-max normalize inputs to [0, 1] "
+                             "(default: on). Use --no-normalize-inputs to "
+                             "disable for ablation.")
+    parser.add_argument("--no-normalize-inputs", dest="normalize_inputs",
+                        action="store_false",
+                        help="Disable per-dim input normalization.")
     args = parser.parse_args()
 
     epochs = args.epochs if args.epochs is not None else int(OPTIM["epochs"])
@@ -360,7 +383,13 @@ def main():
     grad_clip_norm = float(OPTIM["grad_clip_norm"])
     device = args.device if args.device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
 
+    # input-norm-seed/Phase 3: full reproducible seeding (RNG + cuDNN).
     torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    random.seed(args.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
     out_dir = args.output.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -390,7 +419,8 @@ def main():
         train_wrapper.to(device)
 
     train_loader, val_loader, task_fn, inverse_stats = make_data_friedman1(
-        batch_size=batch_size, noise_std=args.target_noise_std
+        batch_size=batch_size, noise_std=args.target_noise_std,
+        normalize_inputs=args.normalize_inputs,
     )
     if args.loss == "huber":
         task_fn = lambda o, t: F.huber_loss(o, t, delta=1.0)

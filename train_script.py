@@ -1222,12 +1222,29 @@ def _friedman3(x: torch.Tensor) -> torch.Tensor:
     return torch.atan(inner / x1)
 
 
+def _minmax_normalize_inputs(
+    u_train: torch.Tensor, u_val: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-dim min-max normalize features to [0, 1] using train-set stats.
+
+    input-norm-seed/Phase 2: maps each input feature to [0, 1] using min/max
+    computed on the *training* set only. Val is normalized with the same
+    scaler. Stats are returned for the caller's inverse_stats dict.
+    """
+    u_min = u_train.amin(dim=0, keepdim=True)
+    u_max = u_train.amax(dim=0, keepdim=True)
+    u_range = (u_max - u_min).clamp(min=1e-8)
+    u_train_n = (u_train - u_min) / u_range
+    u_val_n = (u_val - u_min) / u_range
+    return u_train_n, u_val_n, u_min, u_range
+
+
 def make_data_friedman1(batch_size: int, noise_std: float = 1.0, val_size: int = 4000):
     """Friedman #1 regression on the 5x5 torus topology.
 
     Returns ``(train_loader, val_loader, task_fn, inverse_stats)`` where
     ``task_fn`` is ``F.huber_loss(o, t, delta=1.0)`` and ``inverse_stats``
-    holds ``{"y_mean", "y_std"}`` for denormalization.
+    holds ``{"y_mean", "y_std", "u_min", "u_range"}`` for denormalization.
     """
     n_train = 20000
     u_train = _lhs_samples(n_train, _FRIEDMAN1_IN_DIM, seed=42)
@@ -1237,6 +1254,7 @@ def make_data_friedman1(batch_size: int, noise_std: float = 1.0, val_size: int =
     y_val = _friedman1(u_val).unsqueeze(1)
     if noise_std > 0:
         y_train = y_train + noise_std * torch.randn_like(y_train)
+    u_train, u_val, u_min, u_range = _minmax_normalize_inputs(u_train, u_val)
     y_mean = y_train.mean()
     y_std = y_train.std().clamp(min=1e-6)
     train_loader = DataLoader(
@@ -1247,14 +1265,20 @@ def make_data_friedman1(batch_size: int, noise_std: float = 1.0, val_size: int =
         TensorDataset(u_val, (y_val - y_mean) / y_std),
         batch_size=batch_size, shuffle=False,
     )
-    inverse_stats = {"y_mean": float(y_mean.item()), "y_std": float(y_std.item())}
+    inverse_stats = {
+        "y_mean": float(y_mean.item()),
+        "y_std": float(y_std.item()),
+        "u_min": u_min.squeeze(0).tolist(),
+        "u_range": u_range.squeeze(0).tolist(),
+    }
     return train_loader, val_loader, F.huber_loss, inverse_stats
 
 
 def make_data_friedman2(batch_size: int, noise_std: float = 1.0, val_size: int = 4000):
     """Friedman #2 regression on the 4x4 torus topology.
 
-    Inputs are LHS samples scaled to per-dim ranges via ``_scale_lhs_to_ranges``.
+    Inputs are LHS samples scaled to per-dim ranges via ``_scale_lhs_to_ranges``,
+    then per-dim min-max normalized to [0, 1] from training statistics.
     """
     n_train = 20000
     u_train_unit = _lhs_samples(n_train, _FRIEDMAN2_IN_DIM, seed=42)
@@ -1266,6 +1290,7 @@ def make_data_friedman2(batch_size: int, noise_std: float = 1.0, val_size: int =
     y_val = _friedman2(u_val).unsqueeze(1)
     if noise_std > 0:
         y_train = y_train + noise_std * torch.randn_like(y_train)
+    u_train, u_val, u_min, u_range = _minmax_normalize_inputs(u_train, u_val)
     y_mean = y_train.mean()
     y_std = y_train.std().clamp(min=1e-6)
     train_loader = DataLoader(
@@ -1276,12 +1301,21 @@ def make_data_friedman2(batch_size: int, noise_std: float = 1.0, val_size: int =
         TensorDataset(u_val, (y_val - y_mean) / y_std),
         batch_size=batch_size, shuffle=False,
     )
-    inverse_stats = {"y_mean": float(y_mean.item()), "y_std": float(y_std.item())}
+    inverse_stats = {
+        "y_mean": float(y_mean.item()),
+        "y_std": float(y_std.item()),
+        "u_min": u_min.squeeze(0).tolist(),
+        "u_range": u_range.squeeze(0).tolist(),
+    }
     return train_loader, val_loader, F.huber_loss, inverse_stats
 
 
 def make_data_friedman3(batch_size: int, noise_std: float = 1.0, val_size: int = 4000):
-    """Friedman #3 regression on the 4x4 torus topology (same shape as #2)."""
+    """Friedman #3 regression on the 4x4 torus topology (same shape as #2).
+
+    Inputs are LHS samples scaled to per-dim ranges via ``_scale_lhs_to_ranges``,
+    then per-dim min-max normalized to [0, 1] from training statistics.
+    """
     n_train = 20000
     u_train_unit = _lhs_samples(n_train, _FRIEDMAN3_IN_DIM, seed=42)
     u_train = _scale_lhs_to_ranges(u_train_unit, _FRIEDMAN3_RANGES)
@@ -1292,6 +1326,7 @@ def make_data_friedman3(batch_size: int, noise_std: float = 1.0, val_size: int =
     y_val = _friedman3(u_val).unsqueeze(1)
     if noise_std > 0:
         y_train = y_train + noise_std * torch.randn_like(y_train)
+    u_train, u_val, u_min, u_range = _minmax_normalize_inputs(u_train, u_val)
     y_mean = y_train.mean()
     y_std = y_train.std().clamp(min=1e-6)
     train_loader = DataLoader(
@@ -1302,7 +1337,12 @@ def make_data_friedman3(batch_size: int, noise_std: float = 1.0, val_size: int =
         TensorDataset(u_val, (y_val - y_mean) / y_std),
         batch_size=batch_size, shuffle=False,
     )
-    inverse_stats = {"y_mean": float(y_mean.item()), "y_std": float(y_std.item())}
+    inverse_stats = {
+        "y_mean": float(y_mean.item()),
+        "y_std": float(y_std.item()),
+        "u_min": u_min.squeeze(0).tolist(),
+        "u_range": u_range.squeeze(0).tolist(),
+    }
     return train_loader, val_loader, F.huber_loss, inverse_stats
 
 
@@ -2127,8 +2167,9 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
         "--no-early-stop", dest="early_stop", action="store_false",
         help="Disable early stopping")
     parser.add_argument(
-        "--patience", type=int, default=500,
-        help="Early stopping patience in epochs (default: 500)")
+        "--patience", type=int, default=100,
+        help="Early stopping patience in epochs (default: 100). "
+             "Stops after N epochs with no val improvement > --min-delta.")
     parser.add_argument(
         "--min-delta", type=float, default=1e-4,
         help="Early stopping min improvement in val loss (default: 1e-4)")
@@ -2410,6 +2451,12 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
         help="Seed for analog-noise sampling (default: 0). Each MC trial "
              "uses noise_seed + trial_idx as its seed. Used when --noise "
              "or --noise-aware is set.")
+    parser.add_argument(
+        "--seed", type=int, default=None,
+        help="Random seed for torch/numpy/python RNGs and cuDNN. "
+             "Default: generate random seed at startup. Set to an integer "
+             "for fully reproducible runs (note: cuDNN deterministic mode "
+             "may slow down training).")
 
 # ----------------------------------------------------------------
 # Pruning helpers (PIT): transferable I/O mapper reconstruction.
@@ -2680,6 +2727,19 @@ def main():
     )
     _add_argparse_args(parser)
     args = parser.parse_args()
+
+    # input-norm-seed/Phase 1: reproducible seeding (RNG + cuDNN). The seed
+    # is always printed so a random-seed run can be replayed via --seed.
+    import random as _random
+    if args.seed is None:
+        args.seed = int(torch.randint(0, 2**31 - 1, (1,)).item())
+    print(f"[train] seed={args.seed}")
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    _random.seed(args.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
     amp_enabled = args.amp if args.amp is not None else torch.cuda.is_available()
     compile_enabled = args.compile if args.compile is not None else torch.cuda.is_available()

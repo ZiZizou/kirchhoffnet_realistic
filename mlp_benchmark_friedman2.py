@@ -36,6 +36,7 @@ batch_size=OPTIM.batch_size, early stopping with patience=50, min_delta=1e-4.
 
 import argparse
 import math
+import random
 import sys
 import time
 import warnings
@@ -188,6 +189,14 @@ def make_data_friedman2(batch_size: int, noise_std: float = 1.0, val_size: int =
     if noise_std > 0:
         y_train = y_train + noise_std * torch.randn_like(y_train)
 
+    # input-norm-seed/Phase 2: per-dim min-max normalize inputs to [0, 1] using
+    # training-set statistics. Val is normalized with the same scaler.
+    u_min = u_train.amin(dim=0, keepdim=True)
+    u_max = u_train.amax(dim=0, keepdim=True)
+    u_range = (u_max - u_min).clamp(min=1e-8)
+    u_train = (u_train - u_min) / u_range
+    u_val = (u_val - u_min) / u_range
+
     y_mean = float(y_train.mean().item())
     y_std = float(y_train.std().clamp(min=1e-6).item())
     y_train_n = (y_train - y_mean) / y_std
@@ -199,7 +208,12 @@ def make_data_friedman2(batch_size: int, noise_std: float = 1.0, val_size: int =
     val_loader = DataLoader(
         TensorDataset(u_val, y_val_n), batch_size=batch_size, shuffle=False
     )
-    inverse_stats = {"y_mean": y_mean, "y_std": y_std}
+    inverse_stats = {
+        "y_mean": y_mean,
+        "y_std": y_std,
+        "u_min": u_min.squeeze(0).tolist(),
+        "u_range": u_range.squeeze(0).tolist(),
+    }
     return train_loader, val_loader, F.mse_loss, inverse_stats
 
 
@@ -371,7 +385,13 @@ def main():
     grad_clip_norm = float(OPTIM["grad_clip_norm"])
     device = args.device if args.device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
 
+    # input-norm-seed/Phase 3: full reproducible seeding (RNG + cuDNN).
     torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    random.seed(args.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
     out_dir = args.output.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)

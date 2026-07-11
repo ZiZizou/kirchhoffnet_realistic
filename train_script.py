@@ -540,7 +540,7 @@ def _make_dynamic_preset(
     read_mode_override: str | None = None,
     small_world_k: int = 4,
     small_world_p: float = 0.3,
-    small_world_seed: int = 0,
+    small_world_seed: int | None = None,
     leak_mode: str | None = None,
     leak_constant: float | None = None) -> dict:
     """Build a fresh preset dict that overrides the topology of the named
@@ -571,7 +571,7 @@ Args:
         small_world_p: For 'small_world' family; rewiring probability in
             [0, 1] (default 0.3).
         small_world_seed: For 'small_world' family; RNG seed for rewiring
-            (default 0).
+            (default None, inherited from global --seed).
 
     Returns:
         Fresh dict ready to assign to ``PRESETS[problem]`` before calling
@@ -579,8 +579,12 @@ Args:
     """
     from config import SOLVER
     base = dict(PRESETS[problem])
-    # Use the FIRST stage's num_inputs as the canonical input dimension
-    # (multi-stage presets all share num_inputs; this is just defensive).
+
+    # For friedman presets (friedman1, friedman2, friedman3) preserve original
+    # write_mode, read_mode, and write_idx. The base preset already has
+    # write_idx=[0,4,8,12] for friedman2/friedman3, so keep it.
+    # For small_world override, we still use the preset's write_mode/read_mode
+    # unless explicitly overridden by CLI.
     num_inputs = int(base["stages"][0]["num_inputs"])
     n_stages = max(1, int(num_stages))
     er = int(edge_repeats)
@@ -591,14 +595,9 @@ Args:
         hidden_kwargs = {
             "k": int(small_world_k),
             "p": float(small_world_p),
-            "seed": int(small_world_seed),
+            "seed": int(small_world_seed) if small_world_seed is not None else 0,
             "bidirectional": bidirectional}
-        eff_write_mode = (
-            write_mode_override if write_mode_override is not None else "dense"
-        )
         read_idx = list(range(eff_num_hidden))
-        eff_read_mode = "sparse" if read_mode_override is None else read_mode_override
-        base.pop("write_idx", None)
     elif hidden_family == "torus":
         if grid_size is None:
             grid_size = max(2, round(int(num_hidden) ** 0.5))
@@ -614,12 +613,7 @@ Args:
             "width": grid_size,
             "kernel_size": 3,
             "bidirectional": bidirectional}
-        eff_write_mode = (
-            write_mode_override if write_mode_override is not None else "dense"
-        )
         read_idx = list(range(eff_num_hidden))
-        eff_read_mode = "sparse" if read_mode_override is None else read_mode_override
-        base.pop("write_idx", None)
     elif hidden_family == "grid":
         if grid_size is None:
             grid_size = max(2, round(int(num_hidden) ** 0.5))
@@ -635,19 +629,32 @@ Args:
             "width": grid_size,
             "kernel_size": 3,
             "bidirectional": bidirectional}
-        eff_write_mode = (
-            write_mode_override if write_mode_override is not None
-            else base.get("write_mode", "fan_out")
-        )
+
         if grid_size >= 3:
             center_col = grid_size // 2
             center_nodes = [r * grid_size + center_col for r in range(grid_size)]
             read_idx = center_nodes + list(range(eff_num_hidden, eff_num_hidden + num_proj))
         else:
             read_idx = list(range(eff_num_hidden, eff_num_hidden + num_proj))
-        eff_read_mode = "sparse" if read_mode_override is None else read_mode_override
     else:
         raise ValueError(f"Unknown hidden_family: {hidden_family!r}")
+
+    # Set write_mode/read_mode: CLI override > base preset > family default
+    # For friedman presets, base preset has correct settings (write_mode=sparse_proj,
+    # read_mode=dense). For other families, use family default (dense for torus/grid).
+    if write_mode_override is not None:
+        eff_write_mode = write_mode_override
+    elif hidden_family in ("torus", "grid"):
+        # These families default to dense write mode (no structure-based mapping)
+        eff_write_mode = "dense"
+    else:
+        # Preserve base preset's write_mode (e.g. friedman2's sparse_proj)
+        eff_write_mode = base.get("write_mode", "dense")
+
+    if read_mode_override is not None:
+        eff_read_mode = read_mode_override
+    else:
+        eff_read_mode = base.get("read_mode", "dense")
 
     stage_cfg = {
         "num_inputs": num_inputs,
@@ -666,8 +673,9 @@ Args:
     new_preset = dict(base)
     new_preset["stages"] = [stage_cfg] * n_stages
     new_preset["write_mode"] = eff_write_mode
-    new_preset["read_idx"] = read_idx
     new_preset["read_mode"] = eff_read_mode
+    new_preset["read_idx"] = read_idx
+
     # Fan-out generation: when write_mode='fan_out', every write target
     # list must be present (build_net_from_config requires it). When the
     # base preset already has write_fan_out (e.g. smooth2d_grid), keep it.
@@ -686,11 +694,8 @@ Args:
         new_preset["leak_mode"] = leak_mode
     if leak_constant is not None:
         new_preset["leak_constant"] = leak_constant
-    # Remove schedule/lambdas overrides if present so dynamic topology uses
-    # the global defaults from LAMBDAS. Per-problem schedules (e.g. housing's
-    # default 'three_phase') are still preserved by the explicit
-    # base.get('schedule') check below.
     return new_preset
+
 
 def _log_solidification(log_path, epoch: int, metrics: dict) -> None:
     """Append one row of solidification metrics to ``log_path``.
@@ -2078,7 +2083,7 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--small-world-k", type=int, default=4, dest="small_world_k",
         help="Small-world neighbor count per node in the ring lattice "
-             "(default: 4, must be even and < num_hidden). "
+             "(default: 4, must be even and <16). "
              "Used only when --hidden-family=small_world.")
     parser.add_argument(
         "--small-world-p", type=float, default=0.3, dest="small_world_p",
@@ -2086,8 +2091,9 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "(default: 0.3). p=0 recovers a ring lattice, p=1 produces "
              "a random regular graph. Used only when --hidden-family=small_world.")
     parser.add_argument(
-        "--small-world-seed", type=int, default=0, dest="small_world_seed",
-        help="Small-world rewiring RNG seed (default: 0). "
+        "--small-world-seed", type=int, default=None, dest="small_world_seed",
+        help="Small-world rewiring RNG seed (default: from --seed). "
+             "If not given, tie to the global --seed for reproducible graphs. "
              "Used only when --hidden-family=small_world.")
     parser.add_argument(
         "--output", type=Path, default=Path("./output"),
@@ -2762,19 +2768,16 @@ def _transfer_output_mapper(raw_mapper, raw_read_idx, last_remap,
                 raw_mapper.encoder.W_2.weight.data)
         return new_mapper, None
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Train a reduced differential KirchhoffNet."
-    )
-    _add_argparse_args(parser)
-    args = parser.parse_args()
-
     # input-norm-seed/Phase 1: reproducible seeding (RNG + cuDNN). The seed
     # is always printed so a random-seed run can be replayed via --seed.
     import random as _random
     if args.seed is None:
         args.seed = int(torch.randint(0, 2**31 - 1, (1,)).item())
     print(f"[train] seed={args.seed}")
+    # Tie small_world_seed to global seed for graph reproducibility by default.
+    # If --small-world-seed is not explicitly set (i.e. is None), inherit from --seed.
+    if args.small_world_seed is None:
+        args.small_world_seed = args.seed
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)

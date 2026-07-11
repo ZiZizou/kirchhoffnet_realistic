@@ -997,14 +997,51 @@ def make_friedman1_preset() -> dict:
     }
 
 
-def make_friedman2_preset() -> dict:
+def make_friedman2_preset(
+    hidden_family: str = "torus",
+    small_world_k: int = 4,
+    small_world_p: float = 0.3,
+    small_world_seed: int = 0,
+) -> dict:
     """Friedman #2 preset: 4-dim inputs with custom ranges, 4x4 torus.
 
     Each input lands on a distinct column (stride=4: nodes 0,4,8,12). With
     4 writes covering all 4 columns, reads use ``read_mode='dense'`` (full
     state) for the same reason as Friedman #1.
+
+    With ``hidden_family='small_world'`` the hidden topology is a Watts-Strogatz
+    small-world graph with parameters ``k``, ``p``, and ``seed``.
+
+    Args:
+        hidden_family: Topology family: ``"torus"`` or ``"small_world"``.
+        small_world_k: For ``hidden_family='small_world'`` only; even ring-lattice
+            degree (must be even and < 16).
+        small_world_p: For ``hidden_family='small_world'`` only; rewiring
+            probability in ``[0, 1]``.
+        small_world_seed: For ``hidden_family='small_world'`` only; RNG seed for
+            rewiring (deterministic graph).
     """
+    if hidden_family not in ("torus", "small_world"):
+        raise ValueError(f"hidden_family must be 'torus' or 'small_world', got {hidden_family!r}")
+    if hidden_family == "small_world":
+        if small_world_k < 2 or small_world_k % 2 != 0 or small_world_k >= 16:
+            raise ValueError(
+                f"small_world_k must be even, >=2, and <16 (num_hidden=16), got {small_world_k}"
+            )
+        if not (0.0 <= small_world_p <= 1.0):
+            raise ValueError(f"small_world_p must be in [0, 1], got {small_world_p}")
+
     num_hidden = 16
+    if hidden_family == "torus":
+        hidden_kwargs = {"height": 4, "width": 4, "kernel_size": 3, "bidirectional": False}
+    else:
+        hidden_kwargs = {
+            "k": small_world_k,
+            "p": small_world_p,
+            "seed": small_world_seed,
+            "bidirectional": False,
+        }
+
     return {
         "stages": [
             {
@@ -1012,8 +1049,8 @@ def make_friedman2_preset() -> dict:
                 "num_hidden": num_hidden,
                 "num_proj": 0,
                 "num_outputs": 0,
-                "hidden_family": "torus",
-                "hidden_kwargs": {"height": 4, "width": 4, "kernel_size": 3, "bidirectional": False},
+                "hidden_family": hidden_family,
+                "hidden_kwargs": hidden_kwargs,
                 "input_pattern": "all_to_all",
                 "output_pattern": "all_to_all",
                 "proj_pattern": "all_to_all",
@@ -1033,7 +1070,12 @@ def make_friedman2_preset() -> dict:
 
 
 def make_friedman3_preset() -> dict:
-    """Friedman #3 preset: same shape as #2, different target."""
+    """Friedman #3 preset: same shape as #2, different target.
+
+    For consistency with ``make_friedman2_preset()``, expose the same topology
+    options as defaults (torus with 4x4 hidden shape). Explicit overrides
+    are not available for friedman3 (kept simple).
+    """
     return make_friedman2_preset()
 
 

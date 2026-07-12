@@ -2768,6 +2768,13 @@ def _transfer_output_mapper(raw_mapper, raw_read_idx, last_remap,
                 raw_mapper.encoder.W_2.weight.data)
         return new_mapper, None
 
+def main():
+    parser = argparse.ArgumentParser(
+        description="Train a reduced differential KirchhoffNet."
+    )
+    _add_argparse_args(parser)
+    args = parser.parse_args()
+
     # input-norm-seed/Phase 1: reproducible seeding (RNG + cuDNN). The seed
     # is always printed so a random-seed run can be replayed via --seed.
     import random as _random

@@ -1197,6 +1197,7 @@ def topology_to_stage(
     write_idx: list[int] | None = None,
     leak_mode: str = "programmable",
     leak_constant: float | None = None,
+    read_only_source: bool = False,
 ) -> tuple[DifferentialStage, list[int], dict[int, int]]:
     """Convert a SparseTopology into a DifferentialStage.
 
@@ -1280,6 +1281,7 @@ def topology_to_stage(
         write_idx=write_idx,
         leak_mode=leak_mode,
         leak_constant=leak_constant,
+        read_only_source=read_only_source,
     )
     return stage, active_nodes, id_map
 
@@ -1301,6 +1303,7 @@ def build_net_from_preset(
     decoder_type: str | None = None,
     encoder_hidden_dim: int | None = None,
     decoder_hidden_dim: int | None = None,
+    read_only_source: bool = False,
 ):
     """Build a full KirchhoffNetWithIO from a config.PRESETS entry.
 
@@ -1358,6 +1361,7 @@ def build_net_from_preset(
         cfg, cell_lib=cell_lib, enable_drive=enable_drive,
         drive_mode=drive_mode,
         leak_mode=leak_mode, leak_constant=leak_constant,
+        read_only_source=read_only_source,
     )
 
 
@@ -1368,6 +1372,7 @@ def build_net_from_config(
     drive_mode: str = "fan_out",
     leak_mode: str | None = None,
     leak_constant: float | None = None,
+    read_only_source: bool = False,
 ):
     """Build a KirchhoffNetWithIO from a full config dict.
 
@@ -1519,6 +1524,7 @@ def build_net_from_config(
         stage, active_nodes, id_map = topology_to_stage(
             topo, cell_lib=cell_lib, write_idx=write_idx_arg if enable_drive else None,
             leak_mode=leak_mode, leak_constant=leak_constant,
+            read_only_source=read_only_source,
         )
         stage_modules.append(stage)
         stage_times.append(float(stages_cfg[stage_idx].get("t_span", 0.5)))

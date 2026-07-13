@@ -2449,6 +2449,14 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
         help="Competition axis: 'dst' (per-destination, default), 'src' "
              "(per-source), or 'both' (multiplicative).")
 
+    # --- Read-only source: decouple read (voltage sense) from write (current injection) ---
+    parser.add_argument(
+        "--read-only-source", action="store_true", default=False,
+        dest="read_only_source",
+        help="When set, OTA edges inject current into the destination node "
+             "without sourcing equal current from the source node. The source "
+             "node voltage is still read to compute the differential current.")
+
     # --- kirchhoff-noise: ADC/DAC quant + circuit noise (analog-noise parity) ---
     parser.add_argument(
         "--noise", dest="noise", action="store_true", default=False,
@@ -3039,7 +3047,8 @@ def main():
         encoder_type=args.encoder_type,
         decoder_type=args.decoder_type,
         encoder_hidden_dim=args.encoder_hidden_dim,
-        decoder_hidden_dim=args.decoder_hidden_dim)
+        decoder_hidden_dim=args.decoder_hidden_dim,
+        read_only_source=args.read_only_source)
     net.to(device)
     grid_label = (
         f" {args.grid_size}×{args.grid_size} grid,"

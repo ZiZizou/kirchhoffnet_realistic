@@ -83,10 +83,12 @@ class DifferentialStage(nn.Module):
         drive_isat: float | None = None,
         leak_mode: str = "programmable",
         leak_constant: float | None = None,
+        read_only_source: bool = False,
     ) -> None:
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.cell_lib = cell_lib
+        self.read_only_source = read_only_source
         if leak_mode not in ("programmable", "non-programmable"):
             raise ValueError(f"leak_mode must be 'programmable' or 'non-programmable', got {leak_mode!r}")
         self.leak_mode = leak_mode
@@ -389,7 +391,8 @@ class DifferentialStage(nn.Module):
         i_edge_f32 = i_edge.float()
         acc = torch.zeros_like(x, dtype=torch.float32)
         acc.index_add_(1, self.dst, i_edge_f32)
-        acc.index_add_(1, self.src, -i_edge_f32)
+        if not self.read_only_source:
+            acc.index_add_(1, self.src, -i_edge_f32)
         acc = acc.to(dtype=x.dtype)
 
         leak = self._effective_leak(leak_floor=leak_floor).unsqueeze(0)  # [1, N]

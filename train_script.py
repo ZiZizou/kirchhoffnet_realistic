@@ -2457,6 +2457,14 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "without sourcing equal current from the source node. The source "
              "node voltage is still read to compute the differential current.")
 
+    # --- Interstage activation: pointwise non-linearity between stages ---
+    parser.add_argument(
+        "--interstage-activation", choices=["none", "relu"], default="none",
+        dest="interstage_activation",
+        help="Pointwise non-linearity applied to the state vector between "
+             "stages. 'none' (default) keeps the transfer as a pure "
+             "identity/truncate/pad. 'relu' applies ReLU on each node.")
+
     # --- kirchhoff-noise: ADC/DAC quant + circuit noise (analog-noise parity) ---
     parser.add_argument(
         "--noise", dest="noise", action="store_true", default=False,
@@ -3048,7 +3056,8 @@ def main():
         decoder_type=args.decoder_type,
         encoder_hidden_dim=args.encoder_hidden_dim,
         decoder_hidden_dim=args.decoder_hidden_dim,
-        read_only_source=args.read_only_source)
+        read_only_source=args.read_only_source,
+        interstage_activation=args.interstage_activation)
     net.to(device)
     grid_label = (
         f" {args.grid_size}×{args.grid_size} grid,"

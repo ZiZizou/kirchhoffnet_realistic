@@ -1131,7 +1131,9 @@ def prune_network(
     new_transfers = []
     from stage_transfer import StageTransfer
     for i in range(len(new_stages) - 1):
-        new_transfers.append(StageTransfer(new_widths[i], new_widths[i + 1]))
+        activation = getattr(net.transfers[i], 'activation', 'none')
+        new_transfers.append(StageTransfer(new_widths[i], new_widths[i + 1],
+                                           activation=activation))
 
     return KirchhoffNet(
         stages=new_stages,
@@ -1304,6 +1306,7 @@ def build_net_from_preset(
     encoder_hidden_dim: int | None = None,
     decoder_hidden_dim: int | None = None,
     read_only_source: bool = False,
+    interstage_activation: str = "none",
 ):
     """Build a full KirchhoffNetWithIO from a config.PRESETS entry.
 
@@ -1362,6 +1365,7 @@ def build_net_from_preset(
         drive_mode=drive_mode,
         leak_mode=leak_mode, leak_constant=leak_constant,
         read_only_source=read_only_source,
+        interstage_activation=interstage_activation,
     )
 
 
@@ -1373,6 +1377,7 @@ def build_net_from_config(
     leak_mode: str | None = None,
     leak_constant: float | None = None,
     read_only_source: bool = False,
+    interstage_activation: str = "none",
 ):
     """Build a KirchhoffNetWithIO from a full config dict.
 
@@ -1537,7 +1542,8 @@ def build_net_from_config(
             next_active = sorted(
                 set(next_topo.hidden_node_ids + next_topo.proj_node_ids)
             )
-            transfers.append(StageTransfer(len(active_nodes), len(next_active)))
+            transfers.append(StageTransfer(len(active_nodes), len(next_active),
+                                           activation=interstage_activation))
 
     core = KirchhoffNet(
         stages=stage_modules,

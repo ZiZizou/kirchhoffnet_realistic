@@ -2459,14 +2459,24 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
 
     # --- Interstage activation: pointwise non-linearity between stages ---
     parser.add_argument(
-        "--interstage-activation", choices=["none", "relu", "residual"],
+        "--interstage-activation",
+        choices=["none", "relu", "residual", "residual_mixing"],
         default="none", dest="interstage_activation",
         help="Pointwise non-linearity applied to the state vector between "
              "stages. 'none' (default) keeps the transfer as a pure "
              "identity/truncate/pad. 'relu' applies ReLU on each node. "
              "'residual' uses a per-node learnable W1*x + W2*tanh(x); "
-             "persistently driven nodes bypass the residual and pass "
-             "through as identity.")
+             "'residual_mixing' adds an additive zero-initialized mixing "
+             "term that can mix signals across nodes. Persistently driven "
+             "nodes bypass the transform and pass through as identity.")
+    parser.add_argument(
+        "--interstage-residual-rank", type=int, default=-1,
+        dest="interstage_residual_rank",
+        help="Rank of the additive mixing term when "
+             "--interstage-activation=residual_mixing. -1 (default) or any "
+             "value >= out_nodes = full N×N matrix. 0 = pure diagonal "
+             "(equivalent to 'residual'). 1..N-1 = low-rank factorization "
+             "with N×r and r×N factors. Ignored for other activation modes.")
 
     # --- kirchhoff-noise: ADC/DAC quant + circuit noise (analog-noise parity) ---
     parser.add_argument(
@@ -3060,7 +3070,8 @@ def main():
         encoder_hidden_dim=args.encoder_hidden_dim,
         decoder_hidden_dim=args.decoder_hidden_dim,
         read_only_source=args.read_only_source,
-        interstage_activation=args.interstage_activation)
+        interstage_activation=args.interstage_activation,
+        interstage_residual_rank=args.interstage_residual_rank)
     net.to(device)
     grid_label = (
         f" {args.grid_size}×{args.grid_size} grid,"

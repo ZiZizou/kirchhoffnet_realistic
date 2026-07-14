@@ -1132,12 +1132,14 @@ def prune_network(
     from stage_transfer import StageTransfer
     for i in range(len(new_stages) - 1):
         activation = getattr(net.transfers[i], 'activation', 'none')
+        residual_rank = getattr(net.transfers[i], 'residual_rank', -1)
         drive_indices = None
         if hasattr(new_stages[i], '_has_drive') and new_stages[i]._has_drive:
             drive_indices = new_stages[i]._drive_idx.tolist()
         new_transfers.append(StageTransfer(new_widths[i], new_widths[i + 1],
                                            activation=activation,
-                                           drive_mask=drive_indices))
+                                           drive_mask=drive_indices,
+                                           residual_rank=residual_rank))
 
     return KirchhoffNet(
         stages=new_stages,
@@ -1311,6 +1313,7 @@ def build_net_from_preset(
     decoder_hidden_dim: int | None = None,
     read_only_source: bool = False,
     interstage_activation: str = "none",
+    interstage_residual_rank: int = -1,
 ):
     """Build a full KirchhoffNetWithIO from a config.PRESETS entry.
 
@@ -1370,6 +1373,7 @@ def build_net_from_preset(
         leak_mode=leak_mode, leak_constant=leak_constant,
         read_only_source=read_only_source,
         interstage_activation=interstage_activation,
+        interstage_residual_rank=interstage_residual_rank,
     )
 
 
@@ -1382,6 +1386,7 @@ def build_net_from_config(
     leak_constant: float | None = None,
     read_only_source: bool = False,
     interstage_activation: str = "none",
+    interstage_residual_rank: int = -1,
 ):
     """Build a KirchhoffNetWithIO from a full config dict.
 
@@ -1551,7 +1556,8 @@ def build_net_from_config(
             )
             transfers.append(StageTransfer(len(active_nodes), len(next_active),
                                            activation=interstage_activation,
-                                           drive_mask=transfer_drive_mask))
+                                           drive_mask=transfer_drive_mask,
+                                           residual_rank=interstage_residual_rank))
 
     core = KirchhoffNet(
         stages=stage_modules,

@@ -67,6 +67,12 @@ class DifferentialStage(nn.Module):
             When ``None``, defaults to ``config.INIT["leak_constant"]``
             (0.0486, matching ``softplus(raw_leak_init)``). Ignored when
             ``leak_mode="programmable"``.
+        freeze_read: When ``True``, edge currents (cell_lib output, edge gate,
+            budget gate, and KCL scatter-add) are computed **once** at the
+            start of the stage from the initial state ``x0`` and held constant
+            throughout all Heun / DEQ sub-iterations. Leak, clip, and drive
+            current still read the evolving ``x`` at each step. Default
+            ``False`` (standard behavior: read and write at the same time).
     """
 
     def __init__(
@@ -84,11 +90,13 @@ class DifferentialStage(nn.Module):
         leak_mode: str = "programmable",
         leak_constant: float | None = None,
         read_only_source: bool = False,
+        freeze_read: bool = False,
     ) -> None:
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.cell_lib = cell_lib
         self.read_only_source = read_only_source
+        self.freeze_read = bool(freeze_read)
         if leak_mode not in ("programmable", "non-programmable"):
             raise ValueError(f"leak_mode must be 'programmable' or 'non-programmable', got {leak_mode!r}")
         self.leak_mode = leak_mode
@@ -353,47 +361,60 @@ class DifferentialStage(nn.Module):
 
     def rhs(self, x: torch.Tensor,
             x_drive: torch.Tensor | None = None, drive_scale: float = 0.0,
-            leak_floor: float | None = None) -> torch.Tensor:
+            leak_floor: float | None = None,
+            i_edge_const: torch.Tensor | None = None) -> torch.Tensor:
         """Compute dx/dt at state x. x: [batch, num_nodes].
 
         Gate application:
         - Edge gate: i_edge *= sigmoid(z_logits) — multiplies the edge current
           after cell-library evaluation. When z_e -> 0 the edge contributes
           zero current.
+
+        When ``i_edge_const`` is provided (the ``freeze_read=True`` path), the
+        cell_lib evaluation, edge gate, budget gate, and KCL scatter-add are
+        skipped — the provided ``[batch, num_nodes]`` tensor is used directly
+        as the KCL contribution. Leak, clip, and drive current are still
+        computed from the current ``x``.
         """
-        x_src = x[:, self.src]
-        x_dst = x[:, self.dst]
+        if i_edge_const is None:
+            x_src = x[:, self.src]
+            x_dst = x[:, self.dst]
 
-        i_edge = self.cell_lib(
-            x_src=x_src,
-            x_dst=x_dst,
-            x_max=self.x_max,
-        )
+            i_edge = self.cell_lib(
+                x_src=x_src,
+                x_dst=x_dst,
+                x_max=self.x_max,
+            )
 
-        # Edge gate: multiply each edge's current by its gate.
-        edge_mask = torch.sigmoid(self.z_logits)  # [E]
-        # Degree budget / top-k competition (degree-budget-topk plan).
-        # Budget gate is layered on top of the sigmoid gate: independent
-        # per-edge gate * competitive per-destination (or per-source) mask.
-        # When budget is disabled (budget_frac=0) the budget gate is all-ones
-        # and this multiplication is a no-op.
-        if self.budget_enabled:
-            budget_gate = self._compute_budget_gate()  # [E]
-            edge_mask = edge_mask * budget_gate
-        i_edge = i_edge * edge_mask.unsqueeze(0)  # [B, E]
+            # Edge gate: multiply each edge's current by its gate.
+            edge_mask = torch.sigmoid(self.z_logits)  # [E]
+            # Degree budget / top-k competition (degree-budget-topk plan).
+            # Budget gate is layered on top of the sigmoid gate: independent
+            # per-edge gate * competitive per-destination (or per-source) mask.
+            # When budget is disabled (budget_frac=0) the budget gate is all-ones
+            # and this multiplication is a no-op.
+            if self.budget_enabled:
+                budget_gate = self._compute_budget_gate()  # [E]
+                edge_mask = edge_mask * budget_gate
+            i_edge = i_edge * edge_mask.unsqueeze(0)  # [B, E]
 
-        # KCL scatter-add: accumulate in float32 for AMP robustness.
-        # Under torch.autocast the node/edge gate multiplications promote
-        # i_edge to fp32 even when x is fp16, so x.new_zeros() creates a
-        # Half accumulator while the source is Float → index_add_ error.
-        # Accumulating in float32 then casting back to x.dtype is safe and
-        # numerically preferable for scatter operations.
-        i_edge_f32 = i_edge.float()
-        acc = torch.zeros_like(x, dtype=torch.float32)
-        acc.index_add_(1, self.dst, i_edge_f32)
-        if not self.read_only_source:
-            acc.index_add_(1, self.src, -i_edge_f32)
-        acc = acc.to(dtype=x.dtype)
+            # KCL scatter-add: accumulate in float32 for AMP robustness.
+            # Under torch.autocast the node/edge gate multiplications promote
+            # i_edge to fp32 even when x is fp16, so x.new_zeros() creates a
+            # Half accumulator while the source is Float → index_add_ error.
+            # Accumulating in float32 then casting back to x.dtype is safe and
+            # numerically preferable for scatter operations.
+            i_edge_f32 = i_edge.float()
+            acc = torch.zeros_like(x, dtype=torch.float32)
+            acc.index_add_(1, self.dst, i_edge_f32)
+            if not self.read_only_source:
+                acc.index_add_(1, self.src, -i_edge_f32)
+            acc = acc.to(dtype=x.dtype)
+        else:
+            # Frozen path: i_edge_const is the precomputed KCL contribution
+            # [batch, num_nodes] in x's dtype. No cell_lib, edge gate, or
+            # scatter-add happens here.
+            acc = i_edge_const
 
         leak = self._effective_leak(leak_floor=leak_floor).unsqueeze(0)  # [1, N]
         leak_term = leak * x
@@ -478,13 +499,34 @@ class DifferentialStage(nn.Module):
         num_steps = int(num_steps if num_steps is not None else SOLVER["num_steps"])
         dt = t_span / float(num_steps)
 
+        # freeze_read: precompute edge currents (cell_lib + edge gate + budget
+        # gate + KCL scatter-add) once from x0 and hold them constant across
+        # all sub-steps. Leak, clip, and drive still read the current x.
+        i_edge_const = None
+        if self.freeze_read:
+            x_src0 = x0[:, self.src]
+            x_dst0 = x0[:, self.dst]
+            i_edge = self.cell_lib(x_src=x_src0, x_dst=x_dst0, x_max=self.x_max)
+            edge_mask = torch.sigmoid(self.z_logits)
+            if self.budget_enabled:
+                edge_mask = edge_mask * self._compute_budget_gate()
+            i_edge = i_edge * edge_mask.unsqueeze(0)
+            i_edge_f32 = i_edge.float()
+            acc_const = torch.zeros_like(x0, dtype=torch.float32)
+            acc_const.index_add_(1, self.dst, i_edge_f32)
+            if not self.read_only_source:
+                acc_const.index_add_(1, self.src, -i_edge_f32)
+            i_edge_const = acc_const.to(dtype=x0.dtype)
+
         x = x0
         traj_chunks = [x] if store_trajectory else None
 
         for _ in range(num_steps):
-            k1 = self.rhs(x, x_drive=x_drive, drive_scale=drive_scale)
+            k1 = self.rhs(x, x_drive=x_drive, drive_scale=drive_scale,
+                          i_edge_const=i_edge_const)
             x_pred = x + dt * k1
-            k2 = self.rhs(x_pred, x_drive=x_drive, drive_scale=drive_scale)
+            k2 = self.rhs(x_pred, x_drive=x_drive, drive_scale=drive_scale,
+                          i_edge_const=i_edge_const)
             x = x + 0.5 * dt * (k1 + k2)
             if store_trajectory:
                 traj_chunks.append(x)
@@ -518,12 +560,32 @@ class DifferentialStage(nn.Module):
         lf = float(cfg.get("leak_floor", 0.0))
         dt = float(cfg.get("deq_step", 0.1))
 
+        # freeze_read: precompute edge currents (cell_lib + edge gate + budget
+        # gate + KCL scatter-add) once from x0 and hold them constant across
+        # all fixed-point iterations.
+        i_edge_const = None
+        if self.freeze_read:
+            x_src0 = x0[:, self.src]
+            x_dst0 = x0[:, self.dst]
+            i_edge = self.cell_lib(x_src=x_src0, x_dst=x_dst0, x_max=self.x_max)
+            edge_mask = torch.sigmoid(self.z_logits)
+            if self.budget_enabled:
+                edge_mask = edge_mask * self._compute_budget_gate()
+            i_edge = i_edge * edge_mask.unsqueeze(0)
+            i_edge_f32 = i_edge.float()
+            acc_const = torch.zeros_like(x0, dtype=torch.float32)
+            acc_const.index_add_(1, self.dst, i_edge_f32)
+            if not self.read_only_source:
+                acc_const.index_add_(1, self.src, -i_edge_f32)
+            i_edge_const = acc_const.to(dtype=x0.dtype)
+
         self.set_leak_floor(lf)
         try:
             def phi(x):
                 return x + dt * self.rhs(x,
                                         x_drive=x_drive, drive_scale=drive_scale,
-                                        leak_floor=lf)
+                                        leak_floor=lf,
+                                        i_edge_const=i_edge_const)
 
             x_star, info = solve_equilibrium(phi, x0, cfg)
             self.last_deq_info = {

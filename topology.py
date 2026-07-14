@@ -718,6 +718,7 @@ def prune_stage(
     prune_nodes_by_gate: bool = False,
     leak_mode: str = "programmable",
     leak_constant: float | None = None,
+    freeze_read: bool | None = None,
 ) -> tuple["DifferentialStage", dict[int, int]]:
     """Rebuild a DifferentialStage with edges and nodes removed.
 
@@ -985,6 +986,7 @@ def prune_stage(
         write_idx=new_write_idx,
         leak_mode=leak_mode,
         leak_constant=leak_constant,
+        freeze_read=stage.freeze_read if freeze_read is None else freeze_read,
     )
 
     if transfer_params:
@@ -1064,6 +1066,7 @@ def prune_network(
     read_idx: list[int] | None = None,
     min_read_nodes: int = 1,
     prune_nodes_by_gate: bool = False,
+    freeze_read: bool | None = None,
 ) -> tuple["KirchhoffNet", list[dict[int, int]]]:
     """Apply prune_stage to every stage of a KirchhoffNet core.
 
@@ -1124,6 +1127,7 @@ def prune_network(
             protected_nodes=protected,
             min_read_nodes=min_read_nodes,
             prune_nodes_by_gate=prune_nodes_by_gate,
+            freeze_read=freeze_read,
         )
         new_stages.append(new_s)
         stage_remaps.append(remap)
@@ -1206,6 +1210,7 @@ def topology_to_stage(
     leak_mode: str = "programmable",
     leak_constant: float | None = None,
     read_only_source: bool = False,
+    freeze_read: bool = False,
 ) -> tuple[DifferentialStage, list[int], dict[int, int]]:
     """Convert a SparseTopology into a DifferentialStage.
 
@@ -1222,6 +1227,9 @@ def topology_to_stage(
             or a fixed constant.
         leak_constant: Fixed leak value when ``leak_mode="non-programmable"``.
             ``None`` uses ``config.INIT["leak_constant"]``.
+        freeze_read: When ``True``, edge currents are computed once from the
+            initial state and held constant across all Heun / DEQ iterations
+            inside the stage. Forwarded to ``DifferentialStage``.
 
     Returns:
         stage: DifferentialStage
@@ -1290,6 +1298,7 @@ def topology_to_stage(
         leak_mode=leak_mode,
         leak_constant=leak_constant,
         read_only_source=read_only_source,
+        freeze_read=freeze_read,
     )
     return stage, active_nodes, id_map
 
@@ -1314,6 +1323,7 @@ def build_net_from_preset(
     read_only_source: bool = False,
     interstage_activation: str = "none",
     interstage_residual_rank: int = -1,
+    freeze_read: bool = False,
 ):
     """Build a full KirchhoffNetWithIO from a config.PRESETS entry.
 
@@ -1347,6 +1357,9 @@ def build_net_from_preset(
     * encoder_hidden_dim / decoder_hidden_dim: hidden width of the
                     ResidualTanhEncoder tanh branch (default 64). Only
                     used when the corresponding type is "residual_tanh".
+    * freeze_read: When ``True``, edge currents are computed once from the
+                    initial state and held constant across all Heun / DEQ
+                    iterations inside every stage. Defaults to ``False``.
     """
     if preset_name not in PRESETS:
         raise KeyError(f"Unknown preset: {preset_name!r}. Available: {list(PRESETS)}")
@@ -1367,6 +1380,8 @@ def build_net_from_preset(
         cfg["encoder_hidden_dim"] = int(encoder_hidden_dim)
     if decoder_hidden_dim is not None:
         cfg["decoder_hidden_dim"] = int(decoder_hidden_dim)
+    if freeze_read:
+        cfg["freeze_read"] = True
     return build_net_from_config(
         cfg, cell_lib=cell_lib, enable_drive=enable_drive,
         drive_mode=drive_mode,
@@ -1374,6 +1389,7 @@ def build_net_from_preset(
         read_only_source=read_only_source,
         interstage_activation=interstage_activation,
         interstage_residual_rank=interstage_residual_rank,
+        freeze_read=freeze_read,
     )
 
 
@@ -1387,6 +1403,7 @@ def build_net_from_config(
     read_only_source: bool = False,
     interstage_activation: str = "none",
     interstage_residual_rank: int = -1,
+    freeze_read: bool = False,
 ):
     """Build a KirchhoffNetWithIO from a full config dict.
 
@@ -1397,6 +1414,9 @@ def build_net_from_config(
     ``drive_mode`` ("fan_out" | "projection") controls per-stage drive
     mapper architecture when ``enable_drive=True``. See build_net_from_preset
     for details.
+
+    ``freeze_read`` can be specified either explicitly or via
+    ``cfg['freeze_read']``. Explicit kwargs take precedence.
 
     ``encoder_type`` / ``decoder_type`` ("linear" | "residual_tanh")
     select non-linear encoder/decoder variants built on top of
@@ -1409,6 +1429,7 @@ def build_net_from_config(
         leak_mode = cfg.get("leak_mode", "programmable")
     if leak_constant is None:
         leak_constant = cfg.get("leak_constant", None)
+    freeze_read = bool(cfg.get("freeze_read", freeze_read))
     if drive_mode not in ("fan_out", "projection"):
         raise ValueError(
             f"drive_mode must be 'fan_out' or 'projection', got {drive_mode!r}"
@@ -1539,6 +1560,7 @@ def build_net_from_config(
             topo, cell_lib=cell_lib, write_idx=write_idx_arg if enable_drive else None,
             leak_mode=leak_mode, leak_constant=leak_constant,
             read_only_source=read_only_source,
+            freeze_read=freeze_read,
         )
         stage_modules.append(stage)
         stage_times.append(float(stages_cfg[stage_idx].get("t_span", 0.5)))

@@ -2457,6 +2457,13 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "without sourcing equal current from the source node. The source "
              "node voltage is still read to compute the differential current.")
 
+    parser.add_argument(
+        "--freeze-read", dest="freeze_read", action="store_true", default=False,
+        help="Compute edge currents once from the initial state and hold them "
+             "constant across all Heun/DEQ iterations inside every stage. "
+             "Disentangles node-voltage reads from same-step writes "
+             "(experimental).")
+
     # --- Interstage activation: pointwise non-linearity between stages ---
     parser.add_argument(
         "--interstage-activation",
@@ -3070,6 +3077,7 @@ def main():
         encoder_hidden_dim=args.encoder_hidden_dim,
         decoder_hidden_dim=args.decoder_hidden_dim,
         read_only_source=args.read_only_source,
+        freeze_read=args.freeze_read,
         interstage_activation=args.interstage_activation,
         interstage_residual_rank=args.interstage_residual_rank)
     net.to(device)

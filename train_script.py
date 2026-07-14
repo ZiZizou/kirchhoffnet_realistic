@@ -2459,11 +2459,14 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
 
     # --- Interstage activation: pointwise non-linearity between stages ---
     parser.add_argument(
-        "--interstage-activation", choices=["none", "relu"], default="none",
-        dest="interstage_activation",
+        "--interstage-activation", choices=["none", "relu", "residual"],
+        default="none", dest="interstage_activation",
         help="Pointwise non-linearity applied to the state vector between "
              "stages. 'none' (default) keeps the transfer as a pure "
-             "identity/truncate/pad. 'relu' applies ReLU on each node.")
+             "identity/truncate/pad. 'relu' applies ReLU on each node. "
+             "'residual' uses a per-node learnable W1*x + W2*tanh(x); "
+             "persistently driven nodes bypass the residual and pass "
+             "through as identity.")
 
     # --- kirchhoff-noise: ADC/DAC quant + circuit noise (analog-noise parity) ---
     parser.add_argument(

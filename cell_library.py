@@ -223,9 +223,14 @@ class RealisticTanhUpgradeLibrary(nn.Module):
 class FreeTanhLibrary(nn.Module):
     """Per-edge signed-realistic tanh device with independent A/B and STE sign.
 
-    Per-edge formula::
+    Per-edge formula (leaky tanh)::
 
-        I = I_sat * tanh(gm * (s * (A * Vsrc - B * Vdest) + theta))
+        u = gm * (s * (A * Vsrc - B * Vdest) + theta)
+        I = I_sat * (tanh(u) + ALPHA * u)
+
+    The ``ALPHA * u`` linear term guarantees a non-zero gradient even when
+    ``tanh(u)`` is saturated (gradient floor = ``ALPHA``), so the cell never
+    becomes a flat plateau for backward signal.
 
     Parameterization (all per-edge, shape ``[E]``):
       - ``a_raw``   → A = softplus(a_raw), A >= 0, no upper bound, independent of B.
@@ -238,6 +243,11 @@ class FreeTanhLibrary(nn.Module):
     Boundary defaults come from ``config.TANH_REALISTIC_*``.
     Compliance gating applied after tanh.
     """
+
+    # Leaky tanh slope: output = Isat * (tanh(u) + ALPHA * u). Sets the
+    # minimum gradient magnitude so backward signal never vanishes in
+    # saturation. Mirrors the LeakyReLU default of 0.01.
+    ALPHA = 0.01
 
     def __init__(
         self,
@@ -291,7 +301,7 @@ class FreeTanhLibrary(nn.Module):
         isat = (self.isat_min + (self.isat_max - self.isat_min) * sig_isat).clamp_min(1e-6)  # [E]
         theta = self.theta_raw.unsqueeze(0) if self._bias_enabled else 0.0
         u = (s_ste.unsqueeze(0) * (A * x_src - B * x_dst) + theta) * gm.unsqueeze(0)
-        i_cell = isat.unsqueeze(0) * torch.tanh(u)
+        i_cell = isat.unsqueeze(0) * (torch.tanh(u) + self.ALPHA * u)
 
         gate_src = torch.sigmoid((x_max - x_src.abs()) / self._beta_softness)
         gate_dst = torch.sigmoid((x_max - x_dst.abs()) / self._beta_softness)

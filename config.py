@@ -364,6 +364,9 @@ LAMBDAS = {
     "power": 1e-6,
     "capacitance": 0.0,     # DEPRECATED (deprecate-node-gates)
     "entropy": 1e-4,
+    # tanh saturation penalty for FreeTanhLibrary edges: mean(tanh(u)^2) over edges,
+    # penalizes edges operating in the saturated region of tanh.
+    "tanh_sat": 0.0,
 }
 
 # Pruning thresholds for the overprovision-then-prune pipeline (CP-5).
@@ -415,6 +418,7 @@ SCHEDULE_THREE_PHASE = {
         "node_gate": 0.0,        # DEPRECATED (deprecate-node-gates)
         "power": 1e-6,
         "capacitance": 0.0,      # DEPRECATED (deprecate-node-gates)
+        "tanh_sat": 0.0,
     },
     # Phase C retrain lambdas: gate penalties off (irrelevant post-prune),
     # tiny sparsity for crisp cell family, rail unchanged.
@@ -424,6 +428,7 @@ SCHEDULE_THREE_PHASE = {
         "node_gate": 0.0,        # DEPRECATED (deprecate-node-gates)
         "power": 0.0,
         "capacitance": 0.0,      # DEPRECATED (deprecate-node-gates)
+        "tanh_sat": 0.0,
     },
     # Prune thresholds used at the Phase B->C boundary.
     # four-phase-redesign/1a: edge 0.1 -> 0.05 (gentler cut, retains more
@@ -457,17 +462,20 @@ SCHEDULE_FOUR_PHASE = {
     # deprecate-node-gates: node_gate/capacitance default to 0.0 via .get.
     "lambdas_b1": {
         "sparsity": 5e-5,
-        "power": 1e-4
+        "power": 1e-4,
+        "tanh_sat": 0.0,
     },
     # Phase B2 lambdas: sparsity + edge_gate. No node_gate (DEPRECATED).
     "lambdas_b2": {
         "sparsity": 5e-5,
         "edge_gate": 0,
-        "power": 1e-5
+        "power": 1e-5,
+        "tanh_sat": 0.0,
     },
     # Phase C retrain lambdas: tiny sparsity for crisp cell family.
     "lambdas_c": {
         "sparsity": 1e-5,
+        "tanh_sat": 0.0,
     },
     # Warmup within each compress phase: ramp from 0 to full over this fraction.
     "warmup_frac_b1": 0.25,

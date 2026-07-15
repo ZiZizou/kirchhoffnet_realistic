@@ -352,13 +352,13 @@ def _apply_ablation_set(args, schedule_mode: str) -> None:
         # we mutate the schedule dict in place for the run duration
         # (a non-invasive in-memory override).
         from config import SCHEDULE_THREE_PHASE
-        for k in ("sparsity", "edge_gate", "node_gate", "power", "capacitance"):
+        for k in ("sparsity", "edge_gate", "node_gate", "power", "capacitance", "tanh_sat"):
             if k in SCHEDULE_THREE_PHASE.get("lambdas_b", {}):
                 SCHEDULE_THREE_PHASE["lambdas_b"][k] = 0.0
         from config import SCHEDULE_FOUR_PHASE
         for phase_key in ("lambdas_b1", "lambdas_b2"):
             if phase_key in SCHEDULE_FOUR_PHASE:
-                for k in ("sparsity", "edge_gate", "power", "capacitance"):
+                for k in ("sparsity", "edge_gate", "power", "capacitance", "tanh_sat"):
                     if k in SCHEDULE_FOUR_PHASE[phase_key]:
                         SCHEDULE_FOUR_PHASE[phase_key][k] = 0.0
         print(
@@ -2540,6 +2540,14 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
         "--no-normalize-inputs", dest="normalize_inputs", action="store_false",
         help="Disable per-dim input normalization (ablation against the "
              "default normalized mode).")
+    parser.add_argument(
+        "--tanh-sat-lambda", type=float, default=None,
+        dest="tanh_sat_lambda",
+        help="Tanh-saturation penalty weight for FreeTanhLibrary edges: "
+             "λ * mean_over_edges(tanh(u)^2), where u is the per-edge tanh "
+             "argument. Discourages edges from operating in the saturated "
+             "region of tanh unless necessary. Set to 0 to disable. "
+             "Default: None (use config.LAMBDAS['tanh_sat'], currently 0.0).")
 
 # ----------------------------------------------------------------
 # Pruning helpers (PIT): transferable I/O mapper reconstruction.
@@ -2841,6 +2849,9 @@ def main():
 
     out_dir = _ensure_dir(args.output.resolve())
     lambdas = _resolve_lambdas(args.problem)
+    if getattr(args, "tanh_sat_lambda", None) is not None:
+        lambdas["tanh_sat"] = float(args.tanh_sat_lambda)
+        print(f"[train] tanh_sat lambda overridden via CLI: {lambdas['tanh_sat']}")
     schedule_mode = _resolve_schedule(args.problem, args.schedule)
     # four-phase-redesign/Phase 1c: apply diagnostic ablation preset
     # overrides BEFORE any other flag is consumed (e.g. before the

@@ -103,33 +103,85 @@ def _stage_rail_loss(stage, traj: torch.Tensor) -> torch.Tensor:
     return excess.pow(2).mean()
 
 
+def _stage_tanh_sat_loss(stage, traj: torch.Tensor) -> torch.Tensor:
+    """Mean over (batch, edges, time) of tanh(u)^2 for FreeTanhLibrary stages.
+
+    Penalizes edges whose tanh input magnitude is large (operating in the
+    saturated region of tanh, where the cell output is near ±Isat and small
+    input changes produce negligible output changes). Returns zero for stages
+    whose cell library is not a ``FreeTanhLibrary``.
+
+    The tanh input ``u`` is recomputed from the library's effective parameters
+    and the per-step trajectory voltages:
+
+        u = gm * (s * (A * Vsrc - B * Vdest) + theta)
+
+    Args:
+        stage: ``DifferentialStage`` with a ``cell_lib`` attribute.
+        traj: ``[batch, num_nodes, num_steps+1]`` node-voltage trajectory.
+
+    Returns:
+        Scalar tensor equal to ``tanh(u).pow(2).mean()`` over (batch, edges,
+        time). Returns 0 for non-``FreeTanhLibrary`` stages.
+    """
+    lib = stage.cell_lib
+    if not isinstance(lib, FreeTanhLibrary):
+        return traj.new_zeros(())
+    if stage.src.numel() == 0:
+        return traj.new_zeros(())
+
+    A = F.softplus(lib.a_raw).unsqueeze(0).unsqueeze(-1)        # [1, E, 1]
+    B = F.softplus(lib.b_raw).unsqueeze(0).unsqueeze(-1)        # [1, E, 1]
+    s = torch.sign(lib.s_raw)
+    s_ste = s + lib.s_raw - lib.s_raw.detach()                  # [E]
+    sig_gm = torch.sigmoid(lib.gm_raw)
+    gm = lib.gm_min + (lib.gm_max - lib.gm_min) * sig_gm        # [E]
+    gm_e = gm.unsqueeze(0).unsqueeze(-1)                        # [1, E, 1]
+
+    # traj: [B, N, T] -> gather per-edge src/dst voltages -> [B, E, T]
+    x_src = traj.index_select(1, stage.src)
+    x_dst = traj.index_select(1, stage.dst)
+
+    pre = s_ste.unsqueeze(0).unsqueeze(-1) * (A * x_src - B * x_dst)
+    if lib._bias_enabled:
+        theta = lib.theta_raw.unsqueeze(0).unsqueeze(-1)        # [1, E, 1]
+        pre = pre + theta
+    u = gm_e * pre                                              # [B, E, T]
+
+    return torch.tanh(u).pow(2).mean()
+
+
 def _compute_regularizers(
     net: KirchhoffNetWithIO | KirchhoffNet,
     trajs: list[torch.Tensor],
     lambdas: dict,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Shared regularizer computation: edge_gate, power, rail.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Shared regularizer computation: edge_gate, rail, tanh_sat.
 
     Complexity terms:
       - edge_gate   : Σ_e σ(z_logits)                  (active edge count)
+      - rail        : ReLU²(|x| - x_max).mean()        (voltage excursion)
+      - tanh_sat    : tanh(u)².mean()                  (FreeTanhLibrary saturation)
 
-    Returns ``(loss_edge_gate, loss_power, loss_rail)``.
+    Returns ``(loss_edge_gate, loss_rail, loss_tanh_sat)``.
     """
     stages = net.core.stages if isinstance(net, KirchhoffNetWithIO) else net.stages
-    loss_edge_gate = loss_rail = trajs[0].new_zeros(())
+    loss_edge_gate = loss_rail = loss_tanh_sat = trajs[0].new_zeros(())
     for stage, traj in zip(stages, trajs):
         z = _stage_edge_gates(stage)
 
         loss_edge_gate = loss_edge_gate + z.sum()
         loss_rail = loss_rail + _stage_rail_loss(stage, traj)
+        loss_tanh_sat = loss_tanh_sat + _stage_tanh_sat_loss(stage, traj)
 
-    return (loss_edge_gate, loss_rail)
+    return (loss_edge_gate, loss_rail, loss_tanh_sat)
 
 
 # ---------- regularizer warm-up schedule (RR-A + CP) ----------
 
 _REG_KEYS = (
     "edge_gate",
+    "tanh_sat",
 )
 
 
@@ -159,7 +211,7 @@ def reg_schedule(epoch: int, *, warmup: int | None = None, anneal: int | None = 
 
 
 def apply_reg_schedule(lambdas: dict, epoch: int, **kw) -> dict:
-    """Return a copy of ``lambdas`` with ``edge_gate`` scaled by
+    """Return a copy of ``lambdas`` with each ``_REG_KEYS`` entry scaled by
     ``reg_schedule(epoch)``. ``rail`` is left untouched."""
     scale = reg_schedule(epoch, **kw)
     out = dict(lambdas)
@@ -567,16 +619,20 @@ def compute_loss(
                 return loss_task, zero, {"task": float(loss_task.item())}
             return loss_task, zero
 
-        loss_edge_gate, loss_rail = _compute_regularizers(net, trajs, lambdas)
+        loss_edge_gate, loss_rail, loss_tanh_sat = _compute_regularizers(net, trajs, lambdas)
 
         total_task = loss_task + float(lambdas.get("rail", 0.0)) * loss_rail
-        structural = reg_scale * float(lambdas.get("edge_gate", 0.0)) * loss_edge_gate
+        structural = reg_scale * (
+            float(lambdas.get("edge_gate", 0.0)) * loss_edge_gate
+            + float(lambdas.get("tanh_sat", 0.0)) * loss_tanh_sat
+        )
 
     if return_parts:
         parts = {
             "task": float(loss_task.item()) if torch.is_tensor(loss_task) else float(loss_task),
             "edge_gate": float(loss_edge_gate.item()),
             "rail": float(loss_rail.item()),
+            "tanh_sat": float(loss_tanh_sat.item()),
             "reg_scale": float(reg_scale),
             "total": float((total_task + structural).item()),
         }
@@ -663,13 +719,16 @@ def compute_solver_loss(
                 }
             return loss_task, loss_task.new_zeros(())
 
-        loss_edge_gate, loss_rail = _compute_regularizers(net, trajs, lambdas)
+        loss_edge_gate, loss_rail, loss_tanh_sat = _compute_regularizers(net, trajs, lambdas)
 
         total_task = (
             loss_task
             + float(lambdas.get("rail", 0.0)) * loss_rail
         )
-        structural = reg_scale * float(lambdas.get("edge_gate", 0.0)) * loss_edge_gate
+        structural = reg_scale * (
+            float(lambdas.get("edge_gate", 0.0)) * loss_edge_gate
+            + float(lambdas.get("tanh_sat", 0.0)) * loss_tanh_sat
+        )
 
     if return_parts:
         parts = {
@@ -678,6 +737,7 @@ def compute_solver_loss(
             "solution": float(loss_sol.item()),
             "edge_gate": float(loss_edge_gate.item()),
             "rail": float(loss_rail.item()),
+            "tanh_sat": float(loss_tanh_sat.item()),
             "reg_scale": float(reg_scale),
             "total": float((total_task + structural).item()),
         }

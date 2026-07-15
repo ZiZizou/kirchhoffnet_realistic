@@ -221,16 +221,23 @@ class RealisticTanhUpgradeLibrary(nn.Module):
 
 
 class FreeTanhLibrary(nn.Module):
-    """Per-edge signed-realistic tanh device with independent A/B and STE sign.
+    """Per-edge signed-realistic tanh device with independent A/B and STE sign,
+    in parallel with an optimizable resistive shunt.
 
-    Per-edge formula (leaky tanh)::
+    Per-edge formula (leaky tanh + linear shunt)::
 
         u = gm * (s * (A * Vsrc - B * Vdest) + theta)
-        I = I_sat * (tanh(u) + ALPHA * u)
+        I_tanh      = I_sat * (tanh(u) + ALPHA * u)
+        I_resistive = G * (Vsrc - Vdest),   G = softplus(g_resistive_raw) > 0
+        I_total     = I_tanh + I_resistive
 
     The ``ALPHA * u`` linear term guarantees a non-zero gradient even when
     ``tanh(u)`` is saturated (gradient floor = ``ALPHA``), so the cell never
     becomes a flat plateau for backward signal.
+
+    The resistive shunt is exposed via a dedicated method so that, under
+    ``--freeze-read``, the tanh contribution can be frozen at the initial state
+    while the resistive term keeps routing current from evolving voltages.
 
     Parameterization (all per-edge, shape ``[E]``):
       - ``a_raw``   → A = softplus(a_raw), A >= 0, no upper bound, independent of B.
@@ -239,6 +246,8 @@ class FreeTanhLibrary(nn.Module):
       - ``gm_raw``  → gm = gm_min + (gm_max - gm_min) * sigmoid(gm_raw).
       - ``isat_raw``→ Isat = clamp_min(isat_min + (isat_max - isat_min) * sigmoid(isat_raw), 1e-6).
       - ``theta_raw``→ theta; only present when ``bias_enabled=True`` (init=0).
+      - ``g_resistive_raw``→ G = softplus(g_resistive_raw), positive shunt
+        conductance (init=0 → G ≈ 0.69).
 
     Boundary defaults come from ``config.TANH_REALISTIC_*``.
     Compliance gating applied after tanh.
@@ -282,8 +291,59 @@ class FreeTanhLibrary(nn.Module):
         self.isat_raw = nn.Parameter(torch.full((num_edges,), -2.3))
         if self._bias_enabled:
             self.theta_raw = nn.Parameter(torch.zeros(num_edges))
+        # Resistive shunt: g_raw=0 → G = softplus(0) ≈ 0.6931.
+        self.g_resistive_raw = nn.Parameter(torch.zeros(num_edges))
 
         self._beta_softness = float(PHYS["beta_softness"])
+
+    def _tanh_core(self, x_src: torch.Tensor, x_dst: torch.Tensor) -> torch.Tensor:
+        """Internal: leaky-tanh current (no compliance gating).
+
+        Returns ``I_sat * (tanh(u) + ALPHA * u)`` with shape ``[1, E]`` —
+        broadcastable against ``x_src``/``x_dst`` which are ``[B, E]``.
+        """
+        A = torch.nn.functional.softplus(self.a_raw).unsqueeze(0)        # [1, E]
+        B = torch.nn.functional.softplus(self.b_raw).unsqueeze(0)        # [1, E]
+        s = torch.sign(self.s_raw)                                       # [E]
+        s_ste = s + self.s_raw - self.s_raw.detach()                     # STE: [E]
+        sig_gm = torch.sigmoid(self.gm_raw)
+        gm = self.gm_min + (self.gm_max - self.gm_min) * sig_gm          # [E]
+        sig_isat = torch.sigmoid(self.isat_raw)
+        isat = (self.isat_min + (self.isat_max - self.isat_min) * sig_isat).clamp_min(1e-6)  # [E]
+        theta = self.theta_raw.unsqueeze(0) if self._bias_enabled else 0.0
+        u = (s_ste.unsqueeze(0) * (A * x_src - B * x_dst) + theta) * gm.unsqueeze(0)
+        return isat.unsqueeze(0) * (torch.tanh(u) + self.ALPHA * u)
+
+    def forward_tanh(
+        self,
+        x_src: torch.Tensor,
+        x_dst: torch.Tensor,
+        x_max: float,
+    ) -> torch.Tensor:
+        """Leaky-tanh current with compliance gating, no resistive shunt.
+
+        Use this when the resistive term must be excluded (e.g. ``--freeze-read``
+        wants to freeze only the tanh contribution at ``x0``).
+        Returns ``[batch, E]`` gated by ``gate_src * gate_dst``.
+        """
+        i_cell = self._tanh_core(x_src, x_dst)                          # [1, E]
+        i_cell = i_cell.expand(x_src.shape[0], -1)                      # [B, E]
+        gate_src = torch.sigmoid((x_max - x_src.abs()) / self._beta_softness)
+        gate_dst = torch.sigmoid((x_max - x_dst.abs()) / self._beta_softness)
+        return (gate_src * gate_dst) * i_cell
+
+    def resistive_current(
+        self,
+        x_src: torch.Tensor,
+        x_dst: torch.Tensor,
+    ) -> torch.Tensor:
+        """Resistive shunt current ``G * (Vsrc - Vdest)``, no compliance gating.
+
+        Returns shape ``[batch, E]``. Always uses evolving voltages (intended
+        to bypass ``--freeze-read``).
+        """
+        G = torch.nn.functional.softplus(self.g_resistive_raw).unsqueeze(0)  # [1, E]
+        return G * (x_src - x_dst)
 
     def forward(
         self,
@@ -291,23 +351,17 @@ class FreeTanhLibrary(nn.Module):
         x_dst: torch.Tensor,
         x_max: float,
     ) -> torch.Tensor:
-        A = torch.nn.functional.softplus(self.a_raw).unsqueeze(0)  # [1, E]
-        B = torch.nn.functional.softplus(self.b_raw).unsqueeze(0)  # [1, E]
-        s = torch.sign(self.s_raw)  # [E]
-        s_ste = s + self.s_raw - self.s_raw.detach()  # STE: forward ±1, backward grad=1
-        sig_gm = torch.sigmoid(self.gm_raw)
-        gm = self.gm_min + (self.gm_max - self.gm_min) * sig_gm  # [E]
-        sig_isat = torch.sigmoid(self.isat_raw)
-        isat = (self.isat_min + (self.isat_max - self.isat_min) * sig_isat).clamp_min(1e-6)  # [E]
-        theta = self.theta_raw.unsqueeze(0) if self._bias_enabled else 0.0
-        u = (s_ste.unsqueeze(0) * (A * x_src - B * x_dst) + theta) * gm.unsqueeze(0)
-        i_cell = isat.unsqueeze(0) * (torch.tanh(u) + self.ALPHA * u)
+        """Full cell current: leaky tanh + resistive shunt.
 
-        gate_src = torch.sigmoid((x_max - x_src.abs()) / self._beta_softness)
-        gate_dst = torch.sigmoid((x_max - x_dst.abs()) / self._beta_softness)
-        gate = gate_src * gate_dst
-
-        return gate * i_cell
+        Only the tanh contribution is compliance-gated; the resistive shunt
+        is a physical conductor that always routes current based on the
+        voltage difference (intentional — see ``resistive_current``).
+        Stage-level edge_mask / budget_gate are applied separately in
+        ``DifferentialStage.rhs()``.
+        """
+        i_tanh = self.forward_tanh(x_src, x_dst, x_max)
+        i_res = self.resistive_current(x_src, x_dst)
+        return i_tanh + i_res
 
     def compile_forward(self, backend: str = "inductor"):
         pass

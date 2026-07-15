@@ -169,6 +169,13 @@ class DifferentialStage(nn.Module):
         self.budget_axis: str = "dst"
         self.budget_enabled: bool = False
 
+        # Parallel resistive shunt (FreeTanhLibrary): if the cell library
+        # exposes a ``resistive_current(x_src, x_dst)`` method, route an
+        # additional current ``G * (Vsrc - Vdest)`` per edge from evolving
+        # voltages, bypassing ``freeze_read``. Cached here so the dispatch
+        # in ``rhs`` is a fast attribute check instead of a hasattr scan.
+        self._has_resistive = hasattr(cell_lib, "resistive_current")
+
     def num_edges(self) -> int:
         return int(self.src.numel())
 
@@ -376,26 +383,28 @@ class DifferentialStage(nn.Module):
         as the KCL contribution. Leak, clip, and drive current are still
         computed from the current ``x``.
         """
-        if i_edge_const is None:
-            x_src = x[:, self.src]
-            x_dst = x[:, self.dst]
+        x_src = x[:, self.src]
+        x_dst = x[:, self.dst]
 
+        # Edge gate: multiply each edge's current by its gate. Computed once
+        # here and reused for both the tanh current and the resistive shunt
+        # (when applicable), avoiding redundant sigmoid + budget_gate calls.
+        edge_mask = torch.sigmoid(self.z_logits)  # [E]
+        # Degree budget / top-k competition (degree-budget-topk plan).
+        # Budget gate is layered on top of the sigmoid gate: independent
+        # per-edge gate * competitive per-destination (or per-source) mask.
+        # When budget is disabled (budget_frac=0) the budget gate is all-ones
+        # and this multiplication is a no-op.
+        if self.budget_enabled:
+            budget_gate = self._compute_budget_gate()  # [E]
+            edge_mask = edge_mask * budget_gate
+
+        if i_edge_const is None:
             i_edge = self.cell_lib(
                 x_src=x_src,
                 x_dst=x_dst,
                 x_max=self.x_max,
             )
-
-            # Edge gate: multiply each edge's current by its gate.
-            edge_mask = torch.sigmoid(self.z_logits)  # [E]
-            # Degree budget / top-k competition (degree-budget-topk plan).
-            # Budget gate is layered on top of the sigmoid gate: independent
-            # per-edge gate * competitive per-destination (or per-source) mask.
-            # When budget is disabled (budget_frac=0) the budget gate is all-ones
-            # and this multiplication is a no-op.
-            if self.budget_enabled:
-                budget_gate = self._compute_budget_gate()  # [E]
-                edge_mask = edge_mask * budget_gate
             i_edge = i_edge * edge_mask.unsqueeze(0)  # [B, E]
 
             # KCL scatter-add: accumulate in float32 for AMP robustness.
@@ -412,9 +421,27 @@ class DifferentialStage(nn.Module):
             acc = acc.to(dtype=x.dtype)
         else:
             # Frozen path: i_edge_const is the precomputed KCL contribution
-            # [batch, num_nodes] in x's dtype. No cell_lib, edge gate, or
-            # scatter-add happens here.
+            # [batch, num_nodes] in x's dtype. The tanh contribution was
+            # computed from x0 and held constant. The resistive shunt (if
+            # any) is added below from evolving voltages.
             acc = i_edge_const
+
+        # Parallel resistive shunt (FreeTanhLibrary): always uses evolving
+        # voltages, bypassing ``freeze_read``. Gated by the same edge_mask /
+        # budget_gate as the tanh current so it can be pruned away.
+        if self._has_resistive:
+            i_res = self.cell_lib.resistive_current(x_src, x_dst)
+            i_res = i_res * edge_mask.unsqueeze(0)              # [B, E]
+            i_res_f32 = i_res.float()
+            # Clone when freeze_read is active so we don't mutate the
+            # shared ``i_edge_const`` tensor across rhs calls.
+            if i_edge_const is not None:
+                acc = acc.clone()
+            acc_res = torch.zeros_like(x, dtype=torch.float32)
+            acc_res.index_add_(1, self.dst, i_res_f32)
+            if not self.read_only_source:
+                acc_res.index_add_(1, self.src, -i_res_f32)
+            acc = (acc.float() + acc_res).to(dtype=x.dtype)
 
         leak = self._effective_leak(leak_floor=leak_floor).unsqueeze(0)  # [1, N]
         leak_term = leak * x
@@ -502,11 +529,17 @@ class DifferentialStage(nn.Module):
         # freeze_read: precompute edge currents (cell_lib + edge gate + budget
         # gate + KCL scatter-add) once from x0 and hold them constant across
         # all sub-steps. Leak, clip, and drive still read the current x.
+        # For cell libraries with a parallel resistive shunt, use
+        # ``forward_tanh`` here so the resistive term stays dynamic in ``rhs``
+        # (the resistive current is added per-step from evolving voltages).
         i_edge_const = None
         if self.freeze_read:
             x_src0 = x0[:, self.src]
             x_dst0 = x0[:, self.dst]
-            i_edge = self.cell_lib(x_src=x_src0, x_dst=x_dst0, x_max=self.x_max)
+            if self._has_resistive and hasattr(self.cell_lib, "forward_tanh"):
+                i_edge = self.cell_lib.forward_tanh(x_src=x_src0, x_dst=x_dst0, x_max=self.x_max)
+            else:
+                i_edge = self.cell_lib(x_src=x_src0, x_dst=x_dst0, x_max=self.x_max)
             edge_mask = torch.sigmoid(self.z_logits)
             if self.budget_enabled:
                 edge_mask = edge_mask * self._compute_budget_gate()

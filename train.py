@@ -1070,7 +1070,7 @@ def apply_ablation(net, ablation: str) -> None:
                 if hasattr(stage.cell_lib, "bias_raw"):
                     stage.cell_lib.bias_raw = nn.Parameter(stage.cell_lib.bias_raw.new_zeros(0))
             elif isinstance(cell_lib, FreeTanhLibrary):
-                for name in ("a_raw", "b_raw", "s_raw", "gm_raw", "isat_raw"):
+                for name in ("a_raw", "b_raw", "s_raw", "gm_raw", "isat_raw", "g_resistive_raw"):
                     setattr(
                         stage.cell_lib,
                         name,

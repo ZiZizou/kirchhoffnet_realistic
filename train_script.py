@@ -2548,6 +2548,14 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "argument. Discourages edges from operating in the saturated "
              "region of tanh unless necessary. Set to 0 to disable. "
              "Default: None (use config.LAMBDAS['tanh_sat'], currently 0.0).")
+    parser.add_argument(
+        "--no-resistive-shunt", action="store_true", default=False,
+        dest="no_resistive_shunt",
+        help="Disable the parallel resistive shunt in FreeTanhLibrary. "
+             "Zeros g_resistive_raw and sets _has_resistive=False on every "
+             "stage so the resistive branch is bypassed in rhs() and frozen "
+             "with the tanh current in the freeze_read path. The "
+             "tanh_sat lambda is unaffected. Default: shunt enabled.")
 
 # ----------------------------------------------------------------
 # Pruning helpers (PIT): transferable I/O mapper reconstruction.
@@ -3092,6 +3100,24 @@ def main():
         interstage_activation=args.interstage_activation,
         interstage_residual_rank=args.interstage_residual_rank)
     net.to(device)
+
+    # --no-resistive-shunt: bypass the parallel resistive shunt across all
+    # stages (no-resistive-shunt). Sets _has_resistive=False so rhs() skips
+    # the resistive block, zeros g_resistive_raw (so the static forward()
+    # path contributes zero too under --freeze-read), and freezes the
+    # parameter so the optimizer ignores it. The tanh_sat lambda is
+    # independent of this flag and remains active.
+    if args.no_resistive_shunt:
+        from cell_library import FreeTanhLibrary as _FreeTanhLibrary
+        n_disabled = 0
+        for stage in net.core.stages:
+            if isinstance(stage.cell_lib, _FreeTanhLibrary) and stage._has_resistive:
+                stage._has_resistive = False
+                stage.cell_lib.g_resistive_raw.data.zero_()
+                stage.cell_lib.g_resistive_raw.requires_grad_(False)
+                n_disabled += 1
+        print(f"[train] resistive shunt disabled on {n_disabled} "
+              f"stage(s) (--no-resistive-shunt)")
     grid_label = (
         f" {args.grid_size}×{args.grid_size} grid,"
         if args.problem in ("smooth2d_grid", "housing_grid")
@@ -3995,6 +4021,18 @@ def main():
             write_idx=pruned_write_idx if effective_write_mode in ("one_to_one", "sparse_proj") else None,
             read_idx=pruned_read_idx if effective_read_mode == "sparse" else None)
         pruned_net.to(device)
+        # Re-apply --no-resistive-shunt: prune_stage constructs fresh
+        # DifferentialStage + FreeTanhLibrary objects (topology.py:1288),
+        # which reset _has_resistive=True and g_resistive_raw to a fresh
+        # trainable parameter. Without re-applying the disable here, the
+        # retrain phase would silently re-enable the resistive shunt.
+        if args.no_resistive_shunt:
+            from cell_library import FreeTanhLibrary as _FreeTanhLibrary
+            for stage in pruned_net.core.stages:
+                if isinstance(stage.cell_lib, _FreeTanhLibrary) and stage._has_resistive:
+                    stage._has_resistive = False
+                    stage.cell_lib.g_resistive_raw.data.zero_()
+                    stage.cell_lib.g_resistive_raw.requires_grad_(False)
         n_pruned_params = sum(p.numel() for p in pruned_net.parameters() if p.requires_grad)
         print(f"[prune] retrain trainable params: {n_pruned_params:,}")
 

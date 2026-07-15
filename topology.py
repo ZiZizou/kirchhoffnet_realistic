@@ -1324,6 +1324,7 @@ def build_net_from_preset(
     interstage_activation: str = "none",
     interstage_residual_rank: int = -1,
     freeze_read: bool = False,
+    enable_skip_linear: bool = False,
 ):
     """Build a full KirchhoffNetWithIO from a config.PRESETS entry.
 
@@ -1390,6 +1391,7 @@ def build_net_from_preset(
         interstage_activation=interstage_activation,
         interstage_residual_rank=interstage_residual_rank,
         freeze_read=freeze_read,
+        enable_skip_linear=enable_skip_linear,
     )
 
 
@@ -1404,6 +1406,7 @@ def build_net_from_config(
     interstage_activation: str = "none",
     interstage_residual_rank: int = -1,
     freeze_read: bool = False,
+    enable_skip_linear: bool = False,
 ):
     """Build a KirchhoffNetWithIO from a full config dict.
 
@@ -1737,6 +1740,9 @@ def build_net_from_config(
         read_idx=read_idx_arg,
         enable_drive=enable_drive,
         drive_mappers=drive_mappers_list,
+        enable_skip_linear=enable_skip_linear,
+        skip_linear_in_dim=in_dim if enable_skip_linear else None,
+        skip_linear_out_dim=out_dim if enable_skip_linear else None,
     )
 
     # Hard topology check: write_idx → read_idx must be >1 hop on the core

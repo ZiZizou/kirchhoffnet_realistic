@@ -367,6 +367,11 @@ LAMBDAS = {
     # tanh saturation penalty for FreeTanhLibrary edges: mean(tanh(u)^2) over edges,
     # penalizes edges operating in the saturated region of tanh.
     "tanh_sat": 0.0,
+    # L2 penalty on the linear skip-connection W₁ weight and b₁ bias
+    # (only active when --skip-linear / enable_skip_linear=True). Incentivizes
+    # the skip projection toward zero so the KirchhoffNet ODE core does the
+    # bulk of the fitting.
+    "skip_linear_l2": 1e-4,
 }
 
 # Pruning thresholds for the overprovision-then-prune pipeline (CP-5).

@@ -621,11 +621,26 @@ def compute_loss(
 
         loss_edge_gate, loss_rail, loss_tanh_sat = _compute_regularizers(net, trajs, lambdas)
 
+        loss_skip_l2 = 0.0
+        skip_l2_lambda = float(lambdas.get("skip_linear_l2", 0.0))
+        if skip_l2_lambda > 0:
+            net_skip = net
+            if hasattr(net_skip, "module") and isinstance(net_skip, torch.nn.DataParallel):
+                net_skip = net_skip.module
+            if hasattr(net_skip, "base") and hasattr(net_skip, "_stage_noise_std"):
+                net_skip = net_skip.base
+            if getattr(net_skip, "skip_linear_enabled", False):
+                p = net_skip.skip_linear
+                loss_skip_l2 = skip_l2_lambda * (
+                    p.weight.pow(2).sum()
+                    + (p.bias.pow(2).sum() if p.bias is not None else torch.zeros((), device=p.weight.device))
+                )
+
         total_task = loss_task + float(lambdas.get("rail", 0.0)) * loss_rail
         structural = reg_scale * (
             float(lambdas.get("edge_gate", 0.0)) * loss_edge_gate
             + float(lambdas.get("tanh_sat", 0.0)) * loss_tanh_sat
-        )
+        ) + loss_skip_l2
 
     if return_parts:
         parts = {
@@ -633,6 +648,7 @@ def compute_loss(
             "edge_gate": float(loss_edge_gate.item()),
             "rail": float(loss_rail.item()),
             "tanh_sat": float(loss_tanh_sat.item()),
+            "skip_linear_l2": float(loss_skip_l2.item()) if torch.is_tensor(loss_skip_l2) else float(loss_skip_l2),
             "reg_scale": float(reg_scale),
             "total": float((total_task + structural).item()),
         }

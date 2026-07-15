@@ -59,8 +59,9 @@ def format_parameter_breakdown(breakdown: dict) -> str:
     stage_label_w = max(stage_label_w, 8)
     width = max(label_w + 18, stage_label_w + 18, 30)
     lines: list[str] = []
-    for name in ("input_mapper", "output_mapper", "drive_mappers"):
-        lines.append(f"  {name:<{label_w}}: {groups.get(name, 0):>{width - label_w - 4}}")
+    for name in ("input_mapper", "output_mapper", "drive_mappers", "skip_linear"):
+        if groups.get(name, 0) or name in ("input_mapper", "output_mapper", "drive_mappers"):
+            lines.append(f"  {name:<{label_w}}: {groups.get(name, 0):>{width - label_w - 4}}")
     for stage_key in sorted(per_stage.keys()):
         lines.append(f"  {stage_key}:")
         bucket = per_stage[stage_key]
@@ -231,6 +232,9 @@ class KirchhoffNetWithIO(nn.Module):
         enable_drive: bool = False,
         drive_mappers: list | None = None,
         drive_scales: list[float] | None = None,
+        enable_skip_linear: bool = False,
+        skip_linear_in_dim: int | None = None,
+        skip_linear_out_dim: int | None = None,
     ) -> None:
         super().__init__()
         if hid_count < 0 or proj_count < 0:
@@ -306,6 +310,26 @@ class KirchhoffNetWithIO(nn.Module):
             self.read_dim = self.final_proj_count
         self.read_slice = slice(self.read_start, self.read_start + self.read_dim)
 
+        self.skip_linear_enabled = bool(enable_skip_linear)
+        if self.skip_linear_enabled:
+            if skip_linear_in_dim is None or skip_linear_out_dim is None:
+                raise ValueError(
+                    "enable_skip_linear=True requires skip_linear_in_dim and "
+                    "skip_linear_out_dim"
+                )
+            self.skip_linear_in_dim = int(skip_linear_in_dim)
+            self.skip_linear_out_dim = int(skip_linear_out_dim)
+            self.skip_linear = nn.Linear(
+                self.skip_linear_in_dim, self.skip_linear_out_dim, bias=True,
+            )
+            nn.init.xavier_uniform_(self.skip_linear.weight)
+            with torch.no_grad():
+                self.skip_linear.bias.zero_()
+        else:
+            self.skip_linear = None
+            self.skip_linear_in_dim = None
+            self.skip_linear_out_dim = None
+
     def _make_full_drive(self, hidden_drive: torch.Tensor) -> torch.Tensor:
         B = hidden_drive.shape[0]
         if self.proj_count > 0:
@@ -364,6 +388,13 @@ class KirchhoffNetWithIO(nn.Module):
                     f"{x_read.size(1)} dims; expected {self.read_dim}"
                 )
         y = self.output_mapper(x_read)
+        if self.skip_linear_enabled and self.skip_linear is not None:
+            if u.size(-1) != self.skip_linear_in_dim:
+                raise ValueError(
+                    f"SkipLinear: input has {u.size(-1)} features, "
+                    f"expected {self.skip_linear_in_dim}"
+                )
+            y = y + self.skip_linear(u)
         return y, trajs
 
     def parameter_breakdown(self) -> dict:
@@ -375,6 +406,7 @@ class KirchhoffNetWithIO(nn.Module):
           - ``input_mapper.*``
           - ``output_mapper.*``
           - ``drive_mappers.*``
+          - ``skip_linear.*``  (skip connection, enabled via enable_skip_linear)
           - ``core.stages.N.z_logits``  (structural)
           - ``core.stages.N.u_logits``  (structural, deprecated)
           - ``core.stages.N.raw_leak``  (dynamical)
@@ -389,6 +421,7 @@ class KirchhoffNetWithIO(nn.Module):
             "input_mapper": 0,
             "output_mapper": 0,
             "drive_mappers": 0,
+            "skip_linear": 0,
         }
         per_stage: dict[str, dict[str, int]] = {}
         total = 0
@@ -403,6 +436,8 @@ class KirchhoffNetWithIO(nn.Module):
                 groups["output_mapper"] += n
             elif name.startswith("drive_mappers"):
                 groups["drive_mappers"] += n
+            elif name.startswith("skip_linear"):
+                groups["skip_linear"] += n
             elif name.startswith("core.stages."):
                 parts = name.split(".")
                 if len(parts) < 4:
@@ -438,8 +473,12 @@ class KirchhoffNetWithIO(nn.Module):
         }
 
     def extra_repr(self) -> str:
+        skip = (
+            f", skip_linear={self.skip_linear_in_dim}->{self.skip_linear_out_dim}"
+            if self.skip_linear_enabled else ""
+        )
         return (
             f"hid_count={self.hid_count}, proj_count={self.proj_count}, "
             f"final_hid_count={self.final_hid_count}, final_proj_count={self.final_proj_count}, "
-            f"write_idx={self.write_idx}, read_idx={self.read_idx}"
+            f"write_idx={self.write_idx}, read_idx={self.read_idx}{skip}"
         )

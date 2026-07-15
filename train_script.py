@@ -3734,14 +3734,14 @@ def main():
         phase_tag = f" [{phase}]" if phase else ""
         if tqdm is not None:
             print(
-                f"{ab_desc}  train={avg_train:.4f}  val={val_loss:.4f}"
+                f"{ab_desc}  train={avg_train:.4e}  val={val_loss:.4e}"
                 + f"  tau={tau:.3f}  lr={lr_str}"
                 + (f"  reg={reg_scale:.2f}" if schedule_mode == "legacy" else "")
             )
             ab_iter.set_description_str("")
         else:
             print_str = (
-                f"  epoch {epoch:4d}{phase_tag}  train={avg_train:.4f}  val={val_loss:.4f}"
+                f"  epoch {epoch:4d}{phase_tag}  train={avg_train:.4e}  val={val_loss:.4e}"
                 + f"  tau={tau:.3f}  lr={lr_str}"
             )
             print(print_str)
@@ -4378,7 +4378,7 @@ def main():
                 phase_tag = " [C]" if schedule_mode in ("three_phase", "four_phase") else ""
                 print(
                     f"  {'retrain' if schedule_mode == 'legacy' else 'phase-C'} epoch {repoch:4d}{phase_tag}  "
-                    f"train={avg:.4f}  "
+                        f"train={avg:.4e}  "
                     f"val={retrain_val_history[-1]:.4f}  tau={tau_r:.3f}  "
                     f"lr={retrain_optimizer.param_groups[0]['lr']:.2e}"
                     + (_format_deq_summary(retrain_deq_metrics) if retrain_deq_metrics is not None else "")

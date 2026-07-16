@@ -65,7 +65,7 @@ def format_parameter_breakdown(breakdown: dict) -> str:
     for stage_key in sorted(per_stage.keys()):
         lines.append(f"  {stage_key}:")
         bucket = per_stage[stage_key]
-        for sub_name in ("cell_lib", "z_logits", "u_logits", "raw_leak", "raw_drive_g", "boundary_cell_lib", "boundary_z_logits", "other"):
+        for sub_name in ("cell_lib", "z_logits", "u_logits", "raw_leak", "raw_drive_g", "boundary_cell_lib", "boundary_z_logits", "raw_vref", "ref_z_logits", "ref_cell_lib", "other"):
             if bucket.get(sub_name, 0):
                 lines.append(f"    {sub_name:<{stage_label_w}}: {bucket[sub_name]:>{width - stage_label_w - 6}}")
         stage_total = sum(bucket.values())
@@ -478,6 +478,9 @@ class KirchhoffNetWithIO(nn.Module):
                     "raw_drive_g": 0,
                     "boundary_z_logits": 0,
                     "boundary_cell_lib": 0,
+                    "raw_vref": 0,
+                    "ref_z_logits": 0,
+                    "ref_cell_lib": 0,
                     "other": 0,
                 })
                 matched = False
@@ -495,6 +498,12 @@ class KirchhoffNetWithIO(nn.Module):
                     stage_bucket["boundary_cell_lib"] += n; matched = True
                 elif tail.startswith("cell_lib."):
                     stage_bucket["cell_lib"] += n; matched = True
+                elif tail == "raw_vref":
+                    stage_bucket["raw_vref"] += n; matched = True
+                elif tail == "ref_z_logits":
+                    stage_bucket["ref_z_logits"] += n; matched = True
+                elif tail.startswith("ref_cell_lib."):
+                    stage_bucket["ref_cell_lib"] += n; matched = True
                 if not matched:
                     stage_bucket["other"] += n
         return {

@@ -2442,6 +2442,19 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "Each boundary edge carries its own OTA cell parameters and "
              "edge gate (compatible with --no-edge-gates).")
     parser.add_argument(
+        "--enable-ref-edges", action="store_true", default=False,
+        dest="enable_ref_edges",
+        help="Enable reference edges (unary nonlinearities via OTA-to-Vref): "
+             "every ODE node gets one OTA edge to a global per-stage learnable "
+             "reference voltage Vref (scalar, constrained to [0, x_max]). The "
+             "reference edge injects I_OTA(Vref, x_j) into node j only (no "
+             "source drain — Vref is an ideal voltage source). Implements "
+             "programmable thresholding, saturation, soft activation, bias "
+             "injection, and nonlinear leak without introducing a heterogeneous "
+             "cell type. Each reference edge uses the same OTA cell family as "
+             "the core edges and carries its own edge gate (compatible with "
+             "--no-edge-gates). Default: disabled.")
+    parser.add_argument(
         "--leak", choices=["programmable", "non-programmable"],
         default="programmable", dest="leak",
         help="Stage leak mode (default: programmable). 'programmable' "
@@ -3199,7 +3212,8 @@ def main():
         interstage_activation=args.interstage_activation,
         interstage_residual_rank=args.interstage_residual_rank,
         enable_skip_linear=args.skip_linear,
-        boundary_fan_out=boundary_fan_out_parsed)
+        boundary_fan_out=boundary_fan_out_parsed,
+        enable_ref_edges=args.enable_ref_edges)
     net.to(device)
 
     if args.no_edge_gates:
@@ -3212,7 +3226,10 @@ def main():
             if hasattr(stage, 'boundary_z_logits') and stage.boundary_z_logits is not None:
                 stage.boundary_z_logits.data.fill_(10.0)
                 stage.boundary_z_logits.requires_grad_(False)
-        print("[train] --no-edge-gates: z_logits (core + boundary) frozen to +10 (all edges permanently on)")
+            if hasattr(stage, 'ref_z_logits') and stage.ref_z_logits is not None:
+                stage.ref_z_logits.data.fill_(10.0)
+                stage.ref_z_logits.requires_grad_(False)
+        print("[train] --no-edge-gates: z_logits (core + boundary + ref) frozen to +10 (all edges permanently on)")
 
     # --no-resistive-shunt: bypass the parallel resistive shunt across all
     # stages (no-resistive-shunt). Sets _has_resistive=False so rhs() skips

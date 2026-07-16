@@ -307,6 +307,14 @@ PHYS = {
     "clip_softness": 0.02,
 }
 
+# Reference-edge configuration (unary nonlinearities via OTA-to-Vref plan).
+# Each node gets one OTA edge to a global per-stage Vref voltage. Vref is a
+# learnable scalar parameter constrained to [0, x_max] via sigmoid. raw_vref=0
+# maps to Vref = x_max/2 (mid-rail init), giving neutral offsets at startup.
+REF = {
+    "raw_vref_init": 0.0,
+}
+
 # Training hyperparameters
 _BASE_BATCH_SIZE = 1024
 _BASE_LR = 3e-4

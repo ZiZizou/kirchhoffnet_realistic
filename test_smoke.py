@@ -3126,6 +3126,8 @@ def main():
 
     test_anti_parallel_basic()                   # APT-1..11: AntiParallelFreeTanhLibrary
 
+    test_ref_edges_basic()                      # REF-1..8: --enable-ref-edges end-to-end
+
     print()
     print("=" * 60)
     print(f"Smoke test results: {passed} passed, {failed} failed")
@@ -8199,6 +8201,124 @@ def test_anti_parallel_basic():
     check("APT-11: net (fwd - rev) is asymmetric across edges",
           bool((net[0, 0] - net[0, 1]).abs().item() > 1e-6
                or (net[1, 0] - net[1, 1]).abs().item() > 1e-6))
+
+
+def test_ref_edges_basic():
+    """Unary nonlinearities via OTA-to-Vref: every node gets one reference edge
+    to a global per-stage learnable Vref."""
+    print("\nTest REF-1..7: --enable-ref-edges end-to-end")
+
+    # REF-1: REF config exists with raw_vref_init
+    import config
+    check("REF-1: REF config has raw_vref_init key",
+          "raw_vref_init" in config.REF)
+    check("REF-1: REF config has raw_vref_init=0.0 (mid-rail Vref=x_max/2)",
+          config.REF["raw_vref_init"] == 0.0)
+
+    # REF-2: build_net_from_preset with enable_ref_edges=True wires up per-stage
+    # raw_vref, ref_z_logits, and ref_cell_lib on every stage.
+    from topology import build_net_from_preset
+    from cell_library import make_cell_library
+    cell_lib = make_cell_library("tanh", num_edges=4)
+
+    net_off = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
+    net_on = build_net_from_preset(
+        "smooth2d_grid", cell_lib=cell_lib, enable_ref_edges=True,
+    )
+    check("REF-2: enable_ref_edges=False → all stages have _has_ref=False",
+          all(not s._has_ref for s in net_off.core.stages))
+    check("REF-2: enable_ref_edges=True → all stages have _has_ref=True",
+          all(s._has_ref for s in net_on.core.stages))
+
+    # REF-3: each stage has a scalar raw_vref parameter (shape [1]) that
+    # maps to Vref = sigmoid(raw_vref) * x_max (in [0, x_max]).
+    import torch
+    for i, stage in enumerate(net_on.core.stages):
+        check(f"REF-3: stage {i} has raw_vref parameter",
+              hasattr(stage, "raw_vref") and isinstance(stage.raw_vref, torch.nn.Parameter))
+        check(f"REF-3: stage {i} raw_vref is scalar (shape [1])",
+              stage.raw_vref.shape == torch.Size([1]))
+        with torch.no_grad():
+            vref_val = torch.sigmoid(stage.raw_vref).item() * stage.x_max
+        check(f"REF-3: stage {i} Vref in [0, x_max]",
+              0.0 <= vref_val <= stage.x_max + 1e-6,
+              f"Vref={vref_val:.4f}, x_max={stage.x_max}")
+        check(f"REF-3: stage {i} raw_vref init=0 → Vref=x_max/2 (within tolerance)",
+              abs(vref_val - stage.x_max / 2.0) < 1e-3)
+
+    # REF-4: each stage has ref_z_logits sized to num_nodes (one gate per ref edge).
+    for i, stage in enumerate(net_on.core.stages):
+        check(f"REF-4: stage {i} ref_z_logits shape == num_nodes",
+              stage.ref_z_logits.shape == torch.Size([stage.num_nodes]))
+        check(f"REF-4: stage {i} ref_dst is arange(num_nodes)",
+              stage.ref_dst.tolist() == list(range(stage.num_nodes)))
+
+    # REF-5: each stage has a separate ref_cell_lib with num_edges=num_nodes.
+    # Cell libraries don't always expose num_edges as an attribute, so derive
+    # it from a representative per-edge parameter shape (gm_raw, alpha_raw,
+    # param for SimpleEdgeLibrary which is [3, E], etc.).
+    for i, stage in enumerate(net_on.core.stages):
+        check(f"REF-5: stage {i} ref_cell_lib exists", stage.ref_cell_lib is not None)
+        # Find a per-edge parameter: pick a 1D param of size num_nodes, or a
+        # 2D param whose second dim is num_nodes (SimpleEdgeLibrary pattern).
+        per_edge_count = None
+        for _n, p in stage.ref_cell_lib.named_parameters():
+            if p.dim() == 1 and p.shape[0] == stage.num_nodes:
+                per_edge_count = p.shape[0]
+                break
+            if p.dim() == 2 and p.shape[1] == stage.num_nodes:
+                per_edge_count = p.shape[1]
+                break
+        check(f"REF-5: stage {i} ref_cell_lib has per-edge param of size num_nodes",
+              per_edge_count == stage.num_nodes,
+              f"per_edge_count={per_edge_count}, num_nodes={stage.num_nodes}")
+
+    # REF-6: forward pass produces finite output and trains backward successfully.
+    u = torch.rand(8, 2)
+    out, _trajs = net_on(u)
+    check("REF-6: forward output is finite", bool(torch.isfinite(out).all().item()))
+    check("REF-6: forward output shape == (B, out_dim)", out.shape == (8, 1))
+
+    # Backward: loss + backward must flow gradients into raw_vref AND into
+    # ref_cell_lib parameters AND into ref_z_logits.
+    loss = (out ** 2).mean()
+    loss.backward()
+    for i, stage in enumerate(net_on.core.stages):
+        check(f"REF-6: stage {i} raw_vref.grad is finite and nonzero",
+              stage.raw_vref.grad is not None
+              and torch.isfinite(stage.raw_vref.grad).all().item()
+              and stage.raw_vref.grad.abs().item() > 0.0,
+              f"grad={stage.raw_vref.grad}")
+        check(f"REF-6: stage {i} ref_z_logits.grad is finite",
+              stage.ref_z_logits.grad is not None
+              and torch.isfinite(stage.ref_z_logits.grad).all().item())
+        check(f"REF-6: stage {i} ref_cell_lib has grad on at least one param",
+              any(p.grad is not None and p.grad.abs().sum().item() > 0.0
+                  for p in stage.ref_cell_lib.parameters()))
+
+    # REF-7: reference edges contribute a non-zero current at construction.
+    # With Vref=x_max/2 mid-rail and initial node state x0=0, I_OTA(Vref, x_j)
+    # should evaluate to a finite nonzero current (since Vref != x_j).
+    stage0 = net_on.core.stages[0]
+    x = torch.zeros(1, stage0.num_nodes)
+    with torch.no_grad():
+        rhs_out = stage0.rhs(x)
+    check("REF-7: rhs(x=0) with ref edges is finite",
+          bool(torch.isfinite(rhs_out).all().item()))
+    check("REF-7: rhs(x=0) with ref edges is nonzero "
+          "(Vref != x_j → nonzero OTA current)",
+          bool(rhs_out.abs().sum().item() > 1e-6),
+          f"|rhs|={rhs_out.abs().sum().item():.6f}")
+
+    # REF-8: disabling ref edges (default) produces different (lower-magnitude)
+    # rhs at x=0 than enabling them.
+    stage0_off = net_off.core.stages[0]
+    x = torch.zeros(1, stage0_off.num_nodes)
+    with torch.no_grad():
+        rhs_off = stage0_off.rhs(x)
+    check("REF-8: ref edges change the rhs output",
+          (rhs_out - rhs_off).abs().sum().item() > 1e-6,
+          f"|delta|={(rhs_out - rhs_off).abs().sum().item():.6f}")
 
 
 if __name__ == "__main__":

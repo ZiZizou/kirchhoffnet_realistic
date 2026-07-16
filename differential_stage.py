@@ -27,6 +27,7 @@ from config import (
     DRIVE,
     INIT,
     PHYS,
+    REF,
     SOLVER,
 )
 from cell_library import (
@@ -85,6 +86,19 @@ class DifferentialStage(nn.Module):
             edge currents ``I_OTA(u_i, x_j)``. Must match the cell type
             of the core ``cell_lib`` and be sized for ``len(boundary_src)``
             edges. Must be provided when boundary edges are configured.
+        enable_ref_edges: When ``True``, every node gets one OTA edge to a
+            global per-stage learnable reference voltage ``Vref`` (scalar,
+            constrained to ``[0, x_max]`` via ``sigmoid(raw_vref) * x_max``).
+            Vref is held constant during the ODE integration of a single
+            stage (no current sourced/sinked into Vref; it's an ideal voltage
+            source). The reference edge injects ``I_OTA(Vref, x_j)`` into
+            node ``j`` only. Implemented via a separate cell library
+            (``ref_cell_lib``) sized to ``num_nodes`` so each node has its
+            own programmable OTA parameters. Default ``False``.
+        ref_cell_lib: Cell library instance used to compute reference edge
+            currents ``I_OTA(Vref, x_j)``. Must match the cell type of the
+            core ``cell_lib`` and be sized for ``num_nodes`` edges. Required
+            when ``enable_ref_edges=True``.
     """
 
     def __init__(
@@ -106,6 +120,8 @@ class DifferentialStage(nn.Module):
         boundary_src: list[int] | None = None,
         boundary_dst: list[int] | None = None,
         boundary_cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | AntiParallelFreeTanhLibrary | None = None,
+        enable_ref_edges: bool = False,
+        ref_cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | AntiParallelFreeTanhLibrary | None = None,
     ) -> None:
         super().__init__()
         self.num_nodes = int(num_nodes)
@@ -245,6 +261,39 @@ class DifferentialStage(nn.Module):
             self.boundary_cell_lib = None
             self.boundary_z_logits = None
             self._has_boundary = False
+
+        # Reference edges (unary nonlinearities via OTA-to-Vref plan).
+        # Every node gets one OTA edge to a global per-stage learnable Vref
+        # voltage constrained to [0, x_max]. Vref is held constant during a
+        # single stage's ODE integration (ideal voltage source: no current
+        # drawn from the Vref rail). Each reference edge has its own OTA
+        # cell in ``ref_cell_lib`` (sized to num_nodes) with independent
+        # per-node gm/Isat/theta/etc., and its own gate ``ref_z_logits``.
+        if enable_ref_edges:
+            if ref_cell_lib is None:
+                raise ValueError(
+                    "DifferentialStage: ref_cell_lib is required when "
+                    "enable_ref_edges=True"
+                )
+            self.ref_cell_lib = ref_cell_lib
+            self.raw_vref = nn.Parameter(
+                torch.tensor([float(REF["raw_vref_init"])], dtype=torch.float32)
+            )
+            self.ref_z_logits = nn.Parameter(
+                torch.full((num_nodes,), z_init),
+            )
+            self.register_buffer(
+                "ref_dst", torch.arange(num_nodes, dtype=torch.long),
+            )
+            self._has_ref = True
+        else:
+            self.register_buffer(
+                "ref_dst", torch.empty(0, dtype=torch.long),
+            )
+            self.ref_cell_lib = None
+            self.raw_vref = None
+            self.ref_z_logits = None
+            self._has_ref = False
 
     def num_edges(self) -> int:
         return int(self.src.numel())
@@ -461,6 +510,14 @@ class DifferentialStage(nn.Module):
           are fixed voltages). They are NOT frozen by ``freeze_read``:
           the destination voltage evolves, so the OTA current is
           recomputed every step.
+
+        Reference edges (unary nonlinearities via OTA-to-Vref plan):
+        - When ``self._has_ref``, every node gets one OTA edge to a
+          global per-stage learnable ``Vref = sigmoid(raw_vref) * x_max``.
+          The reference current ``I_OTA(Vref, x_j)`` is injected into
+          node ``j`` only (no source drain — Vref is an ideal voltage
+          source). Like boundary edges, reference currents are NOT frozen
+          by ``freeze_read`` (the destination voltage ``x_j`` evolves).
         """
         x_src = x[:, self.src]
         x_dst = x[:, self.dst]
@@ -542,6 +599,27 @@ class DifferentialStage(nn.Module):
             # NOTE: no `acc_b.index_add_(1, boundary_src, -i_boundary_f32)` —
             # boundary terminals are fixed voltages, never drained.
             acc = (acc.float() + acc_b).to(dtype=x.dtype)
+
+        # Reference edges (unary nonlinearities via OTA-to-Vref plan).
+        # For each node j: I_ref = I_OTA(Vref, x_j), injected into dst only.
+        # Vref = sigmoid(raw_vref) * x_max is a per-stage learnable scalar
+        # held constant during the ODE integration (no current sourced
+        # from or sinked into the Vref rail — it's an ideal voltage source).
+        if self._has_ref:
+            vref = torch.sigmoid(self.raw_vref) * self.x_max  # [1], in [0, x_max]
+            vref_expanded = vref.view(1, 1).expand(x.size(0), self.num_nodes)  # [B, N]
+            i_ref = self.ref_cell_lib(
+                x_src=vref_expanded, x_dst=x, x_max=self.x_max,
+            )  # [B, N]
+            ref_mask = torch.sigmoid(self.ref_z_logits)  # [N]
+            i_ref = i_ref * ref_mask.unsqueeze(0)  # [B, N]
+            i_ref_f32 = i_ref.float()
+            if i_edge_const is not None:
+                acc = acc.clone()
+            acc_ref = torch.zeros_like(x, dtype=torch.float32)
+            acc_ref.index_add_(1, self.ref_dst, i_ref_f32)
+            # NOTE: no source drain — Vref is an ideal voltage source.
+            acc = (acc.float() + acc_ref).to(dtype=x.dtype)
 
         leak = self._effective_leak(leak_floor=leak_floor).unsqueeze(0)  # [1, N]
         leak_term = leak * x
@@ -866,6 +944,38 @@ class DifferentialStage(nn.Module):
                 )
                 if hasattr(self.boundary_cell_lib, "theta_raw"):
                     bdev += int(self.boundary_cell_lib.theta_raw.numel())
+        # Reference (unary nonlinearity) stats
+        ref_n = 0
+        ref_device_n = 0
+        if self._has_ref:
+            if hasattr(self, "raw_vref"):
+                ref_n += int(self.raw_vref.numel())
+            if hasattr(self, "ref_z_logits"):
+                ref_n += int(self.ref_z_logits.numel())
+            # Device param: count all parameters in ref_cell_lib
+            if self.ref_cell_lib is not None:
+                if hasattr(self.ref_cell_lib, "param"):
+                    ref_device_n += int(self.ref_cell_lib.param.numel())
+                elif hasattr(self.ref_cell_lib, "alpha_raw"):
+                    r = self.ref_cell_lib.alpha_raw.numel()
+                    ref_device_n += r
+                    if hasattr(self.ref_cell_lib, "bias_raw"):
+                        ref_device_n += int(self.ref_cell_lib.bias_raw.numel())
+                elif hasattr(self.ref_cell_lib, "gm_raw"):
+                    r = int(self.ref_cell_lib.gm_raw.numel())
+                    ref_device_n += r
+                    if hasattr(self.ref_cell_lib, "isat_raw"):
+                        ref_device_n += int(self.ref_cell_lib.isat_raw.numel())
+                    if hasattr(self.ref_cell_lib, "a_raw"):
+                        ref_device_n += int(self.ref_cell_lib.a_raw.numel())
+                    if hasattr(self.ref_cell_lib, "b_raw"):
+                        ref_device_n += int(self.ref_cell_lib.b_raw.numel())
+                    if hasattr(self.ref_cell_lib, "s_raw"):
+                        ref_device_n += int(self.ref_cell_lib.s_raw.numel())
+                    if hasattr(self.ref_cell_lib, "theta_raw"):
+                        ref_device_n += int(self.ref_cell_lib.theta_raw.numel())
+                    if hasattr(self.ref_cell_lib, "kappa_raw"):
+                        ref_device_n += int(self.ref_cell_lib.kappa_raw.numel())
         return {
             "raw_leak": raw_leak_n,
             "z_logits": int(self.z_logits.numel()),
@@ -873,6 +983,9 @@ class DifferentialStage(nn.Module):
             "device_param": device_n,
             "boundary_z_logits": bz,
             "boundary_device_param": bdev,
+            "raw_vref": ref_n,
+            "ref_z_logits": ref_n,
+            "ref_device_param": ref_device_n,
             "total": (
                 raw_leak_n
                 + int(self.z_logits.numel())
@@ -880,5 +993,7 @@ class DifferentialStage(nn.Module):
                 + device_n
                 + bz
                 + bdev
+                + ref_n
+                + ref_device_n
             ),
         }

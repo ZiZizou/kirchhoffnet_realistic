@@ -974,6 +974,42 @@ def prune_stage(
     else:
         new_lib = stage.cell_lib
 
+    has_ref = getattr(stage, '_has_ref', False)
+
+    # Ref cell library recreation (for ref edges per node)
+    if has_ref and stage.ref_cell_lib is not None:
+        old_ref = stage.ref_cell_lib
+        if isinstance(old_ref, SimpleEdgeLibrary):
+            new_ref_lib = SimpleEdgeLibrary(num_edges=num_nodes_new, mode=old_ref._mode)
+        elif isinstance(old_ref, RealisticTanhLibrary):
+            new_ref_lib = RealisticTanhLibrary(
+                num_edges=num_nodes_new, bias_enabled=old_ref._bias_enabled,
+            )
+        elif isinstance(old_ref, RealisticTanhUpgradeLibrary):
+            new_ref_lib = RealisticTanhUpgradeLibrary(
+                num_edges=num_nodes_new, gm_min=old_ref.gm_min, gm_max=old_ref.gm_max,
+                isat_min=old_ref.isat_min, isat_max=old_ref.isat_max,
+                bias_enabled=old_ref._bias_enabled,
+            )
+        elif isinstance(old_ref, FreeTanhLibrary):
+            new_ref_lib = FreeTanhLibrary(
+                num_edges=num_nodes_new, gm_min=old_ref.gm_min, gm_max=old_ref.gm_max,
+                isat_min=old_ref.isat_min, isat_max=old_ref.isat_max,
+                bias_enabled=old_ref._bias_enabled,
+            )
+        elif isinstance(old_ref, AntiParallelFreeTanhLibrary):
+            new_ref_lib = AntiParallelFreeTanhLibrary(
+                num_edges=num_nodes_new, kappa_min=old_ref.kappa_min, kappa_max=old_ref.kappa_max,
+                gm_min=old_ref.gm_min, gm_max=old_ref.gm_max,
+                isat_min=old_ref.isat_min, isat_max=old_ref.isat_max,
+                theta_max=old_ref.theta_max, theta_enabled=old_ref._theta_enabled,
+                use_isat_normalization=old_ref._use_isat_normalization,
+            )
+        else:
+            new_ref_lib = old_ref
+    else:
+        new_ref_lib = None
+
     new_stage = DifferentialStage(
         num_nodes=num_nodes_new,
         src=new_src,
@@ -987,6 +1023,9 @@ def prune_stage(
         leak_mode=leak_mode,
         leak_constant=leak_constant,
         freeze_read=stage.freeze_read if freeze_read is None else freeze_read,
+        boundary_cell_lib=stage.boundary_cell_lib,
+        enable_ref_edges=has_ref,
+        ref_cell_lib=new_ref_lib,
     )
 
     if transfer_params:
@@ -1053,6 +1092,52 @@ def prune_stage(
             )
             with torch.no_grad():
                 new_stage.raw_drive_g.data.copy_(stage.raw_drive_g.data[surv_mask].cpu())
+
+        # Transfer reference-edge parameters (if stage had ref edges).
+        if has_ref and transfer_params:
+            with torch.no_grad():
+                if hasattr(new_stage, "raw_vref") and hasattr(stage, "raw_vref"):
+                    new_stage.raw_vref.data.copy_(stage.raw_vref.data.cpu())
+                if hasattr(new_stage, "ref_z_logits") and hasattr(stage, "ref_z_logits"):
+                    old_ref_z = stage.ref_z_logits.data[node_idx_old].cpu()
+                    if getattr(stage, "budget_enabled", False):
+                        _bg = stage._compute_budget_gate().detach().cpu()
+                        combined = torch.sigmoid(old_ref_z) * _bg[node_idx_old]
+                        combined = combined.clamp(1e-6, 1.0 - 1e-6)
+                        old_ref_z = torch.logit(combined)
+                    new_stage.ref_z_logits.data.copy_(old_ref_z)
+                # Transfer per-node ref_cell_lib parameters (one ref edge per node).
+                if hasattr(new_stage, "ref_cell_lib") and new_stage.ref_cell_lib is not None \
+                   and hasattr(stage, "ref_cell_lib") and stage.ref_cell_lib is not None:
+                    rsrc = stage.ref_cell_lib
+                    rdst = new_stage.ref_cell_lib
+                    if hasattr(rdst, "param") and hasattr(rsrc, "param"):
+                        rdst.param.data.copy_(rsrc.param.data[:, node_idx_old].cpu())
+                    elif hasattr(rdst, "alpha_raw") and hasattr(rsrc, "alpha_raw"):
+                        rdst.alpha_raw.data.copy_(rsrc.alpha_raw.data[node_idx_old].cpu())
+                        if hasattr(rdst, "bias_raw") and hasattr(rsrc, "bias_raw"):
+                            rdst.bias_raw.data.copy_(rsrc.bias_raw.data[node_idx_old].cpu())
+                    elif hasattr(rdst, "kappa_raw") and hasattr(rsrc, "kappa_raw"):
+                        for name in ("kappa_raw", "gm_raw", "isat_raw"):
+                            getattr(rdst, name).data.copy_(
+                                getattr(rsrc, name).data[node_idx_old].cpu()
+                            )
+                        if hasattr(rdst, "theta_raw") and hasattr(rsrc, "theta_raw"):
+                            rdst.theta_raw.data.copy_(rsrc.theta_raw.data[node_idx_old].cpu())
+                    elif hasattr(rdst, "a_raw") and hasattr(rsrc, "a_raw"):
+                        for name in ("a_raw", "b_raw", "s_raw", "gm_raw", "isat_raw"):
+                            getattr(rdst, name).data.copy_(
+                                getattr(rsrc, name).data[node_idx_old].cpu()
+                            )
+                        if hasattr(rdst, "theta_raw") and hasattr(rsrc, "theta_raw"):
+                            rdst.theta_raw.data.copy_(rsrc.theta_raw.data[node_idx_old].cpu())
+                    elif hasattr(rdst, "alpha_raw") and hasattr(rsrc, "alpha_raw"):
+                        for name in ("alpha_raw", "gm_raw", "isat_raw"):
+                            getattr(rdst, name).data.copy_(
+                                getattr(rsrc, name).data[node_idx_old].cpu()
+                            )
+                        if hasattr(rdst, "bias_raw") and hasattr(rsrc, "bias_raw"):
+                            rdst.bias_raw.data.copy_(rsrc.bias_raw.data[node_idx_old].cpu())
 
     return new_stage, node_remap
 
@@ -1214,6 +1299,7 @@ def topology_to_stage(
     boundary_src: list[int] | None = None,
     boundary_dst: list[int] | None = None,
     boundary_cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | AntiParallelFreeTanhLibrary | None = None,
+    enable_ref_edges: bool = False,
 ) -> tuple[DifferentialStage, list[int], dict[int, int]]:
     """Convert a SparseTopology into a DifferentialStage.
 
@@ -1241,6 +1327,9 @@ def topology_to_stage(
         boundary_cell_lib: Cell library instance used to compute boundary
             edge currents; must match the cell type of ``cell_lib`` and be
             sized for ``len(boundary_src)`` edges.
+        enable_ref_edges: When ``True``, every node gets one OTA edge to a
+            global per-stage learnable reference voltage ``Vref``. Forwarded
+            to ``DifferentialStage``.
 
     Returns:
         stage: DifferentialStage
@@ -1296,6 +1385,52 @@ def topology_to_stage(
             use_isat_normalization=cell_lib._use_isat_normalization,
         )
 
+    # Reference-edge cell library: one OTA per node (num_nodes edges). Same
+    # cell type/config as the core lib so reference edges behave like normal
+    # OTA cells, just connected to a global per-stage learnable Vref instead
+    # of inter-node voltages.
+    ref_cell_lib = None
+    if enable_ref_edges:
+        n_ref = len(active_nodes)
+        if isinstance(cell_lib, SimpleEdgeLibrary):
+            ref_cell_lib = SimpleEdgeLibrary(num_edges=n_ref, mode=cell_lib._mode)
+        elif isinstance(cell_lib, RealisticTanhLibrary):
+            ref_cell_lib = RealisticTanhLibrary(
+                num_edges=n_ref,
+                bias_enabled=cell_lib._bias_enabled,
+            )
+        elif isinstance(cell_lib, RealisticTanhUpgradeLibrary):
+            ref_cell_lib = RealisticTanhUpgradeLibrary(
+                num_edges=n_ref,
+                gm_min=cell_lib.gm_min,
+                gm_max=cell_lib.gm_max,
+                isat_min=cell_lib.isat_min,
+                isat_max=cell_lib.isat_max,
+                bias_enabled=cell_lib._bias_enabled,
+            )
+        elif isinstance(cell_lib, FreeTanhLibrary):
+            ref_cell_lib = FreeTanhLibrary(
+                num_edges=n_ref,
+                gm_min=cell_lib.gm_min,
+                gm_max=cell_lib.gm_max,
+                isat_min=cell_lib.isat_min,
+                isat_max=cell_lib.isat_max,
+                bias_enabled=cell_lib._bias_enabled,
+            )
+        elif isinstance(cell_lib, AntiParallelFreeTanhLibrary):
+            ref_cell_lib = AntiParallelFreeTanhLibrary(
+                num_edges=n_ref,
+                kappa_min=cell_lib.kappa_min,
+                kappa_max=cell_lib.kappa_max,
+                gm_min=cell_lib.gm_min,
+                gm_max=cell_lib.gm_max,
+                isat_min=cell_lib.isat_min,
+                isat_max=cell_lib.isat_max,
+                theta_max=cell_lib.theta_max,
+                theta_enabled=cell_lib._theta_enabled,
+                use_isat_normalization=cell_lib._use_isat_normalization,
+            )
+
     stage = DifferentialStage(
         num_nodes=len(active_nodes),
         src=remapped_src,
@@ -1313,6 +1448,8 @@ def topology_to_stage(
         boundary_src=boundary_src,
         boundary_dst=boundary_dst,
         boundary_cell_lib=boundary_cell_lib,
+        enable_ref_edges=enable_ref_edges,
+        ref_cell_lib=ref_cell_lib,
     )
     return stage, active_nodes, id_map
 
@@ -1340,6 +1477,7 @@ def build_net_from_preset(
     freeze_read: bool = False,
     enable_skip_linear: bool = False,
     boundary_fan_out: dict[int, list[int]] | None = None,
+    enable_ref_edges: bool = False,
 ):
     """Build a full KirchhoffNetWithIO from a config.PRESETS entry.
 
@@ -1381,6 +1519,14 @@ def build_net_from_preset(
                     is treated as fixed-voltage boundary terminals with
                     sparse OTA edges into the dynamic fabric. All dynamic
                     nodes start at zero (no initial-condition write).
+    * enable_ref_edges: When ``True``, every ODE node gets one OTA edge to
+                    a global per-stage learnable reference voltage ``Vref``
+                    (scalar, constrained to ``[0, x_max]``). Implements
+                    programmable unary nonlinearities (thresholding,
+                    saturation, soft activation, bias injection, etc.)
+                    without introducing a heterogeneous cell type. The
+                    reference edges use a separate cell library sized to
+                    ``num_nodes`` (one OTA per node). Default ``False``.
     """
     if preset_name not in PRESETS:
         raise KeyError(f"Unknown preset: {preset_name!r}. Available: {list(PRESETS)}")
@@ -1413,6 +1559,7 @@ def build_net_from_preset(
         freeze_read=freeze_read,
         enable_skip_linear=enable_skip_linear,
         boundary_fan_out=boundary_fan_out,
+        enable_ref_edges=enable_ref_edges,
     )
 
 
@@ -1429,6 +1576,7 @@ def build_net_from_config(
     freeze_read: bool = False,
     enable_skip_linear: bool = False,
     boundary_fan_out: dict[int, list[int]] | None = None,
+    enable_ref_edges: bool = False,
 ):
     """Build a KirchhoffNetWithIO from a full config dict.
 
@@ -1449,6 +1597,10 @@ def build_net_from_config(
     ``decoder_hidden_dim`` control the hidden width of the residual
     tanh branch (default 64). Defaults are read from the ``cfg`` dict
     when not supplied via the API.
+
+    ``enable_ref_edges`` (``False`` default): every ODE node gets one
+    OTA edge to a global per-stage learnable ``Vref``. Forwarded to
+    :func:`topology_to_stage` for each stage.
     """
     if leak_mode is None:
         leak_mode = cfg.get("leak_mode", "programmable")
@@ -1691,6 +1843,7 @@ def build_net_from_config(
             boundary_src=boundary_src,
             boundary_dst=boundary_dst,
             boundary_cell_lib=boundary_cell_lib,
+            enable_ref_edges=enable_ref_edges,
         )
         stage_modules.append(stage)
         stage_times.append(float(stages_cfg[stage_idx].get("t_span", 0.5)))

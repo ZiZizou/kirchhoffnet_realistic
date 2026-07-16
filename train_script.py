@@ -2430,6 +2430,18 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "any preset write_fan_out and any auto-generated fan-out. "
              "Ignored unless --write-mode fan_out.")
     parser.add_argument(
+        "--boundary-fan-out", type=str, default=None, dest="boundary_fan_out",
+        help="JSON dict specifying sparse OTA edges from fixed-voltage input "
+             "boundary terminals into the dynamic fabric, e.g. "
+             "'{\"0\": [2, 12], \"1\": [7, 17]}'. The input features become "
+             "external voltage terminals that inject current into the listed "
+             "target hidden nodes throughout the entire ODE evolution. All "
+             "dynamic nodes start at zero (no initial-condition write); "
+             "boundary edges inject I_OTA(u_i, x_j) per step, with the "
+             "input terminal itself never drained (unlike core OTA edges). "
+             "Each boundary edge carries its own OTA cell parameters and "
+             "edge gate (compatible with --no-edge-gates).")
+    parser.add_argument(
         "--leak", choices=["programmable", "non-programmable"],
         default="programmable", dest="leak",
         help="Stage leak mode (default: programmable). 'programmable' "
@@ -3117,6 +3129,45 @@ def main():
         active_preset["write_fan_out"] = _build_grid_write_fan_out(
             num_inputs=num_inputs, grid_size=resolved_grid_size)
 
+    # Resolve boundary_fan_out: explicit JSON from --boundary-fan-out.
+    # Boundary mode replaces the initial-condition write with continuous
+    # OTA edge injection from fixed-voltage input terminals. Mutually
+    # exclusive with persistent drive (boundary terminals already inject
+    # the signal continuously; adding drive targets on top would be
+    # redundant and is rejected).
+    boundary_fan_out_parsed = None
+    if args.boundary_fan_out is not None:
+        try:
+            raw = json.loads(args.boundary_fan_out)
+            boundary_fan_out_parsed = {int(k): [int(vv) for vv in v] for k, v in raw.items()}
+            for k, v in boundary_fan_out_parsed.items():
+                if k < 0 or any(x < 0 for x in v):
+                    raise ValueError(
+                        f"--boundary-fan-out: indices must be non-negative, got {k}->{v}"
+                    )
+            num_inputs = int(active_preset["stages"][0]["num_inputs"])
+            if any(k >= num_inputs for k in boundary_fan_out_parsed):
+                raise ValueError(
+                    f"--boundary-fan-out: input key {max(boundary_fan_out_parsed)} "
+                    f">= num_inputs={num_inputs}"
+                )
+            all_b_targets = [t for tgts in boundary_fan_out_parsed.values() for t in tgts]
+            if len(all_b_targets) != len(set(all_b_targets)):
+                dupes = sorted(
+                    {t for t in all_b_targets if all_b_targets.count(t) > 1}
+                )
+                raise ValueError(
+                    f"--boundary-fan-out: duplicate target nodes {dupes}"
+                )
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid --boundary-fan-out JSON: {e}")
+        if args.persistent_drive:
+            raise ValueError(
+                "--boundary-fan-out is incompatible with --persistent-drive: "
+                "boundary terminals already inject the input signal "
+                "continuously; persistent drive would double-inject."
+            )
+
     # Persistent drive: supports fan_out, sparse_proj, and one_to_one modes.
     # write_fan_out is already resolved above; for sparse_proj/one_to_one the
     # driven nodes come from --write-idx (handled by build_net_from_config).
@@ -3147,7 +3198,8 @@ def main():
         freeze_read=args.freeze_read,
         interstage_activation=args.interstage_activation,
         interstage_residual_rank=args.interstage_residual_rank,
-        enable_skip_linear=args.skip_linear)
+        enable_skip_linear=args.skip_linear,
+        boundary_fan_out=boundary_fan_out_parsed)
     net.to(device)
 
     if args.no_edge_gates:
@@ -3157,7 +3209,10 @@ def main():
                 stage.z_logits.requires_grad_(False)
             if getattr(stage, 'budget_enabled', False):
                 stage.budget_enabled = False
-        print("[train] --no-edge-gates: z_logits frozen to +10 (all edges permanently on)")
+            if hasattr(stage, 'boundary_z_logits') and stage.boundary_z_logits is not None:
+                stage.boundary_z_logits.data.fill_(10.0)
+                stage.boundary_z_logits.requires_grad_(False)
+        print("[train] --no-edge-gates: z_logits (core + boundary) frozen to +10 (all edges permanently on)")
 
     # --no-resistive-shunt: bypass the parallel resistive shunt across all
     # stages (no-resistive-shunt). Sets _has_resistive=False so rhs() skips

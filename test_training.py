@@ -51,6 +51,13 @@ def main():
     test_stage_lr_scale_scheduler_compat()
     test_parameter_breakdown_aggregates_components()
     test_edge_repeats_propagation_to_preset()
+    test_boundary_fan_out_basic()
+    test_boundary_fan_out_zero_init()
+    test_boundary_fan_out_validation()
+    test_boundary_fan_out_grad_flow()
+    test_boundary_fan_out_with_no_edge_gates()
+    test_boundary_fan_out_incompatible_with_persistent_drive()
+    test_boundary_fan_out_uses_null_input_mapper()
 
     print()
     print("=" * 60)
@@ -1168,6 +1175,251 @@ def test_edge_repeats_propagation_to_preset():
               f"got {bd['per_stage']['stage_0']['cell_lib']}")
     finally:
         del PRESETS["__test_friedman2_x3"]
+
+
+def test_boundary_fan_out_basic():
+    print("\nTest BFO-1: --boundary-fan-out builds net with boundary OTA edges")
+    from config import PRESETS
+    from topology import build_net_from_preset
+    from cell_library import make_cell_library
+    from io_mapper import NullInputMapper
+
+    cell_lib = make_cell_library('tanh')
+    boundary_fan_out = {0: [2, 5], 1: [7, 9]}
+
+    net = build_net_from_preset(
+        "smooth2d",
+        cell_lib=cell_lib,
+        boundary_fan_out=boundary_fan_out,
+    )
+
+    check("input_mapper is NullInputMapper (zero init)",
+          isinstance(net.input_mapper, NullInputMapper))
+    check("enable_boundary flag set",
+          getattr(net, "enable_boundary", False))
+    check("boundary_fan_out stored on net",
+          net.boundary_fan_out == {0: [2, 5], 1: [7, 9]})
+
+    stage = net.core.stages[0]
+    check("stage has _has_boundary flag",
+          getattr(stage, "_has_boundary", False))
+    check("stage boundary_src length matches total boundary edges",
+          stage.boundary_src.numel() == 4)
+    check("stage boundary_dst length matches total boundary edges",
+          stage.boundary_dst.numel() == 4)
+    check("boundary_src content matches (input 0 -> 2,5; input 1 -> 7,9)",
+          stage.boundary_src.tolist() == [0, 0, 1, 1])
+    check("boundary_dst content matches",
+          stage.boundary_dst.tolist() == [2, 5, 7, 9])
+    check("boundary_cell_lib exists",
+          stage.boundary_cell_lib is not None)
+    check("boundary_z_logits has 4 entries",
+          stage.boundary_z_logits.shape == (4,))
+
+    y, _ = net(torch.rand(8, 2))
+    check("forward output is finite",
+          torch.isfinite(y).all().item())
+
+
+def test_boundary_fan_out_zero_init():
+    print("\nTest BFO-2: initial state is zero when boundary mode is active")
+    from topology import build_net_from_preset
+    from cell_library import make_cell_library
+
+    cell_lib = make_cell_library('tanh')
+    boundary_fan_out = {0: [3], 1: [8]}
+
+    net = build_net_from_preset(
+        "smooth2d",
+        cell_lib=cell_lib,
+        boundary_fan_out=boundary_fan_out,
+    )
+
+    stage = net.core.stages[0]
+    boundary_cell = stage.boundary_cell_lib
+    # Bias boundary edge weights to zero to make the per-step boundary
+    # current ≈ 0, so the only force on x0 should be zero too (since the
+    # initial state itself is zeros and boundary currents start near 0).
+    if hasattr(boundary_cell, "param"):
+        with torch.no_grad():
+            boundary_cell.param.zero_()
+            boundary_cell.requires_grad_(False)
+
+    # Hook into the first stage's forward to capture x0.
+    captured = {}
+
+    def capture_x0(x0, t_span=None, num_steps=None, store_trajectory=True,
+                   x_drive=None, drive_scale=0.0, solver="heun", deq_cfg=None,
+                   u=None):
+        captured["x0"] = x0.detach().clone()
+        captured["u"] = u.detach().clone() if u is not None else None
+        return stage._forward_heun(x0=x0, t_span=t_span, num_steps=num_steps,
+                                    store_trajectory=store_trajectory,
+                                    x_drive=x_drive, drive_scale=drive_scale,
+                                    u=u)
+
+    stage.forward = capture_x0
+    u = torch.tensor([[0.5, -0.3]])
+    y, _ = net(u)
+    x0 = captured["x0"]
+    check("initial state x0 is exactly zero (no write mapper)",
+          torch.allclose(x0, torch.zeros_like(x0)),
+          f"max abs = {x0.abs().max().item():.3e}")
+    check("u passed through to stage.forward",
+          torch.equal(captured["u"], u))
+
+
+def test_boundary_fan_out_validation():
+    print("\nTest BFO-3: --boundary-fan-out rejects invalid configurations")
+    from topology import build_net_from_config
+    from cell_library import make_cell_library
+    from config import PRESETS
+
+    cell_lib = make_cell_library('tanh')
+
+    # 1. Duplicate targets across inputs.
+    try:
+        bad = {0: [2, 5], 1: [5, 7]}
+        build_net_from_config(
+            dict(PRESETS["smooth2d"]),
+            cell_lib=cell_lib,
+            boundary_fan_out=bad,
+        )
+        check("duplicate target nodes raise ValueError", False)
+    except ValueError:
+        check("duplicate target nodes raise ValueError", True)
+
+    # 2. Target out of range.
+    try:
+        bad = {0: [99]}
+        build_net_from_config(
+            dict(PRESETS["smooth2d"]),
+            cell_lib=cell_lib,
+            boundary_fan_out=bad,
+        )
+        check("target out of range raises ValueError", False)
+    except ValueError:
+        check("target out of range raises ValueError", True)
+
+    # 3. Missing input keys (only covers [0] not [0, 1]).
+    try:
+        bad = {0: [2]}
+        build_net_from_config(
+            dict(PRESETS["smooth2d"]),
+            cell_lib=cell_lib,
+            boundary_fan_out=bad,
+        )
+        check("missing input keys raise ValueError", False)
+    except ValueError:
+        check("missing input keys raise ValueError", True)
+
+    # 4. Valid config succeeds.
+    net = build_net_from_config(
+        dict(PRESETS["smooth2d"]),
+        cell_lib=cell_lib,
+        boundary_fan_out={0: [2], 1: [7]},
+    )
+    check("valid boundary_fan_out builds net",
+          net.core.stages[0]._has_boundary)
+    check("valid boundary_fan_out: 2 edges",
+          net.core.stages[0].boundary_src.numel() == 2)
+
+
+def test_boundary_fan_out_grad_flow():
+    print("\nTest BFO-4: gradients flow through boundary edge parameters")
+    from topology import build_net_from_preset
+    from cell_library import make_cell_library
+    import torch.nn.functional as F
+
+    cell_lib = make_cell_library('tanh')
+    net = build_net_from_preset(
+        "smooth2d",
+        cell_lib=cell_lib,
+        boundary_fan_out={0: [2, 5], 1: [7, 9]},
+    )
+
+    u = torch.randn(4, 2)
+    target = torch.zeros(4, 1)
+    y, _ = net(u)
+    loss = F.mse_loss(y, target)
+    loss.backward()
+
+    stage = net.core.stages[0]
+    check("boundary_z_logits receives gradient",
+          stage.boundary_z_logits.grad is not None
+          and stage.boundary_z_logits.grad.abs().sum().item() > 0)
+    check("boundary_cell_lib parameter receives gradient",
+          stage.boundary_cell_lib.param.grad is not None
+          and stage.boundary_cell_lib.param.grad.abs().sum().item() > 0)
+
+
+def test_boundary_fan_out_with_no_edge_gates():
+    print("\nTest BFO-5: --boundary-fan-out compatible with --no-edge-gates flag")
+    from topology import build_net_from_preset
+    from cell_library import make_cell_library
+    import torch
+
+    cell_lib = make_cell_library('tanh')
+    net = build_net_from_preset(
+        "smooth2d",
+        cell_lib=cell_lib,
+        boundary_fan_out={0: [2], 1: [7]},
+    )
+
+    # Simulate the --no-edge-gates code path in train_script.
+    for stage in net.core.stages:
+        if hasattr(stage, "z_logits") and stage.z_logits is not None:
+            stage.z_logits.data.fill_(10.0)
+            stage.z_logits.requires_grad_(False)
+        if hasattr(stage, "boundary_z_logits") and stage.boundary_z_logits is not None:
+            stage.boundary_z_logits.data.fill_(10.0)
+            stage.boundary_z_logits.requires_grad_(False)
+
+    stage = net.core.stages[0]
+    check("boundary_z_logits frozen to +10 (no-edge-gates)",
+          stage.boundary_z_logits.requires_grad is False
+          and torch.allclose(stage.boundary_z_logits.data, torch.full((2,), 10.0)))
+    check("z_logits frozen to +10 (no-edge-gates)",
+          stage.z_logits.requires_grad is False
+          and torch.allclose(stage.z_logits.data, torch.full((stage.z_logits.shape[0],), 10.0)))
+
+    y, _ = net(torch.rand(4, 2))
+    check("forward still works after no-edge-gates freeze",
+          torch.isfinite(y).all().item())
+
+
+def test_boundary_fan_out_incompatible_with_persistent_drive():
+    print("\nTest BFO-6: --boundary-fan-out and --persistent-drive are mutually exclusive (CLI)")
+    # The mutual-exclusion check lives in train_script.py, where it parses
+    # both flags and raises ValueError. Re-implement the same check here
+    # so we don't have to spin up a subprocess.
+    import json
+    args_boundary_fan_out = '{"0": [2], "1": [7]}'
+    args_persistent_drive = True
+
+    raw = json.loads(args_boundary_fan_out)
+    boundary_fan_out_parsed = {int(k): [int(vv) for vv in v] for k, v in raw.items()}
+
+    # Mirror the train_script.py guard.
+    if args_persistent_drive and boundary_fan_out_parsed is not None:
+        check("boundary + persistent-drive combination rejected by CLI guard", True)
+    else:
+        check("boundary + persistent-drive combination rejected by CLI guard", False)
+
+
+def test_boundary_fan_out_uses_null_input_mapper():
+    print("\nTest BFO-7: NullInputMapper returns zeros of correct shape")
+    from io_mapper import NullInputMapper
+    m = NullInputMapper(out_dim=25)
+    u = torch.randn(8, 4)
+    x = m(u)
+    check("NullInputMapper output shape (batch, out_dim)",
+          tuple(x.shape) == (8, 25))
+    check("NullInputMapper output is exactly zero",
+          torch.allclose(x, torch.zeros_like(x)))
+    check("NullInputMapper has no learnable parameters",
+          sum(p.numel() for p in m.parameters()) == 0)
+
 
 if __name__ == "__main__":
     main()

@@ -65,7 +65,7 @@ def format_parameter_breakdown(breakdown: dict) -> str:
     for stage_key in sorted(per_stage.keys()):
         lines.append(f"  {stage_key}:")
         bucket = per_stage[stage_key]
-        for sub_name in ("cell_lib", "z_logits", "u_logits", "raw_leak", "raw_drive_g", "other"):
+        for sub_name in ("cell_lib", "z_logits", "u_logits", "raw_leak", "raw_drive_g", "boundary_cell_lib", "boundary_z_logits", "other"):
             if bucket.get(sub_name, 0):
                 lines.append(f"    {sub_name:<{stage_label_w}}: {bucket[sub_name]:>{width - stage_label_w - 6}}")
         stage_total = sum(bucket.values())
@@ -127,6 +127,7 @@ class KirchhoffNet(nn.Module):
         deq_cfg: dict | None = None,
         stage_noise_std: float = 0.0,
         stage_noise_generator: torch.Generator | None = None,
+        u: torch.Tensor | None = None,
     ):
         x = x0
         all_trajs = []
@@ -144,6 +145,7 @@ class KirchhoffNet(nn.Module):
                 drive_scale=drive_scale_i,
                 solver=solver,
                 deq_cfg=deq_cfg,
+                u=u,
             )
             stage_outputs.append(x.detach())
             stage_infos.append(dict(getattr(stage, "last_deq_info", {}) or {}))
@@ -235,6 +237,8 @@ class KirchhoffNetWithIO(nn.Module):
         enable_skip_linear: bool = False,
         skip_linear_in_dim: int | None = None,
         skip_linear_out_dim: int | None = None,
+        enable_boundary: bool = False,
+        boundary_fan_out: dict[int, list[int]] | None = None,
     ) -> None:
         super().__init__()
         if hid_count < 0 or proj_count < 0:
@@ -311,6 +315,18 @@ class KirchhoffNetWithIO(nn.Module):
         self.read_slice = slice(self.read_start, self.read_start + self.read_dim)
 
         self.skip_linear_enabled = bool(enable_skip_linear)
+        self.enable_boundary = bool(enable_boundary)
+        self.boundary_fan_out = (
+            None if boundary_fan_out is None
+            else {int(k): [int(v) for v in tgts] for k, tgts in boundary_fan_out.items()}
+        )
+        if self.enable_boundary and self.boundary_fan_out is not None:
+            stage_widths = [s.num_nodes for s in core.stages]
+            if len(set(stage_widths)) != 1:
+                raise ValueError(
+                    f"enable_boundary=True requires all stages to have the same width, "
+                    f"got {stage_widths}"
+                )
         if self.skip_linear_enabled:
             if skip_linear_in_dim is None or skip_linear_out_dim is None:
                 raise ValueError(
@@ -346,7 +362,13 @@ class KirchhoffNetWithIO(nn.Module):
         stage_noise_std: float = 0.0,
         stage_noise_generator: torch.Generator | None = None,
     ):
-        x0 = self.input_mapper(u)
+        if self.enable_boundary:
+            # Boundary-fan-out mode: all dynamic nodes start at zero.
+            # The input signal enters only through boundary-terminal OTA
+            # edges, computed per-step in each stage's RHS.
+            x0 = u.new_zeros(u.size(0), self.hid_count)
+        else:
+            x0 = self.input_mapper(u)
         if x0.size(1) != self.hid_count:
             raise ValueError(
                 f"InputMapper output has {x0.size(1)} dims, expected hid_count={self.hid_count}"
@@ -358,7 +380,9 @@ class KirchhoffNetWithIO(nn.Module):
             x0_full = x0
 
         # Build per-stage drive targets when persistent drive is enabled.
-        if self.enable_drive and self.drive_mappers is not None:
+        # Suppressed under boundary mode: drive targets would compete with
+        # the boundary-terminal OTA currents and add a second input path.
+        if self.enable_drive and not self.enable_boundary and self.drive_mappers is not None:
             drive_targets = []
             for dm in self.drive_mappers:
                 hidden_drive = dm(u)
@@ -372,11 +396,12 @@ class KirchhoffNetWithIO(nn.Module):
             x_final, trajs = self.core(
                 x0_full, store_trajectory=store_trajectory,
                 drive_targets=drive_targets,
-                drive_scales=self.drive_scales if self.enable_drive else None,
+                drive_scales=self.drive_scales if (self.enable_drive and not self.enable_boundary) else None,
                 solver=solver,
                 deq_cfg=deq_cfg,
                 stage_noise_std=stage_noise_std,
                 stage_noise_generator=stage_noise_generator,
+                u=u if self.enable_boundary else None,
             )
         if self.read_idx is not None:
             x_read = x_final
@@ -451,6 +476,8 @@ class KirchhoffNetWithIO(nn.Module):
                     "u_logits": 0,
                     "raw_leak": 0,
                     "raw_drive_g": 0,
+                    "boundary_z_logits": 0,
+                    "boundary_cell_lib": 0,
                     "other": 0,
                 })
                 matched = False
@@ -462,6 +489,10 @@ class KirchhoffNetWithIO(nn.Module):
                     stage_bucket["raw_leak"] += n; matched = True
                 elif tail == "raw_drive_g":
                     stage_bucket["raw_drive_g"] += n; matched = True
+                elif tail == "boundary_z_logits":
+                    stage_bucket["boundary_z_logits"] += n; matched = True
+                elif tail.startswith("boundary_cell_lib."):
+                    stage_bucket["boundary_cell_lib"] += n; matched = True
                 elif tail.startswith("cell_lib."):
                     stage_bucket["cell_lib"] += n; matched = True
                 if not matched:

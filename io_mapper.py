@@ -50,6 +50,7 @@ __all__ = [
     "SparseInputMapper",
     "ProjectedSparseInputMapper",
     "FanOutInputMapper",
+    "NullInputMapper",
     "OutputMapper",
     "GroupedOutputMapper",
     "ResidualTanhEncoder",
@@ -272,6 +273,24 @@ class FanOutInputMapper(nn.Module):
         x = u.new_zeros(*u.shape[:-1], self.out_dim)
         x.index_copy_(-1, self._flat_targets.to(u.device), per_target.to(dtype=x.dtype))
         return x
+
+
+class NullInputMapper(nn.Module):
+    """Zero-output input mapper. Returns ``zeros(batch, out_dim)``.
+
+    Used as the input_mapper when the network is driven entirely by
+    boundary-terminal OTA edges (``--boundary-fan-out``). Carries no
+    learnable parameters; the input signal enters the network only
+    through the boundary-edge currents injected at the stage RHS.
+    """
+
+    def __init__(self, out_dim: int) -> None:
+        super().__init__()
+        self.in_dim = 0
+        self.out_dim = int(out_dim)
+
+    def forward(self, u: torch.Tensor) -> torch.Tensor:
+        return u.new_zeros(*u.shape[:-1], self.out_dim)
 
 
 class ProjectedSparseInputMapper(nn.Module):

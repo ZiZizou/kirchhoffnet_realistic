@@ -73,6 +73,18 @@ class DifferentialStage(nn.Module):
             throughout all Heun / DEQ sub-iterations. Leak, clip, and drive
             current still read the evolving ``x`` at each step. Default
             ``False`` (standard behavior: read and write at the same time).
+        boundary_src: List of input-terminal indices for sparse OTA edges
+            from fixed-voltage boundary terminals into the dynamic fabric.
+            Length must equal ``len(boundary_dst)``. ``None`` (default)
+            disables boundary edges for this stage.
+        boundary_dst: List of target dynamic-node indices for the boundary
+            OTA edges (same length as ``boundary_src``). Indices are in
+            the compact 0..num_nodes-1 coordinate space, matching
+            ``write_idx``.
+        boundary_cell_lib: Cell library instance used to compute boundary
+            edge currents ``I_OTA(u_i, x_j)``. Must match the cell type
+            of the core ``cell_lib`` and be sized for ``len(boundary_src)``
+            edges. Must be provided when boundary edges are configured.
     """
 
     def __init__(
@@ -91,6 +103,9 @@ class DifferentialStage(nn.Module):
         leak_constant: float | None = None,
         read_only_source: bool = False,
         freeze_read: bool = False,
+        boundary_src: list[int] | None = None,
+        boundary_dst: list[int] | None = None,
+        boundary_cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | AntiParallelFreeTanhLibrary | None = None,
     ) -> None:
         super().__init__()
         self.num_nodes = int(num_nodes)
@@ -175,6 +190,61 @@ class DifferentialStage(nn.Module):
         # voltages, bypassing ``freeze_read``. Cached here so the dispatch
         # in ``rhs`` is a fast attribute check instead of a hasattr scan.
         self._has_resistive = hasattr(cell_lib, "resistive_current")
+
+        # Boundary-terminal OTA edges (boundary-fan-out plan).
+        # Optional sparse programmable edges from fixed-voltage input
+        # terminals (carried in ``u``) into dynamic-node targets. The
+        # boundary terminals are ideal voltage sources: current flows
+        # only into the destination node, the terminal voltage is never
+        # drained. Gated by a separate ``boundary_z_logits`` parameter
+        # so they can be pruned/trained independently of the core edges.
+        if boundary_src is not None or boundary_dst is not None:
+            if boundary_src is None or boundary_dst is None:
+                raise ValueError(
+                    "DifferentialStage: boundary_src and boundary_dst must "
+                    "be provided together (got one without the other)"
+                )
+            if len(boundary_src) != len(boundary_dst):
+                raise ValueError(
+                    f"DifferentialStage: boundary_src/dst length mismatch: "
+                    f"{len(boundary_src)} vs {len(boundary_dst)}"
+                )
+            if any(s < 0 or s >= self.num_nodes for s in boundary_dst):
+                raise ValueError(
+                    f"DifferentialStage: boundary_dst entries must be in "
+                    f"[0, {self.num_nodes}), got {boundary_dst}"
+                )
+            if any(s < 0 for s in boundary_src):
+                raise ValueError(
+                    f"DifferentialStage: boundary_src entries must be "
+                    f"non-negative, got {boundary_src}"
+                )
+            if boundary_cell_lib is None:
+                raise ValueError(
+                    "DifferentialStage: boundary_cell_lib is required when "
+                    "boundary_src/boundary_dst are provided"
+                )
+            self.register_buffer(
+                "boundary_src", torch.tensor(boundary_src, dtype=torch.long),
+            )
+            self.register_buffer(
+                "boundary_dst", torch.tensor(boundary_dst, dtype=torch.long),
+            )
+            self.boundary_cell_lib = boundary_cell_lib
+            self.boundary_z_logits = nn.Parameter(
+                torch.full((len(boundary_src),), z_init),
+            )
+            self._has_boundary = True
+        else:
+            self.register_buffer(
+                "boundary_src", torch.empty(0, dtype=torch.long),
+            )
+            self.register_buffer(
+                "boundary_dst", torch.empty(0, dtype=torch.long),
+            )
+            self.boundary_cell_lib = None
+            self.boundary_z_logits = None
+            self._has_boundary = False
 
     def num_edges(self) -> int:
         return int(self.src.numel())
@@ -367,6 +437,7 @@ class DifferentialStage(nn.Module):
         return out.to(dtype=x.dtype)
 
     def rhs(self, x: torch.Tensor,
+            u: torch.Tensor | None = None,
             x_drive: torch.Tensor | None = None, drive_scale: float = 0.0,
             leak_floor: float | None = None,
             i_edge_const: torch.Tensor | None = None) -> torch.Tensor:
@@ -382,6 +453,14 @@ class DifferentialStage(nn.Module):
         skipped — the provided ``[batch, num_nodes]`` tensor is used directly
         as the KCL contribution. Leak, clip, and drive current are still
         computed from the current ``x``.
+
+        Boundary-terminal OTA edges (boundary-fan-out plan):
+        - When ``u`` is provided and ``self._has_boundary``, the boundary
+          edges inject ``I_OTA(u[:, boundary_src], x[:, boundary_dst])``
+          into the destination nodes only (no source drain — terminals
+          are fixed voltages). They are NOT frozen by ``freeze_read``:
+          the destination voltage evolves, so the OTA current is
+          recomputed every step.
         """
         x_src = x[:, self.src]
         x_dst = x[:, self.dst]
@@ -443,6 +522,27 @@ class DifferentialStage(nn.Module):
                 acc_res.index_add_(1, self.src, -i_res_f32)
             acc = (acc.float() + acc_res).to(dtype=x.dtype)
 
+        # Boundary-terminal OTA edges: I_OTA(u_i, x_j) injected into dst only.
+        # Boundary terminals are ideal voltage sources, never drained.
+        if self._has_boundary and u is not None and self.boundary_src.numel() > 0:
+            u_src = u[:, self.boundary_src]
+            x_dst_b = x[:, self.boundary_dst]
+            i_boundary = self.boundary_cell_lib(
+                x_src=u_src, x_dst=x_dst_b, x_max=self.x_max,
+            )
+            boundary_mask = torch.sigmoid(self.boundary_z_logits)  # [Eb]
+            i_boundary = i_boundary * boundary_mask.unsqueeze(0)   # [B, Eb]
+            i_boundary_f32 = i_boundary.float()
+            # Clone when freeze_read is active so we don't mutate the shared
+            # ``acc`` (= i_edge_const) tensor.
+            if i_edge_const is not None:
+                acc = acc.clone()
+            acc_b = torch.zeros_like(x, dtype=torch.float32)
+            acc_b.index_add_(1, self.boundary_dst, i_boundary_f32)
+            # NOTE: no `acc_b.index_add_(1, boundary_src, -i_boundary_f32)` —
+            # boundary terminals are fixed voltages, never drained.
+            acc = (acc.float() + acc_b).to(dtype=x.dtype)
+
         leak = self._effective_leak(leak_floor=leak_floor).unsqueeze(0)  # [1, N]
         leak_term = leak * x
 
@@ -472,6 +572,7 @@ class DifferentialStage(nn.Module):
         drive_scale: float = 0.0,
         solver: str = "heun",
         deq_cfg: dict | None = None,
+        u: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Integrate stage with fixed-step Heun or solve to fixed point.
 
@@ -501,12 +602,14 @@ class DifferentialStage(nn.Module):
                 x0=x0, t_span=t_span, num_steps=num_steps,
                 store_trajectory=store_trajectory,
                 x_drive=x_drive, drive_scale=drive_scale,
+                u=u,
             )
         if solver == "deq":
             x_star, _info = self.forward_equilibrium(
                 x0=x0,
                 x_drive=x_drive, drive_scale=drive_scale,
                 deq_cfg=deq_cfg,
+                u=u,
             )
             self.last_deq_info = dict(_info)
             traj = x_star.unsqueeze(-1) if store_trajectory else None
@@ -521,6 +624,7 @@ class DifferentialStage(nn.Module):
         store_trajectory: bool,
         x_drive: torch.Tensor | None,
         drive_scale: float,
+        u: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         t_span = float(t_span if t_span is not None else SOLVER["t_span"])
         num_steps = int(num_steps if num_steps is not None else SOLVER["num_steps"])
@@ -528,7 +632,9 @@ class DifferentialStage(nn.Module):
 
         # freeze_read: precompute edge currents (cell_lib + edge gate + budget
         # gate + KCL scatter-add) once from x0 and hold them constant across
-        # all sub-steps. Leak, clip, and drive still read the current x.
+        # all sub-steps. Leak, clip, drive, and boundary-edge currents still
+        # read the current x (boundary terminals are fixed but the dynamic
+        # target node voltage evolves, so the OTA current is per-step).
         # For cell libraries with a parallel resistive shunt, use
         # ``forward_tanh`` here so the resistive term stays dynamic in ``rhs``
         # (the resistive current is added per-step from evolving voltages).
@@ -555,10 +661,10 @@ class DifferentialStage(nn.Module):
         traj_chunks = [x] if store_trajectory else None
 
         for _ in range(num_steps):
-            k1 = self.rhs(x, x_drive=x_drive, drive_scale=drive_scale,
+            k1 = self.rhs(x, u=u, x_drive=x_drive, drive_scale=drive_scale,
                           i_edge_const=i_edge_const)
             x_pred = x + dt * k1
-            k2 = self.rhs(x_pred, x_drive=x_drive, drive_scale=drive_scale,
+            k2 = self.rhs(x_pred, u=u, x_drive=x_drive, drive_scale=drive_scale,
                           i_edge_const=i_edge_const)
             x = x + 0.5 * dt * (k1 + k2)
             if store_trajectory:
@@ -573,6 +679,7 @@ class DifferentialStage(nn.Module):
         x_drive: torch.Tensor | None = None,
         drive_scale: float = 0.0,
         deq_cfg: dict | None = None,
+        u: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict]:
         """Solve ``rhs(x*) = 0`` starting from ``x0`` (Deep Equilibrium).
 
@@ -615,7 +722,7 @@ class DifferentialStage(nn.Module):
         self.set_leak_floor(lf)
         try:
             def phi(x):
-                return x + dt * self.rhs(x,
+                return x + dt * self.rhs(x, u=u,
                                         x_drive=x_drive, drive_scale=drive_scale,
                                         leak_floor=lf,
                                         i_edge_const=i_edge_const)
@@ -724,15 +831,54 @@ class DifferentialStage(nn.Module):
         else:
             device_n = 0
         raw_leak_n = int(self.raw_leak.numel()) if hasattr(self, "raw_leak") else 0
+        bz = int(self.boundary_z_logits.numel()) if self.boundary_z_logits is not None else 0
+        bdev = 0
+        if self.boundary_cell_lib is not None:
+            if isinstance(self.boundary_cell_lib, SimpleEdgeLibrary):
+                bdev = int(self.boundary_cell_lib.param.numel())
+            elif isinstance(self.boundary_cell_lib, RealisticTanhLibrary):
+                bdev = int(self.boundary_cell_lib.alpha_raw.numel())
+                if hasattr(self.boundary_cell_lib, "bias_raw"):
+                    bdev += int(self.boundary_cell_lib.bias_raw.numel())
+            elif isinstance(self.boundary_cell_lib, RealisticTanhUpgradeLibrary):
+                bdev = (
+                    int(self.boundary_cell_lib.alpha_raw.numel())
+                    + int(self.boundary_cell_lib.gm_raw.numel())
+                    + int(self.boundary_cell_lib.isat_raw.numel())
+                )
+                if hasattr(self.boundary_cell_lib, "bias_raw"):
+                    bdev += int(self.boundary_cell_lib.bias_raw.numel())
+            elif isinstance(self.boundary_cell_lib, FreeTanhLibrary):
+                bdev = (
+                    int(self.boundary_cell_lib.a_raw.numel())
+                    + int(self.boundary_cell_lib.b_raw.numel())
+                    + int(self.boundary_cell_lib.s_raw.numel())
+                    + int(self.boundary_cell_lib.gm_raw.numel())
+                    + int(self.boundary_cell_lib.isat_raw.numel())
+                )
+                if hasattr(self.boundary_cell_lib, "theta_raw"):
+                    bdev += int(self.boundary_cell_lib.theta_raw.numel())
+            elif isinstance(self.boundary_cell_lib, AntiParallelFreeTanhLibrary):
+                bdev = (
+                    int(self.boundary_cell_lib.kappa_raw.numel())
+                    + int(self.boundary_cell_lib.gm_raw.numel())
+                    + int(self.boundary_cell_lib.isat_raw.numel())
+                )
+                if hasattr(self.boundary_cell_lib, "theta_raw"):
+                    bdev += int(self.boundary_cell_lib.theta_raw.numel())
         return {
             "raw_leak": raw_leak_n,
             "z_logits": int(self.z_logits.numel()),
             "u_logits": int(self.u_logits.numel()),
             "device_param": device_n,
+            "boundary_z_logits": bz,
+            "boundary_device_param": bdev,
             "total": (
                 raw_leak_n
                 + int(self.z_logits.numel())
                 + int(self.u_logits.numel())
                 + device_n
+                + bz
+                + bdev
             ),
         }

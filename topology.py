@@ -1211,6 +1211,9 @@ def topology_to_stage(
     leak_constant: float | None = None,
     read_only_source: bool = False,
     freeze_read: bool = False,
+    boundary_src: list[int] | None = None,
+    boundary_dst: list[int] | None = None,
+    boundary_cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | AntiParallelFreeTanhLibrary | None = None,
 ) -> tuple[DifferentialStage, list[int], dict[int, int]]:
     """Convert a SparseTopology into a DifferentialStage.
 
@@ -1230,6 +1233,14 @@ def topology_to_stage(
         freeze_read: When ``True``, edge currents are computed once from the
             initial state and held constant across all Heun / DEQ iterations
             inside the stage. Forwarded to ``DifferentialStage``.
+        boundary_src: List of input-terminal indices for sparse OTA edges
+            from fixed-voltage boundary terminals into the dynamic fabric.
+            Forwarded to ``DifferentialStage`` unchanged.
+        boundary_dst: List of target dynamic-node indices for the boundary
+            OTA edges (compact coordinates, must be in ``[0, num_nodes)``).
+        boundary_cell_lib: Cell library instance used to compute boundary
+            edge currents; must match the cell type of ``cell_lib`` and be
+            sized for ``len(boundary_src)`` edges.
 
     Returns:
         stage: DifferentialStage
@@ -1299,6 +1310,9 @@ def topology_to_stage(
         leak_constant=leak_constant,
         read_only_source=read_only_source,
         freeze_read=freeze_read,
+        boundary_src=boundary_src,
+        boundary_dst=boundary_dst,
+        boundary_cell_lib=boundary_cell_lib,
     )
     return stage, active_nodes, id_map
 
@@ -1325,6 +1339,7 @@ def build_net_from_preset(
     interstage_residual_rank: int = -1,
     freeze_read: bool = False,
     enable_skip_linear: bool = False,
+    boundary_fan_out: dict[int, list[int]] | None = None,
 ):
     """Build a full KirchhoffNetWithIO from a config.PRESETS entry.
 
@@ -1361,6 +1376,11 @@ def build_net_from_preset(
     * freeze_read: When ``True``, edge currents are computed once from the
                     initial state and held constant across all Heun / DEQ
                     iterations inside every stage. Defaults to ``False``.
+    * boundary_fan_out: dict mapping input indices to lists of target
+                    hidden-node indices. When provided, the input signal
+                    is treated as fixed-voltage boundary terminals with
+                    sparse OTA edges into the dynamic fabric. All dynamic
+                    nodes start at zero (no initial-condition write).
     """
     if preset_name not in PRESETS:
         raise KeyError(f"Unknown preset: {preset_name!r}. Available: {list(PRESETS)}")
@@ -1392,6 +1412,7 @@ def build_net_from_preset(
         interstage_residual_rank=interstage_residual_rank,
         freeze_read=freeze_read,
         enable_skip_linear=enable_skip_linear,
+        boundary_fan_out=boundary_fan_out,
     )
 
 
@@ -1407,6 +1428,7 @@ def build_net_from_config(
     interstage_residual_rank: int = -1,
     freeze_read: bool = False,
     enable_skip_linear: bool = False,
+    boundary_fan_out: dict[int, list[int]] | None = None,
 ):
     """Build a KirchhoffNetWithIO from a full config dict.
 
@@ -1457,6 +1479,7 @@ def build_net_from_config(
         SparseInputMapper,
         ProjectedSparseInputMapper,
         FanOutInputMapper,
+        NullInputMapper,
         GroupedOutputMapper,
         ResidualTanhInputMapper,
         ResidualTanhOutputMapper,
@@ -1489,9 +1512,110 @@ def build_net_from_config(
     n_first_hid = len(first_hid)
     final_state_dim = len(last_hid) + len(last_proj)
 
+    # Boundary-fan-out mode: input is treated as fixed-voltage boundary
+    # terminals rather than as an initial-condition write. All dynamic
+    # nodes start at zero; the input signal is injected continuously via
+    # sparse OTA edges computed in each stage's RHS.
+    boundary_src: list[int] | None = None
+    boundary_dst: list[int] | None = None
+    boundary_cell_lib = None
+    enable_boundary = False
+    if boundary_fan_out is not None:
+        enable_boundary = True
+        # Validate keys cover [0, in_dim).
+        missing_b = [i for i in range(in_dim) if i not in boundary_fan_out]
+        if missing_b:
+            raise ValueError(
+                f"boundary_fan_out: missing input indices {missing_b}; "
+                f"must cover [0, {in_dim})"
+            )
+        # Validate target indices are in [0, n_first_hid) and unique across inputs.
+        all_b_targets: list[int] = []
+        for i, targets in boundary_fan_out.items():
+            if i < 0 or i >= in_dim:
+                raise ValueError(
+                    f"boundary_fan_out: input key {i} out of range [0, {in_dim})"
+                )
+            for t in targets:
+                if t < 0 or t >= n_first_hid:
+                    raise ValueError(
+                        f"boundary_fan_out: input {i} target {t} out of "
+                        f"range [0, {n_first_hid})"
+                    )
+                all_b_targets.append(t)
+        if len(all_b_targets) != len(set(all_b_targets)):
+            dupes = sorted(
+                {t for t in all_b_targets if all_b_targets.count(t) > 1}
+            )
+            raise ValueError(
+                f"boundary_fan_out: duplicate target nodes {dupes}"
+            )
+        # Build flat lists: for each input i, for each target j, push (i, j).
+        boundary_src = []
+        boundary_dst = []
+        for i in range(in_dim):
+            for t in boundary_fan_out[i]:
+                boundary_src.append(int(i))
+                boundary_dst.append(int(t))
+        # Build a fresh cell library instance matching the cell type of
+        # ``cell_lib`` but sized for the boundary-edge count. We carry the
+        # same cell-type config (bias_enabled, gm bounds, theta, etc.) so
+        # the boundary OTA behaves identically to core edges.
+        n_boundary = len(boundary_src)
+        if isinstance(cell_lib, SimpleEdgeLibrary):
+            boundary_cell_lib = SimpleEdgeLibrary(
+                num_edges=n_boundary, mode=cell_lib._mode,
+            )
+        elif isinstance(cell_lib, RealisticTanhLibrary):
+            boundary_cell_lib = RealisticTanhLibrary(
+                num_edges=n_boundary,
+                bias_enabled=cell_lib._bias_enabled,
+            )
+        elif isinstance(cell_lib, RealisticTanhUpgradeLibrary):
+            boundary_cell_lib = RealisticTanhUpgradeLibrary(
+                num_edges=n_boundary,
+                gm_min=cell_lib.gm_min,
+                gm_max=cell_lib.gm_max,
+                isat_min=cell_lib.isat_min,
+                isat_max=cell_lib.isat_max,
+                bias_enabled=cell_lib._bias_enabled,
+            )
+        elif isinstance(cell_lib, FreeTanhLibrary):
+            boundary_cell_lib = FreeTanhLibrary(
+                num_edges=n_boundary,
+                gm_min=cell_lib.gm_min,
+                gm_max=cell_lib.gm_max,
+                isat_min=cell_lib.isat_min,
+                isat_max=cell_lib.isat_max,
+                bias_enabled=cell_lib._bias_enabled,
+            )
+        elif isinstance(cell_lib, AntiParallelFreeTanhLibrary):
+            boundary_cell_lib = AntiParallelFreeTanhLibrary(
+                num_edges=n_boundary,
+                kappa_min=cell_lib.kappa_min,
+                kappa_max=cell_lib.kappa_max,
+                gm_min=cell_lib.gm_min,
+                gm_max=cell_lib.gm_max,
+                isat_min=cell_lib.isat_min,
+                isat_max=cell_lib.isat_max,
+                theta_max=cell_lib.theta_max,
+                theta_enabled=cell_lib._theta_enabled,
+                use_isat_normalization=cell_lib._use_isat_normalization,
+            )
+        else:
+            raise ValueError(
+                f"build_net_from_config: unsupported cell_lib type for "
+                f"boundary edges: {type(cell_lib).__name__}"
+            )
+
     # Resolve write_idx and input mapper.
     fan_out_map = None
-    if write_mode == "one_to_one":
+    if enable_boundary:
+        # Boundary mode: input_mapper returns zeros; boundary edges inject
+        # the signal. write_idx remains None (no persistent drive needed).
+        input_mapper = NullInputMapper(out_dim=n_first_hid)
+        write_idx_arg = None
+    elif write_mode == "one_to_one":
         preset_write_idx = cfg.get("write_idx")
         if preset_write_idx is None:
             preset_write_idx = list(range(min(in_dim, n_first_hid)))
@@ -1564,6 +1688,9 @@ def build_net_from_config(
             leak_mode=leak_mode, leak_constant=leak_constant,
             read_only_source=read_only_source,
             freeze_read=freeze_read,
+            boundary_src=boundary_src,
+            boundary_dst=boundary_dst,
+            boundary_cell_lib=boundary_cell_lib,
         )
         stage_modules.append(stage)
         stage_times.append(float(stages_cfg[stage_idx].get("t_span", 0.5)))
@@ -1743,6 +1870,8 @@ def build_net_from_config(
         enable_skip_linear=enable_skip_linear,
         skip_linear_in_dim=in_dim if enable_skip_linear else None,
         skip_linear_out_dim=out_dim if enable_skip_linear else None,
+        enable_boundary=enable_boundary,
+        boundary_fan_out=boundary_fan_out,
     )
 
     # Hard topology check: write_idx → read_idx must be >1 hop on the core

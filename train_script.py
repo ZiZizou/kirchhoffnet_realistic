@@ -2584,6 +2584,12 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "stage so the resistive branch is bypassed in rhs() and frozen "
              "with the tanh current in the freeze_read path. The "
              "tanh_sat lambda is unaffected. Default: shunt enabled.")
+    parser.add_argument(
+        "--no-edge-gates", action="store_true", default=False,
+        dest="no_edge_gates",
+        help="Remove edge gating: freeze z_logits to +10 (sigmoid~1) so "
+             "all edges are permanently on. Disables edge_gate regularizer, "
+             "budget gate, and gate-based pruning.")
 
 # ----------------------------------------------------------------
 # Pruning helpers (PIT): transferable I/O mapper reconstruction.
@@ -2885,6 +2891,18 @@ def main():
 
     out_dir = _ensure_dir(args.output.resolve())
     lambdas = _resolve_lambdas(args.problem)
+    if args.no_edge_gates:
+        lambdas["edge_gate"] = 0.0
+        lambdas["sparsity"] = 0.0
+        from config import SCHEDULE_THREE_PHASE, SCHEDULE_FOUR_PHASE
+        for k in ("sparsity", "edge_gate"):
+            if k in SCHEDULE_THREE_PHASE.get("lambdas_b", {}):
+                SCHEDULE_THREE_PHASE["lambdas_b"][k] = 0.0
+        for phase_key in ("lambdas_b1", "lambdas_b2"):
+            if phase_key in SCHEDULE_FOUR_PHASE:
+                for k in ("sparsity", "edge_gate"):
+                    if k in SCHEDULE_FOUR_PHASE[phase_key]:
+                        SCHEDULE_FOUR_PHASE[phase_key][k] = 0.0
     if getattr(args, "tanh_sat_lambda", None) is not None:
         lambdas["tanh_sat"] = float(args.tanh_sat_lambda)
         print(f"[train] tanh_sat lambda overridden via CLI: {lambdas['tanh_sat']}")
@@ -2978,6 +2996,8 @@ def main():
                 f"The edge_gate regularizer (L1 on σ(z_logits)) may fight the budget. "
                 f"Consider setting edge_gate to 0 in the preset's lambdas override."
             )
+    if args.no_edge_gates:
+        budget_enabled = False
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if args.device is not None:
         device = args.device
@@ -3129,6 +3149,15 @@ def main():
         interstage_residual_rank=args.interstage_residual_rank,
         enable_skip_linear=args.skip_linear)
     net.to(device)
+
+    if args.no_edge_gates:
+        for stage in net.core.stages:
+            if hasattr(stage, 'z_logits') and stage.z_logits is not None:
+                stage.z_logits.data.fill_(10.0)
+                stage.z_logits.requires_grad_(False)
+            if getattr(stage, 'budget_enabled', False):
+                stage.budget_enabled = False
+        print("[train] --no-edge-gates: z_logits frozen to +10 (all edges permanently on)")
 
     # --no-resistive-shunt: bypass the parallel resistive shunt across all
     # stages (no-resistive-shunt). Sets _has_resistive=False so rhs() skips
@@ -3421,6 +3450,9 @@ def main():
         ab_total = epochs
         c_total = 0
         needs_prune = args.prune
+
+    if args.no_edge_gates:
+        needs_prune = False
 
     best_val = float("inf")
     best_epoch = -1

@@ -110,6 +110,8 @@ from train import (
 from io_mapper import (
     FanOutInputMapper,
     InputMapper,
+    NullInputMapper,
+    OutputAffine,
     OutputMapper,
     ProjectedSparseInputMapper,
     ResidualTanhInputMapper,
@@ -2796,6 +2798,11 @@ def _transfer_input_mapper(raw_mapper, raw_write_idx, stage0_remap,
                 raw_mapper.encoder.W_1.bias.data)
         return new_mapper, raw_write_idx
 
+    if isinstance(raw_mapper, NullInputMapper):
+        # No parameters to transfer — the mapper just returns zeros of
+        # shape (batch, out_dim). Recreate with the pruned output dim.
+        return NullInputMapper(out_dim=pruned_first_n), None
+
     raise TypeError(
         f"transfer_input_mapper: unsupported mapper type {type(raw_mapper).__name__}"
     )
@@ -2892,6 +2899,21 @@ def _transfer_output_mapper(raw_mapper, raw_read_idx, last_remap,
             new_mapper.encoder.W_2.weight.data.copy_(
                 raw_mapper.encoder.W_2.weight.data)
         return new_mapper, None
+
+    if isinstance(raw_mapper, OutputAffine):
+        # Learned gain/bias over the output ODE accumulator voltages.
+        # Transfer the per-dim gain and bias directly. OutputAffine has
+        # no node-dim dependency, so the pruned node count does not
+        # change the affine shape.
+        new_mapper = OutputAffine(out_dim=out_dim)
+        with torch.no_grad():
+            new_mapper.gain.data.copy_(raw_mapper.gain.data)
+            new_mapper.bias.data.copy_(raw_mapper.bias.data)
+        return new_mapper, None
+
+    raise TypeError(
+        f"transfer_output_mapper: unsupported mapper type {type(raw_mapper).__name__}"
+    )
 
 def main():
     parser = argparse.ArgumentParser(

@@ -208,7 +208,7 @@ def _per_dim_stats(
     }
 
 
-def validate(net, val_loader, task_fn, device) -> tuple[float, dict[str, np.ndarray]]:
+def validate(net, val_loader, task_fn, device, wrapper=None) -> tuple[float, dict[str, np.ndarray]]:
     """Compute mean MSE and per-dim stats over ``val_loader``."""
     net.eval()
     total = 0.0
@@ -219,7 +219,10 @@ def validate(net, val_loader, task_fn, device) -> tuple[float, dict[str, np.ndar
         for u, target in val_loader:
             u = u.to(device)
             target = target.to(device)
-            out = net(u)
+            if wrapper is not None:
+                out = wrapper(u)
+            else:
+                out = net(u)
             loss = task_fn(out, target)
             total += float(loss.item()) * u.size(0)
             n += u.size(0)
@@ -245,7 +248,7 @@ def denormalize_predictions(
 
 def compute_denorm_metrics(
     net, val_loader, target_mean, target_std, inverse_stats, device,
-    denorm_task_fn,
+    denorm_task_fn, wrapper=None,
 ) -> dict[str, float]:
     """Compute MSE / MAE in the original (un-normalized) logit space.
 
@@ -261,7 +264,10 @@ def compute_denorm_metrics(
         for u, t in val_loader:
             u = u.to(device)
             t = t.to(device)
-            out = net(u)
+            if wrapper is not None:
+                out = wrapper(u)
+            else:
+                out = net(u)
             preds_norm.append(out.detach())
             targets_norm.append(t.detach())
     if not preds_norm:
@@ -737,7 +743,7 @@ def main():
         avg_train = total_loss / max(1, n_batches)
         do_validate = (epoch % args.validate_every == 0) or (epoch == epochs - 1)
         if do_validate:
-            val_loss, stats = validate(net, val_loader, lambda o, t: F.mse_loss(o, t), device_t)
+            val_loss, stats = validate(net, val_loader, lambda o, t: F.mse_loss(o, t), device_t, wrapper=train_wrapper)
         else:
             val_loss = val_history[-1] if val_history else avg_train
             stats = stats_history[-1] if stats_history else {
@@ -823,7 +829,10 @@ def main():
     val_batch = next(iter(val_loader))
     u_val, y_val = val_batch[0][:64], val_batch[1][:64]
     with torch.no_grad():
-        out_val = net(u_val.to(device_t))
+        if train_wrapper is not None:
+            out_val = train_wrapper(u_val.to(device_t))
+        else:
+            out_val = net(u_val.to(device_t))
     plot_output_fit(
         out_val, y_val,
         save_path=str(out_dir / "output_fit.png"),
@@ -833,11 +842,13 @@ def main():
 
     full_val_loss, full_stats = validate(
         net, val_loader, lambda o, t: F.mse_loss(o, t), device_t,
+        wrapper=train_wrapper,
     )
     denorm = compute_denorm_metrics(
         net, val_loader, target_mean, target_std,
         inverse_stats=None, device=device_t,
         denorm_task_fn=lambda o, t: F.mse_loss(o, t),
+        wrapper=train_wrapper,
     )
     print(
         f"[mlp_ctle] final val MSE = {full_val_loss:.6f} "

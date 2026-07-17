@@ -252,7 +252,7 @@ def _import_matplotlib():
         return None
 
 
-def validate(net, val_loader, task_fn, device) -> float:
+def validate(net, val_loader, task_fn, device, wrapper=None) -> float:
     net.eval()
     total = 0.0
     n = 0
@@ -260,7 +260,10 @@ def validate(net, val_loader, task_fn, device) -> float:
         for u, target in val_loader:
             u = u.to(device)
             target = target.to(device)
-            out = net(u)
+            if wrapper is not None:
+                out = wrapper(u)
+            else:
+                out = net(u)
             loss = task_fn(out, target)
             total += float(loss.item()) * u.size(0)
             n += u.size(0)
@@ -268,7 +271,7 @@ def validate(net, val_loader, task_fn, device) -> float:
     return total / max(1, n)
 
 
-def compute_orig_metrics(net, val_loader, inverse_stats, device):
+def compute_orig_metrics(net, val_loader, inverse_stats, device, wrapper=None):
     """Compute MSE/RMSE in original (un-standardized) target units."""
     net.eval()
     preds, targets = [], []
@@ -276,7 +279,10 @@ def compute_orig_metrics(net, val_loader, inverse_stats, device):
         for u, t in val_loader:
             u = u.to(device)
             t = t.to(device)
-            preds.append(net(u))
+            if wrapper is not None:
+                preds.append(wrapper(u))
+            else:
+                preds.append(net(u))
             targets.append(t)
     y_pred_std = torch.cat(preds, dim=0)
     y_true_std = torch.cat(targets, dim=0)
@@ -523,8 +529,8 @@ def main():
         avg_train = total_loss / max(1, n_batches)
         do_validate = (epoch % args.validate_every == 0) or (epoch == epochs - 1)
         if do_validate:
-            val_loss = validate(net, val_loader, task_fn, device)
-            _, rmse, mae = compute_orig_metrics(net, val_loader, inverse_stats, device)
+            val_loss = validate(net, val_loader, task_fn, device, wrapper=train_wrapper)
+            _, rmse, mae = compute_orig_metrics(net, val_loader, inverse_stats, device, wrapper=train_wrapper)
         else:
             val_loss = val_history[-1] if val_history else avg_train
             rmse = orig_rmse_history[-1] if orig_rmse_history else 0.0
@@ -583,15 +589,18 @@ def main():
     u_val = u_val.to(device)
     y_val = y_val.to(device)
     with torch.no_grad():
-        out = net(u_val)
+        if train_wrapper is not None:
+            out = train_wrapper(u_val)
+        else:
+            out = net(u_val)
     plot_output_fit(
         out, y_val,
         save_path=str(out_dir / "output_fit.png"),
         title=f"MLP (hidden={args.hidden_dim}, layers={args.num_layers}, {args.activation}) — Friedman #2 output fit",
     )
 
-    full_val_loss = validate(net, val_loader, task_fn, device)
-    final_mse, final_rmse, final_mae = compute_orig_metrics(net, val_loader, inverse_stats, device)
+    full_val_loss = validate(net, val_loader, task_fn, device, wrapper=train_wrapper)
+    final_mse, final_rmse, final_mae = compute_orig_metrics(net, val_loader, inverse_stats, device, wrapper=train_wrapper)
     print(
         f"[mlp_friedman2] final val {loss_label} = {full_val_loss:.6f} "
         f"(best val = {best_val:.6f} @ epoch {best_epoch})  "

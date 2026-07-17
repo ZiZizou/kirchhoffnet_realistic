@@ -163,13 +163,26 @@ def fake_quantize_symmetric(
     x: torch.Tensor,
     bits: int,
     ste: bool = True,
+    dim: int | None = None,
 ) -> torch.Tensor:
     """Symmetric N-bit quantization on tensor ``x``.
 
     Symmetric quantization uses ``2^(bits-1) - 1`` positive levels and the
-    same number of negative levels around zero. The scale is the maximum
-    absolute value across the tensor; if the input is all-zero the scale
-    defaults to ``1.0`` to avoid division-by-zero.
+    same number of negative levels around zero.
+
+    Scale granularity:
+      - ``dim=None`` (default): per-tensor scale, computed from the global
+        maximum absolute value across the entire tensor. A single outlier
+        weight forces the entire quantization grid to coarsen.
+      - ``dim`` specified: per-row scale computed from the maximum absolute
+        value along that axis (with ``keepdim=True``). For a
+        ``(out_features, in_features)`` weight matrix, ``dim=0`` gives each
+        output channel its own full-resolution grid regardless of outliers
+        elsewhere in the matrix. ``dim=-1`` is equivalent to ``dim=0`` for a
+        2-D matrix and is the typical choice for Linear weight tensors.
+
+    All-zero rows are handled by leaving their scale at the floor
+    ``1.0`` so division stays finite.
 
     With ``ste=True`` the forward returns hard-quantized values but the
     backward gradient is passed through unchanged (straight-through
@@ -179,11 +192,17 @@ def fake_quantize_symmetric(
     if bits is None or bits <= 0:
         return x
     qmax = _quant_levels(bits)
-    abs_max = x.abs().detach().max()
-    if abs_max.item() == 0.0:
-        scale = torch.ones_like(abs_max)
+    if dim is None:
+        abs_max = x.abs().detach().max()
+        if abs_max.item() == 0.0:
+            scale = torch.ones_like(abs_max)
+        else:
+            scale = abs_max / float(qmax)
     else:
+        abs_max = x.abs().detach().max(dim=dim, keepdim=True).values
+        all_zero = (abs_max == 0.0)
         scale = abs_max / float(qmax)
+        scale = torch.where(all_zero, torch.ones_like(scale), scale)
     # avoid div-by-zero in the very small scale case
     scale = scale.clamp_min(1e-12)
     x_scaled = x / scale
@@ -191,8 +210,7 @@ def fake_quantize_symmetric(
         x_rounded = x_scaled + (x_scaled.detach().round() - x_scaled.detach())
     else:
         x_rounded = x_scaled.round()
-    return (x_rounded * scale).clamp(-abs_max.item() - scale.item(),
-                                     abs_max.item() + scale.item())
+    return (x_rounded * scale).clamp(-abs_max - scale, abs_max + scale)
 
 
 def quantize_with_range(
@@ -240,8 +258,9 @@ class WeightQuantizer:
     def apply(self, w: torch.Tensor, generator: torch.Generator | None = None) -> torch.Tensor:
         out = w
         if self.cfg.quant_bits is not None and self.cfg.quant_bits > 0:
+            quant_dim = w.ndim - 1 if w.ndim >= 2 else None
             out = fake_quantize_symmetric(
-                out, self.cfg.quant_bits, ste=self.cfg.ste,
+                out, self.cfg.quant_bits, ste=self.cfg.ste, dim=quant_dim,
             )
         if self.cfg.noise_std > 0.0 and self.cfg.weight_noise:
             noise = torch.empty_like(out)

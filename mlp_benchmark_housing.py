@@ -150,7 +150,7 @@ def _import_matplotlib():
         return None
 
 
-def validate(net, val_loader, task_fn, device) -> float:
+def validate(net, val_loader, task_fn, device, wrapper=None) -> float:
     net.eval()
     total = 0.0
     n = 0
@@ -158,7 +158,10 @@ def validate(net, val_loader, task_fn, device) -> float:
         for u, target in val_loader:
             u = u.to(device)
             target = target.to(device)
-            out = net(u)
+            if wrapper is not None:
+                out = wrapper(u)
+            else:
+                out = net(u)
             loss = task_fn(out, target)
             total += float(loss.item()) * u.size(0)
             n += u.size(0)
@@ -166,7 +169,7 @@ def validate(net, val_loader, task_fn, device) -> float:
     return total / max(1, n)
 
 
-def compute_orig_metrics(net, val_loader, inverse_stats, device):
+def compute_orig_metrics(net, val_loader, inverse_stats, device, wrapper=None):
     """Compute MAE and RMSE in original units (USD x 100k)."""
     net.eval()
     preds, targets = [], []
@@ -174,7 +177,10 @@ def compute_orig_metrics(net, val_loader, inverse_stats, device):
         for u, t in val_loader:
             u = u.to(device)
             t = t.to(device)
-            out = net(u)
+            if wrapper is not None:
+                out = wrapper(u)
+            else:
+                out = net(u)
             preds.append(out)
             targets.append(t)
     y_pred = denormalize_targets(torch.cat(preds, dim=0), inverse_stats)
@@ -394,8 +400,8 @@ def main():
         avg_train = total_loss / max(1, n_batches)
         do_validate = (epoch % args.validate_every == 0) or (epoch == epochs - 1)
         if do_validate:
-            val_loss = validate(net, val_loader, task_fn, device)
-            mae, rmse = compute_orig_metrics(net, val_loader, inverse_stats, device)
+            val_loss = validate(net, val_loader, task_fn, device, wrapper=train_wrapper)
+            mae, rmse = compute_orig_metrics(net, val_loader, inverse_stats, device, wrapper=train_wrapper)
         else:
             val_loss = val_history[-1] if val_history else avg_train
             mae = orig_mae_history[-1] if orig_mae_history else 0.0
@@ -453,15 +459,18 @@ def main():
     u_val = u_val.to(device)
     y_val = y_val.to(device)
     with torch.no_grad():
-        out = net(u_val)
+        if train_wrapper is not None:
+            out = train_wrapper(u_val)
+        else:
+            out = net(u_val)
     plot_output_fit(
         out, y_val,
         save_path=str(out_dir / "output_fit.png"),
         title=f"MLP (hidden={args.hidden_dim}, layers={args.num_layers}, {args.activation}) — CA Housing output fit",
     )
 
-    full_val_loss = validate(net, val_loader, task_fn, device)
-    final_mae, final_rmse = compute_orig_metrics(net, val_loader, inverse_stats, device)
+    full_val_loss = validate(net, val_loader, task_fn, device, wrapper=train_wrapper)
+    final_mae, final_rmse = compute_orig_metrics(net, val_loader, inverse_stats, device, wrapper=train_wrapper)
     print(
         f"[mlp_housing] final val Huber = {full_val_loss:.6f} "
         f"(best val = {best_val:.6f} @ epoch {best_epoch})  "

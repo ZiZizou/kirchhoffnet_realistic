@@ -198,8 +198,12 @@ def test_no_adc_flag():
 
     from analog_noise import fake_quantize_symmetric
     with torch.no_grad():
-        q_fc1 = fake_quantize_symmetric(base.fc1.weight, bits=4, ste=False)
-        q_fc2 = fake_quantize_symmetric(base.fc2.weight, bits=4, ste=False)
+        q_fc1 = fake_quantize_symmetric(
+            base.fc1.weight, bits=4, ste=False, dim=-1,
+        )
+        q_fc2 = fake_quantize_symmetric(
+            base.fc2.weight, bits=4, ste=False, dim=-1,
+        )
         h = F.relu(F.linear(x, q_fc1, base.fc1.bias))
         y_ref = F.linear(h, q_fc2, base.fc2.bias)
     check(

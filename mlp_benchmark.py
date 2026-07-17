@@ -141,7 +141,7 @@ def _import_matplotlib():
         return None
 
 
-def validate(net, val_loader, task_fn, device) -> float:
+def validate(net, val_loader, task_fn, device, wrapper=None) -> float:
     net.eval()
     total = 0.0
     n = 0
@@ -149,7 +149,10 @@ def validate(net, val_loader, task_fn, device) -> float:
         for u, target in val_loader:
             u = u.to(device)
             target = target.to(device)
-            out = net(u)
+            if wrapper is not None:
+                out = wrapper(u)
+            else:
+                out = net(u)
             loss = task_fn(out, target)
             total += float(loss.item()) * u.size(0)
             n += u.size(0)
@@ -346,7 +349,7 @@ def main():
         avg_train = total_loss / max(1, n_batches)
         do_validate = (epoch % args.validate_every == 0) or (epoch == args.epochs - 1)
         if do_validate:
-            val_loss = validate(net, val_loader, task_fn, device)
+            val_loss = validate(net, val_loader, task_fn, device, wrapper=train_wrapper)
         else:
             val_loss = val_history[-1] if val_history else avg_train
 
@@ -399,14 +402,17 @@ def main():
     u_val = u_val.to(device)
     y_val = y_val.to(device)
     with torch.no_grad():
-        out = net(u_val)
+        if train_wrapper is not None:
+            out = train_wrapper(u_val)
+        else:
+            out = net(u_val)
     plot_output_fit(
         out, y_val,
         save_path=str(out_dir / "output_fit.png"),
         title=f"MLP (hidden={args.hidden_dim}, {args.activation}) — smooth2d output fit",
     )
 
-    full_val_loss = validate(net, val_loader, task_fn, device)
+    full_val_loss = validate(net, val_loader, task_fn, device, wrapper=train_wrapper)
     print(f"[mlp] final val MSE = {full_val_loss:.6f} (best val = {best_val:.6f} @ epoch {best_epoch})")
     with open(out_dir / "final_metrics.txt", "w") as f:
         f.write(f"param_count: {n_params}\n")

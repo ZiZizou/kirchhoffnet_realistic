@@ -956,6 +956,7 @@ def prune_stage(
             isat_min=old.isat_min,
             isat_max=old.isat_max,
             bias_enabled=old._bias_enabled,
+            parallel_tanh_mult_enabled=old._parallel_tanh_mult_enabled,
         )
     elif is_anti_parallel:
         old = stage.cell_lib
@@ -1393,6 +1394,7 @@ def topology_to_stage(
             isat_min=cell_lib.isat_min,
             isat_max=cell_lib.isat_max,
             bias_enabled=cell_lib._bias_enabled,
+            parallel_tanh_mult_enabled=cell_lib._parallel_tanh_mult_enabled,
         )
     elif isinstance(cell_lib, AntiParallelFreeTanhLibrary):
         cell_lib = AntiParallelFreeTanhLibrary(
@@ -1439,6 +1441,7 @@ def topology_to_stage(
                 isat_min=cell_lib.isat_min,
                 isat_max=cell_lib.isat_max,
                 bias_enabled=cell_lib._bias_enabled,
+                parallel_tanh_mult_enabled=cell_lib._parallel_tanh_mult_enabled,
             )
         elif isinstance(cell_lib, AntiParallelFreeTanhLibrary):
             ref_cell_lib = AntiParallelFreeTanhLibrary(
@@ -1489,6 +1492,7 @@ def topology_to_stage(
                 isat_min=cell_lib.isat_min,
                 isat_max=cell_lib.isat_max,
                 bias_enabled=cell_lib._bias_enabled,
+                parallel_tanh_mult_enabled=cell_lib._parallel_tanh_mult_enabled,
             )
         elif isinstance(cell_lib, AntiParallelFreeTanhLibrary):
             output_ode_cell_lib = AntiParallelFreeTanhLibrary(
@@ -1839,6 +1843,7 @@ def build_net_from_config(
                 isat_min=cell_lib.isat_min,
                 isat_max=cell_lib.isat_max,
                 bias_enabled=cell_lib._bias_enabled,
+                parallel_tanh_mult_enabled=cell_lib._parallel_tanh_mult_enabled,
             )
         elif isinstance(cell_lib, AntiParallelFreeTanhLibrary):
             boundary_cell_lib = AntiParallelFreeTanhLibrary(
@@ -1930,6 +1935,7 @@ def build_net_from_config(
                 isat_min=cell_lib.isat_min,
                 isat_max=cell_lib.isat_max,
                 bias_enabled=cell_lib._bias_enabled,
+                parallel_tanh_mult_enabled=cell_lib._parallel_tanh_mult_enabled,
             )
         elif isinstance(cell_lib, AntiParallelFreeTanhLibrary):
             output_ode_cell_lib = AntiParallelFreeTanhLibrary(

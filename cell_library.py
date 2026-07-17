@@ -266,6 +266,7 @@ class FreeTanhLibrary(nn.Module):
         isat_min: float | None = None,
         isat_max: float | None = None,
         bias_enabled: bool = False,
+        parallel_tanh_mult_enabled: bool = False,
     ) -> None:
         super().__init__()
         self.gm_min = float(gm_min if gm_min is not None else TANH_REALISTIC_GM_MIN)
@@ -284,6 +285,7 @@ class FreeTanhLibrary(nn.Module):
             )
 
         self._bias_enabled = bool(bias_enabled)
+        self._parallel_tanh_mult_enabled = bool(parallel_tanh_mult_enabled)
         self.a_raw = nn.Parameter(torch.randn(num_edges))
         self.b_raw = nn.Parameter(torch.randn(num_edges))
         self.s_raw = nn.Parameter(torch.randn(num_edges))
@@ -291,6 +293,12 @@ class FreeTanhLibrary(nn.Module):
         self.isat_raw = nn.Parameter(torch.full((num_edges,), -2.3))
         if self._bias_enabled:
             self.theta_raw = nn.Parameter(torch.zeros(num_edges))
+        # Experimental parallel tanh-multiplier cell:
+        #   I_parallel = Isat * tanh(gm_x * Vsrc) * tanh(gm_y * Vdest)
+        if self._parallel_tanh_mult_enabled:
+            self.gm_x_raw = nn.Parameter(torch.full((num_edges,), -2.3))
+            self.gm_y_raw = nn.Parameter(torch.full((num_edges,), -2.3))
+            self.isat_parallel_raw = nn.Parameter(torch.full((num_edges,), -2.3))
         # Resistive shunt: g_raw=0 → G = softplus(0) ≈ 0.6931.
         self.g_resistive_raw = nn.Parameter(torch.zeros(num_edges))
 
@@ -327,6 +335,20 @@ class FreeTanhLibrary(nn.Module):
         Returns ``[batch, E]`` gated by ``gate_src * gate_dst``.
         """
         i_cell = self._tanh_core(x_src, x_dst)                          # [1, E]
+        if self._parallel_tanh_mult_enabled:
+            sig_gm_x = torch.sigmoid(self.gm_x_raw)
+            gm_x = self.gm_min + (self.gm_max - self.gm_min) * sig_gm_x # [E]
+            sig_gm_y = torch.sigmoid(self.gm_y_raw)
+            gm_y = self.gm_min + (self.gm_max - self.gm_min) * sig_gm_y # [E]
+            sig_isat_p = torch.sigmoid(self.isat_parallel_raw)
+            isat_p = (
+                self.isat_min
+                + (self.isat_max - self.isat_min) * sig_isat_p
+            ).clamp_min(1e-6)                                           # [E]
+            i_parallel = isat_p.unsqueeze(0) * torch.tanh(
+                gm_x.unsqueeze(0) * x_src
+            ) * torch.tanh(gm_y.unsqueeze(0) * x_dst)                   # [1, E]
+            i_cell = i_cell + i_parallel
         i_cell = i_cell.expand(x_src.shape[0], -1)                      # [B, E]
         gate_src = torch.sigmoid((x_max - x_src.abs()) / self._beta_softness)
         gate_dst = torch.sigmoid((x_max - x_dst.abs()) / self._beta_softness)
@@ -496,7 +518,9 @@ def make_cell_library(
     ``CELL_LIBRARIES[library_name]`` entry (default ``False``) and passes
     it to ``RealisticTanhLibrary`` / ``RealisticTanhUpgradeLibrary`` /
     ``FreeTanhLibrary``. For ``tanh_anti``, ``THETA_ENABLED`` is read
-    instead and passed as ``theta_enabled``.
+    instead and passed as ``theta_enabled``. For ``tanh_free``, the
+    experimental ``PARALLEL_TANH_MULT_ENABLED`` flag is also read and
+    passed as ``parallel_tanh_mult_enabled``.
 
     When ``num_edges`` is ``None`` (template), the returned library
     is created with ``num_edges=1`` and must be replaced with a per-stage
@@ -513,7 +537,14 @@ def make_cell_library(
         return RealisticTanhUpgradeLibrary(num_edges=n, bias_enabled=bias_enabled)
     if library_name == "tanh_free":
         bias_enabled = bool(CELL_LIBRARIES[library_name].get("BIAS_ENABLED", False))
-        return FreeTanhLibrary(num_edges=n, bias_enabled=bias_enabled)
+        parallel_tanh_mult_enabled = bool(
+            CELL_LIBRARIES[library_name].get("PARALLEL_TANH_MULT_ENABLED", False)
+        )
+        return FreeTanhLibrary(
+            num_edges=n,
+            bias_enabled=bias_enabled,
+            parallel_tanh_mult_enabled=parallel_tanh_mult_enabled,
+        )
     if library_name == "tanh_anti":
         theta_enabled = bool(CELL_LIBRARIES[library_name].get("THETA_ENABLED", False))
         return AntiParallelFreeTanhLibrary(num_edges=n, theta_enabled=theta_enabled)

@@ -1107,6 +1107,13 @@ def apply_ablation(net, ablation: str) -> None:
                     )
                 if hasattr(stage.cell_lib, "theta_raw"):
                     stage.cell_lib.theta_raw = nn.Parameter(stage.cell_lib.theta_raw.new_zeros(0))
+                if getattr(stage.cell_lib, "_parallel_tanh_mult_enabled", False):
+                    for name in ("gm_x_raw", "gm_y_raw", "isat_parallel_raw"):
+                        setattr(
+                            stage.cell_lib,
+                            name,
+                            nn.Parameter(getattr(stage.cell_lib, name).new_zeros(0)),
+                        )
             elif isinstance(cell_lib, AntiParallelFreeTanhLibrary):
                 for name in ("kappa_raw", "gm_raw", "isat_raw"):
                     setattr(

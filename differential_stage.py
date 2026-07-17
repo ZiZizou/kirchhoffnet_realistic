@@ -1011,6 +1011,12 @@ class DifferentialStage(nn.Module):
             )
             if hasattr(self.cell_lib, "theta_raw"):
                 device_n += int(self.cell_lib.theta_raw.numel())
+            if getattr(self.cell_lib, "_parallel_tanh_mult_enabled", False):
+                device_n += (
+                    int(self.cell_lib.gm_x_raw.numel())
+                    + int(self.cell_lib.gm_y_raw.numel())
+                    + int(self.cell_lib.isat_parallel_raw.numel())
+                )
         elif isinstance(self.cell_lib, AntiParallelFreeTanhLibrary):
             device_n = (
                 int(self.cell_lib.kappa_raw.numel())
@@ -1049,6 +1055,12 @@ class DifferentialStage(nn.Module):
                 )
                 if hasattr(self.boundary_cell_lib, "theta_raw"):
                     bdev += int(self.boundary_cell_lib.theta_raw.numel())
+                if getattr(self.boundary_cell_lib, "_parallel_tanh_mult_enabled", False):
+                    bdev += (
+                        int(self.boundary_cell_lib.gm_x_raw.numel())
+                        + int(self.boundary_cell_lib.gm_y_raw.numel())
+                        + int(self.boundary_cell_lib.isat_parallel_raw.numel())
+                    )
             elif isinstance(self.boundary_cell_lib, AntiParallelFreeTanhLibrary):
                 bdev = (
                     int(self.boundary_cell_lib.kappa_raw.numel())

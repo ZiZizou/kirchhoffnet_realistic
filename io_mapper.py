@@ -574,6 +574,38 @@ class ResidualTanhInputMapper(nn.Module):
         )
 
 
+class OutputAffine(nn.Module):
+    """y = gain * x + bias, learnable per-dim affine scaling.
+
+    Drop-in OutputMapper replacement used by the temporal-readout plan.
+    The temporal-readout flag wires the final output ODE node voltages into
+    this module instead of a learned linear projection over the projection
+    portion. The affine transform calibrates the output range / DC level
+    without burdening the recurrent fabric — equivalent to a final analog
+    output amplifier stage.
+
+    ``gain`` is initialized to ``1.0`` and ``bias`` to ``0.0`` so the
+    default behavior is identity read-out of the output ODE node voltages.
+    """
+
+    def __init__(self, out_dim: int) -> None:
+        super().__init__()
+        self.out_dim = int(out_dim)
+        self.gain = nn.Parameter(torch.ones(self.out_dim))
+        self.bias = nn.Parameter(torch.zeros(self.out_dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.size(-1) != self.out_dim:
+            raise ValueError(
+                f"OutputAffine: input last dim={x.size(-1)}, expected "
+                f"out_dim={self.out_dim}"
+            )
+        return self.gain * x + self.bias
+
+    def extra_repr(self) -> str:
+        return f"out_dim={self.out_dim}"
+
+
 class ResidualTanhOutputMapper(nn.Module):
     """Drop-in ``OutputMapper`` replacement using ``ResidualTanhEncoder``.
 

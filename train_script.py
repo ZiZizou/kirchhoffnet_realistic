@@ -2455,6 +2455,20 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "the core edges and carries its own edge gate (compatible with "
              "--no-edge-gates). Default: disabled.")
     parser.add_argument(
+        "--temporal-readout", action="store_true", default=False,
+        dest="enable_temporal_readout",
+        help="Replace the linear OutputMapper readout with a dynamical "
+             "temporal-readout path: append out_dim extra output ODE "
+             "accumulator nodes to each stage's ODE state. Hidden nodes "
+             "connect all-to-all to each output ODE node via one-way OTA "
+             "edges (source read-only, destination writable — the hidden "
+             "grid is never drained). The output ODE node voltages are "
+             "scaled by a learnable OutputAffine (gain + bias) layer. "
+             "Output ODE nodes receive leak + clip like regular nodes and "
+             "are initialized to zero. Requires all stages to have the "
+             "same width. Incompatible with --decoder-type residual_tanh "
+             "and --grouped-readout. Default: disabled.")
+    parser.add_argument(
         "--leak", choices=["programmable", "non-programmable"],
         default="programmable", dest="leak",
         help="Stage leak mode (default: programmable). 'programmable' "
@@ -2486,7 +2500,7 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
         "--budget-frac-end", type=float, default=None,
         dest="budget_frac_end",
         help="Final budget fraction per group (restrictive, 0.0 = disables "
-             "budget, 0.75 = keep 75% of edges). Default: 0.75.")
+             "budget, 0.75 = keep 75%% of edges). Default: 0.75.")
     parser.add_argument(
         "--budget-temp-start", type=float, default=None,
         dest="budget_temp_start",
@@ -3213,7 +3227,8 @@ def main():
         interstage_residual_rank=args.interstage_residual_rank,
         enable_skip_linear=args.skip_linear,
         boundary_fan_out=boundary_fan_out_parsed,
-        enable_ref_edges=args.enable_ref_edges)
+        enable_ref_edges=args.enable_ref_edges,
+        enable_temporal_readout=args.enable_temporal_readout)
     net.to(device)
 
     if args.no_edge_gates:
@@ -3229,7 +3244,10 @@ def main():
             if hasattr(stage, 'ref_z_logits') and stage.ref_z_logits is not None:
                 stage.ref_z_logits.data.fill_(10.0)
                 stage.ref_z_logits.requires_grad_(False)
-        print("[train] --no-edge-gates: z_logits (core + boundary + ref) frozen to +10 (all edges permanently on)")
+            if hasattr(stage, 'output_ode_z_logits') and stage.output_ode_z_logits is not None:
+                stage.output_ode_z_logits.data.fill_(10.0)
+                stage.output_ode_z_logits.requires_grad_(False)
+        print("[train] --no-edge-gates: z_logits (core + boundary + ref + temporal-readout) frozen to +10 (all edges permanently on)")
 
     # --no-resistive-shunt: bypass the parallel resistive shunt across all
     # stages (no-resistive-shunt). Sets _has_resistive=False so rhs() skips

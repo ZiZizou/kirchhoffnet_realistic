@@ -65,7 +65,7 @@ def format_parameter_breakdown(breakdown: dict) -> str:
     for stage_key in sorted(per_stage.keys()):
         lines.append(f"  {stage_key}:")
         bucket = per_stage[stage_key]
-        for sub_name in ("cell_lib", "z_logits", "u_logits", "raw_leak", "raw_drive_g", "boundary_cell_lib", "boundary_z_logits", "raw_vref", "ref_z_logits", "ref_cell_lib", "other"):
+        for sub_name in ("cell_lib", "z_logits", "u_logits", "raw_leak", "raw_drive_g", "boundary_cell_lib", "boundary_z_logits", "raw_vref", "ref_z_logits", "ref_cell_lib", "output_ode_cell_lib", "output_ode_z_logits", "other"):
             if bucket.get(sub_name, 0):
                 lines.append(f"    {sub_name:<{stage_label_w}}: {bucket[sub_name]:>{width - stage_label_w - 6}}")
         stage_total = sum(bucket.values())
@@ -239,6 +239,8 @@ class KirchhoffNetWithIO(nn.Module):
         skip_linear_out_dim: int | None = None,
         enable_boundary: bool = False,
         boundary_fan_out: dict[int, list[int]] | None = None,
+        enable_temporal_readout: bool = False,
+        output_ode_count: int = 0,
     ) -> None:
         super().__init__()
         if hid_count < 0 or proj_count < 0:
@@ -293,7 +295,39 @@ class KirchhoffNetWithIO(nn.Module):
                 raise ValueError(
                     f"write_idx entries must be unique, got {self.write_idx}"
                 )
-        if self.read_idx is not None:
+        self.enable_temporal_readout = bool(enable_temporal_readout)
+        self.output_ode_count = int(output_ode_count)
+        if self.enable_temporal_readout:
+            if self.output_ode_count <= 0:
+                raise ValueError(
+                    f"enable_temporal_readout=True requires output_ode_count > 0, "
+                    f"got {self.output_ode_count}"
+                )
+            # Require all stages to have the same width so StageTransfer
+            # doesn't need to remap the output ODE accumulator region
+            # (which lives outside the topology's compact space).
+            stage_widths = [s.num_nodes for s in core.stages]
+            if len(set(stage_widths)) != 1:
+                raise ValueError(
+                    f"enable_temporal_readout=True requires all stages to "
+                    f"have the same width, got {stage_widths}"
+                )
+            if (
+                self.final_hid_count + self.final_proj_count + self.output_ode_count
+                != stage_widths[0]
+            ):
+                raise ValueError(
+                    f"enable_temporal_readout: final stage width "
+                    f"{stage_widths[0]} must equal "
+                    f"final_hid_count + final_proj_count + output_ode_count "
+                    f"= {self.final_hid_count} + {self.final_proj_count} + "
+                    f"{self.output_ode_count}"
+                )
+            # Read slice targets the output ODE accumulator region at the
+            # tail of the ODE state vector.
+            self.read_start = self.final_hid_count + self.final_proj_count
+            self.read_dim = self.output_ode_count
+        elif self.read_idx is not None:
             max_full = self.final_hid_count + self.final_proj_count
             if any(i < 0 or i >= max_full for i in self.read_idx):
                 raise ValueError(
@@ -348,10 +382,16 @@ class KirchhoffNetWithIO(nn.Module):
 
     def _make_full_drive(self, hidden_drive: torch.Tensor) -> torch.Tensor:
         B = hidden_drive.shape[0]
+        parts = [hidden_drive]
         if self.proj_count > 0:
             proj_zeros = hidden_drive.new_zeros(B, self.proj_count)
-            return torch.cat([hidden_drive, proj_zeros], dim=1)
-        return hidden_drive
+            parts.append(proj_zeros)
+        if self.output_ode_count > 0:
+            out_zeros = hidden_drive.new_zeros(B, self.output_ode_count)
+            parts.append(out_zeros)
+        if len(parts) == 1:
+            return hidden_drive
+        return torch.cat(parts, dim=1)
 
     def forward(
         self,
@@ -373,11 +413,19 @@ class KirchhoffNetWithIO(nn.Module):
             raise ValueError(
                 f"InputMapper output has {x0.size(1)} dims, expected hid_count={self.hid_count}"
             )
+        # Append zero padding for projection and (when enabled) output
+        # ODE accumulator nodes so the initial ODE state has the full
+        # stage width. Output ODE nodes are always zero-initialized;
+        # their current comes from the temporal-readout OTA edges only.
+        parts = [x0]
         if self.proj_count > 0:
-            pad = x0.new_zeros(x0.size(0), self.proj_count)
-            x0_full = torch.cat([x0, pad], dim=1)
-        else:
+            parts.append(x0.new_zeros(x0.size(0), self.proj_count))
+        if self.output_ode_count > 0:
+            parts.append(x0.new_zeros(x0.size(0), self.output_ode_count))
+        if len(parts) == 1:
             x0_full = x0
+        else:
+            x0_full = torch.cat(parts, dim=1)
 
         # Build per-stage drive targets when persistent drive is enabled.
         # Suppressed under boundary mode: drive targets would compete with
@@ -481,6 +529,8 @@ class KirchhoffNetWithIO(nn.Module):
                     "raw_vref": 0,
                     "ref_z_logits": 0,
                     "ref_cell_lib": 0,
+                    "output_ode_z_logits": 0,
+                    "output_ode_cell_lib": 0,
                     "other": 0,
                 })
                 matched = False
@@ -504,6 +554,10 @@ class KirchhoffNetWithIO(nn.Module):
                     stage_bucket["ref_z_logits"] += n; matched = True
                 elif tail.startswith("ref_cell_lib."):
                     stage_bucket["ref_cell_lib"] += n; matched = True
+                elif tail == "output_ode_z_logits":
+                    stage_bucket["output_ode_z_logits"] += n; matched = True
+                elif tail.startswith("output_ode_cell_lib."):
+                    stage_bucket["output_ode_cell_lib"] += n; matched = True
                 if not matched:
                     stage_bucket["other"] += n
         return {

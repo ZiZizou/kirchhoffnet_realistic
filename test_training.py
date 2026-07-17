@@ -58,6 +58,14 @@ def main():
     test_boundary_fan_out_with_no_edge_gates()
     test_boundary_fan_out_incompatible_with_persistent_drive()
     test_boundary_fan_out_uses_null_input_mapper()
+    test_temporal_readout_basic()
+    test_temporal_readout_zero_init()
+    test_temporal_readout_grad_flow()
+    test_temporal_readout_hidden_grid_untouched()
+    test_temporal_readout_validation()
+    test_temporal_readout_with_boundary_mode()
+    test_output_affine_identity_init()
+    test_temporal_readout_with_no_edge_gates()
 
     print()
     print("=" * 60)
@@ -1423,6 +1431,303 @@ def test_boundary_fan_out_uses_null_input_mapper():
           torch.allclose(x, torch.zeros_like(x)))
     check("NullInputMapper has no learnable parameters",
           sum(p.numel() for p in m.parameters()) == 0)
+
+
+# ============================================================================
+# Temporal-readout flag tests (temporal-readout plan)
+# ============================================================================
+
+
+def test_temporal_readout_basic():
+    print("\nTest TR-1: --temporal-readout builds net with output ODE nodes")
+    from config import PRESETS
+    from topology import build_net_from_preset
+    from cell_library import make_cell_library
+    from io_mapper import OutputAffine
+
+    cell_lib = make_cell_library('tanh')
+    # Use sinx (out_dim=1) for a deterministic test.
+    net = build_net_from_preset(
+        "sinx",
+        cell_lib=cell_lib,
+        enable_temporal_readout=True,
+    )
+
+    check("enable_temporal_readout flag set",
+          getattr(net, "enable_temporal_readout", False))
+    check("output_ode_count equals out_dim=1",
+          net.output_ode_count == 1)
+    check("output_mapper is OutputAffine",
+          isinstance(net.output_mapper, OutputAffine))
+    check("OutputAffine gain is initialized to 1",
+          torch.allclose(net.output_mapper.gain.detach(),
+                         torch.ones(1)))
+    check("OutputAffine bias is initialized to 0",
+          torch.allclose(net.output_mapper.bias.detach(),
+                         torch.zeros(1)))
+
+    stage = net.core.stages[0]
+    check("stage._has_output_ode flag set",
+          getattr(stage, "_has_output_ode", False))
+    # 8 hidden, 2 proj, 1 output_ode -> 8 all-to-all edges to the single
+    # output ODE accumulator.
+    check("stage.output_ode_src has 8 entries (one per hidden node)",
+          stage.output_ode_src.numel() == 8)
+    check("stage.output_ode_dst has 8 entries",
+          stage.output_ode_dst.numel() == 8)
+    check("output_ode_src content is all hidden indices [0..7]",
+          stage.output_ode_src.tolist() == list(range(8)))
+    check("output_ode_dst content is all index 10 (first output ODE node)",
+          stage.output_ode_dst.tolist() == [10] * 8)
+    check("output_ode_cell_lib exists",
+          stage.output_ode_cell_lib is not None)
+    check("output_ode_z_logits has 8 entries",
+          stage.output_ode_z_logits.shape == (8,))
+    # Stage state width = hidden + proj + output_ode = 8 + 2 + 1 = 11.
+    check("stage num_nodes includes output_ode_count",
+          stage.num_nodes == 11)
+    # raw_leak should also be sized to cover the output_ode node.
+    check("stage.raw_leak is sized to num_nodes",
+          stage.raw_leak.shape == (11,))
+
+    y, trajs = net(torch.rand(4, 1), store_trajectory=True)
+    check("forward output shape is (batch, out_dim)",
+          tuple(y.shape) == (4, 1))
+    check("forward output is finite",
+          torch.isfinite(y).all().item())
+    # trajs is a list of per-stage trajectory tensors [B, num_nodes, T+1].
+    check("trajectory is a non-empty list (one entry per stage)",
+          trajs is not None and isinstance(trajs, list)
+          and len(trajs) == 1)
+    check("trajectory[0] shape is (batch, num_nodes, T+1)",
+          trajs[0].shape[1] == 11)
+
+
+def test_temporal_readout_zero_init():
+    print("\nTest TR-2: output ODE nodes start at zero")
+    from topology import build_net_from_preset
+    from cell_library import make_cell_library
+
+    cell_lib = make_cell_library('tanh')
+    net = build_net_from_preset(
+        "sinx",
+        cell_lib=cell_lib,
+        enable_temporal_readout=True,
+    )
+
+    stage = net.core.stages[0]
+    out_cell = stage.output_ode_cell_lib
+    # Zero all cell-lib OTA parameters so the per-step readout current
+    # is ~0. Then the output ODE node receives only leak/clip and the
+    # hidden drive from the input mapper, but since we only check the
+    # initial state we expect the last slice (output_ode) to be exactly
+    # zero.
+    for p in out_cell.parameters():
+        with torch.no_grad():
+            p.zero_()
+            p.requires_grad_(False)
+    # Zero out the output_ode gates too for completeness.
+    with torch.no_grad():
+        stage.output_ode_z_logits.fill_(-10.0)
+        stage.output_ode_z_logits.requires_grad_(False)
+
+    captured = {}
+    orig_forward = stage._forward_heun
+
+    def capture_x0(x0, t_span=None, num_steps=None, store_trajectory=True,
+                   x_drive=None, drive_scale=0.0, u=None):
+        captured["x0"] = x0.detach().clone()
+        return orig_forward(x0=x0, t_span=t_span, num_steps=num_steps,
+                            store_trajectory=store_trajectory,
+                            x_drive=x_drive, drive_scale=drive_scale, u=u)
+
+    stage._forward_heun = capture_x0
+    try:
+        net(torch.rand(2, 1))
+    finally:
+        stage._forward_heun = orig_forward
+
+    x0 = captured["x0"]
+    check("x0 last slice (output_ode region) is zero",
+          torch.allclose(x0[:, -1], torch.zeros_like(x0[:, -1])))
+    check("x0 full state shape covers hidden+proj+out_ode",
+          x0.shape == (2, 11))
+
+
+def test_temporal_readout_grad_flow():
+    print("\nTest TR-3: backward pass reaches output_ode cell_lib and gain/bias")
+    from topology import build_net_from_preset
+    from cell_library import make_cell_library
+
+    cell_lib = make_cell_library('tanh')
+    net = build_net_from_preset(
+        "sinx",
+        cell_lib=cell_lib,
+        enable_temporal_readout=True,
+    )
+
+    u = torch.rand(4, 1)
+    target = torch.rand(4, 1)
+    y, _ = net(u)
+    loss = ((y - target) ** 2).mean()
+    loss.backward()
+
+    stage = net.core.stages[0]
+    check("output_ode_z_logits receives gradient",
+          stage.output_ode_z_logits.grad is not None
+          and stage.output_ode_z_logits.grad.abs().sum().item() > 0)
+    check("output_ode_cell_lib receives gradient",
+          any(
+              p.grad is not None and p.grad.abs().sum().item() > 0
+              for p in stage.output_ode_cell_lib.parameters()
+          ))
+    check("OutputAffine.gain receives gradient",
+          net.output_mapper.gain.grad is not None
+          and net.output_mapper.gain.grad.abs().sum().item() > 0)
+    check("OutputAffine.bias receives gradient",
+          net.output_mapper.bias.grad is not None
+          and net.output_mapper.bias.grad.abs().sum().item() > 0)
+
+
+def test_temporal_readout_hidden_grid_untouched():
+    print("\nTest TR-4: hidden nodes are NOT drained by temporal-readout edges")
+    from topology import build_net_from_preset
+    from cell_library import make_cell_library
+    from differential_stage import DifferentialStage
+
+    cell_lib = make_cell_library('tanh')
+    net = build_net_from_preset(
+        "sinx",
+        cell_lib=cell_lib,
+        enable_temporal_readout=True,
+    )
+    stage = net.core.stages[0]
+    # Compute the KCL contribution of temporal-readout edges only.
+    x = torch.randn(2, stage.num_nodes)
+    with torch.no_grad():
+        # Zero all output_ode gates so the only thing left is the OTA.
+        stage.output_ode_z_logits.fill_(10.0)
+    x_src_o = x[:, stage.output_ode_src]
+    x_dst_o = x[:, stage.output_ode_dst]
+    i_out = stage.output_ode_cell_lib(
+        x_src=x_src_o, x_dst=x_dst_o, x_max=stage.x_max,
+    )
+    i_out = i_out * torch.sigmoid(stage.output_ode_z_logits).unsqueeze(0)
+    # Scatter-add: only dst indices get nonzero contributions.
+    acc = torch.zeros_like(x)
+    acc.index_add_(1, stage.output_ode_dst, i_out)
+    # The hidden slice [0..7] must be exactly zero (no source drain).
+    check("hidden slice receives no current from temporal-readout edges",
+          torch.allclose(acc[:, :8], torch.zeros_like(acc[:, :8])))
+    # The output_ode slice (index 10) must be nonzero (something is injected).
+    check("output_ode slice receives current (not all zero)",
+          acc[:, 10].abs().sum().item() > 0)
+
+
+def test_temporal_readout_validation():
+    print("\nTest TR-5: temporal-readout rejects incompatible decoder/preset")
+    from topology import build_net_from_config, build_net_from_preset
+    from cell_library import make_cell_library
+    from config import PRESETS
+
+    cell_lib = make_cell_library('tanh')
+
+    # residual_tanh decoder must be rejected
+    cfg = dict(PRESETS["sinx"])
+    cfg["decoder_type"] = "residual_tanh"
+    try:
+        build_net_from_config(cfg, cell_lib=cell_lib,
+                              enable_temporal_readout=True)
+        rejected = False
+    except ValueError as e:
+        rejected = "residual_tanh" in str(e)
+    check("rejects decoder_type='residual_tanh'", rejected)
+
+    # grouped_readout must be rejected
+    cfg = dict(PRESETS["sinx"])
+    cfg["grouped_readout"] = {"nodes_per_target": 1, "offset": 0}
+    try:
+        build_net_from_config(cfg, cell_lib=cell_lib,
+                              enable_temporal_readout=True)
+        rejected = False
+    except ValueError as e:
+        rejected = "grouped_readout" in str(e)
+    check("rejects grouped_readout", rejected)
+
+
+def test_temporal_readout_with_boundary_mode():
+    print("\nTest TR-6: temporal-readout is compatible with boundary mode")
+    from topology import build_net_from_preset
+    from cell_library import make_cell_library
+    from io_mapper import NullInputMapper
+
+    cell_lib = make_cell_library('tanh')
+    net = build_net_from_preset(
+        "smooth2d",
+        cell_lib=cell_lib,
+        boundary_fan_out={0: [3], 1: [8]},
+        enable_temporal_readout=True,
+    )
+    check("enable_boundary flag set",
+          getattr(net, "enable_boundary", False))
+    check("enable_temporal_readout flag set",
+          getattr(net, "enable_temporal_readout", False))
+    check("input_mapper is NullInputMapper (boundary mode)",
+          isinstance(net.input_mapper, NullInputMapper))
+    stage = net.core.stages[0]
+    check("stage has _has_boundary flag",
+          getattr(stage, "_has_boundary", False))
+    check("stage has _has_output_ode flag",
+          getattr(stage, "_has_output_ode", False))
+
+    y, _ = net(torch.rand(2, 2))
+    check("forward output shape is (batch, out_dim=1)",
+          tuple(y.shape) == (2, 1))
+    check("forward output is finite",
+          torch.isfinite(y).all().item())
+
+
+def test_output_affine_identity_init():
+    print("\nTest TR-7: OutputAffine default init is identity")
+    from io_mapper import OutputAffine
+    m = OutputAffine(out_dim=3)
+    x = torch.tensor([[1.0, -2.0, 0.5]])
+    y = m(x)
+    check("OutputAffine identity at init (gain=1, bias=0)",
+          torch.allclose(y, x))
+    # After zeroing gain, output should be bias only.
+    with torch.no_grad():
+        m.gain.zero_()
+        m.bias.data = torch.tensor([1.0, 2.0, 3.0])
+    y2 = m(x)
+    check("OutputAffine with zero gain returns bias only",
+          torch.allclose(y2, torch.tensor([[1.0, 2.0, 3.0]])))
+
+
+def test_temporal_readout_with_no_edge_gates():
+    print("\nTest TR-8: temporal-readout compatible with --no-edge-gates")
+    from topology import build_net_from_preset
+    from cell_library import make_cell_library
+
+    cell_lib = make_cell_library('tanh')
+    net = build_net_from_preset(
+        "sinx",
+        cell_lib=cell_lib,
+        enable_temporal_readout=True,
+    )
+    stage = net.core.stages[0]
+    # Simulate --no-edge-gates freeze for output_ode_z_logits.
+    stage.output_ode_z_logits.data.fill_(10.0)
+    stage.output_ode_z_logits.requires_grad_(False)
+    u = torch.rand(2, 1)
+    y, _ = net(u)
+    check("forward output is finite after gate freeze",
+          torch.isfinite(y).all().item())
+    check("output_ode_z_logits frozen to +10",
+          torch.allclose(stage.output_ode_z_logits.data,
+                         torch.full((8,), 10.0)))
+    check("output_ode_z_logits has requires_grad=False",
+          stage.output_ode_z_logits.requires_grad is False)
 
 
 if __name__ == "__main__":

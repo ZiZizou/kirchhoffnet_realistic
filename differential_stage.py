@@ -96,9 +96,28 @@ class DifferentialStage(nn.Module):
             (``ref_cell_lib``) sized to ``num_nodes`` so each node has its
             own programmable OTA parameters. Default ``False``.
         ref_cell_lib: Cell library instance used to compute reference edge
-            currents ``I_OTA(Vref, x_j)``. Must match the cell type of the
-            core ``cell_lib`` and be sized for ``num_nodes`` edges. Required
+            currents ``I_OTA(Vref, x_j)``. Must match the cell type of
+            the core ``cell_lib`` and be sized for ``num_nodes`` edges. Required
             when ``enable_ref_edges=True``.
+        output_ode_src: List of source node indices (compact 0..num_nodes-1
+            coordinate space) for the temporal-readout OTA edges. These edges
+            inject current from a hidden (or projection) node into an output
+            ODE accumulator node. The source is read-only (its voltage drives
+            the OTA current but no current is drained from the source); the
+            output ODE node is the writable destination. Length must equal
+            ``len(output_ode_dst)`` when provided. ``None`` (default)
+            disables temporal-readout edges for this stage.
+        output_ode_dst: List of destination node indices (compact 0..num_nodes-1
+            coordinate space, same length as ``output_ode_src``) for the
+            temporal-readout OTA edges. Indices typically lie in the
+            output-ode accumulator region (e.g., ``[core_count, num_nodes)``),
+            but any valid node index is permitted so a hidden→hidden
+            temporal-readout edge is also expressible.
+        output_ode_cell_lib: Cell library instance used to compute temporal
+            readout edge currents ``I_OTA(x_src, x_dst)``. Must match the
+            cell type of the core ``cell_lib`` and be sized for
+            ``len(output_ode_src)`` edges. Required when
+            ``output_ode_src``/``output_ode_dst`` are provided.
     """
 
     def __init__(
@@ -122,6 +141,9 @@ class DifferentialStage(nn.Module):
         boundary_cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | AntiParallelFreeTanhLibrary | None = None,
         enable_ref_edges: bool = False,
         ref_cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | AntiParallelFreeTanhLibrary | None = None,
+        output_ode_src: list[int] | None = None,
+        output_ode_dst: list[int] | None = None,
+        output_ode_cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | AntiParallelFreeTanhLibrary | None = None,
     ) -> None:
         super().__init__()
         self.num_nodes = int(num_nodes)
@@ -294,6 +316,66 @@ class DifferentialStage(nn.Module):
             self.raw_vref = None
             self.ref_z_logits = None
             self._has_ref = False
+
+        # Temporal-readout OTA edges (temporal-readout plan).
+        # Sparse programmable edges from hidden/projection nodes (read-only
+        # source) into the output ODE accumulator nodes (writable destination).
+        # The output ODE nodes are the last ``output_ode_count`` entries of the
+        # state vector and are part of the ODE dynamics (they receive leak,
+        # clip, and the OTA current injected here). The source node is never
+        # drained — only the destination receives current — matching the
+        # boundary-fan-out pattern.
+        if output_ode_src is not None or output_ode_dst is not None:
+            if output_ode_src is None or output_ode_dst is None:
+                raise ValueError(
+                    "DifferentialStage: output_ode_src and output_ode_dst "
+                    "must be provided together (got one without the other)"
+                )
+            if len(output_ode_src) != len(output_ode_dst):
+                raise ValueError(
+                    f"DifferentialStage: output_ode_src/dst length mismatch: "
+                    f"{len(output_ode_src)} vs {len(output_ode_dst)}"
+                )
+            if any(
+                s < 0 or s >= self.num_nodes or d < 0 or d >= self.num_nodes
+                for s, d in zip(output_ode_src, output_ode_dst)
+            ):
+                raise ValueError(
+                    f"DifferentialStage: output_ode_src/dst entries must be "
+                    f"in [0, {self.num_nodes}), got src={output_ode_src} "
+                    f"dst={output_ode_dst}"
+                )
+            if any(s == d for s, d in zip(output_ode_src, output_ode_dst)):
+                raise ValueError(
+                    "DifferentialStage: self-loops are not allowed in "
+                    "output_ode edges."
+                )
+            if output_ode_cell_lib is None:
+                raise ValueError(
+                    "DifferentialStage: output_ode_cell_lib is required when "
+                    "output_ode_src/output_ode_dst are provided"
+                )
+            self.register_buffer(
+                "output_ode_src", torch.tensor(output_ode_src, dtype=torch.long),
+            )
+            self.register_buffer(
+                "output_ode_dst", torch.tensor(output_ode_dst, dtype=torch.long),
+            )
+            self.output_ode_cell_lib = output_ode_cell_lib
+            self.output_ode_z_logits = nn.Parameter(
+                torch.full((len(output_ode_src),), z_init),
+            )
+            self._has_output_ode = True
+        else:
+            self.register_buffer(
+                "output_ode_src", torch.empty(0, dtype=torch.long),
+            )
+            self.register_buffer(
+                "output_ode_dst", torch.empty(0, dtype=torch.long),
+            )
+            self.output_ode_cell_lib = None
+            self.output_ode_z_logits = None
+            self._has_output_ode = False
 
     def num_edges(self) -> int:
         return int(self.src.numel())
@@ -518,6 +600,14 @@ class DifferentialStage(nn.Module):
           node ``j`` only (no source drain — Vref is an ideal voltage
           source). Like boundary edges, reference currents are NOT frozen
           by ``freeze_read`` (the destination voltage ``x_j`` evolves).
+
+        Temporal-readout OTA edges (temporal-readout plan):
+        - When ``self._has_output_ode``, ``I_OTA(x[output_ode_src[e]],
+          x[output_ode_dst[e]])`` is injected into the destination (output
+          ODE accumulator) only. The source (hidden/projection) is a
+          read-only voltage — no current is drained from it. Like boundary
+          and reference edges, the temporal-readout current is NOT frozen
+          by ``freeze_read`` (the destination voltage evolves).
         """
         x_src = x[:, self.src]
         x_dst = x[:, self.dst]
@@ -620,6 +710,29 @@ class DifferentialStage(nn.Module):
             acc_ref.index_add_(1, self.ref_dst, i_ref_f32)
             # NOTE: no source drain — Vref is an ideal voltage source.
             acc = (acc.float() + acc_ref).to(dtype=x.dtype)
+
+        # Temporal-readout OTA edges (temporal-readout plan).
+        # For each edge e: I_out = I_OTA(x[output_ode_src[e]], x[output_ode_dst[e]]).
+        # Current is injected into the destination (output ODE accumulator)
+        # only; the source (hidden/projection) is read-only and is not
+        # drained. The destination voltage evolves through the ODE so the
+        # OTA current is recomputed every step (NOT frozen by freeze_read).
+        if self._has_output_ode and self.output_ode_src.numel() > 0:
+            x_src_o = x[:, self.output_ode_src]  # hidden (read-only)
+            x_dst_o = x[:, self.output_ode_dst]  # output ODE (writable)
+            i_out = self.output_ode_cell_lib(
+                x_src=x_src_o, x_dst=x_dst_o, x_max=self.x_max,
+            )
+            out_mask = torch.sigmoid(self.output_ode_z_logits)  # [Eo]
+            i_out = i_out * out_mask.unsqueeze(0)  # [B, Eo]
+            i_out_f32 = i_out.float()
+            if i_edge_const is not None:
+                acc = acc.clone()
+            acc_out = torch.zeros_like(x, dtype=torch.float32)
+            acc_out.index_add_(1, self.output_ode_dst, i_out_f32)
+            # NOTE: no source drain on output_ode_src — the hidden/projection
+            # grid is untouched, only the output accumulator receives current.
+            acc = (acc.float() + acc_out).to(dtype=x.dtype)
 
         leak = self._effective_leak(leak_floor=leak_floor).unsqueeze(0)  # [1, N]
         leak_term = leak * x
@@ -976,6 +1089,30 @@ class DifferentialStage(nn.Module):
                         ref_device_n += int(self.ref_cell_lib.theta_raw.numel())
                     if hasattr(self.ref_cell_lib, "kappa_raw"):
                         ref_device_n += int(self.ref_cell_lib.kappa_raw.numel())
+        # Temporal-readout OTA edge stats
+        out_z = int(self.output_ode_z_logits.numel()) if self.output_ode_z_logits is not None else 0
+        out_dev = 0
+        if self.output_ode_cell_lib is not None:
+            if hasattr(self.output_ode_cell_lib, "param"):
+                out_dev = int(self.output_ode_cell_lib.param.numel())
+            elif hasattr(self.output_ode_cell_lib, "alpha_raw"):
+                out_dev = int(self.output_ode_cell_lib.alpha_raw.numel())
+                if hasattr(self.output_ode_cell_lib, "bias_raw"):
+                    out_dev += int(self.output_ode_cell_lib.bias_raw.numel())
+            elif hasattr(self.output_ode_cell_lib, "gm_raw"):
+                out_dev = int(self.output_ode_cell_lib.gm_raw.numel())
+                if hasattr(self.output_ode_cell_lib, "isat_raw"):
+                    out_dev += int(self.output_ode_cell_lib.isat_raw.numel())
+                if hasattr(self.output_ode_cell_lib, "a_raw"):
+                    out_dev += int(self.output_ode_cell_lib.a_raw.numel())
+                if hasattr(self.output_ode_cell_lib, "b_raw"):
+                    out_dev += int(self.output_ode_cell_lib.b_raw.numel())
+                if hasattr(self.output_ode_cell_lib, "s_raw"):
+                    out_dev += int(self.output_ode_cell_lib.s_raw.numel())
+                if hasattr(self.output_ode_cell_lib, "theta_raw"):
+                    out_dev += int(self.output_ode_cell_lib.theta_raw.numel())
+                if hasattr(self.output_ode_cell_lib, "kappa_raw"):
+                    out_dev += int(self.output_ode_cell_lib.kappa_raw.numel())
         return {
             "raw_leak": raw_leak_n,
             "z_logits": int(self.z_logits.numel()),
@@ -986,6 +1123,8 @@ class DifferentialStage(nn.Module):
             "raw_vref": ref_n,
             "ref_z_logits": ref_n,
             "ref_device_param": ref_device_n,
+            "output_ode_z_logits": out_z,
+            "output_ode_device_param": out_dev,
             "total": (
                 raw_leak_n
                 + int(self.z_logits.numel())
@@ -995,5 +1134,7 @@ class DifferentialStage(nn.Module):
                 + bdev
                 + ref_n
                 + ref_device_n
+                + out_z
+                + out_dev
             ),
         }

@@ -1300,6 +1300,10 @@ def topology_to_stage(
     boundary_dst: list[int] | None = None,
     boundary_cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | AntiParallelFreeTanhLibrary | None = None,
     enable_ref_edges: bool = False,
+    output_ode_src: list[int] | None = None,
+    output_ode_dst: list[int] | None = None,
+    output_ode_cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | AntiParallelFreeTanhLibrary | None = None,
+    output_ode_node_count: int = 0,
 ) -> tuple[DifferentialStage, list[int], dict[int, int]]:
     """Convert a SparseTopology into a DifferentialStage.
 
@@ -1330,6 +1334,25 @@ def topology_to_stage(
         enable_ref_edges: When ``True``, every node gets one OTA edge to a
             global per-stage learnable reference voltage ``Vref``. Forwarded
             to ``DifferentialStage``.
+        output_ode_src: List of source node indices (compact coordinates) for
+            temporal-readout OTA edges. The source is a hidden or projection
+            node and is read-only (its voltage drives the OTA current, no
+            current is drained from it). Forwarded to ``DifferentialStage``
+            unchanged.
+        output_ode_dst: List of destination node indices (compact coordinates,
+            must be in ``[0, num_nodes)``) for temporal-readout OTA edges.
+            Typically the output ODE accumulator region
+            ``[len(active_nodes), num_nodes)`` but any valid index works.
+        output_ode_cell_lib: Cell library instance used to compute temporal-
+            readout edge currents ``I_OTA(x_src, x_dst)``. Must match the
+            cell type of ``cell_lib`` and be sized for ``len(output_ode_src)``
+            edges. Required when ``output_ode_src``/``output_ode_dst`` are
+            provided.
+        output_ode_node_count: Number of output ODE accumulator nodes appended
+            to this stage's state. When ``> 0``, ``num_nodes`` passed to
+            ``DifferentialStage`` is ``len(active_nodes) + output_ode_node_count``
+            so the ODE state vector includes both the core nodes and the
+            output accumulators. Defaults to ``0``.
 
     Returns:
         stage: DifferentialStage
@@ -1431,8 +1454,58 @@ def topology_to_stage(
                 use_isat_normalization=cell_lib._use_isat_normalization,
             )
 
+    # Clone the temporal-readout cell library per stage so each stage owns
+    # its own OTA parameter set for the readout edges. Without this clone,
+    # the same library object would be registered as a submodule on every
+    # DifferentialStage and its parameters would appear N times in
+    # named_parameters() (causing the optimizer to apply N gradient steps
+    # per optimization pass). Same cloning pattern as the core cell_lib
+    # above and ref_cell_lib above.
+    if output_ode_cell_lib is not None and len(output_ode_src or []) > 0:
+        n_out_ode = len(output_ode_src)
+        if isinstance(cell_lib, SimpleEdgeLibrary):
+            output_ode_cell_lib = SimpleEdgeLibrary(
+                num_edges=n_out_ode, mode=cell_lib._mode,
+            )
+        elif isinstance(cell_lib, RealisticTanhLibrary):
+            output_ode_cell_lib = RealisticTanhLibrary(
+                num_edges=n_out_ode,
+                bias_enabled=cell_lib._bias_enabled,
+            )
+        elif isinstance(cell_lib, RealisticTanhUpgradeLibrary):
+            output_ode_cell_lib = RealisticTanhUpgradeLibrary(
+                num_edges=n_out_ode,
+                gm_min=cell_lib.gm_min,
+                gm_max=cell_lib.gm_max,
+                isat_min=cell_lib.isat_min,
+                isat_max=cell_lib.isat_max,
+                bias_enabled=cell_lib._bias_enabled,
+            )
+        elif isinstance(cell_lib, FreeTanhLibrary):
+            output_ode_cell_lib = FreeTanhLibrary(
+                num_edges=n_out_ode,
+                gm_min=cell_lib.gm_min,
+                gm_max=cell_lib.gm_max,
+                isat_min=cell_lib.isat_min,
+                isat_max=cell_lib.isat_max,
+                bias_enabled=cell_lib._bias_enabled,
+            )
+        elif isinstance(cell_lib, AntiParallelFreeTanhLibrary):
+            output_ode_cell_lib = AntiParallelFreeTanhLibrary(
+                num_edges=n_out_ode,
+                kappa_min=cell_lib.kappa_min,
+                kappa_max=cell_lib.kappa_max,
+                gm_min=cell_lib.gm_min,
+                gm_max=cell_lib.gm_max,
+                isat_min=cell_lib.isat_min,
+                isat_max=cell_lib.isat_max,
+                theta_max=cell_lib.theta_max,
+                theta_enabled=cell_lib._theta_enabled,
+                use_isat_normalization=cell_lib._use_isat_normalization,
+            )
+
     stage = DifferentialStage(
-        num_nodes=len(active_nodes),
+        num_nodes=len(active_nodes) + int(output_ode_node_count),
         src=remapped_src,
         dst=remapped_dst,
         cell_lib=cell_lib,
@@ -1450,6 +1523,9 @@ def topology_to_stage(
         boundary_cell_lib=boundary_cell_lib,
         enable_ref_edges=enable_ref_edges,
         ref_cell_lib=ref_cell_lib,
+        output_ode_src=output_ode_src,
+        output_ode_dst=output_ode_dst,
+        output_ode_cell_lib=output_ode_cell_lib,
     )
     return stage, active_nodes, id_map
 
@@ -1478,6 +1554,7 @@ def build_net_from_preset(
     enable_skip_linear: bool = False,
     boundary_fan_out: dict[int, list[int]] | None = None,
     enable_ref_edges: bool = False,
+    enable_temporal_readout: bool = False,
 ):
     """Build a full KirchhoffNetWithIO from a config.PRESETS entry.
 
@@ -1527,6 +1604,17 @@ def build_net_from_preset(
                     without introducing a heterogeneous cell type. The
                     reference edges use a separate cell library sized to
                     ``num_nodes`` (one OTA per node). Default ``False``.
+    * enable_temporal_readout: When ``True``, append ``out_dim`` extra
+                    output ODE accumulator nodes to each stage's state
+                    (after hidden+proj). All hidden nodes connect all-to-
+                    all to each output ODE node via one-way OTA edges
+                    (source read-only, destination writable). At readout
+                    time the output ODE node voltages are scaled by a
+                    learnable affine layer (``OutputAffine``). The
+                    ``OutputMapper`` linear projection is bypassed.
+                    Mutually exclusive with ``--decoder-type residual_tanh``
+                    and ``--grouped-readout``. Requires all stages to have
+                    the same width. Default ``False``.
     """
     if preset_name not in PRESETS:
         raise KeyError(f"Unknown preset: {preset_name!r}. Available: {list(PRESETS)}")
@@ -1560,6 +1648,7 @@ def build_net_from_preset(
         enable_skip_linear=enable_skip_linear,
         boundary_fan_out=boundary_fan_out,
         enable_ref_edges=enable_ref_edges,
+        enable_temporal_readout=enable_temporal_readout,
     )
 
 
@@ -1577,6 +1666,7 @@ def build_net_from_config(
     enable_skip_linear: bool = False,
     boundary_fan_out: dict[int, list[int]] | None = None,
     enable_ref_edges: bool = False,
+    enable_temporal_readout: bool = False,
 ):
     """Build a KirchhoffNetWithIO from a full config dict.
 
@@ -1601,6 +1691,15 @@ def build_net_from_config(
     ``enable_ref_edges`` (``False`` default): every ODE node gets one
     OTA edge to a global per-stage learnable ``Vref``. Forwarded to
     :func:`topology_to_stage` for each stage.
+
+    ``enable_temporal_readout`` (``False`` default): append ``out_dim``
+    extra output ODE accumulator nodes to each stage. Hidden nodes
+    connect all-to-all to each output ODE node via one-way OTA edges
+    (source read-only, destination writable). Output ODE node voltages
+    are read at the end and scaled by a learnable ``OutputAffine``
+    layer, bypassing the linear ``OutputMapper`` projection. Requires
+    all stages to have the same width. Mutually exclusive with
+    ``decoder_type='residual_tanh'`` and ``grouped_readout``.
     """
     if leak_mode is None:
         leak_mode = cfg.get("leak_mode", "programmable")
@@ -1760,6 +1859,97 @@ def build_net_from_config(
                 f"boundary edges: {type(cell_lib).__name__}"
             )
 
+    # Temporal-readout mode (temporal-readout plan): append ``out_dim``
+    # extra output ODE accumulator nodes to each stage's state, after
+    # the hidden and projection nodes. Hidden nodes connect all-to-all
+    # to each output ODE node via one-way OTA edges (source read-only,
+    # destination writable). At readout time the output ODE node
+    # voltages are scaled by a learnable ``OutputAffine`` layer,
+    # bypassing the linear ``OutputMapper`` projection.
+    output_ode_src: list[int] | None = None
+    output_ode_dst: list[int] | None = None
+    output_ode_cell_lib = None
+    output_ode_count = 0
+    enable_temporal_readout_effective = bool(enable_temporal_readout)
+    if enable_temporal_readout_effective:
+        # Mutual exclusion with residual_tanh decoder: explicit digital
+        # nonlinearity over the readout contradicts the analog-readout
+        # contract.
+        if decoder_type == "residual_tanh":
+            raise ValueError(
+                "build_net_from_config: enable_temporal_readout=True is "
+                "incompatible with decoder_type='residual_tanh' (the "
+                "temporal-readout path uses OutputAffine)."
+            )
+        if cfg.get("grouped_readout") is not None:
+            raise ValueError(
+                "build_net_from_config: enable_temporal_readout=True is "
+                "incompatible with grouped_readout."
+            )
+        # ``out_dim`` output ODE nodes. Each hidden node connects to each
+        # output ODE node via a one-way OTA edge. ``output_ode_dst`` uses
+        # compact coordinates [hid_count + proj_count, hid_count +
+        # proj_count + out_dim) so the edges reference the accumulator
+        # region at the tail of the ODE state vector.
+        output_ode_count = int(out_dim)
+        proj_count_first = len(first_proj)
+        core_node_count_first = n_first_hid + proj_count_first
+        output_ode_src = []
+        output_ode_dst = []
+        for h_idx in range(n_first_hid):
+            for o_idx in range(output_ode_count):
+                output_ode_src.append(int(h_idx))
+                output_ode_dst.append(core_node_count_first + o_idx)
+        # Fresh cell library for the readout edges, sized for the
+        # boundary-edge count. Same type/config as the core cell_lib so
+        # readout OTAs behave identically to core edges.
+        n_out_ode_edges = len(output_ode_src)
+        if isinstance(cell_lib, SimpleEdgeLibrary):
+            output_ode_cell_lib = SimpleEdgeLibrary(
+                num_edges=n_out_ode_edges, mode=cell_lib._mode,
+            )
+        elif isinstance(cell_lib, RealisticTanhLibrary):
+            output_ode_cell_lib = RealisticTanhLibrary(
+                num_edges=n_out_ode_edges,
+                bias_enabled=cell_lib._bias_enabled,
+            )
+        elif isinstance(cell_lib, RealisticTanhUpgradeLibrary):
+            output_ode_cell_lib = RealisticTanhUpgradeLibrary(
+                num_edges=n_out_ode_edges,
+                gm_min=cell_lib.gm_min,
+                gm_max=cell_lib.gm_max,
+                isat_min=cell_lib.isat_min,
+                isat_max=cell_lib.isat_max,
+                bias_enabled=cell_lib._bias_enabled,
+            )
+        elif isinstance(cell_lib, FreeTanhLibrary):
+            output_ode_cell_lib = FreeTanhLibrary(
+                num_edges=n_out_ode_edges,
+                gm_min=cell_lib.gm_min,
+                gm_max=cell_lib.gm_max,
+                isat_min=cell_lib.isat_min,
+                isat_max=cell_lib.isat_max,
+                bias_enabled=cell_lib._bias_enabled,
+            )
+        elif isinstance(cell_lib, AntiParallelFreeTanhLibrary):
+            output_ode_cell_lib = AntiParallelFreeTanhLibrary(
+                num_edges=n_out_ode_edges,
+                kappa_min=cell_lib.kappa_min,
+                kappa_max=cell_lib.kappa_max,
+                gm_min=cell_lib.gm_min,
+                gm_max=cell_lib.gm_max,
+                isat_min=cell_lib.isat_min,
+                isat_max=cell_lib.isat_max,
+                theta_max=cell_lib.theta_max,
+                theta_enabled=cell_lib._theta_enabled,
+                use_isat_normalization=cell_lib._use_isat_normalization,
+            )
+        else:
+            raise ValueError(
+                f"build_net_from_config: unsupported cell_lib type for "
+                f"temporal-readout edges: {type(cell_lib).__name__}"
+            )
+
     # Resolve write_idx and input mapper.
     fan_out_map = None
     if enable_boundary:
@@ -1844,6 +2034,10 @@ def build_net_from_config(
             boundary_dst=boundary_dst,
             boundary_cell_lib=boundary_cell_lib,
             enable_ref_edges=enable_ref_edges,
+            output_ode_src=output_ode_src,
+            output_ode_dst=output_ode_dst,
+            output_ode_cell_lib=output_ode_cell_lib,
+            output_ode_node_count=output_ode_count,
         )
         stage_modules.append(stage)
         stage_times.append(float(stages_cfg[stage_idx].get("t_span", 0.5)))
@@ -1859,7 +2053,17 @@ def build_net_from_config(
             transfer_drive_mask = (
                 list(write_idx_arg) if (enable_drive and write_idx_arg is not None) else None
             )
-            transfers.append(StageTransfer(len(active_nodes), len(next_active),
+            # When temporal readout is active, each stage's state includes
+            # output_ode_count extra output accumulator nodes appended after
+            # the core nodes. StageTransfer must be sized for the full state
+            # width so the output ODE slice is preserved (not truncated) when
+            # the state passes between stages.
+            transfer_in_nodes = len(active_nodes)
+            transfer_out_nodes = len(next_active)
+            if enable_temporal_readout_effective:
+                transfer_in_nodes += output_ode_count
+                transfer_out_nodes += output_ode_count
+            transfers.append(StageTransfer(transfer_in_nodes, transfer_out_nodes,
                                            activation=interstage_activation,
                                            drive_mask=transfer_drive_mask,
                                            residual_rank=interstage_residual_rank))
@@ -1942,7 +2146,17 @@ def build_net_from_config(
         # only happens for dense mode. Leave drive disabled (no mappers).
 
     grouped_cfg = cfg.get("grouped_readout")
-    if grouped_cfg is not None:
+    if enable_temporal_readout_effective:
+        # Temporal readout overrides the standard OutputMapper / sparse
+        # read / dense read / grouped read selections. OutputAffine
+        # learns gain + bias for the output ODE node voltages (the
+        # output ODE slice is read directly by KirchhoffNetWithIO).
+        from io_mapper import OutputAffine
+        output_mapper = OutputAffine(out_dim=out_dim)
+        # read_idx_arg is unused; KirchhoffNetWithIO targets the output
+        # ODE slice via its own output_ode_count bookkeeping.
+        read_idx_arg = None
+    elif grouped_cfg is not None:
         nodes_per_target = int(grouped_cfg.get("nodes_per_target", 0))
         readout_offset = int(grouped_cfg.get("offset", 0))
         if nodes_per_target <= 0:
@@ -2025,6 +2239,8 @@ def build_net_from_config(
         skip_linear_out_dim=out_dim if enable_skip_linear else None,
         enable_boundary=enable_boundary,
         boundary_fan_out=boundary_fan_out,
+        enable_temporal_readout=enable_temporal_readout_effective,
+        output_ode_count=output_ode_count,
     )
 
     # Hard topology check: write_idx → read_idx must be >1 hop on the core
@@ -2043,7 +2259,12 @@ def build_net_from_config(
     # Skip when grouped readout is active: read_idx covers all state nodes and
     # the >1-hop write→read constraint cannot be satisfied across the whole
     # state. GroupedOutputMapper handles its own node selection.
-    if grouped_cfg is None and write_idx_arg is not None and read_idx_arg is not None:
+    if (
+        grouped_cfg is None
+        and not enable_temporal_readout_effective
+        and write_idx_arg is not None
+        and read_idx_arg is not None
+    ):
         all_read_are_proj = all(r >= n_first_hid for r in read_idx_arg)
         if not all_read_are_proj:
             hidden_read_idx = [r for r in read_idx_arg if r < n_first_hid]

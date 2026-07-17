@@ -159,7 +159,8 @@ def _compute_regularizers(
     """Shared regularizer computation: edge_gate, rail, tanh_sat.
 
     Complexity terms:
-      - edge_gate   : Σ_e σ(z_logits)                  (active edge count)
+      - edge_gate   : Σ_e σ(z_logits) over core, boundary, ref, and
+                       temporal-readout (output_ode) edges (active edge count).
       - rail        : ReLU²(|x| - x_max).mean()        (voltage excursion)
       - tanh_sat    : tanh(u)².mean()                  (FreeTanhLibrary saturation)
 
@@ -171,6 +172,18 @@ def _compute_regularizers(
         z = _stage_edge_gates(stage)
 
         loss_edge_gate = loss_edge_gate + z.sum()
+        # Include boundary-fan-out edge gates when present so the
+        # structural regularizer also prunes the boundary read-in edges.
+        if getattr(stage, "boundary_z_logits", None) is not None:
+            loss_edge_gate = loss_edge_gate + torch.sigmoid(
+                stage.boundary_z_logits
+            ).sum()
+        # Include temporal-readout edge gates when present so the
+        # structural regularizer also prunes the readout OTA edges.
+        if getattr(stage, "output_ode_z_logits", None) is not None:
+            loss_edge_gate = loss_edge_gate + torch.sigmoid(
+                stage.output_ode_z_logits
+            ).sum()
         loss_rail = loss_rail + _stage_rail_loss(stage, traj)
         loss_tanh_sat = loss_tanh_sat + _stage_tanh_sat_loss(stage, traj)
 

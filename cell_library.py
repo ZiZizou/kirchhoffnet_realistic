@@ -243,8 +243,10 @@ class FreeTanhLibrary(nn.Module):
       - ``a_raw``   → A = softplus(a_raw), A >= 0, no upper bound, independent of B.
       - ``b_raw``   → B = softplus(b_raw), B >= 0, no upper bound, no sum constraint.
       - ``s_raw``   → s = sign(s_raw) (forward discrete ±1; backward uses STE).
-      - ``gm_raw``  → gm = gm_min + (gm_max - gm_min) * sigmoid(gm_raw).
-      - ``isat_raw``→ Isat = clamp_min(isat_min + (isat_max - isat_min) * sigmoid(isat_raw), 1e-6).
+      - ``gm_raw``  → gm = exp(gm_raw), then hard-clipped to [gm_min, gm_max]
+        for the simulation; gradients pass straight through the clip (STE).
+      - ``isat_raw``→ Isat = exp(isat_raw), then hard-clipped to [isat_min, isat_max];
+        gradients pass straight through the clip (STE).
       - ``theta_raw``→ theta; only present when ``bias_enabled=True`` (init=0).
       - ``g_resistive_raw``→ G = softplus(g_resistive_raw), positive shunt
         conductance (init=0 → G ≈ 0.69).
@@ -314,10 +316,12 @@ class FreeTanhLibrary(nn.Module):
         B = torch.nn.functional.softplus(self.b_raw).unsqueeze(0)        # [1, E]
         s = torch.sign(self.s_raw)                                       # [E]
         s_ste = s + self.s_raw - self.s_raw.detach()                     # STE: [E]
-        sig_gm = torch.sigmoid(self.gm_raw)
-        gm = self.gm_min + (self.gm_max - self.gm_min) * sig_gm          # [E]
-        sig_isat = torch.sigmoid(self.isat_raw)
-        isat = (self.isat_min + (self.isat_max - self.isat_min) * sig_isat).clamp_min(1e-6)  # [E]
+        sig_gm = torch.exp(self.gm_raw)
+        gm_clipped = sig_gm.clamp(self.gm_min, self.gm_max)
+        gm = sig_gm + (gm_clipped - sig_gm).detach()                     # STE: [E]
+        sig_isat = torch.exp(self.isat_raw)
+        isat_clipped = sig_isat.clamp(self.isat_min, self.isat_max)
+        isat = sig_isat + (isat_clipped - sig_isat).detach()              # STE: [E]
         theta = self.theta_raw.unsqueeze(0) if self._bias_enabled else 0.0
         u = (s_ste.unsqueeze(0) * (A * x_src - B * x_dst) + theta) * gm.unsqueeze(0)
         return isat.unsqueeze(0) * (torch.tanh(u) + self.ALPHA * u)
@@ -336,15 +340,15 @@ class FreeTanhLibrary(nn.Module):
         """
         i_cell = self._tanh_core(x_src, x_dst)                          # [1, E]
         if self._parallel_tanh_mult_enabled:
-            sig_gm_x = torch.sigmoid(self.gm_x_raw)
-            gm_x = self.gm_min + (self.gm_max - self.gm_min) * sig_gm_x # [E]
-            sig_gm_y = torch.sigmoid(self.gm_y_raw)
-            gm_y = self.gm_min + (self.gm_max - self.gm_min) * sig_gm_y # [E]
-            sig_isat_p = torch.sigmoid(self.isat_parallel_raw)
-            isat_p = (
-                self.isat_min
-                + (self.isat_max - self.isat_min) * sig_isat_p
-            ).clamp_min(1e-6)                                           # [E]
+            sig_gm_x = torch.exp(self.gm_x_raw)
+            gm_x_clipped = sig_gm_x.clamp(self.gm_min, self.gm_max)
+            gm_x = sig_gm_x + (gm_x_clipped - sig_gm_x).detach()         # STE: [E]
+            sig_gm_y = torch.exp(self.gm_y_raw)
+            gm_y_clipped = sig_gm_y.clamp(self.gm_min, self.gm_max)
+            gm_y = sig_gm_y + (gm_y_clipped - sig_gm_y).detach()         # STE: [E]
+            sig_isat_p = torch.exp(self.isat_parallel_raw)
+            isat_p_clipped = sig_isat_p.clamp(self.isat_min, self.isat_max)
+            isat_p = sig_isat_p + (isat_p_clipped - sig_isat_p).detach()  # STE: [E]
             i_parallel = isat_p.unsqueeze(0) * torch.tanh(
                 gm_x.unsqueeze(0) * x_src
             ) * torch.tanh(gm_y.unsqueeze(0) * x_dst)                   # [1, E]

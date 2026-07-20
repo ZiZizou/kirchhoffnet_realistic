@@ -1416,7 +1416,7 @@ def topology_to_stage(
     # of inter-node voltages.
     ref_cell_lib = None
     if enable_ref_edges:
-        n_ref = len(active_nodes)
+        n_ref = len(active_nodes) + int(output_ode_node_count)
         if isinstance(cell_lib, SimpleEdgeLibrary):
             ref_cell_lib = SimpleEdgeLibrary(num_edges=n_ref, mode=cell_lib._mode)
         elif isinstance(cell_lib, RealisticTanhLibrary):

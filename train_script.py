@@ -2537,7 +2537,7 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
     # --- Interstage activation: pointwise non-linearity between stages ---
     parser.add_argument(
         "--interstage-activation",
-        choices=["none", "relu", "residual", "residual_mixing"],
+        choices=["none", "relu", "residual", "residual_mixing", "residual-relu-tanh"],
         default="none", dest="interstage_activation",
         help="Pointwise non-linearity applied to the state vector between "
              "stages. 'none' (default) keeps the transfer as a pure "

@@ -28,7 +28,7 @@ import torch.nn.functional as F
 
 __all__ = ["StageTransfer", "STAGE_TRANSFER_VALID_ACTIVATIONS"]
 
-STAGE_TRANSFER_VALID_ACTIVATIONS = ("none", "relu", "residual", "residual_mixing")
+STAGE_TRANSFER_VALID_ACTIVATIONS = ("none", "relu", "residual", "residual_mixing", "residual-relu-tanh")
 
 
 class StageTransfer(nn.Module):
@@ -95,9 +95,16 @@ class StageTransfer(nn.Module):
         if activation in ("residual", "residual_mixing"):
             self.residual_w1 = nn.Parameter(torch.full((self.out_nodes,), 1.0))
             self.residual_w2 = nn.Parameter(torch.full((self.out_nodes,), 0.0))
+        elif activation == "residual-relu-tanh":
+            self.residual_w1 = nn.Parameter(torch.full((self.out_nodes,), 1.0))
+            self.residual_w2 = nn.Parameter(torch.full((self.out_nodes,), 0.0))
+            self.residual_w3 = nn.Parameter(torch.zeros(self.out_nodes))
+            self.residual_vth = nn.Parameter(torch.zeros(self.out_nodes))
         else:
             self.register_parameter("residual_w1", None)
             self.register_parameter("residual_w2", None)
+            self.register_parameter("residual_w3", None)
+            self.register_parameter("residual_vth", None)
 
         # Mixing-term parameters and rank flag (only meaningful for
         # "residual_mixing").
@@ -151,6 +158,15 @@ class StageTransfer(nn.Module):
 
         if self.activation == "relu":
             out = F.relu(out)
+        elif self.activation == "residual-relu-tanh":
+            transformed = (
+                self.residual_w1 * out
+                + self.residual_w2 * torch.tanh(out)
+                + self.residual_w3 * F.relu(out - self.residual_vth)
+            )
+            if self._drive_mask.numel() > 0:
+                transformed[:, self._drive_mask] = out[:, self._drive_mask]
+            out = transformed
         elif self.activation in ("residual", "residual_mixing"):
             transformed = self.residual_w1 * out + self.residual_w2 * torch.tanh(out)
 

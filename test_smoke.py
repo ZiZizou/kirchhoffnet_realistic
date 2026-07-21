@@ -290,6 +290,96 @@ def test_stage_transfer():
     check("transfer pad: zeros appended", torch.equal(out[:, 5:], torch.zeros(1, 3)))
 
 
+def test_stage_transfer_residual_relu_tanh():
+    print("\nTest 4b: StageTransfer activation='residual-relu-tanh'")
+    from stage_transfer import StageTransfer
+
+    # 1. Init: starts as identity (W1=1, W2=W3=Vth=0)
+    m = StageTransfer(4, 4, activation="residual-relu-tanh")
+    x = torch.randn(3, 4)
+    check("identity at init", torch.allclose(m(x), x, atol=1e-6))
+
+    # 2. Valid activations tuple includes new mode
+    from stage_transfer import STAGE_TRANSFER_VALID_ACTIVATIONS
+    check("residual-relu-tanh in STAGE_TRANSFER_VALID_ACTIVATIONS",
+          "residual-relu-tanh" in STAGE_TRANSFER_VALID_ACTIVATIONS)
+
+    # 3. All four learnable params exist and have correct shape
+    check("residual_w1 shape", m.residual_w1.shape == (4,))
+    check("residual_w2 shape", m.residual_w2.shape == (4,))
+    check("residual_w3 shape", m.residual_w3.shape == (4,))
+    check("residual_vth shape", m.residual_vth.shape == (4,))
+
+    # 4. Init values
+    check("w1 init = 1", torch.equal(m.residual_w1, torch.ones(4)))
+    check("w2 init = 0", torch.equal(m.residual_w2, torch.zeros(4)))
+    check("w3 init = 0", torch.equal(m.residual_w3, torch.zeros(4)))
+    check("vth init = 0", torch.equal(m.residual_vth, torch.zeros(4)))
+
+    # 5. Formula: x_next = W1*x + W2*tanh(x) + W3*relu(x - Vth)
+    m2 = StageTransfer(2, 2, activation="residual-relu-tanh")
+    with torch.no_grad():
+        m2.residual_w3.fill_(1.0)
+        m2.residual_vth.fill_(0.5)
+    x = torch.tensor([[-1.0, 0.5], [0.4, 1.0]])
+    expected = x + torch.relu(x - 0.5)
+    check("formula: W1*x + W2*tanh(x) + W3*relu(x-Vth)",
+          torch.allclose(m2(x), expected, atol=1e-6))
+
+    # 6. Gradients flow to all four params when ReLU active
+    m3 = StageTransfer(2, 2, activation="residual-relu-tanh")
+    with torch.no_grad():
+        m3.residual_w3.fill_(1.0)
+        m3.residual_vth.fill_(-0.5)
+    x = torch.tensor([[1.0, 2.0]], requires_grad=True)
+    loss = m3(x).pow(2).sum()
+    loss.backward()
+    check("w1 grad nonzero", m3.residual_w1.grad is not None and m3.residual_w1.grad.abs().sum().item() > 0)
+    check("w2 grad nonzero", m3.residual_w2.grad is not None and m3.residual_w2.grad.abs().sum().item() > 0)
+    check("w3 grad nonzero", m3.residual_w3.grad is not None and m3.residual_w3.grad.abs().sum().item() > 0)
+    check("vth grad nonzero", m3.residual_vth.grad is not None and m3.residual_vth.grad.abs().sum().item() > 0)
+
+    # 7. vth grad is zero when all x < vth (dead ReLU)
+    m_dead = StageTransfer(2, 2, activation="residual-relu-tanh")
+    with torch.no_grad():
+        m_dead.residual_w3.fill_(1.0)
+        m_dead.residual_vth.fill_(10.0)
+    x = torch.tensor([[1.0, 2.0]], requires_grad=True)
+    loss = m_dead(x).pow(2).sum()
+    loss.backward()
+    check("vth grad zero when ReLU dead",
+          m_dead.residual_vth.grad is not None and m_dead.residual_vth.grad.abs().sum().item() == 0)
+
+    # 8. Width-changing (truncate / pad) works
+    m_pad = StageTransfer(4, 8, activation="residual-relu-tanh")
+    x = torch.randn(2, 4)
+    out = m_pad(x)
+    check("pad: shape (2,8)", out.shape == (2, 8))
+    check("pad: last 4 cols zero", torch.equal(out[:, 4:], torch.zeros(2, 4)))
+
+    m_trunc = StageTransfer(8, 4, activation="residual-relu-tanh")
+    x = torch.randn(2, 8)
+    out = m_trunc(x)
+    check("trunc: shape (2,4)", out.shape == (2, 4))
+    check("trunc: matches first 4 cols", torch.equal(out, x[:, :4]))
+
+    # 9. Drive-mask pass-through
+    m_dm = StageTransfer(4, 4, activation="residual-relu-tanh", drive_mask=[0, 2])
+    with torch.no_grad():
+        m_dm.residual_w3.fill_(1.0)
+        m_dm.residual_vth.fill_(-0.5)
+    x = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+    y = m_dm(x)
+    expected = torch.tensor([
+        [x[0, 0].item(),
+         x[0, 1].item() + max(0.0, x[0, 1].item() + 0.5),
+         x[0, 2].item(),
+         x[0, 3].item() + max(0.0, x[0, 3].item() + 0.5)]
+    ])
+    check("drive_mask: driven nodes pass through identity",
+          torch.allclose(y, expected, atol=1e-6))
+
+
 def test_heun_converges():
     print("\nTest 5: Heun integration converges without explosion (small 1-stage net)")
     from cell_library import make_cell_library
@@ -2858,6 +2948,7 @@ def main():
     test_isat_variation_pipeline()
     test_topology_primitives()
     test_stage_transfer()
+    test_stage_transfer_residual_relu_tanh()
     test_heun_converges()
     test_gradient_flow()
     test_compute_loss_finite()

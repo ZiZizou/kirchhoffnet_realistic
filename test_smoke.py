@@ -6684,12 +6684,12 @@ def test_free_tanh_construction():
           ((s == -1) | (s == 1)).all(),
           f"unique s values: {torch.unique(s).tolist()}")
 
-    sig_gm = F.softplus(lib.gm_raw)
-    gm = sig_gm.clamp(TANH_REALISTIC_GM_MIN, TANH_REALISTIC_GM_MAX)
+    sig_gm = torch.sigmoid(lib.gm_raw)
+    gm = TANH_REALISTIC_GM_MIN + (TANH_REALISTIC_GM_MAX - TANH_REALISTIC_GM_MIN) * sig_gm
     check("FT-1: gm in [gm_min, gm_max]",
           TANH_REALISTIC_GM_MIN <= gm.min().item() and gm.max().item() <= TANH_REALISTIC_GM_MAX)
-    sig_isat = F.softplus(lib.isat_raw)
-    isat_v = sig_isat.clamp(TANH_REALISTIC_ISAT_MIN, TANH_REALISTIC_ISAT_MAX)
+    sig_isat = torch.sigmoid(lib.isat_raw)
+    isat_v = TANH_REALISTIC_ISAT_MIN + (TANH_REALISTIC_ISAT_MAX - TANH_REALISTIC_ISAT_MIN) * sig_isat
     check("FT-1: isat in [isat_min, isat_max]",
           TANH_REALISTIC_ISAT_MIN <= isat_v.min().item() and isat_v.max().item() <= TANH_REALISTIC_ISAT_MAX)
 

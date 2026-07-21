@@ -134,8 +134,8 @@ def _stage_tanh_sat_loss(stage, traj: torch.Tensor) -> torch.Tensor:
     B = F.softplus(lib.b_raw).unsqueeze(0).unsqueeze(-1)        # [1, E, 1]
     s = torch.sign(lib.s_raw)
     s_ste = s + lib.s_raw - lib.s_raw.detach()                  # [E]
-    gm_uncl = F.softplus(lib.gm_raw)
-    gm = gm_uncl.clamp(lib.gm_min, lib.gm_max)                  # [E]
+    gm_uncl = torch.sigmoid(lib.gm_raw)
+    gm = lib.gm_min + (lib.gm_max - lib.gm_min) * gm_uncl       # [E]
     gm_e = gm.unsqueeze(0).unsqueeze(-1)                        # [1, E, 1]
 
     # traj: [B, N, T] -> gather per-edge src/dst voltages -> [B, E, T]

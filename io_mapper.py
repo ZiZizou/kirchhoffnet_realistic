@@ -575,19 +575,22 @@ class ResidualTanhInputMapper(nn.Module):
 
 
 class OutputAffine(nn.Module):
-    """y = gain * x + bias + tanh_gain * tanh(x), per-dim learnable.
+    """y = gain * x + bias + tanh_gain * tanh(x) + relu_gain * relu(x - relu_threshold), per-dim learnable.
 
     Drop-in OutputMapper replacement used by the temporal-readout plan.
     The temporal-readout flag wires the final output ODE node voltages into
     this module instead of a learned linear projection over the projection
     portion. The affine transform calibrates the output range / DC level
     without burdening the recurrent fabric — equivalent to a final analog
-    output amplifier stage with a soft-saturating residual branch.
+    output amplifier stage with two soft-saturating residual branches.
 
-    ``gain`` is initialized to ``1.0``, ``bias`` to ``0.0``, and
-    ``tanh_gain`` to ``0.0`` so the default behavior is identity read-out
-    of the output ODE node voltages. The tanh branch starts silent and the
-    optimizer activates it only if beneficial.
+    ``gain`` is initialized to ``1.0``, ``bias`` to ``0.0``,
+    ``tanh_gain`` to ``0.0``, ``relu_gain`` to ``0.0``, and
+    ``relu_threshold`` to ``0.0`` so the default behavior is identity
+    read-out of the output ODE node voltages. Both nonlinear branches
+    (tanh and ReLU) start silent and the optimizer activates them only if
+    beneficial. Mirrors the ``residual-tanh-relu`` interstage activation
+    in ``StageTransfer``.
     """
 
     def __init__(self, out_dim: int) -> None:
@@ -596,6 +599,8 @@ class OutputAffine(nn.Module):
         self.gain = nn.Parameter(torch.ones(self.out_dim))
         self.bias = nn.Parameter(torch.zeros(self.out_dim))
         self.tanh_gain = nn.Parameter(torch.zeros(self.out_dim))
+        self.relu_gain = nn.Parameter(torch.zeros(self.out_dim))
+        self.relu_threshold = nn.Parameter(torch.zeros(self.out_dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.size(-1) != self.out_dim:
@@ -603,7 +608,12 @@ class OutputAffine(nn.Module):
                 f"OutputAffine: input last dim={x.size(-1)}, expected "
                 f"out_dim={self.out_dim}"
             )
-        return self.gain * x + self.bias + self.tanh_gain * torch.tanh(x)
+        return (
+            self.gain * x
+            + self.bias
+            + self.tanh_gain * torch.tanh(x)
+            + self.relu_gain * torch.relu(x - self.relu_threshold)
+        )
 
     def extra_repr(self) -> str:
         return f"out_dim={self.out_dim}"

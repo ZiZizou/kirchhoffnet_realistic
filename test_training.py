@@ -1468,6 +1468,12 @@ def test_temporal_readout_basic():
     check("OutputAffine tanh_gain is initialized to 0",
           torch.allclose(net.output_mapper.tanh_gain.detach(),
                          torch.zeros(1)))
+    check("OutputAffine relu_gain is initialized to 0",
+          torch.allclose(net.output_mapper.relu_gain.detach(),
+                         torch.zeros(1)))
+    check("OutputAffine relu_threshold is initialized to 0",
+          torch.allclose(net.output_mapper.relu_threshold.detach(),
+                         torch.zeros(1)))
 
     stage = net.core.stages[0]
     check("stage._has_output_ode flag set",
@@ -1699,7 +1705,8 @@ def test_output_affine_identity_init():
     m = OutputAffine(out_dim=3)
     x = torch.tensor([[1.0, -2.0, 0.5]])
     y = m(x)
-    check("OutputAffine identity at init (gain=1, bias=0)",
+    check("OutputAffine identity at init (gain=1, bias=0, "
+          "tanh_gain=0, relu_gain=0)",
           torch.allclose(y, x))
     # After zeroing gain, output should be bias only.
     with torch.no_grad():
@@ -1708,6 +1715,18 @@ def test_output_affine_identity_init():
     y2 = m(x)
     check("OutputAffine with zero gain returns bias only",
           torch.allclose(y2, torch.tensor([[1.0, 2.0, 3.0]])))
+    # Activating relu_gain with relu_threshold=0 should add relu(x) on top
+    # of the existing bias.
+    with torch.no_grad():
+        m.gain.zero_()
+        m.relu_gain.data = torch.tensor([0.5, -0.5, 1.0])
+    y3 = m(x)
+    expected = (
+        torch.tensor([[1.0, 2.0, 3.0]])
+        + torch.tensor([[0.5, -0.5, 1.0]]) * torch.relu(x)
+    )
+    check("OutputAffine relu_gain adds ReLU branch",
+          torch.allclose(y3, expected))
 
 
 def test_temporal_readout_with_no_edge_gates():

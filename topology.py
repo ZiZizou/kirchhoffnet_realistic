@@ -1701,9 +1701,10 @@ def build_net_from_config(
     connect all-to-all to each output ODE node via one-way OTA edges
     (source read-only, destination writable). Output ODE node voltages
     are read at the end and scaled by a learnable ``OutputAffine``
-    layer, bypassing the linear ``OutputMapper`` projection. Requires
-    all stages to have the same width. Mutually exclusive with
-    ``decoder_type='residual_tanh'`` and ``grouped_readout``.
+    layer (gain * V + bias + tanh_gain * tanh(V)), bypassing the linear
+    ``OutputMapper`` projection. Requires all stages to have the same
+    width. Mutually exclusive with ``decoder_type='residual_tanh'`` and
+    ``grouped_readout``.
     """
     if leak_mode is None:
         leak_mode = cfg.get("leak_mode", "programmable")

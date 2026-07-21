@@ -1465,6 +1465,9 @@ def test_temporal_readout_basic():
     check("OutputAffine bias is initialized to 0",
           torch.allclose(net.output_mapper.bias.detach(),
                          torch.zeros(1)))
+    check("OutputAffine tanh_gain is initialized to 0",
+          torch.allclose(net.output_mapper.tanh_gain.detach(),
+                         torch.zeros(1)))
 
     stage = net.core.stages[0]
     check("stage._has_output_ode flag set",
@@ -1587,6 +1590,9 @@ def test_temporal_readout_grad_flow():
     check("OutputAffine.bias receives gradient",
           net.output_mapper.bias.grad is not None
           and net.output_mapper.bias.grad.abs().sum().item() > 0)
+    check("OutputAffine.tanh_gain receives gradient",
+          net.output_mapper.tanh_gain.grad is not None
+          and net.output_mapper.tanh_gain.grad.abs().sum().item() > 0)
 
 
 def test_temporal_readout_hidden_grid_untouched():

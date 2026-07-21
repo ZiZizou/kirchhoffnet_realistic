@@ -2465,7 +2465,8 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "connect all-to-all to each output ODE node via one-way OTA "
              "edges (source read-only, destination writable — the hidden "
              "grid is never drained). The output ODE node voltages are "
-             "scaled by a learnable OutputAffine (gain + bias) layer. "
+             "scaled by a learnable OutputAffine "
+             "(gain * V + bias + tanh_gain * tanh(V)) layer. "
              "Output ODE nodes receive leak + clip like regular nodes and "
              "are initialized to zero. Requires all stages to have the "
              "same width. Incompatible with --decoder-type residual_tanh "
@@ -2902,13 +2903,14 @@ def _transfer_output_mapper(raw_mapper, raw_read_idx, last_remap,
 
     if isinstance(raw_mapper, OutputAffine):
         # Learned gain/bias over the output ODE accumulator voltages.
-        # Transfer the per-dim gain and bias directly. OutputAffine has
-        # no node-dim dependency, so the pruned node count does not
-        # change the affine shape.
+        # Transfer the per-dim gain, bias, and tanh_gain directly.
+        # OutputAffine has no node-dim dependency, so the pruned node
+        # count does not change the affine shape.
         new_mapper = OutputAffine(out_dim=out_dim)
         with torch.no_grad():
             new_mapper.gain.data.copy_(raw_mapper.gain.data)
             new_mapper.bias.data.copy_(raw_mapper.bias.data)
+            new_mapper.tanh_gain.data.copy_(raw_mapper.tanh_gain.data)
         return new_mapper, None
 
     raise TypeError(

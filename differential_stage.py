@@ -734,7 +734,7 @@ class DifferentialStage(nn.Module):
             # grid is untouched, only the output accumulator receives current.
             acc = (acc.float() + acc_out).to(dtype=x.dtype)
 
-        leak = self._effective_leak(leak_floor=leak_floor).unsqueeze(0)  # [1, N]
+        leak = self._effective_leak(leak_floor=leak_floor).unsqueeze(0).to(x.device)  # [1, N]
         leak_term = leak * x
 
         clip = torch.sigmoid((x - self.x_max) / self.clip_softness)

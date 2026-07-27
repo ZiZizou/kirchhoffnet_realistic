@@ -65,7 +65,7 @@ def format_parameter_breakdown(breakdown: dict) -> str:
     for stage_key in sorted(per_stage.keys()):
         lines.append(f"  {stage_key}:")
         bucket = per_stage[stage_key]
-        for sub_name in ("cell_lib", "z_logits", "u_logits", "raw_leak", "raw_drive_g", "boundary_cell_lib", "boundary_z_logits", "raw_vref", "ref_z_logits", "ref_cell_lib", "output_ode_cell_lib", "output_ode_z_logits", "other"):
+        for sub_name in ("cell_lib", "z_logits", "u_logits", "raw_leak", "raw_drive_g", "boundary_cell_lib", "boundary_z_logits", "raw_vref", "ref_z_logits", "ref_cell_lib", "output_ode_cell_lib", "output_ode_z_logits", "vca_W", "vca_v", "other"):
             if bucket.get(sub_name, 0):
                 lines.append(f"    {sub_name:<{stage_label_w}}: {bucket[sub_name]:>{width - stage_label_w - 6}}")
         stage_total = sum(bucket.values())
@@ -241,6 +241,9 @@ class KirchhoffNetWithIO(nn.Module):
         boundary_fan_out: dict[int, list[int]] | None = None,
         enable_temporal_readout: bool = False,
         output_ode_count: int = 0,
+        enable_vca: bool = False,
+        vca_rank: int | None = None,
+        vca_in_dim: int | None = None,
     ) -> None:
         super().__init__()
         if hid_count < 0 or proj_count < 0:
@@ -354,6 +357,14 @@ class KirchhoffNetWithIO(nn.Module):
             None if boundary_fan_out is None
             else {int(k): [int(v) for v in tgts] for k, tgts in boundary_fan_out.items()}
         )
+        # VCA (low-rank input-driven attention gating) lives on unfrozen
+        # edges. Stored at the IO level so the forward pass knows to pass
+        # ``u`` to every stage (boundary / temporal-readout edge currents
+        # already need ``u``; VCA needs the raw input features for its
+        # shared input projection ``W``).
+        self.enable_vca = bool(enable_vca)
+        self.vca_rank = int(vca_rank) if vca_rank is not None else 0
+        self.vca_in_dim = int(vca_in_dim) if vca_in_dim is not None else 0
         if self.enable_boundary and self.boundary_fan_out is not None:
             stage_widths = [s.num_nodes for s in core.stages]
             if len(set(stage_widths)) != 1:
@@ -449,7 +460,7 @@ class KirchhoffNetWithIO(nn.Module):
                 deq_cfg=deq_cfg,
                 stage_noise_std=stage_noise_std,
                 stage_noise_generator=stage_noise_generator,
-                u=u if self.enable_boundary else None,
+                u=u if (self.enable_boundary or self.enable_vca) else None,
             )
         if self.read_idx is not None:
             x_read = x_final
@@ -531,6 +542,8 @@ class KirchhoffNetWithIO(nn.Module):
                     "ref_cell_lib": 0,
                     "output_ode_z_logits": 0,
                     "output_ode_cell_lib": 0,
+                    "vca_W": 0,
+                    "vca_v": 0,
                     "other": 0,
                 })
                 matched = False
@@ -558,6 +571,10 @@ class KirchhoffNetWithIO(nn.Module):
                     stage_bucket["output_ode_z_logits"] += n; matched = True
                 elif tail.startswith("output_ode_cell_lib."):
                     stage_bucket["output_ode_cell_lib"] += n; matched = True
+                elif tail == "vca_W":
+                    stage_bucket["vca_W"] += n; matched = True
+                elif tail.startswith("vca_v_"):
+                    stage_bucket["vca_v"] += n; matched = True
                 if not matched:
                     stage_bucket["other"] += n
         return {

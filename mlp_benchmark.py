@@ -160,6 +160,39 @@ def validate(net, val_loader, task_fn, device, wrapper=None) -> float:
     return total / max(1, n)
 
 
+def compute_orig_metrics(net, val_loader, inverse_stats, device, wrapper=None):
+    """Compute MSE/RMSE/MAE/MAPE in original (un-standardized) target units.
+
+    Returns ``(mse_orig, rmse_orig, mae_orig, mape_orig)``. MAPE clips the
+    ``|y_true|`` denominator at ``1e-8`` to avoid division by zero.
+    """
+    net.eval()
+    preds, targets = [], []
+    with torch.no_grad():
+        for u, t in val_loader:
+            u = u.to(device)
+            t = t.to(device)
+            if wrapper is not None:
+                preds.append(wrapper(u))
+            else:
+                preds.append(net(u))
+            targets.append(t)
+    y_pred_std = torch.cat(preds, dim=0)
+    y_true_std = torch.cat(targets, dim=0)
+    y_mean = inverse_stats["y_mean"]
+    y_std = inverse_stats["y_std"]
+    y_pred = y_pred_std * y_std + y_mean
+    y_true = y_true_std * y_std + y_mean
+    err = y_pred - y_true
+    abs_err = err.abs()
+    mse = float(F.mse_loss(y_pred, y_true).item())
+    rmse = float(torch.sqrt(F.mse_loss(y_pred, y_true)).item())
+    mae = float(F.l1_loss(y_pred, y_true).item())
+    mape = float((abs_err / y_true.abs().clamp(min=1e-8)).mean().item()) * 100.0
+    net.train()
+    return mse, rmse, mae, mape
+
+
 def plot_output_fit(out, target, save_path, title):
     plt = _import_matplotlib()
     if plt is None:
@@ -293,7 +326,7 @@ def main():
         train_wrapper = AnalogMLPWrapper(net, noise_cfg, adc_full_range=args.adc_full_range)
         train_wrapper.to(device)
 
-    train_loader, val_loader, task_fn = make_data_smooth2d(batch_size=batch_size)
+    train_loader, val_loader, task_fn, inverse_stats = make_data_smooth2d(batch_size=batch_size)
     if args.loss == "huber":
         task_fn = lambda o, t: F.huber_loss(o, t, delta=1.0)
     else:
@@ -328,6 +361,10 @@ def main():
 
     history = []
     val_history = []
+    orig_mse_history = []
+    orig_rmse_history = []
+    orig_mae_history = []
+    orig_mape_history = []
     best_val = float("inf")
     best_epoch = -1
     best_state = None
@@ -360,11 +397,22 @@ def main():
         do_validate = (epoch % args.validate_every == 0) or (epoch == args.epochs - 1)
         if do_validate:
             val_loss = validate(net, val_loader, task_fn, device, wrapper=train_wrapper)
+            mse_o, rmse_o, mae_o, mape_o = compute_orig_metrics(
+                net, val_loader, inverse_stats, device, wrapper=train_wrapper,
+            )
         else:
             val_loss = val_history[-1] if val_history else avg_train
+            mse_o = orig_mse_history[-1] if orig_mse_history else 0.0
+            rmse_o = orig_rmse_history[-1] if orig_rmse_history else 0.0
+            mae_o = orig_mae_history[-1] if orig_mae_history else 0.0
+            mape_o = orig_mape_history[-1] if orig_mape_history else 0.0
 
         history.append(avg_train)
         val_history.append(val_loss)
+        orig_mse_history.append(mse_o)
+        orig_rmse_history.append(rmse_o)
+        orig_mae_history.append(mae_o)
+        orig_mape_history.append(mape_o)
 
         if do_validate:
             if val_loss < best_val - args.min_delta:
@@ -397,9 +445,12 @@ def main():
     torch.save(net.state_dict(), out_dir / "model.pt")
 
     with open(out_dir / "loss_history.txt", "w") as f:
-        f.write("epoch\ttrain\tval\n")
-        for i, (t, v) in enumerate(zip(history, val_history)):
-            f.write(f"{i}\t{t}\t{v}\n")
+        f.write("epoch\ttrain\tval\tmse_orig\trmse_orig\tmae_orig\tmape_orig\n")
+        for i, (t, v, ms, rms, mas, maps) in enumerate(
+            zip(history, val_history, orig_mse_history,
+                orig_rmse_history, orig_mae_history, orig_mape_history)
+        ):
+            f.write(f"{i}\t{t}\t{v}\t{ms:.6f}\t{rms:.6f}\t{mas:.6f}\t{maps:.6f}\n")
 
     plot_loss_curve(
         history, val_history,
@@ -423,6 +474,13 @@ def main():
     )
 
     full_val_loss = validate(net, val_loader, task_fn, device, wrapper=train_wrapper)
+    final_mse, final_rmse, final_mae, final_mape = compute_orig_metrics(
+        net, val_loader, inverse_stats, device, wrapper=train_wrapper,
+    )
+    best_mse = orig_mse_history[best_epoch] if 0 <= best_epoch < len(orig_mse_history) else float("nan")
+    best_rmse = orig_rmse_history[best_epoch] if 0 <= best_epoch < len(orig_rmse_history) else float("nan")
+    best_mae = orig_mae_history[best_epoch] if 0 <= best_epoch < len(orig_mae_history) else float("nan")
+    best_mape = orig_mape_history[best_epoch] if 0 <= best_epoch < len(orig_mape_history) else float("nan")
     loss_label = args.loss.upper()
     print(f"[mlp] final val {loss_label} = {full_val_loss:.6f} (best val = {best_val:.6f} @ epoch {best_epoch})")
     with open(out_dir / "final_metrics.txt", "w") as f:
@@ -431,6 +489,14 @@ def main():
         f.write(f"best_val: {best_val:.6f}\n")
         f.write(f"best_epoch: {best_epoch}\n")
         f.write(f"final_val: {full_val_loss:.6f}\n")
+        f.write(f"best_mse_orig: {best_mse:.6f}\n")
+        f.write(f"best_rmse_orig: {best_rmse:.6f}\n")
+        f.write(f"best_mae_orig: {best_mae:.6f}\n")
+        f.write(f"best_mape_orig: {best_mape:.6f}\n")
+        f.write(f"final_mse_orig: {final_mse:.6f}\n")
+        f.write(f"final_rmse_orig: {final_rmse:.6f}\n")
+        f.write(f"final_mae_orig: {final_mae:.6f}\n")
+        f.write(f"final_mape_orig: {final_mape:.6f}\n")
         f.write(f"epochs_run: {len(history)}\n")
         f.write(f"elapsed_seconds: {elapsed:.2f}\n")
 

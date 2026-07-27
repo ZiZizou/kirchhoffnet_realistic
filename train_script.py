@@ -84,6 +84,7 @@ from config import (
     TAU,
     VARIATION,
     DEGREE_BUDGET,
+    VCA,
     make_smooth2d_grid_preset,
     make_housing_grid_preset)
 from cell_library import make_cell_library, SimpleEdgeLibrary
@@ -1434,7 +1435,8 @@ def make_data_smooth2d(batch_size: int, val_size: int = 4000, huber_delta: float
     val_loader = DataLoader(
         TensorDataset(u_val, y_val), batch_size=batch_size, shuffle=False
     )
-    return train_loader, val_loader, lambda o, t: F.huber_loss(o, t, delta=huber_delta)
+    inverse_stats = {"y_mean": float(y_mean.item()), "y_std": float(y_std.item())}
+    return train_loader, val_loader, lambda o, t: F.huber_loss(o, t, delta=huber_delta), inverse_stats
 
 def make_data(problem: str, batch_size: int, noise_std: float = 0.0,
               normalize_inputs: bool = True):
@@ -1727,8 +1729,11 @@ def validate_with_inverse(
       - ``val``: training-space loss (mean of ``task_fn(out, target)``)
       - ``mae_orig``: MAE in original target units (USD x 100k for California housing)
       - ``rmse_orig``: RMSE in original target units
-    If ``inverse_stats`` is None, ``mae_orig`` and ``rmse_orig`` are
-    reported as NaN (no denormalization available).
+      - ``mse_orig``: MSE in original target units
+      - ``mape_orig``: MAPE in original target units (percent). MAPE clips
+        ``|y_true|`` at ``1e-8`` to avoid division by zero.
+    If ``inverse_stats`` is None, ``mae_orig`` / ``rmse_orig`` / ``mse_orig`` /
+    ``mape_orig`` are reported as NaN (no denormalization available).
     """
     net.eval()
     use_cached_deq_stats = collect_deq_metrics and solver == "deq" and not isinstance(net, torch.nn.DataParallel)
@@ -1736,6 +1741,7 @@ def validate_with_inverse(
     n = 0
     se_sum = 0.0
     ae_sum = 0.0
+    ape_sum = 0.0
     deq_sum_residual = 0.0
     deq_max_residual = 0.0
     deq_sum_nstep = 0.0
@@ -1754,8 +1760,11 @@ def validate_with_inverse(
             if inverse_stats is not None:
                 pred_orig = denormalize_targets(out, inverse_stats)
                 targ_orig = denormalize_targets(target, inverse_stats)
-                ae_sum += float((pred_orig - targ_orig).abs().sum().item())
-                se_sum += float(((pred_orig - targ_orig) ** 2).sum().item())
+                err = pred_orig - targ_orig
+                abs_err = err.abs()
+                ae_sum += float(abs_err.sum().item())
+                se_sum += float((err ** 2).sum().item())
+                ape_sum += float((abs_err / targ_orig.abs().clamp(min=1e-8)).sum().item())
             n += u.size(0)
             if use_cached_deq_stats:
                 raw = _unwrap_raw_net(net)
@@ -1773,9 +1782,13 @@ def validate_with_inverse(
     if inverse_stats is not None and n > 0:
         out_dict["mae_orig"] = ae_sum / n
         out_dict["rmse_orig"] = (se_sum / n) ** 0.5
+        out_dict["mse_orig"] = se_sum / n
+        out_dict["mape_orig"] = (ape_sum / n) * 100.0
     else:
         out_dict["mae_orig"] = float("nan")
         out_dict["rmse_orig"] = float("nan")
+        out_dict["mse_orig"] = float("nan")
+        out_dict["mape_orig"] = float("nan")
     if collect_deq_metrics and solver == "deq":
         probe_metrics = None
         if first_batch is not None:
@@ -2472,6 +2485,28 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "are initialized to zero. Requires all stages to have the "
              "same width. Incompatible with --decoder-type residual_tanh "
              "and --grouped-readout. Default: disabled.")
+    parser.add_argument(
+        "--vca", action="store_true", default=False,
+        dest="vca",
+        help="Enable low-rank input-driven VCA (Voltage-Controlled Amplifier) "
+             "gating on boundary and temporal-readout edges. Each gated "
+             "edge's tail current is modulated by vca_e = sigma(u^T W v_e), "
+             "where W (in_dim x rank) is a shared input projection and v_e "
+             "(rank) is a per-edge embedding. Physically: rank global control "
+             "buses broadcast from the input terminals, each unfrozen edge "
+             "taps into them with a programmable weight. Provides "
+             "content-dependent multiplicative cross-node interaction "
+             "(attention analog). Compatible with --freeze-read because u is "
+             "constant per sample across all sub-iterations. Requires at "
+             "least one of --boundary-fan-out or --temporal-readout. "
+             "Default: disabled.")
+    parser.add_argument(
+        "--vca-rank", type=int, default=None, dest="vca_rank",
+        help="VCA projection rank r (default: config.VCA['rank'] = "
+             f"{VCA['rank']}). r=1 collapses to a shared input projection "
+             "with per-edge scalar gain; larger r gives the optimizer more "
+             "axes to express input-edge alignment. Must be >= "
+             f"{VCA['min_rank']}.")
     parser.add_argument(
         "--leak", choices=["programmable", "non-programmable"],
         default="programmable", dest="leak",
@@ -3233,6 +3268,22 @@ def main():
                 "'sparse_proj', or 'one_to_one' "
                 f"(got --write-mode {args.write_mode!r})"
             )
+
+    # VCA (input-driven attention gating): requires at least one of
+    # --boundary-fan-out or --temporal-readout to have any gated edges.
+    if args.vca:
+        vca_rank_eff = args.vca_rank if args.vca_rank is not None else VCA["rank"]
+        if vca_rank_eff < VCA["min_rank"]:
+            raise ValueError(
+                f"--vca-rank must be >= {VCA['min_rank']}, got {vca_rank_eff}"
+            )
+        if boundary_fan_out_parsed is None and not args.enable_temporal_readout:
+            raise ValueError(
+                "--vca requires at least one of --boundary-fan-out or "
+                "--temporal-readout: VCA only modulates unfrozen edges that "
+                "have access to the input features."
+            )
+
     net = build_net_from_preset(
         args.problem,
         cell_lib=cell_lib,
@@ -3255,7 +3306,9 @@ def main():
         enable_skip_linear=args.skip_linear,
         boundary_fan_out=boundary_fan_out_parsed,
         enable_ref_edges=args.enable_ref_edges,
-        enable_temporal_readout=args.enable_temporal_readout)
+        enable_temporal_readout=args.enable_temporal_readout,
+        vca_enabled=args.vca,
+        vca_rank=args.vca_rank)
     net.to(device)
 
     if args.no_edge_gates:
@@ -3322,6 +3375,20 @@ def main():
             f"y = W₁·u + b₁ + f(x), "
             f"shape={net.skip_linear_in_dim}->{net.skip_linear_out_dim}, "
             f"L2 lambda={skip_l2_lambda}"
+        )
+    if getattr(net, "enable_vca", False):
+        vca_rank_eff = net.vca_rank if hasattr(net, "vca_rank") else VCA["rank"]
+        n_b_edges = sum(
+            len(s.boundary_src) for s in net.core.stages if hasattr(s, "boundary_src")
+        )
+        n_r_edges = sum(
+            len(s.output_ode_src)
+            for s in net.core.stages
+            if hasattr(s, "output_ode_src")
+        )
+        print(
+            f"[train] VCA ENABLED: rank={vca_rank_eff}, "
+            f"total gated edges: {n_b_edges} boundary + {n_r_edges} temporal-readout"
         )
     # Resolve the actually-applied edge_repeats from the preset (post the
     # CLI-injection step). When multiple stages disagree, fall back to None.
@@ -3622,6 +3689,8 @@ def main():
     deq_train_log_path = out_dir / "deq_training_history.txt" if solver == "deq" else None
     deq_val_log_path = out_dir / "deq_validation_history.txt" if solver == "deq" else None
 
+    train_start_time = time.time()
+
     for epoch in ab_iter:
         if stop_training:
             break
@@ -3838,6 +3907,8 @@ def main():
 
         else:
             val_loss = val_history[-1] if val_history else avg_train
+            if inverse_stats is not None and val_orig_history is not None and val_orig_history:
+                val_orig_history.append(val_orig_history[-1])
 
         history.append(avg_train)
         val_history.append(val_loss)
@@ -3944,7 +4015,7 @@ def main():
     with open(history_path, "w") as f:
         has_orig = val_orig_history is not None and len(val_orig_history) == len(val_history)
         if has_orig:
-            f.write("epoch\ttrain\tval\tmae_orig\trmse_orig\tphase\n")
+            f.write("epoch\ttrain\tval\tmae_orig\trmse_orig\tmse_orig\tmape_orig\tphase\n")
             for i, (t, v, m) in enumerate(zip(history, val_history, val_orig_history)):
                 if schedule_mode == "three_phase":
                     p = phase_for_epoch(i, epochs)
@@ -3952,7 +4023,7 @@ def main():
                     p = phase_for_epoch_four(i, epochs)
                 else:
                     p = "A"
-                f.write(f"{i}\t{t}\t{v}\t{m['mae_orig']:.6f}\t{m['rmse_orig']:.6f}\t{p}\n")
+                f.write(f"{i}\t{t}\t{v}\t{m['mae_orig']:.6f}\t{m['rmse_orig']:.6f}\t{m['mse_orig']:.6f}\t{m['mape_orig']:.6f}\t{p}\n")
         else:
             f.write("epoch\ttrain\tval\tphase\n")
             for i, (t, v) in enumerate(zip(history, val_history)):
@@ -3978,6 +4049,33 @@ def main():
     fig.tight_layout()
     fig.savefig(out_dir / "loss_curve.png", dpi=120, bbox_inches="tight")
     plt.close(fig)
+
+    final_metrics_path = out_dir / "final_metrics.txt"
+    elapsed = time.time() - train_start_time
+    has_best_orig = (
+        val_orig_history is not None
+        and len(val_orig_history) > 0
+        and 0 <= best_epoch < len(val_orig_history)
+        and val_orig_history[best_epoch] is not None
+    )
+    with open(final_metrics_path, "w") as f:
+        f.write(f"problem: {args.problem}\n")
+        f.write(f"loss: {args.loss}\n")
+        f.write(f"best_epoch: {best_epoch}\n")
+        f.write(f"best_val: {best_val:.6f}\n")
+        if has_best_orig:
+            m = val_orig_history[best_epoch]
+            f.write(f"best_mse_orig: {m['mse_orig']:.6f}\n")
+            f.write(f"best_rmse_orig: {m['rmse_orig']:.6f}\n")
+            f.write(f"best_mae_orig: {m['mae_orig']:.6f}\n")
+            f.write(f"best_mape_orig: {m['mape_orig']:.6f}\n")
+        else:
+            f.write("best_mse_orig: nan\n")
+            f.write("best_rmse_orig: nan\n")
+            f.write("best_mae_orig: nan\n")
+            f.write("best_mape_orig: nan\n")
+        f.write(f"epochs_run: {len(history)}\n")
+        f.write(f"elapsed_seconds: {elapsed:.2f}\n")
 
     if best_state is not None:
         raw = net.module if isinstance(net, torch.nn.DataParallel) else net
@@ -4470,16 +4568,16 @@ def main():
                         if solver == "deq":
                             val_metrics_c = validate_with_inverse(
                                 pruned_net, val_loader, task_fn, ctx_factory, device,
-                                inverse_stats=inverse_stats_c,
+                                inverse_stats=inverse_stats,
                                 solver=solver, deq_cfg=deq_cfg,
                                 collect_deq_metrics=True)
                             val_deq_metrics = val_metrics_c.pop("deq", None)
                         else:
                             val_metrics_c = validate_with_inverse(
                                 pruned_net, val_loader, task_fn, ctx_factory, device,
-                                inverse_stats=inverse_stats_c,
+                                inverse_stats=inverse_stats,
                                 solver=solver, deq_cfg=deq_cfg)
-                        val = val_metrics_c["val"]
+                        val = val_metrics_c["val"] 
                     else:
                         val_metrics_c = None
                         if solver == "deq":
@@ -4552,7 +4650,7 @@ def main():
                     if has_orig and retrain_orig_history is not None:
                         for i, (t, v, m) in enumerate(zip(retrain_history, retrain_val_history, retrain_orig_history)):
                             global_ep = phase_c_start + i
-                            f.write(f"{global_ep}\t{t}\t{v}\t{m['mae_orig']:.6f}\t{m['rmse_orig']:.6f}\tC\n")
+                            f.write(f"{global_ep}\t{t}\t{v}\t{m['mae_orig']:.6f}\t{m['rmse_orig']:.6f}\t{m['mse_orig']:.6f}\t{m['mape_orig']:.6f}\tC\n")
                     else:
                         for i, (t, v) in enumerate(zip(retrain_history, retrain_val_history)):
                             global_ep = phase_c_start + i
@@ -4619,6 +4717,14 @@ def main():
                 f.write(f"retrain_lr: {c_lr}\n")
                 f.write(f"best_val_pruned: {best_val_pruned:.6f}\n")
                 f.write(f"best_epoch_pruned: {best_epoch_pruned}\n")
+                if (retrain_orig_history is not None and len(retrain_orig_history) > 0
+                        and 0 <= best_epoch_pruned < len(retrain_orig_history)
+                        and retrain_orig_history[best_epoch_pruned] is not None):
+                    mp = retrain_orig_history[best_epoch_pruned]
+                    f.write(f"best_mse_pruned_orig: {mp['mse_orig']:.6f}\n")
+                    f.write(f"best_rmse_pruned_orig: {mp['rmse_orig']:.6f}\n")
+                    f.write(f"best_mae_pruned_orig: {mp['mae_orig']:.6f}\n")
+                    f.write(f"best_mape_pruned_orig: {mp['mape_orig']:.6f}\n")
                 f.write(f"scheduler: {args.use_scheduler}\n")
 
     # ----------------------------------------------------------------

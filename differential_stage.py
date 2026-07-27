@@ -29,6 +29,7 @@ from config import (
     PHYS,
     REF,
     SOLVER,
+    VCA,
 )
 from cell_library import (
     AntiParallelFreeTanhLibrary,
@@ -141,9 +142,12 @@ class DifferentialStage(nn.Module):
         boundary_cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | AntiParallelFreeTanhLibrary | None = None,
         enable_ref_edges: bool = False,
         ref_cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | AntiParallelFreeTanhLibrary | None = None,
-        output_ode_src: list[int] | None = None,
+output_ode_src: list[int] | None = None,
         output_ode_dst: list[int] | None = None,
         output_ode_cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | AntiParallelFreeTanhLibrary | None = None,
+        vca_enabled: bool = False,
+        vca_rank: int = 2,
+        vca_in_dim: int = 0,
     ) -> None:
         super().__init__()
         self.num_nodes = int(num_nodes)
@@ -153,6 +157,13 @@ class DifferentialStage(nn.Module):
         if leak_mode not in ("programmable", "non-programmable"):
             raise ValueError(f"leak_mode must be 'programmable' or 'non-programmable', got {leak_mode!r}")
         self.leak_mode = leak_mode
+        self.vca_enabled = bool(vca_enabled)
+        self.vca_rank = int(vca_rank) if vca_enabled else int(vca_rank)
+        self._vca_in_dim = int(vca_in_dim)
+        if self.vca_enabled and self.vca_rank < VCA["min_rank"]:
+            raise ValueError(
+                f"vca_rank must be >= {VCA['min_rank']}, got {self.vca_rank}"
+            )
 
         self.c_eff = float(c_eff if c_eff is not None else PHYS["C_eff"])
         self.x_max = float(x_max if x_max is not None else PHYS["x_max"])
@@ -377,6 +388,59 @@ class DifferentialStage(nn.Module):
             self.output_ode_z_logits = None
             self._has_output_ode = False
 
+        # Low-rank input-driven VCA (Voltage-Controlled Amplifier) gating.
+        # When enabled, builds per-edge embeddings for boundary and
+        # temporal-readout edges plus a shared input projection. The VCA
+        # gate per gated edge is ``sigma(u^T W v_e)`` where ``W``
+        # (in_dim x rank) is the shared projection and ``v_e`` (rank) is
+        # the per-edge embedding. ``W[:, 0]`` is initialized to zero
+        # (input-independent bus) so the VCA gate starts as a no-op
+        # (``sigma(0 * v_e) = 0.5``) and the optimizer can gradually
+        # activate the input-dependent modulation. Incompatible with
+        # --vca-rank < VCA['min_rank']; requires at least one of
+        # boundary or temporal-readout edges.
+        if self.vca_enabled:
+            n_b = int(self.boundary_src.numel())
+            n_r = int(self.output_ode_src.numel())
+            if n_b == 0 and n_r == 0:
+                raise ValueError(
+                    "DifferentialStage: --vca requires boundary_src or "
+                    "output_ode_src to be non-empty (VCA only modulates "
+                    "unfrozen edges that read the input)."
+                )
+            if self._vca_in_dim <= 0:
+                raise ValueError(
+                    "DifferentialStage: vca_in_dim must be > 0 when "
+                    "vca_enabled=True"
+                )
+            init_scale = float(VCA["scale_init"])
+            self.vca_W = nn.Parameter(
+                torch.zeros(self._vca_in_dim, self.vca_rank)
+            )
+            with torch.no_grad():
+                if self.vca_rank > 1:
+                    nn.init.normal_(
+                        self.vca_W[:, 1:],
+                        std=init_scale,
+                    )
+                self.vca_W[:, 0].zero_()
+            if n_b > 0:
+                self.vca_v_boundary = nn.Parameter(
+                    torch.empty(n_b, self.vca_rank).normal_(std=init_scale)
+                )
+            else:
+                self.vca_v_boundary = None
+            if n_r > 0:
+                self.vca_v_readout = nn.Parameter(
+                    torch.empty(n_r, self.vca_rank).normal_(std=init_scale)
+                )
+            else:
+                self.vca_v_readout = None
+        else:
+            self.vca_W = None
+            self.vca_v_boundary = None
+            self.vca_v_readout = None
+
     def num_edges(self) -> int:
         return int(self.src.numel())
 
@@ -567,6 +631,27 @@ class DifferentialStage(nn.Module):
         out[:, self._drive_idx] = i
         return out.to(dtype=x.dtype)
 
+    def _compute_vca_gate(
+        self,
+        u: torch.Tensor,
+        v_e: torch.Tensor,
+    ) -> torch.Tensor:
+        """Low-rank VCA gate for one edge set.
+
+        Computes ``sigma( (u @ W) @ v_e.T )`` of shape ``[batch, E]`` where
+        ``W`` is the shared input projection ``(in_dim, rank)``, ``v_e``
+        is the per-edge embedding ``(E, rank)``, and ``u`` is the input
+        feature batch ``(batch, in_dim)``.
+
+        Caller is responsible for ensuring ``vca_enabled=True``,
+        ``u`` is not None and has the expected in_dim, and that the
+        shared projection ``self.vca_W`` and per-edge ``v_e`` have been
+        built (consistent shapes).
+        """
+        u_proj = u @ self.vca_W              # [batch, rank]
+        vca_logits = u_proj @ v_e.T          # [batch, E]
+        return torch.sigmoid(vca_logits)
+
     def rhs(self, x: torch.Tensor,
             u: torch.Tensor | None = None,
             x_drive: torch.Tensor | None = None, drive_scale: float = 0.0,
@@ -679,6 +764,10 @@ class DifferentialStage(nn.Module):
             )
             boundary_mask = torch.sigmoid(self.boundary_z_logits)  # [Eb]
             i_boundary = i_boundary * boundary_mask.unsqueeze(0)   # [B, Eb]
+            if self.vca_enabled and self.vca_v_boundary is not None:
+                i_boundary = i_boundary * self._compute_vca_gate(
+                    u, self.vca_v_boundary,
+                )  # [B, Eb]
             i_boundary_f32 = i_boundary.float()
             # Clone when freeze_read is active so we don't mutate the shared
             # ``acc`` (= i_edge_const) tensor.
@@ -725,6 +814,10 @@ class DifferentialStage(nn.Module):
             )
             out_mask = torch.sigmoid(self.output_ode_z_logits)  # [Eo]
             i_out = i_out * out_mask.unsqueeze(0)  # [B, Eo]
+            if self.vca_enabled and self.vca_v_readout is not None and u is not None:
+                i_out = i_out * self._compute_vca_gate(
+                    u, self.vca_v_readout,
+                )  # [B, Eo]
             i_out_f32 = i_out.float()
             if i_edge_const is not None:
                 acc = acc.clone()
@@ -1125,6 +1218,12 @@ class DifferentialStage(nn.Module):
                     out_dev += int(self.output_ode_cell_lib.theta_raw.numel())
                 if hasattr(self.output_ode_cell_lib, "kappa_raw"):
                     out_dev += int(self.output_ode_cell_lib.kappa_raw.numel())
+        vca_proj_n = int(self.vca_W.numel()) if self.vca_W is not None else 0
+        vca_embed_n = 0
+        if self.vca_v_boundary is not None:
+            vca_embed_n += int(self.vca_v_boundary.numel())
+        if self.vca_v_readout is not None:
+            vca_embed_n += int(self.vca_v_readout.numel())
         return {
             "raw_leak": raw_leak_n,
             "z_logits": int(self.z_logits.numel()),
@@ -1137,6 +1236,8 @@ class DifferentialStage(nn.Module):
             "ref_device_param": ref_device_n,
             "output_ode_z_logits": out_z,
             "output_ode_device_param": out_dev,
+            "vca_proj": vca_proj_n,
+            "vca_embed": vca_embed_n,
             "total": (
                 raw_leak_n
                 + int(self.z_logits.numel())
@@ -1148,5 +1249,7 @@ class DifferentialStage(nn.Module):
                 + ref_device_n
                 + out_z
                 + out_dev
+                + vca_proj_n
+                + vca_embed_n
             ),
         }

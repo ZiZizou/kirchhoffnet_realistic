@@ -23,7 +23,7 @@ from typing import Iterable
 import torch
 import torch.nn as nn
 
-from config import PRESETS
+from config import PRESETS, VCA
 from differential_stage import DifferentialStage
 from cell_library import (
     AntiParallelFreeTanhLibrary,
@@ -1027,6 +1027,9 @@ def prune_stage(
         boundary_cell_lib=stage.boundary_cell_lib,
         enable_ref_edges=has_ref,
         ref_cell_lib=new_ref_lib,
+        vca_enabled=False,
+        vca_rank=VCA["rank"],
+        vca_in_dim=0,
     )
 
     if transfer_params:
@@ -1305,6 +1308,9 @@ def topology_to_stage(
     output_ode_dst: list[int] | None = None,
     output_ode_cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | AntiParallelFreeTanhLibrary | None = None,
     output_ode_node_count: int = 0,
+    vca_enabled: bool = False,
+    vca_rank: int = 2,
+    vca_in_dim: int = 0,
 ) -> tuple[DifferentialStage, list[int], dict[int, int]]:
     """Convert a SparseTopology into a DifferentialStage.
 
@@ -1320,6 +1326,15 @@ def topology_to_stage(
             Controls whether the stage has a learnable per-node ``raw_leak``
             or a fixed constant.
         leak_constant: Fixed leak value when ``leak_mode="non-programmable"``.
+        vca_enabled: When ``True``, the stage builds per-edge VCA
+            (Voltage-Controlled Amplifier) embeddings for boundary and
+            temporal-readout edges plus a shared input projection matrix.
+            The gate per gated edge is ``sigma(u^T W v_e)``. Requires at
+            least one of ``boundary_src`` or ``output_ode_src`` to be
+            non-empty (else raises ``ValueError``).
+        vca_rank: Projection rank ``r`` for the low-rank VCA. Default 2.
+        vca_in_dim: Input feature dimension used to size ``W``. Must
+            match the network-wide ``in_dim``. Default 0 (unset).
             ``None`` uses ``config.INIT["leak_constant"]``.
         freeze_read: When ``True``, edge currents are computed once from the
             initial state and held constant across all Heun / DEQ iterations
@@ -1530,6 +1545,9 @@ def topology_to_stage(
         output_ode_src=output_ode_src,
         output_ode_dst=output_ode_dst,
         output_ode_cell_lib=output_ode_cell_lib,
+        vca_enabled=vca_enabled,
+        vca_rank=vca_rank,
+        vca_in_dim=vca_in_dim,
     )
     return stage, active_nodes, id_map
 
@@ -1559,6 +1577,8 @@ def build_net_from_preset(
     boundary_fan_out: dict[int, list[int]] | None = None,
     enable_ref_edges: bool = False,
     enable_temporal_readout: bool = False,
+    vca_enabled: bool = False,
+    vca_rank: int | None = None,
 ):
     """Build a full KirchhoffNetWithIO from a config.PRESETS entry.
 
@@ -1641,6 +1661,10 @@ def build_net_from_preset(
         cfg["decoder_hidden_dim"] = int(decoder_hidden_dim)
     if freeze_read:
         cfg["freeze_read"] = True
+    if vca_enabled:
+        cfg["vca_enabled"] = True
+        if vca_rank is not None:
+            cfg["vca_rank"] = int(vca_rank)
     return build_net_from_config(
         cfg, cell_lib=cell_lib, enable_drive=enable_drive,
         drive_mode=drive_mode,
@@ -1653,6 +1677,8 @@ def build_net_from_preset(
         boundary_fan_out=boundary_fan_out,
         enable_ref_edges=enable_ref_edges,
         enable_temporal_readout=enable_temporal_readout,
+        vca_enabled=vca_enabled,
+        vca_rank=vca_rank,
     )
 
 
@@ -1671,6 +1697,8 @@ def build_net_from_config(
     boundary_fan_out: dict[int, list[int]] | None = None,
     enable_ref_edges: bool = False,
     enable_temporal_readout: bool = False,
+    vca_enabled: bool = False,
+    vca_rank: int | None = None,
 ):
     """Build a KirchhoffNetWithIO from a full config dict.
 
@@ -1684,6 +1712,16 @@ def build_net_from_config(
 
     ``freeze_read`` can be specified either explicitly or via
     ``cfg['freeze_read']``. Explicit kwargs take precedence.
+
+    ``vca_enabled`` (``False`` default): enable low-rank input-driven VCA
+    (Voltage-Controlled Amplifier) gating on boundary and temporal-readout
+    edges. ``vca_rank`` (default ``cfg['vca_rank']`` then
+    ``config.VCA['rank']``) controls the projection rank ``r``. The VCA
+    gate per gated edge is ``sigma(u^T W v_e)`` where ``W`` (in_dim x rank)
+    is a shared input projection and ``v_e`` (rank) is a per-edge
+    embedding. Requires at least one of ``boundary_fan_out`` or
+    ``enable_temporal_readout``; VCA only modulates unfrozen edges that
+    have access to the input features.
 
     ``encoder_type`` / ``decoder_type`` ("linear" | "residual_tanh")
     select non-linear encoder/decoder variants built on top of
@@ -1727,6 +1765,19 @@ def build_net_from_config(
         raise ValueError(
             f"decoder_type must be 'linear' or 'residual_tanh', got {decoder_type!r}"
         )
+    # VCA rank resolution: explicit kwarg > cfg > config default.
+    vca_enabled_effective = bool(vca_enabled or cfg.get("vca_enabled", False))
+    if vca_enabled_effective:
+        vca_rank_effective = int(
+            vca_rank if vca_rank is not None
+            else cfg.get("vca_rank", VCA["rank"])
+        )
+        if vca_rank_effective < VCA["min_rank"]:
+            raise ValueError(
+                f"VCA rank must be >= {VCA['min_rank']}, got {vca_rank_effective}"
+            )
+    else:
+        vca_rank_effective = VCA["rank"]
     from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
     from io_mapper import (
         InputMapper,
@@ -2045,6 +2096,9 @@ def build_net_from_config(
             output_ode_dst=output_ode_dst,
             output_ode_cell_lib=output_ode_cell_lib,
             output_ode_node_count=output_ode_count,
+            vca_enabled=vca_enabled_effective,
+            vca_rank=vca_rank_effective,
+            vca_in_dim=in_dim,
         )
         stage_modules.append(stage)
         stage_times.append(float(stages_cfg[stage_idx].get("t_span", 0.5)))
@@ -2248,6 +2302,9 @@ def build_net_from_config(
         boundary_fan_out=boundary_fan_out,
         enable_temporal_readout=enable_temporal_readout_effective,
         output_ode_count=output_ode_count,
+        enable_vca=vca_enabled_effective,
+        vca_rank=vca_rank_effective,
+        vca_in_dim=in_dim,
     )
 
     # Hard topology check: write_idx → read_idx must be >1 hop on the core

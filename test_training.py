@@ -359,7 +359,7 @@ def test_smooth2d_preset():
 
     from train import make_optimizer
     from train_script import make_data_smooth2d
-    train_loader, _, task_fn = make_data_smooth2d(batch_size=8, val_size=16)
+    train_loader, _, task_fn, _ = make_data_smooth2d(batch_size=8, val_size=16)
     optimizer = make_optimizer(net, lr=1e-3)
     net.train()
     for u_b, y_b in train_loader:
@@ -473,7 +473,7 @@ def test_smooth2d_grid_preset():
 
     from train import make_optimizer
     from train_script import make_data_smooth2d
-    train_loader, _, task_fn = make_data_smooth2d(batch_size=8, val_size=16)
+    train_loader, _, task_fn, _ = make_data_smooth2d(batch_size=8, val_size=16)
     optimizer = make_optimizer(net, lr=1e-3)
     net.train()
     for u_b, y_b in train_loader:
@@ -972,7 +972,7 @@ def test_mlp_benchmark():
 
     from mlp_benchmark import validate
     from train_script import make_data_smooth2d
-    train_loader, val_loader, task_fn = make_data_smooth2d(batch_size=128, val_size=200)
+    train_loader, val_loader, task_fn, _ = make_data_smooth2d(batch_size=128, val_size=200)
     optimizer = torch.optim.AdamW(net.parameters(), lr=1e-3)
     initial_val = validate(net, val_loader, task_fn, device="cpu")
 
@@ -1041,7 +1041,7 @@ def test_mlp_benchmark_tanh():
 
     from mlp_benchmark import validate
     from train_script import make_data_smooth2d
-    train_loader, val_loader, task_fn = make_data_smooth2d(batch_size=128, val_size=200)
+    train_loader, val_loader, task_fn, _ = make_data_smooth2d(batch_size=128, val_size=200)
     optimizer = torch.optim.AdamW(net.parameters(), lr=1e-3)
     initial_val = validate(net, val_loader, task_fn, device="cpu")
     net.train()

@@ -557,6 +557,27 @@ DEGREE_BUDGET = {
     "anneal_frac": 0.8,         # fraction of total epochs over which to anneal
 }
 
+# Low-rank input-driven VCA (Voltage-Controlled Amplifier) gating.
+# Applied to boundary and temporal-readout edges (the unfrozen edges that
+# already read ``u``). VCA gate per edge is
+#   vca_e = sigma( u^T W v_e )
+# where ``W`` (in_dim x rank) is a shared input projection and ``v_e``
+# (rank) is a per-edge embedding. Physically: ``rank`` global control
+# buses broadcast from the input terminals, each unfrozen edge taps into
+# them with a programmable weight.
+#
+# Default rank=2 keeps the parameter cost small (e.g. rank=2 with 52
+# boundary edges and in_dim=13 = 130 params per stage) while still
+# letting the network express content-dependent cross-node interaction.
+# Compatible with --freeze-read because ``u`` is constant per sample
+# across all Heun/DEQ sub-iterations, so the VCA gate can be co-frozen
+# with the unfrozen edge currents that depend on it.
+VCA = {
+    "rank": 2,                # projection rank r; must be >= 1
+    "scale_init": 0.01,       # std for both W (excluding first column) and v_e init
+    "min_rank": 1,
+}
+
 # Initialization biases
 # (fix-z-death: logits_z_bias=0.0 (was 1.0) gives all four cells equal
 # P=0.25 probability at init. Previously Z started at ~42% and, combined

@@ -1411,7 +1411,7 @@ def _lhs_samples(n: int, d: int, seed: int = 42) -> torch.Tensor:
     sampler = LatinHypercube(d=d, seed=seed)
     return torch.from_numpy(sampler.random(n=n)).float()
 
-def make_data_smooth2d(batch_size: int, val_size: int = 4000):
+def make_data_smooth2d(batch_size: int, val_size: int = 4000, huber_delta: float = 1.0):
     # Fixed seed for reproducible train/val splits and noise across runs.
     n_train = 20000
     u_train = _lhs_samples(n_train, 2, seed=42)
@@ -1434,7 +1434,7 @@ def make_data_smooth2d(batch_size: int, val_size: int = 4000):
     val_loader = DataLoader(
         TensorDataset(u_val, y_val), batch_size=batch_size, shuffle=False
     )
-    return train_loader, val_loader, F.mse_loss
+    return train_loader, val_loader, lambda o, t: F.huber_loss(o, t, delta=huber_delta)
 
 def make_data(problem: str, batch_size: int, noise_std: float = 0.0,
               normalize_inputs: bool = True):

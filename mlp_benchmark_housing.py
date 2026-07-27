@@ -255,6 +255,11 @@ def main():
                         help="Random seed (default: 0)")
     parser.add_argument("--activation", choices=["relu", "tanh"], default="relu",
                         help="Hidden activation (default: relu)")
+    parser.add_argument("--loss", choices=["mse", "huber"], default="huber",
+                        help="Training loss: 'huber' (default, matches "
+                             "make_data_housing_grid) or 'mse' "
+                             "(F.mse_loss). Huber is the standard for "
+                             "California Housing due to long-tailed targets.")
     parser.add_argument("--output", type=Path, default=Path("./output/mlp_housing"),
                         help="Output directory (default: ./output/mlp_housing)")
     parser.add_argument("--device", default=None,
@@ -326,6 +331,10 @@ def main():
         train_wrapper.to(device)
 
     train_loader, val_loader, task_fn, inverse_stats = make_data_housing_grid(batch_size=batch_size)
+    if args.loss == "huber":
+        task_fn = lambda o, t: F.huber_loss(o, t, delta=1.0)
+    else:
+        task_fn = F.mse_loss
     optimizer = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = CosineAnnealingWarmRestarts(
         optimizer,
@@ -336,7 +345,7 @@ def main():
 
     print(
         f"[mlp_housing] hidden_dim={args.hidden_dim} num_layers={args.num_layers} "
-        f"params={n_params} activation={args.activation} "
+        f"params={n_params} activation={args.activation} loss={args.loss} "
         f"epochs={epochs} lr={lr} weight_decay={weight_decay} "
         f"batch_size={batch_size} grad_clip_norm={grad_clip_norm} device={device} "
         f"output={out_dir}"
@@ -349,6 +358,7 @@ def main():
         f.write(f"num_layers: {args.num_layers}\n")
         f.write(f"hidden_dim: {args.hidden_dim}\n")
         f.write(f"activation: {args.activation}\n")
+        f.write(f"loss: {args.loss}\n")
         f.write(f"epochs: {epochs}\n")
         f.write(f"lr: {lr}\n")
         f.write(f"weight_decay: {weight_decay}\n")
@@ -359,8 +369,12 @@ def main():
         f.write(f"validate_every: {args.validate_every}\n")
         f.write(f"seed: {args.seed}\n")
         f.write(f"device: {device}\n")
-        f.write(f"dataset: California Housing (20640 samples, 80/20 split, "
-                f"min-max features, standardized targets, Huber loss delta=1.0)\n")
+        if args.loss == "huber":
+            f.write(f"dataset: California Housing (20640 samples, 80/20 split, "
+                    f"min-max features, standardized targets, Huber loss delta=1.0)\n")
+        else:
+            f.write(f"dataset: California Housing (20640 samples, 80/20 split, "
+                    f"min-max features, standardized targets, MSE loss)\n")
         f.write(f"scheduler: CosineAnnealingWarmRestarts(T_0={OPTIM['scheduler_T_0']}, "
                 f"T_mult={OPTIM['scheduler_T_mult']}, eta_min={OPTIM['scheduler_eta_min']})\n")
 
@@ -471,16 +485,18 @@ def main():
 
     full_val_loss = validate(net, val_loader, task_fn, device, wrapper=train_wrapper)
     final_mae, final_rmse = compute_orig_metrics(net, val_loader, inverse_stats, device, wrapper=train_wrapper)
+    loss_label = args.loss.upper()
     print(
-        f"[mlp_housing] final val Huber = {full_val_loss:.6f} "
+        f"[mlp_housing] final val {loss_label} = {full_val_loss:.6f} "
         f"(best val = {best_val:.6f} @ epoch {best_epoch})  "
         f"MAE_orig={final_mae:.4f}  RMSE_orig={final_rmse:.4f}"
     )
     with open(out_dir / "final_metrics.txt", "w") as f:
         f.write(f"param_count: {n_params}\n")
-        f.write(f"best_val_huber: {best_val:.6f}\n")
+        f.write(f"loss: {args.loss}\n")
+        f.write(f"best_val: {best_val:.6f}\n")
         f.write(f"best_epoch: {best_epoch}\n")
-        f.write(f"final_val_huber: {full_val_loss:.6f}\n")
+        f.write(f"final_val: {full_val_loss:.6f}\n")
         f.write(f"final_mae_orig: {final_mae:.6f}\n")
         f.write(f"final_rmse_orig: {final_rmse:.6f}\n")
         f.write(f"epochs_run: {len(history)}\n")
@@ -527,7 +543,8 @@ def main():
             f.write(f"noise_seed: {args.noise_seed}\n")
             f.write(f"noise_aware_training: {bool(args.noise_aware)}\n")
             f.write(f"adc_quantization: {not bool(args.no_adc)}\n")
-            f.write(f"clean_val_huber: {clean_loss:.6f}\n")
+            f.write(f"loss: {args.loss}\n")
+            f.write(f"clean_val: {clean_loss:.6f}\n")
             f.write(f"noisy_mean: {noise_result.mean:.6f}\n")
             f.write(f"noisy_std: {noise_result.std:.6f}\n")
             f.write(f"noisy_p50: {noise_result.p50:.6f}\n")

@@ -320,7 +320,7 @@ def test_smooth2d_preset():
     check("smooth2d: radius=2 (line topology)", s["hidden_kwargs"].get("radius") == 2)
     check("smooth2d: write_idx=[0,1]", cfg["write_idx"] == [0, 1])
     check("smooth2d: read_idx=[9] (hidden, not proj)", cfg["read_idx"] == [9])
-    check("smooth2d: loss=mse", cfg["loss"] == "mse")
+    check("smooth2d: loss=huber", cfg["loss"] == "huber")
     check("smooth2d: out_dim=1", cfg["out_dim"] == 1)
     from config import SOLVER
     check("smooth2d: t_span=SOLVER.t_span",
@@ -400,7 +400,7 @@ def test_smooth2d_grid_preset():
           cfg.get("write_fan_out") == {0: [0, 14, 28, 42], 1: [6, 20, 34, 48]})
     check("smooth2d_grid: read_idx = 7 center column + 3 proj",
           cfg["read_idx"] == [3, 10, 17, 24, 31, 38, 45, 49, 50, 51])
-    check("smooth2d_grid: loss=mse", cfg["loss"] == "mse")
+    check("smooth2d_grid: loss=huber", cfg["loss"] == "huber")
     check("smooth2d_grid: out_dim=1", cfg["out_dim"] == 1)
     check("smooth2d_grid: per-stage t_span=5/3 (~1.667)",
           abs(s["t_span"] - 5.0 / 3) < 1e-6)

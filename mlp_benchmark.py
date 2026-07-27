@@ -224,6 +224,11 @@ def main():
                         help="Random seed (default: 0)")
     parser.add_argument("--activation", choices=["relu", "tanh"], default="relu",
                         help="Hidden activation (default: relu)")
+    parser.add_argument("--loss", choices=["mse", "huber"], default="mse",
+                        help="Training loss: 'mse' (default) or 'huber' "
+                             "(F.huber_loss delta=1.0). Huber is more "
+                             "robust to outliers and matches the loss "
+                             "used by the KirchhoffNet on smooth2d.")
     parser.add_argument("--output", type=Path, default=Path("./output/mlp_smooth2d"),
                         help="Output directory (default: ./output/mlp_smooth2d)")
     parser.add_argument("--device", default=None,
@@ -289,11 +294,15 @@ def main():
         train_wrapper.to(device)
 
     train_loader, val_loader, task_fn = make_data_smooth2d(batch_size=batch_size)
+    if args.loss == "huber":
+        task_fn = lambda o, t: F.huber_loss(o, t, delta=1.0)
+    else:
+        task_fn = F.mse_loss
     optimizer = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=weight_decay)
 
     print(
         f"[mlp] hidden_dim={args.hidden_dim} num_layers={args.num_layers} params={n_params} "
-        f"activation={args.activation} "
+        f"activation={args.activation} loss={args.loss} "
         f"epochs={args.epochs} lr={lr} weight_decay={weight_decay} "
         f"batch_size={batch_size} grad_clip_norm={grad_clip_norm} device={device} "
         f"output={out_dir}"
@@ -304,6 +313,7 @@ def main():
         f.write(f"param_count: {n_params}\n")
         f.write(f"num_layers: {args.num_layers}\n")
         f.write(f"activation: {args.activation}\n")
+        f.write(f"loss: {args.loss}\n")
         f.write(f"epochs: {args.epochs}\n")
         f.write(f"lr: {lr}\n")
         f.write(f"weight_decay: {weight_decay}\n")
@@ -413,12 +423,14 @@ def main():
     )
 
     full_val_loss = validate(net, val_loader, task_fn, device, wrapper=train_wrapper)
-    print(f"[mlp] final val MSE = {full_val_loss:.6f} (best val = {best_val:.6f} @ epoch {best_epoch})")
+    loss_label = args.loss.upper()
+    print(f"[mlp] final val {loss_label} = {full_val_loss:.6f} (best val = {best_val:.6f} @ epoch {best_epoch})")
     with open(out_dir / "final_metrics.txt", "w") as f:
         f.write(f"param_count: {n_params}\n")
-        f.write(f"best_val_mse: {best_val:.6f}\n")
+        f.write(f"loss: {args.loss}\n")
+        f.write(f"best_val: {best_val:.6f}\n")
         f.write(f"best_epoch: {best_epoch}\n")
-        f.write(f"final_val_mse: {full_val_loss:.6f}\n")
+        f.write(f"final_val: {full_val_loss:.6f}\n")
         f.write(f"epochs_run: {len(history)}\n")
         f.write(f"elapsed_seconds: {elapsed:.2f}\n")
 
@@ -463,7 +475,8 @@ def main():
             f.write(f"noise_seed: {args.noise_seed}\n")
             f.write(f"noise_aware_training: {bool(args.noise_aware)}\n")
             f.write(f"adc_quantization: {not bool(args.no_adc)}\n")
-            f.write(f"clean_val_mse: {clean_loss:.6f}\n")
+            f.write(f"loss: {args.loss}\n")
+            f.write(f"clean_val: {clean_loss:.6f}\n")
             f.write(f"noisy_mean: {noise_result.mean:.6f}\n")
             f.write(f"noisy_std: {noise_result.std:.6f}\n")
             f.write(f"noisy_p50: {noise_result.p50:.6f}\n")

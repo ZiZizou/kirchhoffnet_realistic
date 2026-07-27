@@ -758,7 +758,7 @@ PRESET_SMOOTH2D = {
         },
     ],
     "use_robust_input": False,
-    "loss": "mse",
+    "loss": "huber",
     "out_dim": 1,
     "write_idx": [0, 1],
     "read_idx": [9],
@@ -849,7 +849,7 @@ def make_smooth2d_grid_preset(
     preset = {
         "stages": [_stage_cfg] * n_stages,
         "use_robust_input": False,
-        "loss": "mse",
+        "loss": "huber",
         "out_dim": 1,
         "write_mode": "fan_out",
         "write_fan_out": fan_out,

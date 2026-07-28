@@ -4076,6 +4076,7 @@ def main():
             f.write("best_mape_orig: nan\n")
         f.write(f"epochs_run: {len(history)}\n")
         f.write(f"elapsed_seconds: {elapsed:.2f}\n")
+        f.write(f"param_count: {n_params}\n")
 
     if best_state is not None:
         raw = net.module if isinstance(net, torch.nn.DataParallel) else net

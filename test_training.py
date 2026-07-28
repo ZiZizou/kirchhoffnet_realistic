@@ -1755,5 +1755,200 @@ def test_temporal_readout_with_no_edge_gates():
           stage.output_ode_z_logits.requires_grad is False)
 
 
+# ---------------------------------------------------------------------------
+# State-carryover tests
+# ---------------------------------------------------------------------------
+
+def test_state_carryover_basic():
+    print("\nTest SC-1: initial_state / return_final_state round-trip")
+    from topology import build_net_from_preset
+    from cell_library import make_cell_library
+
+    cell_lib = make_cell_library('tanh')
+    net = build_net_from_preset(
+        "sinx",
+        cell_lib=cell_lib,
+        boundary_fan_out={0: [0, 1, 2]},
+        enable_temporal_readout=True,
+    )
+    B, T = 4, 5
+    u_seq = torch.randn(T, B, 1)
+    expected_width = net.hid_count + net.proj_count + net.output_ode_count
+
+    # Call sequentially with state carryover.
+    state = None
+    outputs = []
+    for t in range(T):
+        y, _, state = net(u_seq[t], initial_state=state, return_final_state=True)
+        state = state.detach()
+        outputs.append(y)
+    y_seq = torch.cat(outputs, dim=0)
+    check("output is finite after state carryover",
+          torch.isfinite(y_seq).all().item())
+    check("output shape is (T*B, read_dim)",
+          tuple(y_seq.shape) == (T * B, net.read_dim))
+    check("state has expected width hid+proj+ode",
+          state is not None and state.size(1) == expected_width)
+
+
+def test_state_carryover_with_narma_preset():
+    print("\nTest SC-2: state carryover with full NARMA-10 preset")
+    from topology import build_net_from_preset
+    from cell_library import make_cell_library
+
+    cell_lib = make_cell_library('tanh')
+    net = build_net_from_preset(
+        "narma10", cell_lib=cell_lib, enable_temporal_readout=True,
+    )
+    expected_width = net.hid_count + net.proj_count + net.output_ode_count
+
+    u = torch.randn(8, 1, 1)
+    y, _, state = net(u[0], initial_state=None, return_final_state=True)
+    check("first call returns state of width hid+proj+ode",
+          state is not None and state.size(1) == expected_width)
+
+    y2, _, state2 = net(u[1], initial_state=state, return_final_state=True)
+    check("second call accepts carryover state",
+          state2 is not None and state2.size(1) == expected_width)
+    check("output after carryover differs from first call",
+          not torch.allclose(y, y2))
+
+
+def test_state_carryover_grad_flow():
+    print("\nTest SC-3: gradients flow through initial_state")
+    from topology import build_net_from_preset
+    from cell_library import make_cell_library
+
+    cell_lib = make_cell_library('tanh')
+    net = build_net_from_preset(
+        "narma10", cell_lib=cell_lib, enable_temporal_readout=True,
+    )
+    u1 = torch.randn(1, 1, requires_grad=True)
+    u2 = torch.randn(1, 1, requires_grad=True)
+
+    # Step 1: produce a final state from u1.
+    y1, _, state1 = net(u1, return_final_state=True)
+    # Step 2: carry over and produce output from u2.
+    y2, _, _ = net(u2, initial_state=state1, return_final_state=True)
+    loss = y2.sum()
+    loss.backward()
+
+    check("cell_lib has gradient after state-carryover chain",
+          any(
+              p.grad is not None and p.grad.abs().sum().item() > 0
+              for p in net.core.stages[0].cell_lib.parameters()
+          ))
+    check("output_ode_cell_lib has gradient after chain",
+          any(
+              p.grad is not None and p.grad.abs().sum().item() > 0
+              for p in net.core.stages[0].output_ode_cell_lib.parameters()
+          ))
+    check("output_ode_z_logits has gradient after chain",
+          net.core.stages[0].output_ode_z_logits.grad is not None and
+          net.core.stages[0].output_ode_z_logits.grad.abs().sum().item() > 0)
+    check("input u1 receives gradient through state carryover",
+          u1.grad is not None and u1.grad.abs().item() > 0)
+
+
+def test_state_carryover_validation():
+    print("\nTest SC-4: wrong-sized initial_state raises")
+    from topology import build_net_from_preset
+    from cell_library import make_cell_library
+
+    cell_lib = make_cell_library('tanh')
+    net = build_net_from_preset(
+        "sinx",
+        cell_lib=cell_lib,
+        enable_temporal_readout=True,
+    )
+    # sinx has hid_dim=8, proj=0, output_ode=1 → expected width=9.
+    # Try passing width=3.
+    bad_state = torch.zeros(2, 3)
+    try:
+        net(torch.randn(2, 1), initial_state=bad_state)
+        check("wrong-sized initial_state raises ValueError", False)
+    except ValueError:
+        check("wrong-sized initial_state raises ValueError", True)
+    except Exception:
+        check("wrong-sized initial_state raises ValueError", False)
+
+
+def test_state_carryover_trajectory_off():
+    print("\nTest SC-5: trajectory storage disabled with return_final_state=True")
+    from topology import build_net_from_preset
+    from cell_library import make_cell_library
+
+    cell_lib = make_cell_library('tanh')
+    net = build_net_from_preset(
+        "sinx",
+        cell_lib=cell_lib,
+        enable_temporal_readout=True,
+    )
+    y, trajs, state = net(torch.randn(2, 1), store_trajectory=True,
+                          return_final_state=True)
+    check("trajs is None when return_final_state=True", trajs is None)
+
+
+# ---------------------------------------------------------------------------
+# NARMA preset tests
+# ---------------------------------------------------------------------------
+
+def test_narma_preset_keys():
+    print("\nTest NP-1: NARMA preset has required keys")
+    from config import PRESET_NARMA10, PRESET_NARMA20
+
+    for name, p in [("PRESET_NARMA10", PRESET_NARMA10),
+                    ("PRESET_NARMA20", PRESET_NARMA20)]:
+        check(f"{name} has 'narma_order'",
+              "narma_order" in p)
+        check(f"{name} has 'boundary_fan_out'",
+              "boundary_fan_out" in p)
+        check(f"{name} has 'enable_temporal_readout'",
+              p.get("enable_temporal_readout", False))
+        check(f"{name} has 'output_ode_count' >= 1",
+              p.get("output_ode_count", 0) >= 1)
+        check(f"{name} has 'stages' with 1+ entries",
+              len(p.get("stages", [])) >= 1)
+        check(f"{name} narma_order is int >= 10",
+              isinstance(p["narma_order"], int) and p["narma_order"] >= 10)
+
+    check("PRESET_NARMA10 order is 10",
+          PRESET_NARMA10["narma_order"] == 10)
+    check("PRESET_NARMA20 order is 20",
+          PRESET_NARMA20["narma_order"] == 20)
+    check("PRESET_NARMA10 boundary_fan_out covers all hidden nodes",
+          len(PRESET_NARMA10["boundary_fan_out"].get(0, [])) == 25)
+    check("PRESET_NARMA20 boundary_fan_out covers all hidden nodes",
+          len(PRESET_NARMA20["boundary_fan_out"].get(0, [])) == 25)
+
+
+def test_narma_preset_forward():
+    print("\nTest NP-2: NARMA preset forward pass produces finite output")
+    from topology import build_net_from_preset
+    from cell_library import make_cell_library
+    from config import PRESET_NARMA10
+
+    cell_lib = make_cell_library('tanh')
+    net = build_net_from_preset(
+        "narma10", cell_lib=cell_lib, enable_temporal_readout=True,
+        boundary_fan_out=PRESET_NARMA10["boundary_fan_out"],
+    )
+    check("enable_boundary set on net",
+          getattr(net, "enable_boundary", False))
+    check("enable_temporal_readout set on net",
+          getattr(net, "enable_temporal_readout", False))
+    # Verify each stage has the proper flags.
+    for i, stage in enumerate(net.core.stages):
+        check(f"stage[{i}] has _has_boundary",
+              getattr(stage, "_has_boundary", False))
+        check(f"stage[{i}] has _has_output_ode",
+              getattr(stage, "_has_output_ode", False))
+    y, _ = net(torch.randn(4, 1))
+    check("output shape is (4, 1)",
+          tuple(y.shape) == (4, 1))
+    check("output is finite",
+          torch.isfinite(y).all().item())
+
+
 if __name__ == "__main__":
     main()

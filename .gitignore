@@ -11,3 +11,5 @@ output
 *.md
 *.log
 *report*
+docs
+_count_params.py

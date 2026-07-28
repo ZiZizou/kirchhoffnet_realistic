@@ -128,8 +128,9 @@ class KirchhoffNet(nn.Module):
         stage_noise_std: float = 0.0,
         stage_noise_generator: torch.Generator | None = None,
         u: torch.Tensor | None = None,
+        initial_state: torch.Tensor | None = None,
     ):
-        x = x0
+        x = initial_state if initial_state is not None else x0
         all_trajs = []
         stage_outputs = []
         stage_infos = []
@@ -412,31 +413,60 @@ class KirchhoffNetWithIO(nn.Module):
         deq_cfg: dict | None = None,
         stage_noise_std: float = 0.0,
         stage_noise_generator: torch.Generator | None = None,
+        initial_state: torch.Tensor | None = None,
+        return_final_state: bool = False,
     ):
-        if self.enable_boundary:
-            # Boundary-fan-out mode: all dynamic nodes start at zero.
-            # The input signal enters only through boundary-terminal OTA
-            # edges, computed per-step in each stage's RHS.
-            x0 = u.new_zeros(u.size(0), self.hid_count)
+        """Run the write/evolve/read pipeline on input ``u``.
+
+        When ``initial_state`` is provided, it overrides the input-driven
+        initial ODE state (input_mapper output, or zero-init under
+        boundary mode). The shape must be ``[batch, hid_count + proj_count
+        + output_ode_count]`` (i.e. the full stage width). This is the
+        entry point for sequential/streaming workloads (NARMA, CTLE
+        symbol-by-symbol, etc.) where the fabric state must carry across
+        calls. See ``narma_experiment.py`` for the canonical usage.
+
+        When ``return_final_state`` is True the final ODE state (after
+        integration) is returned as a third tuple element so the caller
+        can pass it back on the next call. Trajectory storage is forced
+        off when ``return_final_state`` is set (trajectory tensors are
+        batch-internal and not designed to be cached across calls).
+        """
+        if initial_state is not None:
+            # Carry-over path: caller owns the initial state. Validate shape
+            # matches the full stage width we expect.
+            expected_width = self.hid_count + self.proj_count + self.output_ode_count
+            if initial_state.size(1) != expected_width:
+                raise ValueError(
+                    f"initial_state has {initial_state.size(1)} dims; expected "
+                    f"hid_count + proj_count + output_ode_count = {expected_width}"
+                )
+            x0_full = initial_state
         else:
-            x0 = self.input_mapper(u)
-        if x0.size(1) != self.hid_count:
-            raise ValueError(
-                f"InputMapper output has {x0.size(1)} dims, expected hid_count={self.hid_count}"
-            )
-        # Append zero padding for projection and (when enabled) output
-        # ODE accumulator nodes so the initial ODE state has the full
-        # stage width. Output ODE nodes are always zero-initialized;
-        # their current comes from the temporal-readout OTA edges only.
-        parts = [x0]
-        if self.proj_count > 0:
-            parts.append(x0.new_zeros(x0.size(0), self.proj_count))
-        if self.output_ode_count > 0:
-            parts.append(x0.new_zeros(x0.size(0), self.output_ode_count))
-        if len(parts) == 1:
-            x0_full = x0
-        else:
-            x0_full = torch.cat(parts, dim=1)
+            if self.enable_boundary:
+                # Boundary-fan-out mode: all dynamic nodes start at zero.
+                # The input signal enters only through boundary-terminal OTA
+                # edges, computed per-step in each stage's RHS.
+                x0 = u.new_zeros(u.size(0), self.hid_count)
+            else:
+                x0 = self.input_mapper(u)
+            if x0.size(1) != self.hid_count:
+                raise ValueError(
+                    f"InputMapper output has {x0.size(1)} dims, expected hid_count={self.hid_count}"
+                )
+            # Append zero padding for projection and (when enabled) output
+            # ODE accumulator nodes so the initial ODE state has the full
+            # stage width. Output ODE nodes are always zero-initialized;
+            # their current comes from the temporal-readout OTA edges only.
+            parts = [x0]
+            if self.proj_count > 0:
+                parts.append(x0.new_zeros(x0.size(0), self.proj_count))
+            if self.output_ode_count > 0:
+                parts.append(x0.new_zeros(x0.size(0), self.output_ode_count))
+            if len(parts) == 1:
+                x0_full = x0
+            else:
+                x0_full = torch.cat(parts, dim=1)
 
         # Build per-stage drive targets when persistent drive is enabled.
         # Suppressed under boundary mode: drive targets would compete with
@@ -453,7 +483,7 @@ class KirchhoffNetWithIO(nn.Module):
             x_final, trajs = x0_full, None
         else:
             x_final, trajs = self.core(
-                x0_full, store_trajectory=store_trajectory,
+                x0_full, store_trajectory=store_trajectory and not return_final_state,
                 drive_targets=drive_targets,
                 drive_scales=self.drive_scales if (self.enable_drive and not self.enable_boundary) else None,
                 solver=solver,
@@ -479,6 +509,8 @@ class KirchhoffNetWithIO(nn.Module):
                     f"expected {self.skip_linear_in_dim}"
                 )
             y = y + self.skip_linear(u)
+        if return_final_state:
+            return y, None, x_final
         return y, trajs
 
     def parameter_breakdown(self) -> dict:

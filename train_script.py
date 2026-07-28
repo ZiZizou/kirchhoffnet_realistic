@@ -4060,7 +4060,7 @@ def main():
     )
     with open(final_metrics_path, "w") as f:
         f.write(f"problem: {args.problem}\n")
-        f.write(f"loss: {args.loss}\n")
+        f.write(f"loss: {PRESETS[args.problem]['loss']}\n")
         f.write(f"best_epoch: {best_epoch}\n")
         f.write(f"best_val: {best_val:.6f}\n")
         if has_best_orig:

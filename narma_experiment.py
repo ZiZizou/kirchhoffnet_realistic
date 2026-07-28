@@ -61,6 +61,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    from tqdm import tqdm as _tqdm
+    _HAS_TQDM = True
+except ImportError:
+    _HAS_TQDM = False
+
+from torch.amp import autocast, GradScaler
+
 THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS_DIR))
 
@@ -294,18 +302,27 @@ def memory_capacity(states: torch.Tensor, targets: torch.Tensor,
 # Fabric training
 # ---------------------------------------------------------------------------
 
+def _progress_iter(iterable, desc, total=None, disable=False):
+    """Wrap an iterable with tqdm if available, else pass through."""
+    if _HAS_TQDM and not disable:
+        return _tqdm(iterable, desc=desc, total=total, leave=False)
+    return iterable
+
+
 def train_fabric(
     net: nn.Module,
     u_train: torch.Tensor,
     y_train: torch.Tensor,
     *,
-    batch_size: int = 32,
+    batch_size: int = 128,
     epochs: int = 200,
     bptt_window: int = 50,
     lr: float = 1e-3,
     weight_decay: float = 1e-4,
     device: str = "cpu",
-    verbose: bool = False,
+    verbose: bool = True,
+    use_amp: bool = True,
+    accum_steps: int = 2,
 ) -> dict[str, Any]:
     """Train the fabric with state carryover and truncated BPTT.
 
@@ -317,6 +334,13 @@ def train_fabric(
     same physical setup as calling the network per sample (since the
     sampled-and-held input is constant during integration) but orders of
     magnitude faster in Python.
+
+    Args:
+        batch_size: Number of windows per micro-batch. Gradients are
+            accumulated over ``accum_steps`` micro-batches before each
+            optimizer step (effective batch = batch_size * accum_steps).
+        use_amp: Enable mixed-precision training via ``torch.amp``.
+        accum_steps: Gradient accumulation steps before optimizer.step().
 
     Returns:
         Dict with ``train_loss_history`` and ``final_loss``.
@@ -336,62 +360,92 @@ def train_fabric(
             f"{bptt_window}; reduce --bptt-window"
         )
 
+    # Micro-batch size for splitting window starts
+    B = min(batch_size, n_windows)
+
+    # Mixed-precision scaler (no-op on CPU)
+    amp_enabled = use_amp and device == "cuda"
+    scaler = GradScaler("cuda", enabled=amp_enabled)
+
+    # Logging interval: every ~5% of epochs, plus first and last
+    log_interval = max(1, epochs // 20)
+    epoch_times: list[float] = []
+
     for epoch in range(epochs):
         net.train()
         # Randomise the window order each epoch
-        window_starts = (
-            torch.randperm(n_windows) * bptt_window
-        )  # [n_windows]
-        chunks = []
-        cur: list[int] = []
-        for s in window_starts.tolist():
-            cur.append(s)
-            if len(cur) == batch_size:
-                chunks.append(cur)
-                cur = []
-        if cur:
-            chunks.append(cur)
+        window_starts = torch.randperm(n_windows) * bptt_window
+        # Split into micro-batches of size B
+        chunks = window_starts.split(B)
 
         epoch_loss = 0.0
         n_batches = 0
-        for chunk in chunks:
-            optim.zero_grad()
+        optim.zero_grad()
+
+        epoch_iter = _progress_iter(
+            enumerate(chunks), desc=f"epoch {epoch:3d}/{epochs}",
+            total=len(chunks), disable=not verbose,
+        )
+        for step_idx, chunk in epoch_iter:
             # Build a single batch of ``bptt_window`` consecutive samples
-            # for each starting position. Shape: (B, bptt_window, 1).
+            # for each starting position. Shape: (B, bptt_window).
             idx = (
-                torch.tensor(chunk, dtype=torch.long).unsqueeze(1)
+                chunk.unsqueeze(1)
                 + torch.arange(bptt_window, dtype=torch.long).unsqueeze(0)
-            )  # (B, bptt_window)
+            )
             u_chunk = u_train[idx]                    # (B, bptt_window)
             y_chunk = y_train[idx]                    # (B, bptt_window)
-            # Zero initial state (the network carries it forward in
-            # chunks of bptt_window consecutive samples)
             total_loss = 0.0
             state = None  # state is (B, hid+proj+out_ode)
-            for s in range(bptt_window):
-                u_b = u_chunk[:, s].unsqueeze(-1)     # (B, 1)
-                y_b = y_chunk[:, s]                    # (B,)
-                y_pred, _, final_state = net(
-                    u_b, initial_state=state, return_final_state=True,
-                )
-                y_pred = y_pred.squeeze(-1)             # (B,)
-                loss_step = F.mse_loss(y_pred, y_b)
-                total_loss = total_loss + loss_step
-                state = final_state.detach()  # truncated BPTT
-            total_loss = total_loss / bptt_window
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=5.0)
-            optim.step()
+            with autocast("cuda", enabled=amp_enabled):
+                for s in range(bptt_window):
+                    u_b = u_chunk[:, s].unsqueeze(-1)     # (B, 1)
+                    y_b = y_chunk[:, s]                    # (B,)
+                    y_pred, _, final_state = net(
+                        u_b, initial_state=state, return_final_state=True,
+                    )
+                    y_pred = y_pred.squeeze(-1)             # (B,)
+                    loss_step = F.mse_loss(y_pred, y_b)
+                    total_loss = total_loss + loss_step
+                    state = final_state.detach()  # truncated BPTT
+                total_loss = total_loss / bptt_window
+
+            # Scaled backward for AMP
+            scaler.scale(total_loss).backward()
             epoch_loss += float(total_loss.item())
             n_batches += 1
+
+            # Gradient accumulation: step every accum_steps micro-batches
+            if (step_idx + 1) % accum_steps == 0 or (step_idx + 1) == len(chunks):
+                scaler.unscale_(optim)
+                torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=5.0)
+                scaler.step(optim)
+                scaler.update()
+                optim.zero_grad()
+
+            if _HAS_TQDM and verbose:
+                epoch_iter.set_postfix(loss=f"{total_loss.item():.4f}")
+
         avg = epoch_loss / max(n_batches, 1)
         history.append(avg)
-        if verbose and (epoch % 10 == 0 or epoch == epochs - 1):
-            elapsed = time.time() - t_start
+
+        # Logging
+        t_epoch = time.time() - t_start
+        epoch_times.append(t_epoch)
+        if verbose and (epoch % log_interval == 0 or epoch == epochs - 1):
+            if len(epoch_times) >= 2:
+                dt = epoch_times[-1] - epoch_times[-2]
+                eta = dt * (epochs - 1 - epoch)
+                eta_str = f"ETA {eta:.0f}s"
+            else:
+                eta_str = ""
             print(
-                f"  fabric epoch {epoch:3d}  train_loss={avg:.6f}  "
-                f"elapsed={elapsed:.1f}s"
+                f"  fabric epoch {epoch:3d}/{epochs}  loss={avg:.6f}  "
+                f"{t_epoch:.1f}s  {eta_str}"
             )
+
+    total_elapsed = time.time() - t_start
+    print(f"  fabric training complete: {epochs} epochs in {total_elapsed:.1f}s")
     return {"train_loss_history": history, "final_loss": history[-1] if history else float("nan")}
 
 
@@ -552,6 +606,9 @@ def run_fabric_condition(
     epochs: int = 200,
     bptt_window: int = 50,
     device: str = "cpu",
+    batch_size: int = 128,
+    use_amp: bool = True,
+    accum_steps: int = 2,
 ) -> dict[str, Any]:
     """Train one fabric condition and return its results.
 
@@ -561,6 +618,9 @@ def run_fabric_condition(
         freeze_read: If True, use the frozen-core configuration.
         epochs: Training epochs.
         bptt_window: Truncated BPTT window in samples.
+        batch_size: Micro-batch size for training (default 128).
+        use_amp: Enable mixed-precision training (default True).
+        accum_steps: Gradient accumulation steps (default 2).
 
     Returns dict with:
         - "nrmse": test NRMSE on the washed test set
@@ -590,12 +650,15 @@ def run_fabric_condition(
 
     res = train_fabric(
         net, u_train, y_train,
-        batch_size=32, epochs=epochs, bptt_window=bptt_window,
+        batch_size=batch_size, epochs=epochs, bptt_window=bptt_window,
         lr=1e-3, weight_decay=1e-4, device=device,
-        verbose=False,
+        verbose=True,
+        use_amp=use_amp,
+        accum_steps=accum_steps,
     )
 
     # Evaluate
+    print("  evaluating on test set...")
     y_pred, y_te = evaluate_fabric(net, u_test, y_test, washout=200, device=device)
     nr = nrmse(y_pred, y_te)
     r2v = r2(y_pred, y_te)
@@ -667,6 +730,12 @@ def parse_args() -> argparse.Namespace:
                         help="Only run the two fabric conditions; skip baselines")
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"],
                         help="Device (default cpu)")
+    parser.add_argument("--batch-size", type=int, default=128,
+                        help="Micro-batch size for fabric training (default 128)")
+    parser.add_argument("--no-amp", action="store_true",
+                        help="Disable mixed-precision (AMP) training")
+    parser.add_argument("--accum-steps", type=int, default=2,
+                        help="Gradient accumulation steps before optimizer step (default 2)")
     parser.add_argument("--no-tanh-cell-lib", action="store_true",
                         help="Use simple cell library instead of tanh (testing)")
     return parser.parse_args()
@@ -679,12 +748,15 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[narma] order={args.order}, seeds={seeds}, output={out_dir}")
+    print(f"[narma] batch_size={args.batch_size}, amp={not args.no_amp}, "
+          f"accum_steps={args.accum_steps}, device={args.device}")
 
     all_results: list[dict[str, Any]] = []
 
     if not args.fabric_only:
         print("\n[narma] === Baselines ===")
-        for seed in seeds:
+        for i, seed in enumerate(seeds, 1):
+            print(f"  [{i}/{len(seeds)}] Baselines seed={seed}")
             base = run_baselines(args.order, seed)
             for cond, vals in base.items():
                 all_results.append({
@@ -694,34 +766,41 @@ def main() -> int:
                     "r2": vals["r2"],
                 })
                 print(
-                    f"  seed={seed}  {cond:>8}  NRMSE={vals['nrmse']:.4f}  "
+                    f"    {cond:>8}  NRMSE={vals['nrmse']:.4f}  "
                     f"R^2={vals['r2']:.4f}"
                 )
 
     if not args.baselines_only:
         print("\n[narma] === Fabric conditions ===")
-        for freeze_read in (False, True):
-            for seed in seeds:
-                cond_name = "fabric_fr_off" if not freeze_read else "fabric_fr_on"
-                res = run_fabric_condition(
-                    args.order, seed, freeze_read=freeze_read,
-                    epochs=args.epochs,
-                    bptt_window=args.bptt_window,
-                    device=args.device,
-                )
-                all_results.append({
-                    "seed": seed,
-                    "condition": cond_name,
-                    "nrmse": res["nrmse"],
-                    "r2": res["r2"],
-                    "mc_total": res["mc_total"],
-                    "n_params": res["n_params"],
-                })
-                print(
-                    f"  seed={seed}  {cond_name}  NRMSE={res['nrmse']:.4f}  "
-                    f"R^2={res['r2']:.4f}  MC={res['mc_total']:.2f}  "
-                    f"params={res['n_params']}"
-                )
+        # Build a flat list of (freeze_read, seed) for progress tracking
+        fabric_jobs = [(fr, s) for fr in (False, True) for s in seeds]
+        for idx, (freeze_read, seed) in enumerate(fabric_jobs, 1):
+            cond_name = "fabric_fr_off" if not freeze_read else "fabric_fr_on"
+            fr_str = "OFF (evolving core)" if not freeze_read else "ON (frozen core)"
+            print(f"  [{idx}/{len(fabric_jobs)}] {cond_name}  seed={seed}  "
+                  f"freeze_read={fr_str}")
+            res = run_fabric_condition(
+                args.order, seed, freeze_read=freeze_read,
+                epochs=args.epochs,
+                bptt_window=args.bptt_window,
+                device=args.device,
+                batch_size=args.batch_size,
+                use_amp=not args.no_amp,
+                accum_steps=args.accum_steps,
+            )
+            all_results.append({
+                "seed": seed,
+                "condition": cond_name,
+                "nrmse": res["nrmse"],
+                "r2": res["r2"],
+                "mc_total": res["mc_total"],
+                "n_params": res["n_params"],
+            })
+            print(
+                f"  RESULT: {cond_name} seed={seed}  NRMSE={res['nrmse']:.4f}  "
+                f"R^2={res['r2']:.4f}  MC={res['mc_total']:.2f}  "
+                f"params={res['n_params']}"
+            )
 
     # ---- Aggregate per condition ----
     by_cond: dict[str, list[dict[str, Any]]] = {}

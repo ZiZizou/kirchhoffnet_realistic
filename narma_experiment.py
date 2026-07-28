@@ -551,6 +551,7 @@ def run_fabric_condition(
     *,
     epochs: int = 200,
     bptt_window: int = 50,
+    device: str = "cpu",
 ) -> dict[str, Any]:
     """Train one fabric condition and return its results.
 
@@ -590,18 +591,18 @@ def run_fabric_condition(
     res = train_fabric(
         net, u_train, y_train,
         batch_size=32, epochs=epochs, bptt_window=bptt_window,
-        lr=1e-3, weight_decay=1e-4, device="cpu",
+        lr=1e-3, weight_decay=1e-4, device=device,
         verbose=False,
     )
 
     # Evaluate
-    y_pred, y_te = evaluate_fabric(net, u_test, y_test, washout=200)
+    y_pred, y_te = evaluate_fabric(net, u_test, y_test, washout=200, device=device)
     nr = nrmse(y_pred, y_te)
     r2v = r2(y_pred, y_te)
 
     # Memory capacity: collect fabric states on the train set
     # MC reconstructs u(n-k) for k=1..20 (Jaeger 2001), not y.
-    states_tr = collect_fabric_states(net, u_train)
+    states_tr = collect_fabric_states(net, u_train, device=device)
     mc_per_delay, mc_total = memory_capacity(
         states_tr, u_train, max_delay=20, ridge_l2=1e-2,
     )
@@ -706,6 +707,7 @@ def main() -> int:
                     args.order, seed, freeze_read=freeze_read,
                     epochs=args.epochs,
                     bptt_window=args.bptt_window,
+                    device=args.device,
                 )
                 all_results.append({
                     "seed": seed,

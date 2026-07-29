@@ -35,6 +35,28 @@ Three families of conditions are evaluated:
        Computed for conditions g and h. ``MC = sum_k R^2_k`` directly
        characterises the fading-memory property.
 
+Training protocol (rewritten 2026-07-29 to fix three critical bugs):
+    - ``t_span=1.0`` per sample (was 7.0). With leak~0.05, t_span=7.0 gives
+      per-sample decay exp(-0.05*7)~0.71 → ~3 sample memory horizon (insufficient
+      for NARMA-10). t_span=1.0 → exp(-0.05)~0.95 → ~20 sample memory horizon.
+    - Sequential truncated BPTT: ``B`` parallel independent NARMA streams
+      (``--n-streams``), state carried across chunks, ``detach()`` only at
+      chunk boundaries (``--tbptt-chunk`` samples per chunk). Each chunk is
+      one optimizer step. With B=4 streams × 2500 samples / 50 chunk = 200
+      optimizer steps per epoch × 200 epochs = 40,000 total Adam steps
+      (vs the old 200).
+    - Targets standardized (zero-mean, unit-variance), denormalized at eval.
+    - Bipolar input drive: u ∈ [0, 0.5] → V_u ∈ [-3.0, +3.0] (use
+      ``--unipolar`` for the old [0, +3.0] mapping).
+
+Diagnostics:
+    ``--ridge-diagnostic`` runs ridge-on-frozen-states first: the untrained
+    fabric's hidden states are read out by a closed-form ridge regression
+    on y. If this hits NRMSE ~0.4–0.6, hardware dynamics are adequate and
+    training issues are purely optimizer problems. If NRMSE ~1.0, the
+    reservoir itself has no memory and the t_span fix is mandatory before
+    training.
+
 Complexity reporting:
     Each condition reports its parameter count alongside NRMSE and R^2 in
     the summary table and CSV output. ESN reports both trained (26) and
@@ -80,9 +102,9 @@ from torch.amp import autocast, GradScaler
 THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS_DIR))
 
-from config import OPTIM, PRESET_NARMA10, PRESET_NARMA20
+from config import OPTIM, PRESET_NARMA10, PRESET_NARMA20, make_narma_preset
 from cell_library import make_cell_library
-from topology import build_net_from_preset
+from topology import build_net_from_config, build_net_from_preset
 
 
 # ---------------------------------------------------------------------------
@@ -117,8 +139,23 @@ def narma(n_samples: int, order: int = 10, seed: int = 0,
 
 
 def scale_input_to_rails(u: torch.Tensor, x_max: float = 3.0,
-                         u_max: float = 0.5) -> torch.Tensor:
-    """Scale u(n) in [0, u_max] to V_u(n) in [0, x_max] (fills rails)."""
+                         u_max: float = 0.5,
+                         bipolar: bool = True) -> torch.Tensor:
+    """Scale u(n) in [0, u_max] to a voltage drive for the boundary OTAs.
+
+    Args:
+        u: Input drive in [0, u_max].
+        x_max: Voltage rail magnitude.
+        u_max: Upper bound of u (default 0.5, NARMA standard).
+        bipolar: If True (default), map to [-x_max, +x_max] so boundary
+            OTAs operate around their most sensitive mid-rail point.
+            If False, map to [0, x_max] (unipolar).
+
+    Returns:
+        Voltage drive tensor of same shape as ``u``.
+    """
+    if bipolar:
+        return 2.0 * x_max * (u / u_max) - x_max
     return (u / u_max) * x_max
 
 
@@ -432,6 +469,69 @@ def memory_capacity(states: torch.Tensor, targets: torch.Tensor,
     return r2_list, mc_total
 
 
+def ridge_readout_diagnostic(
+    net: nn.Module,
+    u_train: torch.Tensor,
+    y_train: torch.Tensor,
+    *,
+    washout: int = 200,
+    ridge_l2: float = 1e-2,
+    device: str = "cpu",
+) -> dict[str, float]:
+    """Decisive 10-minute diagnostic: ridge readout on untrained fabric states.
+
+    Runs the (randomly-initialized, untrained) fabric over the training
+    stream, collects the per-sample hidden node states, and fits a ridge
+    linear regression ``y = W @ state + b`` offline. The NRMSE/R² of the
+    ridge readout cleanly separates two failure modes:
+        - NRMSE ~ 0.4–0.6 (ESN-level): hardware dynamics are adequate;
+          any training difficulty is an optimizer issue.
+        - NRMSE ~ 1.0+: the reservoir itself has no usable memory, and
+          timescale tweaks (issue #2: t_span) must precede training.
+
+    Args:
+        net: An *untrained* KirchhoffNetWithIO module.
+        u_train: Training input drive ``(T,)`` (after scaling).
+        y_train: Training targets ``(T,)`` (raw, not standardized).
+        washout: Number of initial samples to discard (reservoir convention).
+        ridge_l2: Ridge regularization.
+        device: 'cpu' or 'cuda'.
+
+    Returns:
+        Dict with ``ridge_nrmse``, ``ridge_r2``.
+    """
+    net.eval()
+    net.to(device)
+    u_train = u_train.to(device)
+    y_train = y_train.to(device)
+
+    T = u_train.shape[0]
+    # Use the direct stage-call path to capture states
+    stage = net.core.stages[0]
+    t_span = net.core.stage_times[0]
+    num_steps = net.core.stage_steps[0]
+    stage_width = net.hid_count + net.proj_count + net.output_ode_count
+
+    x0 = u_train.new_zeros(1, stage_width)
+    all_states = stage._forward_heun_sequence(
+        x0=x0, t_span=t_span, num_steps=num_steps, u_seq=u_train,
+    )
+    # all_states: (T, 1, stage_width); take hidden nodes only
+    states = all_states[:, 0, :net.hid_count]  # (T, hid_count)
+
+    # Ridge fit on (states -> y), skipping washout
+    X = states[washout:]
+    y = y_train[washout:]
+    X_aug = torch.cat([X, torch.ones(X.shape[0], 1, device=X.device)], dim=1)
+    XtX = X_aug.T @ X_aug + ridge_l2 * torch.eye(X_aug.shape[1], device=X.device)
+    W = torch.linalg.solve(XtX, X_aug.T @ y)
+    y_pred = X_aug @ W
+
+    ridge_nrmse_val = nrmse(y_pred, y)
+    ridge_r2_val = r2(y_pred, y)
+    return {"ridge_nrmse": ridge_nrmse_val, "ridge_r2": ridge_r2_val}
+
+
 # ---------------------------------------------------------------------------
 # Fabric training
 # ---------------------------------------------------------------------------
@@ -443,127 +543,252 @@ def _progress_iter(iterable, desc, total=None, disable=False):
     return iterable
 
 
+def _standardize_targets(
+    y_train: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Zero-mean/unit-variance normalization.
+
+    Returns:
+        ``(y_norm, y_mean, y_std)`` — normalized targets and stats for
+        denormalization at evaluation.
+    """
+    y_mean = y_train.mean()
+    y_std = y_train.std().clamp(min=1e-9)
+    return (y_train - y_mean) / y_std, y_mean, y_std
+
+
+def _denormalize(y_norm: torch.Tensor, y_mean: torch.Tensor,
+                 y_std: torch.Tensor) -> torch.Tensor:
+    """Inverse of :func:`_standardize_targets`."""
+    return y_norm * y_std + y_mean
+
+
 def train_fabric(
     net: nn.Module,
     u_train: torch.Tensor,
     y_train: torch.Tensor,
     *,
-    batch_size: int = 128,
+    batch_size: int = 4,
     epochs: int = 200,
-    bptt_window: int = 50,
+    tbptt_chunk: int = 50,
     lr: float = 1e-3,
     weight_decay: float = 1e-4,
     device: str = "cpu",
     verbose: bool = True,
     use_amp: bool = True,
-    accum_steps: int = 2,
+    standardize: bool = True,
+    grad_clip: float = 1.0,
 ) -> dict[str, Any]:
-    """Train the fabric with state carryover and truncated BPTT.
+    """Train the fabric with sequential truncated BPTT.
 
-    For efficiency we pack ``bptt_window`` consecutive samples as a single
-    batch and call the network ONCE per window (not once per sample). The
-    state is initialized per window and propagates through the integration
-    via Heun — each of the ``num_steps_per_sample`` Heun steps samples a
-    bit of the boundary OTA current and the state evolves. This is the
-    same physical setup as calling the network per sample (since the
-    sampled-and-held input is constant during integration) but orders of
-    magnitude faster in Python.
+    The training protocol is:
+        - ``B = batch_size`` parallel independent streams, each a
+          contiguous segment of length ``n_samples``.
+        - State is carried across chunks (not reset per window).
+        - Within each chunk of ``K = tbptt_chunk`` consecutive samples,
+          full BPTT: no ``detach()`` between samples. Gradients flow
+          through ``K * num_steps`` Heun steps.
+        - ``state = state.detach()`` is the ONLY cut, applied every K
+          samples (chunk boundary).
+        - One optimizer step per chunk.
+
+    ``u_train`` may be 1D ``(n_samples,)`` (a single stream, B=1) or 2D
+    ``(B, n_samples)`` (multiple parallel streams). When 1D, it's
+    reshaped to 2D with B=1.
+
+    Targets are standardized to zero-mean/unit-variance before training
+    (when ``standardize=True``); statistics are returned so the caller
+    can denormalize predictions at evaluation.
 
     Args:
-        batch_size: Number of windows per micro-batch. Gradients are
-            accumulated over ``accum_steps`` micro-batches before each
-            optimizer step (effective batch = batch_size * accum_steps).
-        use_amp: Enable mixed-precision training via ``torch.amp``.
-        accum_steps: Gradient accumulation steps before optimizer.step().
+        net: KirchhoffNetWithIO module.
+        u_train: Input drive ``(n_samples,)`` or ``(B, n_samples)``.
+        y_train: Targets ``(n_samples,)`` or ``(B, n_samples)``.
+        batch_size: Number of parallel independent streams.
+        epochs: Training epochs.
+        tbptt_chunk: TBPTT chunk size K (samples per optimizer step).
+        lr: Learning rate.
+        weight_decay: AdamW weight decay.
+        device: 'cpu' or 'cuda'.
+        verbose: Print epoch progress.
+        use_amp: Mixed-precision training (no-op on CPU).
+        standardize: If True, normalize y to zero-mean/unit-variance.
+        grad_clip: Max gradient norm (AdamW clip).
 
     Returns:
-        Dict with ``train_loss_history`` and ``final_loss``.
+        Dict with ``train_loss_history``, ``final_loss``,
+        ``y_mean`` and ``y_std`` (zero if not standardizing).
     """
     net.to(device)
     u_train = u_train.to(device)
     y_train = y_train.to(device)
-    n_samples = u_train.shape[0]
-    optim = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=weight_decay)
-    history: list[float] = []
-    t_start = time.time()
 
-    n_windows = n_samples // bptt_window
-    if n_windows == 0:
+    # Standardize targets (always — caller can pass raw; we normalize internally)
+    if standardize:
+        y_train_used, y_mean, y_std = _standardize_targets(y_train)
+    else:
+        y_train_used = y_train
+        y_mean = torch.zeros(1, device=device)
+        y_std = torch.ones(1, device=device)
+
+    # Reshape to (B, n_samples) if needed
+    if u_train.dim() == 1:
+        u_train = u_train.unsqueeze(0)
+        y_train_used = y_train_used.unsqueeze(0)
+        y_mean = y_mean.unsqueeze(0)
+        y_std = y_std.unsqueeze(0)
+        single_stream = True
+    else:
+        single_stream = False
+
+    B = u_train.shape[0]
+    n_samples = u_train.shape[1]
+
+    if B != batch_size:
+        if single_stream and batch_size > 1:
+            # Tile the single stream into B copies (each starts from different offset)
+            offsets = torch.linspace(0, n_samples // 2, batch_size, device=device).long()
+            u_streams = []
+            y_streams = []
+            for b in range(batch_size):
+                start = int(offsets[b].item())
+                end = start + n_samples
+                if end <= u_train.shape[1]:
+                    u_streams.append(u_train[0, start:end])
+                    y_streams.append(y_train_used[0, start:end])
+                else:
+                    # Wrap-around for streams that don't fit
+                    wrap = end - u_train.shape[1]
+                    u_streams.append(
+                        torch.cat([u_train[0, start:], u_train[0, :wrap]])
+                    )
+                    y_streams.append(
+                        torch.cat([y_train_used[0, start:], y_train_used[0, :wrap]])
+                    )
+            u_train = torch.stack(u_streams, dim=0)
+            y_train_used = torch.stack(y_streams, dim=0)
+            B = batch_size
+
+    if y_train.shape[0] < B and not single_stream:
+        # user passed 2D with fewer streams than batch_size; pad/truncate
+        B = y_train.shape[0]
+
+    # Use full division so we cover all n_samples; chunks past the stream
+    # end are dropped by the bounds check in the inner loop.
+    n_chunks = n_samples // tbptt_chunk
+    if n_chunks < 1:
         raise ValueError(
-            f"u_train has only {n_samples} samples, must be > bptt_window="
-            f"{bptt_window}; reduce --bptt-window"
+            f"u_train has {n_samples} samples, need at least tbptt_chunk="
+            f"{tbptt_chunk} samples per stream."
         )
 
-    # Micro-batch size for splitting window starts
-    B = min(batch_size, n_windows)
+    # Optimizer
+    optim = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=weight_decay)
 
-    # Mixed-precision scaler (no-op on CPU)
+    # AMP
     amp_enabled = use_amp and device == "cuda"
     scaler = GradScaler("cuda", enabled=amp_enabled)
 
-    # Logging interval: every ~5% of epochs, plus first and last
+    history: list[float] = []
+    raw_leak_grad_history: list[float] = []
+    hidden_rms_history: list[float] = []
+    t_start = time.time()
+
     log_interval = max(1, epochs // 20)
     epoch_times: list[float] = []
 
+    state_width = net.hid_count + net.proj_count + net.output_ode_count
+
     for epoch in range(epochs):
         net.train()
-        # Randomise the window order each epoch
-        window_starts = torch.randperm(n_windows, device=device) * bptt_window
-        # Split into micro-batches of size B
-        chunks = window_starts.split(B)
+        # Carry state across chunks; detach only at chunk boundaries.
+        state = torch.zeros(B, state_width, device=device)
+
+        # Permute chunk-start offsets to decorrelate the chunk sequence across streams.
+        # Each stream processes a chunk of K samples in lockstep.
+        chunk_starts = torch.arange(n_chunks, device=device) * tbptt_chunk
+        # Shuffle chunk order once per epoch for variety
+        chunk_order = torch.randperm(n_chunks, device=device)
 
         epoch_loss = 0.0
-        n_batches = 0
+        epoch_steps = 0
+        epoch_raw_leak_grad = 0.0
+        epoch_hidden_rms = 0.0
+
         optim.zero_grad()
 
         epoch_iter = _progress_iter(
-            enumerate(chunks), desc=f"epoch {epoch:3d}/{epochs}",
-            total=len(chunks), disable=not verbose,
+            enumerate(chunk_order), desc=f"epoch {epoch:3d}/{epochs}",
+            total=n_chunks, disable=not verbose,
         )
-        for step_idx, chunk in epoch_iter:
-            # Build a single batch of ``bptt_window`` consecutive samples
-            # for each starting position. Shape: (B, bptt_window).
-            idx = (
-                chunk.unsqueeze(1)
-                + torch.arange(bptt_window, dtype=torch.long, device=device).unsqueeze(0)
-            )
-            u_chunk = u_train[idx]                    # (B, bptt_window)
-            y_chunk = y_train[idx]                    # (B, bptt_window)
-            total_loss = 0.0
-            state = None  # state is (B, hid+proj+out_ode)
+        for _, ci in epoch_iter:
+            cs = int(chunk_starts[int(ci)].item())
+            ce = cs + tbptt_chunk
+            if ce > n_samples:
+                continue
+
+            u_chunk = u_train[:, cs:ce]   # (B, K)
+            y_chunk = y_train_used[:, cs:ce]  # (B, K)
+            loss = 0.0
+            hidden_acc_sq = 0.0
+            hidden_count = 0
+
             with autocast("cuda", enabled=amp_enabled):
-                for s in range(bptt_window):
-                    u_b = u_chunk[:, s].unsqueeze(-1)     # (B, 1)
-                    y_b = y_chunk[:, s]                    # (B,)
+                for s in range(tbptt_chunk):
+                    u_b = u_chunk[:, s].unsqueeze(-1)   # (B, 1)
+                    y_b = y_chunk[:, s]                  # (B,)
                     y_pred, _, final_state = net(
                         u_b, initial_state=state, return_final_state=True,
                     )
-                    y_pred = y_pred.squeeze(-1)             # (B,)
-                    loss_step = F.mse_loss(y_pred, y_b)
-                    total_loss = total_loss + loss_step
-                    state = final_state.detach()  # truncated BPTT
-                total_loss = total_loss / bptt_window
+                    y_pred = y_pred.squeeze(-1)           # (B,)
+                    loss = loss + F.mse_loss(y_pred, y_b)
+                    # Track hidden voltage RMS (use hidden portion of state).
+                    # Accumulate sum-of-squares across the chunk, compute
+                    # RMS at the chunk boundary.
+                    if net.hid_count > 0:
+                        h = final_state[:, :net.hid_count]
+                        hidden_acc_sq += float(h.detach().pow(2).sum().item())
+                        hidden_count += h.numel()
+                    state = final_state  # NO detach within chunk
 
-            # Scaled backward for AMP
-            scaler.scale(total_loss).backward()
-            epoch_loss += float(total_loss.item())
-            n_batches += 1
+                loss = loss / tbptt_chunk
 
-            # Gradient accumulation: step every accum_steps micro-batches
-            if (step_idx + 1) % accum_steps == 0 or (step_idx + 1) == len(chunks):
-                scaler.unscale_(optim)
-                torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=5.0)
-                scaler.step(optim)
-                scaler.update()
-                optim.zero_grad()
+            # Backward
+            scaler.scale(loss).backward()
+            scaler.unscale_(optim)
+            torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=grad_clip)
+
+            # Capture per-param-group gradient norms (every epoch).
+            # raw_leak has shape (num_nodes,) = (hid_count + proj_count +
+            # output_ode_count), not hid_count alone — match by name
+            # rather than dim to be robust across stage topologies.
+            raw_leak_grad = 0.0
+            for name, p in net.named_parameters():
+                if name.endswith("raw_leak") and p.grad is not None:
+                    raw_leak_grad = float(p.grad.detach().norm().item())
+                    break
+            epoch_raw_leak_grad += raw_leak_grad
+            chunk_rms = (hidden_acc_sq / max(hidden_count, 1)) ** 0.5
+            epoch_hidden_rms += chunk_rms
+
+            scaler.step(optim)
+            scaler.update()
+            optim.zero_grad()
+
+            # The ONLY detach: chunk boundary
+            state = state.detach()
+
+            epoch_loss += float(loss.item())
+            epoch_steps += 1
 
             if _HAS_TQDM and verbose:
-                epoch_iter.set_postfix(loss=f"{total_loss.item():.4f}")
+                epoch_iter.set_postfix(loss=f"{loss.item():.4f}")
 
-        avg = epoch_loss / max(n_batches, 1)
+        avg = epoch_loss / max(epoch_steps, 1)
         history.append(avg)
+        raw_leak_grad_history.append(epoch_raw_leak_grad / max(epoch_steps, 1))
+        hidden_rms_history.append(epoch_hidden_rms / max(epoch_steps, 1))
 
-        # Logging
         t_epoch = time.time() - t_start
         epoch_times.append(t_epoch)
         if verbose and (epoch % log_interval == 0 or epoch == epochs - 1):
@@ -575,12 +800,26 @@ def train_fabric(
                 eta_str = ""
             print(
                 f"  fabric epoch {epoch:3d}/{epochs}  loss={avg:.6f}  "
+                f"h_rms={hidden_rms_history[-1]:.4f}  "
+                f"leak_grad={raw_leak_grad_history[-1]:.2e}  "
                 f"{t_epoch:.1f}s  {eta_str}"
             )
 
     total_elapsed = time.time() - t_start
     print(f"  fabric training complete: {epochs} epochs in {total_elapsed:.1f}s")
-    return {"train_loss_history": history, "final_loss": history[-1] if history else float("nan")}
+    if standardize:
+        print(
+            f"  target stats: mean={float(y_train.mean()):.4f} "
+            f"std={float(y_train.std()):.4f}"
+        )
+    return {
+        "train_loss_history": history,
+        "final_loss": history[-1] if history else float("nan"),
+        "raw_leak_grad_history": raw_leak_grad_history,
+        "hidden_rms_history": hidden_rms_history,
+        "y_mean": y_mean,
+        "y_std": y_std,
+    }
 
 
 @torch.inference_mode()
@@ -591,13 +830,19 @@ def evaluate_fabric(
     *,
     washout: int = 200,
     device: str = "cpu",
+    y_mean: torch.Tensor | None = None,
+    y_std: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the fabric over the test sequence with state carryover.
+
+    Args:
+        y_mean: If provided, denormalize predictions using this and y_std.
+        y_std: Standard deviation of training targets for denormalization.
 
     Returns:
         ``(y_pred, y_test_aligned)``: predictions and ground truth after
         ``washout`` initial samples have been discarded (reservoir
-        convention).
+        convention). Predictions are denormalized if y_mean/y_std provided.
     """
     net.eval()
     net.to(device)
@@ -613,6 +858,8 @@ def evaluate_fabric(
         )
         preds[t] = y_pred.view(-1)
         state = final_state
+    if y_mean is not None and y_std is not None:
+        preds = _denormalize(preds, y_mean.to(device), y_std.to(device))
     return preds[washout:], y_test[washout:]
 
 
@@ -624,12 +871,17 @@ def _evaluate_fabric_direct(
     *,
     washout: int = 200,
     device: str = "cpu",
+    y_mean: torch.Tensor | None = None,
+    y_std: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Direct evaluation bypassing KirchhoffNetWithIO / KirchhoffNet wrappers.
 
     Calls ``DifferentialStage._forward_heun_sequence`` to process the entire
     test sequence in a single call, eliminating per-sample Python overhead.
     Only valid for the NARMA single-stage topology.
+
+    If ``y_mean``/``y_std`` are provided, predictions are denormalized so
+    they live on the same scale as ``y_test`` (needed for NRMSE/R²).
     """
     net.eval()
     net.to(device)
@@ -654,6 +906,8 @@ def _evaluate_fabric_direct(
     x_read = all_states[:, :, read_slice]
     y_preds = output_mapper(x_read)
     preds = y_preds.view(T)
+    if y_mean is not None and y_std is not None:
+        preds = _denormalize(preds, y_mean.to(device), y_std.to(device))
     return preds[washout:], y_test[washout:]
 
 
@@ -881,11 +1135,15 @@ def run_fabric_condition(
     freeze_read: bool,
     *,
     epochs: int = 200,
-    bptt_window: int = 50,
+    tbptt_chunk: int = 50,
+    n_streams: int = 4,
+    train_samples_per_stream: int = 2500,
     device: str = "cpu",
-    batch_size: int = 128,
     use_amp: bool = True,
-    accum_steps: int = 2,
+    bipolar: bool = True,
+    do_ridge_diagnostic: bool = False,
+    t_span: float | None = None,
+    num_steps: int | None = None,
 ) -> dict[str, Any]:
     """Train one fabric condition and return its results.
 
@@ -894,10 +1152,17 @@ def run_fabric_condition(
         seed: RNG seed.
         freeze_read: If True, use the frozen-core configuration.
         epochs: Training epochs.
-        bptt_window: Truncated BPTT window in samples.
-        batch_size: Micro-batch size for training (default 128).
+        tbptt_chunk: TBPTT chunk size K (samples per optimizer step).
+        n_streams: Number of parallel independent NARMA streams (batch B).
+        train_samples_per_stream: Length of each training stream.
         use_amp: Enable mixed-precision training (default True).
-        accum_steps: Gradient accumulation steps (default 2).
+        bipolar: If True, scale input to [-x_max, +x_max] (recommended).
+        do_ridge_diagnostic: If True, run ridge-on-frozen-states diagnostic
+            on an untrained net first to separate hardware vs optimizer issues.
+        t_span: ODE integration window per sample. If None, falls back to
+            the preset default (1.0; was 7.0 historically).
+        num_steps: Heun steps per sample. If None, falls back to preset
+            default (6).
 
     Returns dict with:
         - "nrmse": test NRMSE on the washed test set
@@ -905,61 +1170,123 @@ def run_fabric_condition(
         - "mc_total": memory capacity (sum of R^2 over k=1..20)
         - "mc_per_delay": list of R^2 per delay
         - "train_loss_history": list of training losses
+        - "raw_leak_grad_history": per-epoch gradient norm of raw_leak
+        - "hidden_rms_history": per-epoch RMS of hidden node voltages
         - "n_params": parameter count
+        - "ridge_nrmse": (optional) ridge-on-frozen-states NRMSE
+        - "ridge_r2": (optional) ridge-on-frozen-states R^2
+        - "t_span": t_span actually used (after fallback)
+        - "num_steps": num_steps actually used (after fallback)
     """
-    preset = PRESET_NARMA20 if order == 20 else PRESET_NARMA10
+    # Build the preset inline so CLI overrides (t_span, num_steps) take
+    # effect regardless of module-level PRESET_NARMA10/20 imports. This
+    # avoids the "patch _cfg.PRESETS doesn't reach run_fabric_condition"
+    # trap of binding a separate dict reference at import time.
+    base = PRESET_NARMA20 if order == 20 else PRESET_NARMA10
+    if t_span is None:
+        t_span = base["stages"][0]["t_span"]
+    if num_steps is None:
+        num_steps = base["stages"][0]["num_steps"]
+    preset = make_narma_preset(
+        order=order,
+        hidden_dim=base["stages"][0]["num_hidden"],
+        t_span=t_span,
+        num_steps_per_sample=num_steps,
+    )
+
     cell_lib = make_cell_library("tanh")
     torch.manual_seed(seed)
-    net = build_net_from_preset(
-        f"narma{order}",
+    net = build_net_from_config(
+        cfg=preset,
         cell_lib=cell_lib,
         boundary_fan_out=preset["boundary_fan_out"],
         enable_temporal_readout=True,
         freeze_read=freeze_read,
     )
 
-    u_train, y_train = narma(3000, order=order, seed=seed)
+    # ---- (Optional) Ridge-on-frozen-states diagnostic BEFORE training ----
+    ridge_result: dict[str, float] = {}
+    if do_ridge_diagnostic:
+        # Generate the train stream identically to training (so the
+        # diagnostic reflects what the actual training data looks like).
+        u_diag, y_diag = narma(
+            n_streams * train_samples_per_stream, order=order, seed=seed,
+        )
+        u_diag = scale_input_to_rails(u_diag, bipolar=bipolar)
+        print("  [ridge diagnostic] running untrained fabric on train stream...")
+        ridge_result = ridge_readout_diagnostic(
+            net, u_diag, y_diag, washout=200, ridge_l2=1e-2, device=device,
+        )
+        print(
+            f"  [ridge diagnostic] NRMSE={ridge_result['ridge_nrmse']:.4f}  "
+            f"R^2={ridge_result['ridge_r2']:.4f}"
+        )
+
+    # ---- Generate training data: B independent NARMA streams ----
+    u_streams = []
+    y_streams = []
+    for b in range(n_streams):
+        u_b, y_b = narma(
+            train_samples_per_stream, order=order, seed=seed + b * 7919,
+        )
+        u_streams.append(u_b)
+        y_streams.append(y_b)
+    u_train = torch.stack(u_streams, dim=0)        # (B, n_samples)
+    y_train = torch.stack(y_streams, dim=0)        # (B, n_samples)
+
+    # Test data (single stream, fresh seed)
     u_test, y_test = narma(1000, order=order, seed=seed + 10000)
 
-    # Scale input to fabric rails: V_u(n) = 3.0 * u(n) / 0.5 V
-    u_train = scale_input_to_rails(u_train)
-    u_test = scale_input_to_rails(u_test)
+    # Scale input to fabric rails (bipolar recommended).
+    u_train = scale_input_to_rails(u_train, bipolar=bipolar)
+    u_test = scale_input_to_rails(u_test, bipolar=bipolar)
 
     res = train_fabric(
         net, u_train, y_train,
-        batch_size=batch_size, epochs=epochs, bptt_window=bptt_window,
+        batch_size=n_streams, epochs=epochs, tbptt_chunk=tbptt_chunk,
         lr=1e-3, weight_decay=1e-4, device=device,
         verbose=True,
         use_amp=use_amp,
-        accum_steps=accum_steps,
+        standardize=True,
+        grad_clip=1.0,
     )
 
-    # Evaluate: run the fabric over the test set, collecting both predictions
-    # and the per-sample final ODE state. The states are reused for the
-    # memory-capacity computation on the test set (no separate pass needed).
+    # Evaluate: denormalize predictions using training-set stats.
     print("  evaluating on test set...")
-    y_pred, y_te = _evaluate_fabric_direct(net, u_test, y_test, washout=200, device=device)
+    y_pred, y_te = _evaluate_fabric_direct(
+        net, u_test, y_test, washout=200, device=device,
+        y_mean=res["y_mean"], y_std=res["y_std"],
+    )
     nr = nrmse(y_pred, y_te)
     r2v = r2(y_pred, y_te)
 
     # Memory capacity: collect fabric states on the train set
     # MC reconstructs u(n-k) for k=1..20 (Jaeger 2001), not y.
-    states_tr = collect_fabric_states(net, u_train, device=device)
-    u_train = u_train.to(device)
+    # Use the first stream only to keep MC computation cheap.
+    states_tr = collect_fabric_states(net, u_train[0], device=device)
+    u_train_first = u_train[0].to(device)
     mc_per_delay, mc_total = memory_capacity(
-        states_tr, u_train, max_delay=20, ridge_l2=1e-2,
+        states_tr, u_train_first, max_delay=20, ridge_l2=1e-2,
     )
 
     n_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
-    return {
+    out = {
         "nrmse": nr,
         "r2": r2v,
         "mc_total": mc_total,
         "mc_per_delay": mc_per_delay,
         "train_loss_history": res["train_loss_history"],
+        "raw_leak_grad_history": res.get("raw_leak_grad_history", []),
+        "hidden_rms_history": res.get("hidden_rms_history", []),
         "n_params": n_params,
         "freeze_read": freeze_read,
+        "t_span": t_span,
+        "num_steps": num_steps,
     }
+    if ridge_result:
+        out["ridge_nrmse"] = ridge_result["ridge_nrmse"]
+        out["ridge_r2"] = ridge_result["ridge_r2"]
+    return out
 
 
 def decide(fr_off_res: dict[str, Any], fr_on_res: dict[str, Any],
@@ -999,8 +1326,12 @@ def parse_args() -> argparse.Namespace:
                         help="Comma-separated list of RNG seeds (default '0,1,2')")
     parser.add_argument("--epochs", type=int, default=200,
                         help="Fabric training epochs per condition (default 200)")
-    parser.add_argument("--bptt-window", type=int, default=50,
-                        help="Truncated BPTT window in samples (default 50)")
+    parser.add_argument("--tbptt-chunk", type=int, default=50,
+                        help="TBPTT chunk size K (samples per optimizer step; default 50)")
+    parser.add_argument("--n-streams", type=int, default=4,
+                        help="Number of parallel independent NARMA streams (default 4)")
+    parser.add_argument("--train-samples", type=int, default=2500,
+                        help="Samples per training stream (default 2500)")
     parser.add_argument("--output", type=Path,
                         default=Path("./output/narma_exp"),
                         help="Output directory (default ./output/narma_exp)")
@@ -1010,14 +1341,17 @@ def parse_args() -> argparse.Namespace:
                         help="Only run the two fabric conditions; skip baselines")
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"],
                         help="Device (default cpu)")
-    parser.add_argument("--batch-size", type=int, default=128,
-                        help="Micro-batch size for fabric training (default 128)")
+    parser.add_argument("--unipolar", action="store_true",
+                        help="Use unipolar input drive [0, +x_max] instead of bipolar [-x_max, +x_max]")
     parser.add_argument("--no-amp", action="store_true",
                         help="Disable mixed-precision (AMP) training")
-    parser.add_argument("--accum-steps", type=int, default=2,
-                        help="Gradient accumulation steps before optimizer step (default 2)")
-    parser.add_argument("--no-tanh-cell-lib", action="store_true",
-                        help="Use simple cell library instead of tanh (testing)")
+    parser.add_argument("--ridge-diagnostic", action="store_true",
+                        help="Run ridge-on-frozen-states diagnostic before training")
+    parser.add_argument("--t-span", type=float, default=1.0,
+                        help="Override t_span per sample for NARMA (default 1.0; "
+                             "old value 7.0 gives ~3-sample memory horizon, too short)")
+    parser.add_argument("--num-steps", type=int, default=6,
+                        help="Heun steps per sample (default 6; with t_span=1.0, dt=0.167)")
     return parser.parse_args()
 
 
@@ -1028,8 +1362,20 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[narma] order={args.order}, seeds={seeds}, output={out_dir}")
-    print(f"[narma] batch_size={args.batch_size}, amp={not args.no_amp}, "
-          f"accum_steps={args.accum_steps}, device={args.device}")
+    print(
+        f"[narma] n_streams={args.n_streams}, train_samples={args.train_samples}, "
+        f"tbptt_chunk={args.tbptt_chunk}, amp={not args.no_amp}, device={args.device}"
+    )
+    print(
+        f"[narma] t_span={args.t_span} (per sample), num_steps={args.num_steps}, "
+        f"bipolar={not args.unipolar}"
+    )
+
+    # Note: --t-span and --num-steps are passed to run_fabric_condition
+    # explicitly, where the preset is built inline via make_narma_preset().
+    # We do NOT patch config.PRESETS / config.PRESET_NARMA10 here — those
+    # bindings are imported at module load and would silently ignore the
+    # patch. The inline build guarantees the override actually takes effect.
 
     all_results: list[dict[str, Any]] = []
 
@@ -1066,13 +1412,17 @@ def main() -> int:
             res = run_fabric_condition(
                 args.order, seed, freeze_read=freeze_read,
                 epochs=args.epochs,
-                bptt_window=args.bptt_window,
+                tbptt_chunk=args.tbptt_chunk,
+                n_streams=args.n_streams,
+                train_samples_per_stream=args.train_samples,
                 device=args.device,
-                batch_size=args.batch_size,
                 use_amp=not args.no_amp,
-                accum_steps=args.accum_steps,
+                bipolar=not args.unipolar,
+                do_ridge_diagnostic=args.ridge_diagnostic,
+                t_span=args.t_span,
+                num_steps=args.num_steps,
             )
-            all_results.append({
+            result_row = {
                 "seed": seed,
                 "condition": cond_name,
                 "nrmse": res["nrmse"],
@@ -1081,11 +1431,18 @@ def main() -> int:
                 "n_params": res["n_params"],
                 "total_params": res["n_params"],
                 "hidden_dim": "",
-            })
+            }
+            if "ridge_nrmse" in res:
+                result_row["ridge_nrmse"] = res["ridge_nrmse"]
+                result_row["ridge_r2"] = res["ridge_r2"]
+            all_results.append(result_row)
+            extra = ""
+            if "ridge_nrmse" in res:
+                extra = f"  ridge_NRMSE={res['ridge_nrmse']:.4f}"
             print(
                 f"  RESULT: {cond_name} seed={seed}  NRMSE={res['nrmse']:.4f}  "
                 f"R^2={res['r2']:.4f}  MC={res['mc_total']:.2f}  "
-                f"params={res['n_params']}"
+                f"params={res['n_params']}{extra}"
             )
 
     # ---- Aggregate per condition ----

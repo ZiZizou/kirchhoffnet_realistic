@@ -1151,6 +1151,7 @@ def make_narma_preset(
     output_ode_count: int = 1,
     bidirectional: bool = False,
     edge_repeats: int = 1,
+    t_span: float = 1.0,
 ) -> dict:
     """Build the NARMA reservoir-task preset.
 
@@ -1169,6 +1170,14 @@ def make_narma_preset(
         bidirectional: Whether hidden grid edges emit two directed edges
             per pair (i->j and j->i).
         edge_repeats: Parallel edges per hidden pair.
+        t_span: ODE integration window duration per sample. Defaults to
+            1.0 (vs SOLVER["t_span"]=7.0 used in static regression tasks).
+            The NARMA preset overrides the global setting because in
+            streaming tasks each integration covers ONE timestep, not the
+            full inference: with leak~0.05 and C_eff=1, t_span=7.0 gives
+            per-sample state decay exp(-0.05*7)~0.7 = ~3 sample memory
+            horizon (too short for NARMA-10). t_span=1.0 gives ~0.95
+            retention per sample = ~20 sample memory horizon.
 
     Returns:
         Fresh preset dict ready for ``build_net_from_preset``.
@@ -1200,7 +1209,7 @@ def make_narma_preset(
         "input_pattern": "none",
         "output_pattern": "all_to_all",
         "proj_pattern": "none",
-        "t_span": SOLVER["t_span"],
+        "t_span": t_span,
         "num_steps": num_steps_per_sample,
     }] * num_stages
 

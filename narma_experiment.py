@@ -745,11 +745,7 @@ def train_fabric(
     t_span = float(net.core.stage_times[0])
     num_steps = int(net.core.stage_steps[0])
 
-    epoch_iter_outer = _progress_iter(
-        range(epochs), desc="fabric epochs",
-        total=epochs, disable=not verbose or not _HAS_TQDM,
-    )
-    for epoch in epoch_iter_outer:
+    for epoch in range(epochs):
         net.train()
         # Carry state across chunks; detach only at chunk boundaries.
         state = torch.zeros(B, state_width, device=device)
@@ -874,25 +870,9 @@ def train_fabric(
             val_r2_history.append(val_r2v)
             val_epochs.append(epoch)
 
-        # Update outer tqdm bar with per-epoch metrics.
-        if _HAS_TQDM and verbose:
-            postfix = {
-                "loss": f"{avg:.4f}",
-                "h_rms": f"{h_rms_avg:.3f}",
-                "leak_grad": f"{leak_grad_avg:.2e}",
-            }
-            if not math.isnan(val_nrmse):
-                postfix["nrmse"] = f"{val_nrmse:.3f}"
-                postfix["r2"] = f"{val_r2v:.3f}"
-            epoch_iter_outer.set_postfix(**postfix)
-
         t_epoch = time.time() - t_start
         epoch_times.append(t_epoch)
-        # Print epoch-level text summary at log_interval boundaries.
-        # This runs even when tqdm is available so metrics are visible
-        # in non-interactive / captured terminals (e.g. Kaggle logs)
-        # where tqdm postfix may be overwritten by nested bars.
-        if verbose and (epoch % log_interval == 0 or epoch == epochs - 1):
+        if verbose:
             if len(epoch_times) >= 2:
                 dt = epoch_times[-1] - epoch_times[-2]
                 eta = dt * (epochs - 1 - epoch)

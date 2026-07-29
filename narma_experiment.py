@@ -292,6 +292,7 @@ def train_and_eval_lstm(
     y_train_override: torch.Tensor | None = None,
     u_val_override: torch.Tensor | None = None,
     y_val_override: torch.Tensor | None = None,
+    device: str = "cpu",
 ) -> dict[str, float | int | None]:
     """Train an LSTM on NARMA using truncated BPTT.
 
@@ -323,8 +324,13 @@ def train_and_eval_lstm(
         u_train, y_train = narma(3000, order=order, seed=seed)
         u_test, y_test = narma(1000, order=order, seed=seed + 10000)
 
+    u_train = u_train.to(device)
+    y_train = y_train.to(device)
+    u_test = u_test.to(device)
+    y_test = y_test.to(device)
+
     torch.manual_seed(seed)
-    model = LSTMRegressor(hidden_dim=hidden_dim)
+    model = LSTMRegressor(hidden_dim=hidden_dim).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
 
     n_samples = u_train.shape[0]
@@ -648,7 +654,7 @@ def collect_fabric_states(
 # Experiment orchestration
 # ---------------------------------------------------------------------------
 
-def run_baselines(order: int, seed: int) -> dict[str, dict[str, Any]]:
+def run_baselines(order: int, seed: int, *, device: str = "cpu") -> dict[str, dict[str, Any]]:
     """Train and evaluate the non-fabric baselines.
 
     Returns dict mapping condition name -> {nrmse, r2, n_params, ...}.
@@ -713,7 +719,11 @@ def run_baselines(order: int, seed: int) -> dict[str, dict[str, Any]]:
     y_tr_aligned = y_train[align_offset:]
     X_te, _ = make_mlp_features(u_test, n_taps=n_taps)
     y_te_aligned = y_test[align_offset:]
-    mlp = MLPRegressor(n_taps=n_taps, hidden_dim=25)
+    X_tr = X_tr.to(device)
+    y_tr_aligned = y_tr_aligned.to(device)
+    X_te = X_te.to(device)
+    y_te_aligned = y_te_aligned.to(device)
+    mlp = MLPRegressor(n_taps=n_taps, hidden_dim=25).to(device)
     opt = torch.optim.AdamW(mlp.parameters(), lr=1e-3, weight_decay=1e-4)
     for _ in range(200):
         opt.zero_grad()
@@ -729,7 +739,7 @@ def run_baselines(order: int, seed: int) -> dict[str, dict[str, Any]]:
     mlp_res = {"nrmse": a, "r2": b, "n_params": mlp_n_params, "total_params": mlp_n_params}
 
     # 3b. MLP_large on 30-tap window (hidden_dim=237, ~7,585 params ≈ KNet)
-    mlp_large = MLPRegressor(n_taps=n_taps, hidden_dim=237)
+    mlp_large = MLPRegressor(n_taps=n_taps, hidden_dim=237).to(device)
     opt = torch.optim.AdamW(mlp_large.parameters(), lr=1e-3, weight_decay=1e-4)
     for _ in range(200):
         opt.zero_grad()
@@ -762,6 +772,7 @@ def run_baselines(order: int, seed: int) -> dict[str, dict[str, Any]]:
                 bptt_window=50, epochs=200, washout=washout, lr=lr,
                 u_train_override=u_tr_lstm, y_train_override=y_tr_lstm,
                 u_val_override=u_val_lstm, y_val_override=y_val_lstm,
+                device=device,
             )
             if res["val_nrmse"] is not None and res["val_nrmse"] < best_lstm_val_nrmse:
                 best_lstm_val_nrmse = res["val_nrmse"]
@@ -772,6 +783,7 @@ def run_baselines(order: int, seed: int) -> dict[str, dict[str, Any]]:
     lstm_res_dict = train_and_eval_lstm(
         order=order, seed=seed, hidden_dim=best_lstm_hd,
         bptt_window=50, epochs=200, washout=washout, lr=best_lstm_lr,
+        device=device,
     )
     lstm_res = {
         "nrmse": lstm_res_dict["nrmse"],
@@ -791,6 +803,7 @@ def run_baselines(order: int, seed: int) -> dict[str, dict[str, Any]]:
             bptt_window=50, epochs=200, washout=washout, lr=lr,
             u_train_override=u_tr_lstm, y_train_override=y_tr_lstm,
             u_val_override=u_val_lstm, y_val_override=y_val_lstm,
+            device=device,
         )
         if res["val_nrmse"] is not None and res["val_nrmse"] < best_lstm_large_val_nrmse:
             best_lstm_large_val_nrmse = res["val_nrmse"]
@@ -800,6 +813,7 @@ def run_baselines(order: int, seed: int) -> dict[str, dict[str, Any]]:
     lstm_large_res_dict = train_and_eval_lstm(
         order=order, seed=seed, hidden_dim=42,
         bptt_window=50, epochs=200, washout=washout, lr=best_lstm_large_lr,
+        device=device,
     )
     lstm_large_res = {
         "nrmse": lstm_large_res_dict["nrmse"],
@@ -979,7 +993,7 @@ def main() -> int:
         print("\n[narma] === Baselines ===")
         for i, seed in enumerate(seeds, 1):
             print(f"  [{i}/{len(seeds)}] Baselines seed={seed}")
-            base = run_baselines(args.order, seed)
+            base = run_baselines(args.order, seed, device=args.device)
             for cond, vals in base.items():
                 all_results.append({
                     "seed": seed,

@@ -359,10 +359,10 @@ def train_and_eval_lstm(
     if u_val_override is not None and y_val_override is not None:
         model.eval()
         with torch.no_grad():
-            u_val_seq = u_val_override.unsqueeze(0)
+            u_val_seq = u_val_override.to(device).unsqueeze(0)
             y_val_pred, _ = model(u_val_seq)
             y_val_pred = y_val_pred.squeeze(0)
-        val_nrmse = nrmse(y_val_pred, y_val_override)
+        val_nrmse = nrmse(y_val_pred, y_val_override.to(device))
         model.train()
 
     # Evaluation on test set

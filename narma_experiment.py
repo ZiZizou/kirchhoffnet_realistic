@@ -876,19 +876,23 @@ def train_fabric(
 
         # Update outer tqdm bar with per-epoch metrics.
         if _HAS_TQDM and verbose:
-            epoch_iter_outer.set_postfix(
-                loss=f"{avg:.4f}",
-                h_rms=f"{h_rms_avg:.3f}",
-                leak_grad=f"{leak_grad_avg:.2e}",
-                nrmse=f"{val_nrmse:.3f}",
-                r2=f"{val_r2v:.3f}",
-            )
+            postfix = {
+                "loss": f"{avg:.4f}",
+                "h_rms": f"{h_rms_avg:.3f}",
+                "leak_grad": f"{leak_grad_avg:.2e}",
+            }
+            if not math.isnan(val_nrmse):
+                postfix["nrmse"] = f"{val_nrmse:.3f}"
+                postfix["r2"] = f"{val_r2v:.3f}"
+            epoch_iter_outer.set_postfix(**postfix)
 
         t_epoch = time.time() - t_start
         epoch_times.append(t_epoch)
-        # Print epoch-level text summary when tqdm is unavailable (outer
-        # tqdm bar already shows metrics in its postfix when available).
-        if verbose and not _HAS_TQDM and (epoch % log_interval == 0 or epoch == epochs - 1):
+        # Print epoch-level text summary at log_interval boundaries.
+        # This runs even when tqdm is available so metrics are visible
+        # in non-interactive / captured terminals (e.g. Kaggle logs)
+        # where tqdm postfix may be overwritten by nested bars.
+        if verbose and (epoch % log_interval == 0 or epoch == epochs - 1):
             if len(epoch_times) >= 2:
                 dt = epoch_times[-1] - epoch_times[-2]
                 eta = dt * (epochs - 1 - epoch)
@@ -896,15 +900,15 @@ def train_fabric(
             else:
                 eta_str = ""
             val_str = ""
-            if val_every > 0 and val_nrmse_history:
+            if not math.isnan(val_nrmse):
                 val_str = (
-                    f"  NRMSE={val_nrmse_history[-1]:.4f}  "
-                    f"R^2={val_r2_history[-1]:.4f}"
+                    f"  NRMSE={val_nrmse:.4f}  "
+                    f"R^2={val_r2v:.4f}"
                 )
             print(
                 f"  fabric epoch {epoch:3d}/{epochs}  loss={avg:.6f}  "
-                f"h_rms={hidden_rms_history[-1]:.4f}  "
-                f"leak_grad={raw_leak_grad_history[-1]:.2e}  "
+                f"h_rms={h_rms_avg:.4f}  "
+                f"leak_grad={leak_grad_avg:.2e}  "
                 f"{t_epoch:.1f}s  {eta_str}{val_str}"
             )
 

@@ -957,6 +957,80 @@ output_ode_src: list[int] | None = None,
         traj = torch.stack(traj_chunks, dim=2) if store_trajectory else None
         return x, traj
 
+    def _forward_heun_sequence(
+        self,
+        x0: torch.Tensor,
+        t_span: float,
+        num_steps: int,
+        u_seq: torch.Tensor,
+    ) -> torch.Tensor:
+        """Integrate over a sequence of per-sample inputs with state carryover.
+
+        Processes ``u_seq`` (shape ``(T, 1)``) as ``T`` consecutive sample
+        windows. For each sample, runs ``num_steps`` Heun steps with that
+        sample's ``u`` value, threading the final state into the next sample.
+
+        This moves the per-sample Python loop into a single C++/CUDA call
+        boundary, reducing interpreter overhead for evaluation.
+
+        Args:
+            x0: Initial state, shape ``(B, N)``.
+            t_span: Integration window duration per sample.
+            num_steps: Heun steps per sample.
+            u_seq: Input sequence, shape ``(T, 1)`` or ``(B, T, 1)``.
+
+        Returns:
+            Final states at each sample boundary, shape ``(T, B, N)``
+            (or ``(T, N)`` if B=1).
+        """
+        dt = t_span / float(num_steps)
+        T = u_seq.shape[0]
+        B = x0.shape[0]
+
+        x = x0
+        states = torch.empty(T, B, x0.shape[1], dtype=x0.dtype, device=x0.device)
+
+        for t in range(T):
+            if u_seq.dim() == 1:
+                u_t = u_seq[t].view(1, 1)
+            elif u_seq.dim() == 2:
+                u_t = u_seq[t].view(1, 1)
+            else:
+                u_t = u_seq[:, t, :]
+
+            # freeze_read: precompute edge currents from the current state
+            # (each sample window freezes from its own starting state, matching
+            # the per-sample _forward_heun semantics).
+            i_edge_const = None
+            if self.freeze_read:
+                x_src0 = x[:, self.src]
+                x_dst0 = x[:, self.dst]
+                if self._has_resistive and hasattr(self.cell_lib, "forward_tanh"):
+                    i_edge = self.cell_lib.forward_tanh(x_src=x_src0, x_dst=x_dst0, x_max=self.x_max)
+                else:
+                    i_edge = self.cell_lib(x_src=x_src0, x_dst=x_dst0, x_max=self.x_max)
+                edge_mask = torch.sigmoid(self.z_logits)
+                if self.budget_enabled:
+                    edge_mask = edge_mask * self._compute_budget_gate()
+                i_edge = i_edge * edge_mask.unsqueeze(0)
+                i_edge_f32 = i_edge.float()
+                acc_const = torch.zeros_like(x, dtype=torch.float32)
+                acc_const.index_add_(1, self.dst, i_edge_f32)
+                if not self.read_only_source:
+                    acc_const.index_add_(1, self.src, -i_edge_f32)
+                i_edge_const = acc_const.to(dtype=x.dtype)
+
+            for _ in range(num_steps):
+                k1 = self.rhs(x, u=u_t, x_drive=None, drive_scale=0.0,
+                              i_edge_const=i_edge_const)
+                x_pred = x + dt * k1
+                k2 = self.rhs(x_pred, u=u_t, x_drive=None, drive_scale=0.0,
+                              i_edge_const=i_edge_const)
+                x = x + 0.5 * dt * (k1 + k2)
+            states[t] = x
+
+        return states
+
     def forward_equilibrium(
         self,
         x0: torch.Tensor,

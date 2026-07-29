@@ -583,7 +583,7 @@ def train_fabric(
     return {"train_loss_history": history, "final_loss": history[-1] if history else float("nan")}
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def evaluate_fabric(
     net: nn.Module,
     u_test: torch.Tensor,
@@ -591,7 +591,6 @@ def evaluate_fabric(
     *,
     washout: int = 200,
     device: str = "cpu",
-    chunk: int = 50,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the fabric over the test sequence with state carryover.
 
@@ -605,22 +604,60 @@ def evaluate_fabric(
     u_test = u_test.to(device)
     y_test = y_test.to(device)
     T = u_test.shape[0]
-    # Start from zero state
+    preds = torch.empty(T, device=device)
     state = None
-    preds: list[torch.Tensor] = []
-    # Run sample by sample, threading the state
-    # We do this in chunks for efficiency
-    for t in range(0, T):
+    for t in range(T):
         u_b = u_test[t].view(1, 1)
         y_pred, _, final_state = net(
             u_b, initial_state=state, return_final_state=True,
         )
-        preds.append(y_pred.view(-1))
-        state = final_state.detach()
-    y_pred = torch.stack(preds).squeeze(-1)
-    return y_pred[washout:], y_test[washout:]
+        preds[t] = y_pred.view(-1)
+        state = final_state
+    return preds[washout:], y_test[washout:]
 
 
+@torch.inference_mode()
+def _evaluate_fabric_direct(
+    net: nn.Module,
+    u_seq: torch.Tensor,
+    y_test: torch.Tensor,
+    *,
+    washout: int = 200,
+    device: str = "cpu",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Direct evaluation bypassing KirchhoffNetWithIO / KirchhoffNet wrappers.
+
+    Calls ``DifferentialStage._forward_heun_sequence`` to process the entire
+    test sequence in a single call, eliminating per-sample Python overhead.
+    Only valid for the NARMA single-stage topology.
+    """
+    net.eval()
+    net.to(device)
+    u_seq = u_seq.to(device)
+    y_test = y_test.to(device)
+    T = u_seq.shape[0]
+
+    stage = net.core.stages[0]
+    output_mapper = net.output_mapper
+    read_slice = net.read_slice
+    t_span = net.core.stage_times[0]
+    num_steps = net.core.stage_steps[0]
+    stage_width = net.hid_count + net.proj_count + net.output_ode_count
+
+    x0 = u_seq.new_zeros(1, stage_width)
+    all_states = stage._forward_heun_sequence(
+        x0=x0,
+        t_span=t_span,
+        num_steps=num_steps,
+        u_seq=u_seq,
+    )
+    x_read = all_states[:, :, read_slice]
+    y_preds = output_mapper(x_read)
+    preds = y_preds.view(T)
+    return preds[washout:], y_test[washout:]
+
+
+@torch.inference_mode()
 def collect_fabric_states(
     net: nn.Module,
     u: torch.Tensor,
@@ -628,6 +665,8 @@ def collect_fabric_states(
     device: str = "cpu",
 ) -> torch.Tensor:
     """Collect the per-sample fabric state (last layer only) for MC eval.
+
+    Uses the direct-stage-call path to bypass wrapper overhead.
 
     Returns:
         Tensor of shape ``(T, stage_width)`` — the final ODE state at
@@ -637,17 +676,20 @@ def collect_fabric_states(
     net.to(device)
     u = u.to(device)
     T = u.shape[0]
-    states: list[torch.Tensor] = []
-    state = None
-    with torch.no_grad():
-        for t in range(T):
-            u_b = u[t].view(1, 1)
-            _, _, final_state = net(
-                u_b, initial_state=state, return_final_state=True,
-            )
-            states.append(final_state.view(-1))
-            state = final_state.detach()
-    return torch.stack(states)
+
+    stage = net.core.stages[0]
+    t_span = net.core.stage_times[0]
+    num_steps = net.core.stage_steps[0]
+    stage_width = net.hid_count + net.proj_count + net.output_ode_count
+
+    x0 = u.new_zeros(1, stage_width)
+    all_states = stage._forward_heun_sequence(
+        x0=x0,
+        t_span=t_span,
+        num_steps=num_steps,
+        u_seq=u,
+    )
+    return all_states[:, 0, :]  # (T, stage_width)
 
 
 # ---------------------------------------------------------------------------
@@ -892,9 +934,11 @@ def run_fabric_condition(
         accum_steps=accum_steps,
     )
 
-    # Evaluate
+    # Evaluate: run the fabric over the test set, collecting both predictions
+    # and the per-sample final ODE state. The states are reused for the
+    # memory-capacity computation on the test set (no separate pass needed).
     print("  evaluating on test set...")
-    y_pred, y_te = evaluate_fabric(net, u_test, y_test, washout=200, device=device)
+    y_pred, y_te = _evaluate_fabric_direct(net, u_test, y_test, washout=200, device=device)
     nr = nrmse(y_pred, y_te)
     r2v = r2(y_pred, y_te)
 

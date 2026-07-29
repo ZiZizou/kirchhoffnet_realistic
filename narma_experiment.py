@@ -699,7 +699,11 @@ def train_fabric(
 
     state_width = net.hid_count + net.proj_count + net.output_ode_count
 
-    for epoch in range(epochs):
+    epoch_iter_outer = _progress_iter(
+        range(epochs), desc="fabric epochs",
+        total=epochs, disable=not verbose or not _HAS_TQDM,
+    )
+    for epoch in epoch_iter_outer:
         net.train()
         # Carry state across chunks; detach only at chunk boundaries.
         state = torch.zeros(B, state_width, device=device)
@@ -718,7 +722,7 @@ def train_fabric(
         optim.zero_grad()
 
         epoch_iter = _progress_iter(
-            enumerate(chunk_order), desc=f"epoch {epoch:3d}/{epochs}",
+            enumerate(chunk_order), desc=f"chunks",
             total=n_chunks, disable=not verbose,
         )
         for _, ci in epoch_iter:
@@ -786,12 +790,24 @@ def train_fabric(
 
         avg = epoch_loss / max(epoch_steps, 1)
         history.append(avg)
-        raw_leak_grad_history.append(epoch_raw_leak_grad / max(epoch_steps, 1))
-        hidden_rms_history.append(epoch_hidden_rms / max(epoch_steps, 1))
+        leak_grad_avg = epoch_raw_leak_grad / max(epoch_steps, 1)
+        h_rms_avg = epoch_hidden_rms / max(epoch_steps, 1)
+        raw_leak_grad_history.append(leak_grad_avg)
+        hidden_rms_history.append(h_rms_avg)
+
+        # Update outer tqdm bar with per-epoch metrics.
+        if _HAS_TQDM and verbose:
+            epoch_iter_outer.set_postfix(
+                loss=f"{avg:.4f}",
+                h_rms=f"{h_rms_avg:.3f}",
+                leak_grad=f"{leak_grad_avg:.2e}",
+            )
 
         t_epoch = time.time() - t_start
         epoch_times.append(t_epoch)
-        if verbose and (epoch % log_interval == 0 or epoch == epochs - 1):
+        # Print epoch-level text summary when tqdm is unavailable (outer
+        # tqdm bar already shows metrics in its postfix when available).
+        if verbose and not _HAS_TQDM and (epoch % log_interval == 0 or epoch == epochs - 1):
             if len(epoch_times) >= 2:
                 dt = epoch_times[-1] - epoch_times[-2]
                 eta = dt * (epochs - 1 - epoch)

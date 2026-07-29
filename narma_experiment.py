@@ -338,7 +338,7 @@ def train_and_eval_lstm(
 
     model.train()
     for epoch in range(epochs):
-        window_starts = torch.randperm(n_windows) * bptt_window
+        window_starts = torch.randperm(n_windows, device=device) * bptt_window
         epoch_loss = 0.0
 
         for w_start in window_starts:
@@ -423,8 +423,8 @@ def memory_capacity(states: torch.Tensor, targets: torch.Tensor,
             continue
         X = states[: T - k]
         y = targets[k:]
-        X_aug = torch.cat([X, torch.ones(X.shape[0], 1)], dim=1)
-        XtX = X_aug.T @ X_aug + ridge_l2 * torch.eye(X_aug.shape[1])
+        X_aug = torch.cat([X, torch.ones(X.shape[0], 1, device=X.device)], dim=1)
+        XtX = X_aug.T @ X_aug + ridge_l2 * torch.eye(X_aug.shape[1], device=X.device)
         W = torch.linalg.solve(XtX, X_aug.T @ y)
         y_pred = X_aug @ W
         r2_list.append(r2(y_pred, y))
@@ -508,7 +508,7 @@ def train_fabric(
     for epoch in range(epochs):
         net.train()
         # Randomise the window order each epoch
-        window_starts = torch.randperm(n_windows) * bptt_window
+        window_starts = torch.randperm(n_windows, device=device) * bptt_window
         # Split into micro-batches of size B
         chunks = window_starts.split(B)
 
@@ -525,7 +525,7 @@ def train_fabric(
             # for each starting position. Shape: (B, bptt_window).
             idx = (
                 chunk.unsqueeze(1)
-                + torch.arange(bptt_window, dtype=torch.long).unsqueeze(0)
+                + torch.arange(bptt_window, dtype=torch.long, device=device).unsqueeze(0)
             )
             u_chunk = u_train[idx]                    # (B, bptt_window)
             y_chunk = y_train[idx]                    # (B, bptt_window)

@@ -22,15 +22,23 @@ Three families of conditions are evaluated:
     1. **Baselines** (no fabric, no temporal trickery):
        a. Ridge regression on 30 tapped delays of u(n).
        b. Echo State Network (ESN), 25 nodes, ridge readout.
-       c. MLP on 30-tap window.
+       c. MLP on 30-tap window (25 hidden, 801 params).
+       d. MLP_large on 30-tap window (237 hidden, 7,585 params ≈ KNet).
+       e. LSTM on streaming u(t) (grid search hidden_dim=[16,25,32], lr=[1e-3,5e-4]).
+       f. LSTM_large on streaming u(t) (42 hidden, 7,603 params ≈ KNet).
 
     2. **Fabric conditions**:
-       d. ``freeze_read=False``: evolving nonlinear core.
-       e. ``freeze_read=True``: frozen core (boundary + temporal-readout only).
+       g. ``freeze_read=False``: evolving nonlinear core.
+       h. ``freeze_read=True``: frozen core (boundary + temporal-readout only).
 
     3. **Memory capacity** (linear readouts reconstructing u(n-k) for k=1..20):
-       Computed for conditions d and e. ``MC = sum_k R^2_k`` directly
+       Computed for conditions g and h. ``MC = sum_k R^2_k`` directly
        characterises the fading-memory property.
+
+Complexity reporting:
+    Each condition reports its parameter count alongside NRMSE and R^2 in
+    the summary table and CSV output. ESN reports both trained (26) and
+    total (676) parameters. LSTM variants report their hidden_dim.
 
 Pre-registered decision rule:
     If both fabric conditions achieve NRMSE < 0.3 on NARMA-20 AND
@@ -242,6 +250,27 @@ class MLPRegressor(nn.Module):
         return self.fc2(h)
 
 
+class LSTMRegressor(nn.Module):
+    """LSTM baseline taking streaming scalar u(t) with state carryover."""
+
+    def __init__(self, hidden_dim: int = 25) -> None:
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.lstm = nn.LSTM(input_size=1, hidden_size=hidden_dim, batch_first=True)
+        self.fc = nn.Linear(hidden_dim, 1)
+
+    def forward(
+        self,
+        u_seq: torch.Tensor,
+        state: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        if u_seq.dim() == 2:
+            u_seq = u_seq.unsqueeze(-1)
+        out, final_state = self.lstm(u_seq, state)
+        preds = self.fc(out).squeeze(-1)
+        return preds, final_state
+
+
 def make_mlp_features(u: torch.Tensor, n_taps: int = 30) -> tuple[torch.Tensor, int]:
     """Build the MLP feature matrix; returns (X, washout)."""
     T = u.shape[0]
@@ -249,6 +278,105 @@ def make_mlp_features(u: torch.Tensor, n_taps: int = 30) -> tuple[torch.Tensor, 
     for lag in range(n_taps):
         rows.append(u[n_taps - 1 - lag: T - lag])
     return torch.stack(rows, dim=1), n_taps - 1
+
+
+def train_and_eval_lstm(
+    order: int,
+    seed: int,
+    hidden_dim: int = 25,
+    bptt_window: int = 50,
+    epochs: int = 200,
+    washout: int = 200,
+    lr: float = 1e-3,
+    u_train_override: torch.Tensor | None = None,
+    y_train_override: torch.Tensor | None = None,
+    u_val_override: torch.Tensor | None = None,
+    y_val_override: torch.Tensor | None = None,
+) -> dict[str, float | int | None]:
+    """Train an LSTM on NARMA using truncated BPTT.
+
+    When ``u_train_override`` is provided, train on that data instead of
+    generating fresh NARMA data. When ``u_val_override`` is provided,
+    compute validation NRMSE after training.
+
+    Args:
+        order: NARMA order (10 or 20).
+        seed: RNG seed.
+        hidden_dim: LSTM hidden units.
+        bptt_window: Truncated BPTT window in samples.
+        epochs: Training epochs.
+        washout: Number of initial test samples to discard.
+        lr: Learning rate.
+        u_train_override: Optional training input (overrides narma gen).
+        y_train_override: Optional training target (overrides narma gen).
+        u_val_override: Optional validation input.
+        y_val_override: Optional validation target.
+
+    Returns:
+        Dict with nrmse, r2, val_nrmse, n_params, hidden_dim.
+    """
+    if u_train_override is not None:
+        u_train = u_train_override
+        y_train = y_train_override
+        u_test, y_test = narma(1000, order=order, seed=seed + 10000)
+    else:
+        u_train, y_train = narma(3000, order=order, seed=seed)
+        u_test, y_test = narma(1000, order=order, seed=seed + 10000)
+
+    torch.manual_seed(seed)
+    model = LSTMRegressor(hidden_dim=hidden_dim)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+
+    n_samples = u_train.shape[0]
+    n_windows = n_samples // bptt_window
+
+    model.train()
+    for epoch in range(epochs):
+        window_starts = torch.randperm(n_windows) * bptt_window
+        epoch_loss = 0.0
+
+        for w_start in window_starts:
+            u_win = u_train[w_start : w_start + bptt_window].unsqueeze(0)
+            y_win = y_train[w_start : w_start + bptt_window].unsqueeze(0)
+
+            optimizer.zero_grad()
+            preds, _ = model(u_win)
+            loss = F.mse_loss(preds, y_win)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            epoch_loss += loss.item()
+
+    # Validation NRMSE (if val data provided)
+    val_nrmse: float | None = None
+    if u_val_override is not None and y_val_override is not None:
+        model.eval()
+        with torch.no_grad():
+            u_val_seq = u_val_override.unsqueeze(0)
+            y_val_pred, _ = model(u_val_seq)
+            y_val_pred = y_val_pred.squeeze(0)
+        val_nrmse = nrmse(y_val_pred, y_val_override)
+        model.train()
+
+    # Evaluation on test set
+    model.eval()
+    with torch.no_grad():
+        u_te_seq = u_test.unsqueeze(0)
+        y_pred, _ = model(u_te_seq)
+        y_pred = y_pred.squeeze(0)
+
+    eval_nrmse = nrmse(y_pred[washout:], y_test[washout:])
+    eval_r2 = r2(y_pred[washout:], y_test[washout:])
+
+    n_params = sum(p.numel() for p in model.parameters())
+    return {
+        "nrmse": eval_nrmse,
+        "r2": eval_r2,
+        "val_nrmse": val_nrmse,
+        "n_params": n_params,
+        "hidden_dim": hidden_dim,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -520,10 +648,11 @@ def collect_fabric_states(
 # Experiment orchestration
 # ---------------------------------------------------------------------------
 
-def run_baselines(order: int, seed: int) -> dict[str, dict[str, float]]:
-    """Train and evaluate the three non-fabric baselines.
+def run_baselines(order: int, seed: int) -> dict[str, dict[str, Any]]:
+    """Train and evaluate the non-fabric baselines.
 
-    Returns dict mapping condition name -> {nrmse, r2}.
+    Returns dict mapping condition name -> {nrmse, r2, n_params, ...}.
+    Conditions: ridge, esn, mlp, mlp_large, lstm, lstm_large.
     """
     u_train, y_train = narma(3000, order=order, seed=seed)
     u_test, y_test = narma(1000, order=order, seed=seed + 10000)
@@ -541,7 +670,7 @@ def run_baselines(order: int, seed: int) -> dict[str, dict[str, float]]:
     # Apply washout: discard the first washout predictions
     a = nrmse(y_pred[washout:], y_test_aligned[washout:])
     b = r2(y_pred[washout:], y_test_aligned[washout:])
-    ridge_res = {"nrmse": a, "r2": b}
+    ridge_res = {"nrmse": a, "r2": b, "n_params": n_taps + 1, "total_params": n_taps + 1}
 
     # 2. ESN, 25 nodes — grid search input_scaling and leak rate
     # Use last 500 train samples as validation set.
@@ -574,7 +703,10 @@ def run_baselines(order: int, seed: int) -> dict[str, dict[str, float]]:
     y_pred = esn.predict(u_test)
     a = nrmse(y_pred[washout:], y_test[washout:])
     b = r2(y_pred[washout:], y_test[washout:])
-    esn_res = {"nrmse": a, "r2": b}
+    # ESN: 26 trained (readout) / 676 total (readout + reservoir W + W_in)
+    esn_trained = esn.n_reservoir + 1
+    esn_total = esn.n_reservoir * esn.n_reservoir + esn.n_reservoir + esn.n_reservoir + 1
+    esn_res = {"nrmse": a, "r2": b, "n_params": esn_trained, "total_params": esn_total}
 
     # 3. MLP on 30-tap window (trained via gradient descent)
     X_tr, _ = make_mlp_features(u_train, n_taps=n_taps)
@@ -593,9 +725,98 @@ def run_baselines(order: int, seed: int) -> dict[str, dict[str, float]]:
         y_pred = mlp(X_te).squeeze(-1)
     a = nrmse(y_pred[washout:], y_te_aligned[washout:])
     b = r2(y_pred[washout:], y_te_aligned[washout:])
-    mlp_res = {"nrmse": a, "r2": b}
+    mlp_n_params = sum(p.numel() for p in mlp.parameters())
+    mlp_res = {"nrmse": a, "r2": b, "n_params": mlp_n_params, "total_params": mlp_n_params}
 
-    return {"ridge": ridge_res, "esn": esn_res, "mlp": mlp_res}
+    # 3b. MLP_large on 30-tap window (hidden_dim=237, ~7,585 params ≈ KNet)
+    mlp_large = MLPRegressor(n_taps=n_taps, hidden_dim=237)
+    opt = torch.optim.AdamW(mlp_large.parameters(), lr=1e-3, weight_decay=1e-4)
+    for _ in range(200):
+        opt.zero_grad()
+        y_pred = mlp_large(X_tr).squeeze(-1)
+        loss = F.mse_loss(y_pred, y_tr_aligned)
+        loss.backward()
+        opt.step()
+    with torch.no_grad():
+        y_pred = mlp_large(X_te).squeeze(-1)
+    a = nrmse(y_pred[washout:], y_te_aligned[washout:])
+    b = r2(y_pred[washout:], y_te_aligned[washout:])
+    mlp_large_n_params = sum(p.numel() for p in mlp_large.parameters())
+    mlp_large_res = {"nrmse": a, "r2": b, "n_params": mlp_large_n_params, "total_params": mlp_large_n_params}
+
+    # 4. LSTM with grid search (hidden_dim=[16,25,32], lr=[1e-3,5e-4])
+    # Use last 500 train samples as validation set (same pattern as ESN).
+    val_size_lstm = 500
+    u_tr_lstm = u_train[:-val_size_lstm]
+    y_tr_lstm = y_train[:-val_size_lstm]
+    u_val_lstm = u_train[-val_size_lstm:]
+    y_val_lstm = y_train[-val_size_lstm:]
+
+    best_lstm_val_nrmse = float("inf")
+    best_lstm_hd = 25
+    best_lstm_lr = 1e-3
+    for hidden_dim in [16, 25, 32]:
+        for lr in [1e-3, 5e-4]:
+            res = train_and_eval_lstm(
+                order=order, seed=seed, hidden_dim=hidden_dim,
+                bptt_window=50, epochs=200, washout=washout, lr=lr,
+                u_train_override=u_tr_lstm, y_train_override=y_tr_lstm,
+                u_val_override=u_val_lstm, y_val_override=y_val_lstm,
+            )
+            if res["val_nrmse"] is not None and res["val_nrmse"] < best_lstm_val_nrmse:
+                best_lstm_val_nrmse = res["val_nrmse"]
+                best_lstm_hd = hidden_dim
+                best_lstm_lr = lr
+
+    # Refit on the full train set with the best hyperparameters
+    lstm_res_dict = train_and_eval_lstm(
+        order=order, seed=seed, hidden_dim=best_lstm_hd,
+        bptt_window=50, epochs=200, washout=washout, lr=best_lstm_lr,
+    )
+    lstm_res = {
+        "nrmse": lstm_res_dict["nrmse"],
+        "r2": lstm_res_dict["r2"],
+        "n_params": lstm_res_dict["n_params"],
+        "total_params": lstm_res_dict["n_params"],
+        "hidden_dim": best_lstm_hd,
+    }
+
+    # 4b. LSTM_large (hidden_dim=42, lr grid search)
+    # h=42 gives 4*42^2 + 13*42 + 1 = 7,603 params ≈ KNet's ~7,600
+    best_lstm_large_val_nrmse = float("inf")
+    best_lstm_large_lr = 1e-3
+    for lr in [1e-3, 5e-4]:
+        res = train_and_eval_lstm(
+            order=order, seed=seed, hidden_dim=42,
+            bptt_window=50, epochs=200, washout=washout, lr=lr,
+            u_train_override=u_tr_lstm, y_train_override=y_tr_lstm,
+            u_val_override=u_val_lstm, y_val_override=y_val_lstm,
+        )
+        if res["val_nrmse"] is not None and res["val_nrmse"] < best_lstm_large_val_nrmse:
+            best_lstm_large_val_nrmse = res["val_nrmse"]
+            best_lstm_large_lr = lr
+
+    # Refit on the full train set with the best hyperparameters
+    lstm_large_res_dict = train_and_eval_lstm(
+        order=order, seed=seed, hidden_dim=42,
+        bptt_window=50, epochs=200, washout=washout, lr=best_lstm_large_lr,
+    )
+    lstm_large_res = {
+        "nrmse": lstm_large_res_dict["nrmse"],
+        "r2": lstm_large_res_dict["r2"],
+        "n_params": lstm_large_res_dict["n_params"],
+        "total_params": lstm_large_res_dict["n_params"],
+        "hidden_dim": 42,
+    }
+
+    return {
+        "ridge": ridge_res,
+        "esn": esn_res,
+        "mlp": mlp_res,
+        "mlp_large": mlp_large_res,
+        "lstm": lstm_res,
+        "lstm_large": lstm_large_res,
+    }
 
 
 def run_fabric_condition(
@@ -666,6 +887,7 @@ def run_fabric_condition(
     # Memory capacity: collect fabric states on the train set
     # MC reconstructs u(n-k) for k=1..20 (Jaeger 2001), not y.
     states_tr = collect_fabric_states(net, u_train, device=device)
+    u_train = u_train.to(device)
     mc_per_delay, mc_total = memory_capacity(
         states_tr, u_train, max_delay=20, ridge_l2=1e-2,
     )
@@ -725,7 +947,7 @@ def parse_args() -> argparse.Namespace:
                         default=Path("./output/narma_exp"),
                         help="Output directory (default ./output/narma_exp)")
     parser.add_argument("--baselines-only", action="store_true",
-                        help="Only run the three baselines; skip fabric training")
+                        help="Only run the baselines (ridge, esn, mlp, mlp_large, lstm, lstm_large); skip fabric training")
     parser.add_argument("--fabric-only", action="store_true",
                         help="Only run the two fabric conditions; skip baselines")
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"],
@@ -764,10 +986,14 @@ def main() -> int:
                     "condition": cond,
                     "nrmse": vals["nrmse"],
                     "r2": vals["r2"],
+                    "n_params": vals.get("n_params", ""),
+                    "total_params": vals.get("total_params", ""),
+                    "hidden_dim": vals.get("hidden_dim", ""),
                 })
                 print(
-                    f"    {cond:>8}  NRMSE={vals['nrmse']:.4f}  "
-                    f"R^2={vals['r2']:.4f}"
+                    f"    {cond:>12}  NRMSE={vals['nrmse']:.4f}  "
+                    f"R^2={vals['r2']:.4f}  "
+                    f"params={vals.get('n_params', '')}"
                 )
 
     if not args.baselines_only:
@@ -795,6 +1021,8 @@ def main() -> int:
                 "r2": res["r2"],
                 "mc_total": res["mc_total"],
                 "n_params": res["n_params"],
+                "total_params": res["n_params"],
+                "hidden_dim": "",
             })
             print(
                 f"  RESULT: {cond_name} seed={seed}  NRMSE={res['nrmse']:.4f}  "
@@ -811,7 +1039,7 @@ def main() -> int:
         f"NARMA-{args.order} -- {len(seeds)} seeds -- final results",
         "=" * 60,
     ]
-    csv_lines = ["condition,seed,nrmse,r2,mc_total,n_params"]
+    csv_lines = ["condition,seed,nrmse,r2,mc_total,trained_params,total_params,hidden_dim"]
     for cond in sorted(by_cond):
         runs = by_cond[cond]
         nrmse_vals = [r["nrmse"] for r in runs]
@@ -822,19 +1050,39 @@ def main() -> int:
             f"{(sum((m - sum(mc_vals) / len(mc_vals)) ** 2 for m in mc_vals) / len(mc_vals)) ** 0.5:.2f}"
             if mc_vals else ""
         )
+        # Complexity string: trained/total params + hidden_dim
+        tp_vals = [r.get("total_params") for r in runs if r.get("total_params") != ""]
+        tp_str = ""
+        if tp_vals:
+            tp = tp_vals[0]
+            if isinstance(tp, (int, float)) and tp > 0:
+                # Check if trained differs from total (ESN case)
+                tr_vals = [r.get("n_params") for r in runs if r.get("n_params") != ""]
+                tr = tr_vals[0] if tr_vals else tp
+                if tr != tp:
+                    tp_str = f"  params={tr}t/{tp}T"
+                else:
+                    hd_vals = [r.get("hidden_dim") for r in runs if r.get("hidden_dim") != ""]
+                    if hd_vals and hd_vals[0] != "":
+                        tp_str = f"  params={tp} (hid={hd_vals[0]})"
+                    else:
+                        tp_str = f"  params={tp}"
         summary_lines.append(
             f"{cond:>14}  NRMSE={sum(nrmse_vals) / len(nrmse_vals):.4f} +/- "
             f"{(sum((v - sum(nrmse_vals) / len(nrmse_vals)) ** 2 for v in nrmse_vals) / len(nrmse_vals)) ** 0.5:.4f}  "
             f"R^2={sum(r2_vals) / len(r2_vals):.4f} +/- "
             f"{(sum((v - sum(r2_vals) / len(r2_vals)) ** 2 for v in r2_vals) / len(r2_vals)) ** 0.5:.4f}"
-            f"{mc_str}"
+            f"{mc_str}{tp_str}"
         )
         for r in runs:
             mc = r.get("mc_total", "")
-            np_ = r.get("n_params", "")
+            tp = r.get("n_params", "")
+            tt = r.get("total_params", "")
+            hd = r.get("hidden_dim", "")
             csv_lines.append(
                 f"{cond},{r['seed']},{r['nrmse']:.6f},{r['r2']:.6f},"
-                f"{mc if mc != '' else ''},{np_}"
+                f"{mc if mc != '' else ''},{tp if tp != '' else ''},"
+                f"{tt if tt != '' else ''},{hd if hd != '' else ''}"
             )
 
     summary_text = "\n".join(summary_lines) + "\n"

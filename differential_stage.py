@@ -966,37 +966,57 @@ output_ode_src: list[int] | None = None,
     ) -> torch.Tensor:
         """Integrate over a sequence of per-sample inputs with state carryover.
 
-        Processes ``u_seq`` (shape ``(T, 1)``) as ``T`` consecutive sample
-        windows. For each sample, runs ``num_steps`` Heun steps with that
-        sample's ``u`` value, threading the final state into the next sample.
+        Processes ``u_seq`` as ``T`` consecutive sample windows. For each
+        sample, runs ``num_steps`` Heun steps with that sample's ``u``
+        value, threading the final state into the next sample.
 
         This moves the per-sample Python loop into a single C++/CUDA call
-        boundary, reducing interpreter overhead for evaluation.
+        boundary, reducing interpreter overhead for evaluation and training.
 
         Args:
             x0: Initial state, shape ``(B, N)``.
             t_span: Integration window duration per sample.
             num_steps: Heun steps per sample.
-            u_seq: Input sequence, shape ``(T, 1)`` or ``(B, T, 1)``.
+            u_seq: Input sequence. Accepted shapes:
+                - ``(T, 1)`` — eval mode, single stream (B=1)
+                - ``(B, T)`` — batched, no explicit input-dim axis
+                - ``(B, T, 1)`` — batched with explicit input-dim axis
 
         Returns:
             Final states at each sample boundary, shape ``(T, B, N)``
             (or ``(T, N)`` if B=1).
         """
         dt = t_span / float(num_steps)
-        T = u_seq.shape[0]
         B = x0.shape[0]
+
+        # Determine (batched, T) from u_seq shape.
+        # ``batched`` is True when the first axis is the batch dim.
+        if u_seq.dim() == 3:
+            batched = (u_seq.shape[0] == B)
+            T = u_seq.shape[1] if batched else u_seq.shape[0]
+        elif u_seq.dim() == 2:
+            batched = (u_seq.shape[0] == B)
+            T = u_seq.shape[1] if batched else u_seq.shape[0]
+        else:
+            # 1D: assume (T,) — single-stream eval, B=1
+            batched = False
+            T = u_seq.shape[0]
 
         x = x0
         states = torch.empty(T, B, x0.shape[1], dtype=x0.dtype, device=x0.device)
 
         for t in range(T):
-            if u_seq.dim() == 1:
-                u_t = u_seq[t].view(1, 1)
-            elif u_seq.dim() == 2:
-                u_t = u_seq[t].view(1, 1)
+            if not batched:
+                if u_seq.dim() == 1:
+                    u_t = u_seq[t].view(1, 1)
+                else:
+                    u_t = u_seq[t].view(1, 1)
             else:
-                u_t = u_seq[:, t, :]
+                # u_seq is (B, T) or (B, T, 1)
+                if u_seq.dim() == 2:
+                    u_t = u_seq[:, t].unsqueeze(-1)  # (B, 1)
+                else:
+                    u_t = u_seq[:, t, :]  # (B, 1)
 
             # freeze_read: precompute edge currents from the current state
             # (each sample window freezes from its own starting state, matching
@@ -1020,16 +1040,91 @@ output_ode_src: list[int] | None = None,
                     acc_const.index_add_(1, self.src, -i_edge_f32)
                 i_edge_const = acc_const.to(dtype=x.dtype)
 
-            for _ in range(num_steps):
-                k1 = self.rhs(x, u=u_t, x_drive=None, drive_scale=0.0,
-                              i_edge_const=i_edge_const)
-                x_pred = x + dt * k1
-                k2 = self.rhs(x_pred, u=u_t, x_drive=None, drive_scale=0.0,
-                              i_edge_const=i_edge_const)
-                x = x + 0.5 * dt * (k1 + k2)
+            x = self._call_heun_steps(x, u_t, dt, num_steps, i_edge_const)
             states[t] = x
 
         return states
+
+    def _call_heun_steps(
+        self,
+        x: torch.Tensor,
+        u_t: torch.Tensor,
+        dt: float,
+        num_steps: int,
+        i_edge_const: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Dispatch to compiled or uncompiled Heun steps with fallback.
+
+        ``torch.compile`` is lazy: the compilation error (e.g. missing C++
+        compiler on CPU) surfaces on the *first call*, not at
+        ``enable_sequence_compile()`` time. This wrapper catches such errors
+        and falls back to the original Python implementation so training
+        can proceed.
+        """
+        if getattr(self, "_heun_steps_compiled", False):
+            try:
+                return self._heun_steps_compiled_fn(x, u_t, dt, num_steps, i_edge_const)
+            except Exception as e:
+                print(
+                    f"  [torch.compile] runtime compilation failed: {e}\n"
+                    f"  [torch.compile] falling back to uncompiled Heun steps."
+                )
+                self._heun_steps_compiled = False
+                return self._heun_steps(x, u_t, dt, num_steps, i_edge_const)
+        return self._heun_steps(x, u_t, dt, num_steps, i_edge_const)
+
+    def _heun_steps(
+        self,
+        x: torch.Tensor,
+        u_t: torch.Tensor,
+        dt: float,
+        num_steps: int,
+        i_edge_const: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Run ``num_steps`` Heun integration steps (predictor-corrector).
+
+        Extracted from :meth:`_forward_heun_sequence` so :func:`torch.compile`
+        can capture the hot inner loop into fused CUDA kernels. The outer
+        per-sample loop in ``_forward_heun_sequence`` stays Python so the
+        torch.compile recompilation cost is paid only once per
+        (B, N) shape combination, not per (T, num_steps) slice.
+        """
+        for _ in range(num_steps):
+            k1 = self.rhs(x, u=u_t, x_drive=None, drive_scale=0.0,
+                          i_edge_const=i_edge_const)
+            x_pred = x + dt * k1
+            k2 = self.rhs(x_pred, u=u_t, x_drive=None, drive_scale=0.0,
+                          i_edge_const=i_edge_const)
+            x = x + 0.5 * dt * (k1 + k2)
+        return x
+
+    def enable_sequence_compile(self) -> None:
+        """Wrap :meth:`_heun_steps` with :func:`torch.compile` for speed.
+
+        Call this once after the stage is built (and before training). On
+        CUDA, the inner Heun loop compiles into fused kernels via Inductor,
+        typically yielding 2-3x speedup on the per-sample hot path. On CPU
+        the speedup is smaller (if any); the flag is still safe to set.
+
+        If compilation fails at runtime (e.g. no C++ compiler on CPU-only
+        environments), :meth:`_call_heun_steps` catches the error and falls
+        back to the uncompiled version so training can proceed.
+
+        Cached: subsequent calls are no-ops.
+        """
+        if getattr(self, "_heun_steps_compiled", False):
+            return
+        try:
+            self._heun_steps_compiled_fn = torch.compile(
+                self._heun_steps, dynamic=False
+            )
+            self._heun_steps_compiled = True
+        except Exception as e:
+            print(
+                f"  [torch.compile] skipping sequence compile: {e}\n"
+                f"  [torch.compile] training will proceed without compilation."
+            )
+            self._heun_steps_compiled = False
 
     def forward_equilibrium(
         self,

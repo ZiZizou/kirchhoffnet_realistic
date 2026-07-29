@@ -42,12 +42,27 @@ Training protocol (rewritten 2026-07-29 to fix three critical bugs):
     - Sequential truncated BPTT: ``B`` parallel independent NARMA streams
       (``--n-streams``), state carried across chunks, ``detach()`` only at
       chunk boundaries (``--tbptt-chunk`` samples per chunk). Each chunk is
-      one optimizer step. With B=4 streams × 2500 samples / 50 chunk = 200
-      optimizer steps per epoch × 200 epochs = 40,000 total Adam steps
-      (vs the old 200).
+      one optimizer step. With B=4 streams × 2500 samples / 25 chunk = 100
+      optimizer steps per epoch × 200 epochs = 20,000 total Adam steps.
+      (Default chunk reduced from 50 → 25 in 2026-07-29 for faster optimizer
+      updates; user can override via ``--tbptt-chunk``.)
+    - Per-chunk inner loop is BATCHED via
+      ``DifferentialStage._forward_heun_sequence`` (2026-07-29), eliminating
+      the per-sample ``net()`` wrapper overhead. Was 50 calls/chunk, now 1.
+    - ``--compile`` wraps the per-sample Heun step loop with ``torch.compile``
+      for fused CUDA kernels (~2-3x additional speedup on GPU; first call
+      adds ~10-30s compilation overhead).
+    - ``--num-steps 4`` (was 6) cuts per-sample RHS compute by 33%.
     - Targets standardized (zero-mean, unit-variance), denormalized at eval.
     - Bipolar input drive: u ∈ [0, 0.5] → V_u ∈ [-3.0, +3.0] (use
       ``--unipolar`` for the old [0, +3.0] mapping).
+
+Per-epoch validation:
+    ``--val-every N`` (default 5) evaluates the running model on the test set
+    every N epochs and shows ``nrmse``/``r2`` in the epoch progress bar. This
+    gives real-time convergence feedback during long training runs.
+    Set to 0 to disable. Validation uses the one-shot ``_evaluate_fabric_direct``
+    path (~0.1s overhead per eval).
 
 Diagnostics:
     ``--ridge-diagnostic`` runs ridge-on-frozen-states first: the untrained
@@ -578,6 +593,10 @@ def train_fabric(
     use_amp: bool = True,
     standardize: bool = True,
     grad_clip: float = 1.0,
+    val_every: int = 0,
+    val_u_test: torch.Tensor | None = None,
+    val_y_test: torch.Tensor | None = None,
+    val_washout: int = 200,
 ) -> dict[str, Any]:
     """Train the fabric with sequential truncated BPTT.
 
@@ -614,10 +633,16 @@ def train_fabric(
         use_amp: Mixed-precision training (no-op on CPU).
         standardize: If True, normalize y to zero-mean/unit-variance.
         grad_clip: Max gradient norm (AdamW clip).
+        val_every: If >0, evaluate test-set NRMSE/R^2 every N epochs
+            (using ``val_u_test``/``val_y_test``). Default 0 (disabled).
+        val_u_test: Validation input sequence (shape ``(T,)``).
+        val_y_test: Validation target sequence (shape ``(T,)``).
+        val_washout: Initial samples to discard for validation (default 200).
 
     Returns:
         Dict with ``train_loss_history``, ``final_loss``,
-        ``y_mean`` and ``y_std`` (zero if not standardizing).
+        ``y_mean``, ``y_std``, and (when ``val_every>0``)
+        ``val_nrmse_history``, ``val_r2_history``, ``val_epochs``.
     """
     net.to(device)
     u_train = u_train.to(device)
@@ -692,12 +717,33 @@ def train_fabric(
     history: list[float] = []
     raw_leak_grad_history: list[float] = []
     hidden_rms_history: list[float] = []
+    val_nrmse_history: list[float] = []
+    val_r2_history: list[float] = []
+    val_epochs: list[int] = []
     t_start = time.time()
 
     log_interval = max(1, epochs // 20)
     epoch_times: list[float] = []
 
     state_width = net.hid_count + net.proj_count + net.output_ode_count
+
+    # Single-stage NARMA: hoist stage references and integrator config
+    # out of the chunk loop. The batched inner path uses
+    # stage._forward_heun_sequence to eliminate per-sample wrapper
+    # overhead (mirrors _evaluate_fabric_direct, but in train mode).
+    if not hasattr(net, "core") or not hasattr(net.core, "stages"):
+        raise ValueError(
+            "train_fabric batched inner loop requires a KirchhoffNetWithIO "
+            "wrapper exposing net.core.stages[0]. This net does not have it."
+        )
+    if len(net.core.stages) != 1:
+        raise ValueError(
+            f"train_fabric batched inner loop currently supports single-stage "
+            f"topologies only, got {len(net.core.stages)} stages."
+        )
+    stage = net.core.stages[0]
+    t_span = float(net.core.stage_times[0])
+    num_steps = int(net.core.stage_steps[0])
 
     epoch_iter_outer = _progress_iter(
         range(epochs), desc="fabric epochs",
@@ -733,29 +779,41 @@ def train_fabric(
 
             u_chunk = u_train[:, cs:ce]   # (B, K)
             y_chunk = y_train_used[:, cs:ce]  # (B, K)
-            loss = 0.0
-            hidden_acc_sq = 0.0
-            hidden_count = 0
 
+            # Batched inner loop: process all K samples in one stage call,
+            # eliminating per-sample wrapper overhead. Mirrors the fast
+            # _evaluate_fabric_direct path but in train mode (gradients
+            # thread through the entire chunk; only the chunk boundary
+            # is detached).
             with autocast("cuda", enabled=amp_enabled):
-                for s in range(tbptt_chunk):
-                    u_b = u_chunk[:, s].unsqueeze(-1)   # (B, 1)
-                    y_b = y_chunk[:, s]                  # (B,)
-                    y_pred, _, final_state = net(
-                        u_b, initial_state=state, return_final_state=True,
-                    )
-                    y_pred = y_pred.squeeze(-1)           # (B,)
-                    loss = loss + F.mse_loss(y_pred, y_b)
-                    # Track hidden voltage RMS (use hidden portion of state).
-                    # Accumulate sum-of-squares across the chunk, compute
-                    # RMS at the chunk boundary.
-                    if net.hid_count > 0:
-                        h = final_state[:, :net.hid_count]
-                        hidden_acc_sq += float(h.detach().pow(2).sum().item())
-                        hidden_count += h.numel()
-                    state = final_state  # NO detach within chunk
+                # _forward_heun_sequence expects (B, K, 1) for multi-stream.
+                u_seq_batched = u_chunk.unsqueeze(-1)  # (B, K, 1)
+                all_states = stage._forward_heun_sequence(
+                    x0=state,
+                    t_span=t_span,
+                    num_steps=num_steps,
+                    u_seq=u_seq_batched,
+                )  # (K, B, N)
+                # Read slice (output_ode_count tail for temporal-readout).
+                x_read = all_states[:, :, net.read_slice]  # (K, B, R)
+                y_pred = net.output_mapper(x_read)  # (K, B, out_dim)
+                if y_pred.dim() == 3:
+                    y_pred = y_pred.squeeze(-1)  # (K, B)
+                # y_chunk is (B, K) -> transpose to (K, B) for direct comparison.
+                loss = F.mse_loss(y_pred, y_chunk.t())
 
-                loss = loss / tbptt_chunk
+                # Hidden voltage RMS over the chunk's last sample (matches
+                # the original "RMS at chunk boundary" semantic).
+                hidden_acc_sq = 0.0
+                hidden_count = 0
+                if net.hid_count > 0:
+                    final_state = all_states[-1]
+                    h = final_state[:, :net.hid_count]
+                    hidden_acc_sq = float(h.detach().pow(2).sum().item())
+                    hidden_count = h.numel()
+
+                # The new state for next chunk: the last sample's state.
+                state = all_states[-1]
 
             # Backward
             scaler.scale(loss).backward()
@@ -764,7 +822,7 @@ def train_fabric(
 
             # Capture per-param-group gradient norms (every epoch).
             # raw_leak has shape (num_nodes,) = (hid_count + proj_count +
-            # output_ode_count), not hid_count alone — match by name
+            #output_ode_count), not hid_count alone — match by name
             # rather than dim to be robust across stage topologies.
             raw_leak_grad = 0.0
             for name, p in net.named_parameters():
@@ -795,12 +853,35 @@ def train_fabric(
         raw_leak_grad_history.append(leak_grad_avg)
         hidden_rms_history.append(h_rms_avg)
 
+        # Periodic validation: evaluate on a held-out test stream.
+        # Uses _evaluate_fabric_direct (single-shot Heun over the whole
+        # sequence) so the overhead is ~0.1s — negligible vs the chunk loop.
+        val_nrmse = float("nan")
+        val_r2v = float("nan")
+        if (
+            val_every > 0
+            and val_u_test is not None
+            and val_y_test is not None
+            and ((epoch + 1) % val_every == 0 or epoch == epochs - 1)
+        ):
+            y_pred_v, y_te_v = _evaluate_fabric_direct(
+                net, val_u_test, val_y_test, washout=val_washout,
+                device=device, y_mean=y_mean, y_std=y_std,
+            )
+            val_nrmse = nrmse(y_pred_v, y_te_v)
+            val_r2v = r2(y_pred_v, y_te_v)
+            val_nrmse_history.append(val_nrmse)
+            val_r2_history.append(val_r2v)
+            val_epochs.append(epoch)
+
         # Update outer tqdm bar with per-epoch metrics.
         if _HAS_TQDM and verbose:
             epoch_iter_outer.set_postfix(
                 loss=f"{avg:.4f}",
                 h_rms=f"{h_rms_avg:.3f}",
                 leak_grad=f"{leak_grad_avg:.2e}",
+                nrmse=f"{val_nrmse:.3f}",
+                r2=f"{val_r2v:.3f}",
             )
 
         t_epoch = time.time() - t_start
@@ -814,11 +895,17 @@ def train_fabric(
                 eta_str = f"ETA {eta:.0f}s"
             else:
                 eta_str = ""
+            val_str = ""
+            if val_every > 0 and val_nrmse_history:
+                val_str = (
+                    f"  NRMSE={val_nrmse_history[-1]:.4f}  "
+                    f"R^2={val_r2_history[-1]:.4f}"
+                )
             print(
                 f"  fabric epoch {epoch:3d}/{epochs}  loss={avg:.6f}  "
                 f"h_rms={hidden_rms_history[-1]:.4f}  "
                 f"leak_grad={raw_leak_grad_history[-1]:.2e}  "
-                f"{t_epoch:.1f}s  {eta_str}"
+                f"{t_epoch:.1f}s  {eta_str}{val_str}"
             )
 
     total_elapsed = time.time() - t_start
@@ -833,6 +920,9 @@ def train_fabric(
         "final_loss": history[-1] if history else float("nan"),
         "raw_leak_grad_history": raw_leak_grad_history,
         "hidden_rms_history": hidden_rms_history,
+        "val_nrmse_history": val_nrmse_history,
+        "val_r2_history": val_r2_history,
+        "val_epochs": val_epochs,
         "y_mean": y_mean,
         "y_std": y_std,
     }
@@ -1160,6 +1250,10 @@ def run_fabric_condition(
     do_ridge_diagnostic: bool = False,
     t_span: float | None = None,
     num_steps: int | None = None,
+    compile_sequence: bool = False,
+    val_every: int = 5,
+    val_u_test: torch.Tensor | None = None,
+    val_y_test: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """Train one fabric condition and return its results.
 
@@ -1179,6 +1273,13 @@ def run_fabric_condition(
             the preset default (1.0; was 7.0 historically).
         num_steps: Heun steps per sample. If None, falls back to preset
             default (6).
+        compile_sequence: If True, wrap the per-sample Heun step loop with
+            ``torch.compile`` for fused-kernel speedup (~2-3x on GPU).
+        val_every: Evaluate test-set NRMSE/R^2 every N epochs (default 5).
+            Set to 0 to disable.
+        val_u_test: Optional pre-generated validation input (re-used across
+            epochs). If None, generated from the standard test seed.
+        val_y_test: Optional pre-generated validation target.
 
     Returns dict with:
         - "nrmse": test NRMSE on the washed test set
@@ -1188,6 +1289,9 @@ def run_fabric_condition(
         - "train_loss_history": list of training losses
         - "raw_leak_grad_history": per-epoch gradient norm of raw_leak
         - "hidden_rms_history": per-epoch RMS of hidden node voltages
+        - "val_nrmse_history": per-validation NRMSE (only epochs where eval ran)
+        - "val_r2_history": per-validation R^2 (only epochs where eval ran)
+        - "val_epochs": epoch indices at which val was recorded
         - "n_params": parameter count
         - "ridge_nrmse": (optional) ridge-on-frozen-states NRMSE
         - "ridge_r2": (optional) ridge-on-frozen-states R^2
@@ -1219,6 +1323,14 @@ def run_fabric_condition(
         enable_temporal_readout=True,
         freeze_read=freeze_read,
     )
+
+    # Optionally wrap the per-sample Heun loop with torch.compile for
+    # ~2-3x speedup on GPU (fused CUDA kernels via Inductor). The first
+    # call adds ~10-30s compilation overhead, then subsequent calls run
+    # at compiled speed.
+    if compile_sequence:
+        for stage in net.core.stages:
+            stage.enable_sequence_compile()
 
     # ---- (Optional) Ridge-on-frozen-states diagnostic BEFORE training ----
     ridge_result: dict[str, float] = {}
@@ -1265,6 +1377,10 @@ def run_fabric_condition(
         use_amp=use_amp,
         standardize=True,
         grad_clip=1.0,
+        val_every=val_every,
+        val_u_test=val_u_test if val_u_test is not None else u_test,
+        val_y_test=val_y_test if val_y_test is not None else y_test,
+        val_washout=200,
     )
 
     # Evaluate: denormalize predictions using training-set stats.
@@ -1294,6 +1410,9 @@ def run_fabric_condition(
         "train_loss_history": res["train_loss_history"],
         "raw_leak_grad_history": res.get("raw_leak_grad_history", []),
         "hidden_rms_history": res.get("hidden_rms_history", []),
+        "val_nrmse_history": res.get("val_nrmse_history", []),
+        "val_r2_history": res.get("val_r2_history", []),
+        "val_epochs": res.get("val_epochs", []),
         "n_params": n_params,
         "freeze_read": freeze_read,
         "t_span": t_span,
@@ -1342,8 +1461,10 @@ def parse_args() -> argparse.Namespace:
                         help="Comma-separated list of RNG seeds (default '0,1,2')")
     parser.add_argument("--epochs", type=int, default=200,
                         help="Fabric training epochs per condition (default 200)")
-    parser.add_argument("--tbptt-chunk", type=int, default=50,
-                        help="TBPTT chunk size K (samples per optimizer step; default 50)")
+    parser.add_argument("--tbptt-chunk", type=int, default=25,
+                        help="TBPTT chunk size K (samples per optimizer step; default 25; "
+                             "was 50 historically — 25 gives 2x more optimizer steps "
+                             "per epoch at half the sequential compute per step)")
     parser.add_argument("--n-streams", type=int, default=4,
                         help="Number of parallel independent NARMA streams (default 4)")
     parser.add_argument("--train-samples", type=int, default=2500,
@@ -1366,8 +1487,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--t-span", type=float, default=1.0,
                         help="Override t_span per sample for NARMA (default 1.0; "
                              "old value 7.0 gives ~3-sample memory horizon, too short)")
-    parser.add_argument("--num-steps", type=int, default=6,
-                        help="Heun steps per sample (default 6; with t_span=1.0, dt=0.167)")
+    parser.add_argument("--num-steps", type=int, default=4,
+                        help="Heun steps per sample (default 4; with t_span=1.0, dt=0.25; "
+                             "was 6 historically — 4 cuts per-sample compute by 33%)")
+    parser.add_argument("--compile", action="store_true",
+                        help="Wrap the per-sample Heun steps with torch.compile "
+                             "for fused CUDA kernels. ~2-3x speedup on GPU. "
+                             "Adds ~10-30s compilation overhead on first call.")
+    parser.add_argument("--val-every", type=int, default=5,
+                        help="Evaluate test-set NRMSE/R^2 every N epochs (default 5). "
+                             "Set to 0 to disable.")
     return parser.parse_args()
 
 
@@ -1437,6 +1566,8 @@ def main() -> int:
                 do_ridge_diagnostic=args.ridge_diagnostic,
                 t_span=args.t_span,
                 num_steps=args.num_steps,
+                compile_sequence=args.compile,
+                val_every=args.val_every,
             )
             result_row = {
                 "seed": seed,

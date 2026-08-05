@@ -1126,6 +1126,137 @@ PRESET_FRIEDMAN2 = make_friedman2_preset()
 PRESET_FRIEDMAN3 = make_friedman3_preset()
 
 
+# =============================================================================
+# NARMA reservoir task (narma-discriminator plan)
+# =============================================================================
+# Sequential regression benchmark: the fabric runs one Heun integration
+# window per discrete sample, with state carried across samples (no reset).
+# Inputs enter continuously via boundary-terminal OTA edges. The output
+# ODE accumulator nodes integrate during each window; readout is taken at
+# window end and linearly projected to y_hat(n).
+#
+# Hidden topology: 5x5 torus = 25 hidden nodes, matching the ESN baseline
+# (same node count = honest comparison). One stage, 14 Heun steps per
+# sample, t_span chosen so dominant tau ~0.5-5 time units (a small per-window
+# integration budget that lets the boundary drive actually evolve state).
+#
+# The freeze_read flag is configurable per-experiment: this preset does NOT
+# pin it; the experiment script (narma_experiment.py) sets it explicitly.
+
+def make_narma_preset(
+    order: int = 10,
+    hidden_dim: int = 25,
+    num_stages: int = 1,
+    num_steps_per_sample: int = 6,
+    output_ode_count: int = 1,
+    bidirectional: bool = False,
+    edge_repeats: int = 1,
+    t_span: float = 1.0,
+) -> dict:
+    """Build the NARMA reservoir-task preset.
+
+    Args:
+        order: NARMA order (10 or 20). Stored for the experiment script
+            to read; does not affect the network topology directly.
+        hidden_dim: Number of hidden nodes (default 25, matching ESN
+            baseline). Must be a perfect square for the torus family.
+        num_stages: Number of ODE stages stacked. Each stage has its own
+            ``t_span`` (split from the global config). With ``num_stages=1``
+            the whole window is one stage; with >1 the window is sliced
+            into shorter stages (rare for NARMA).
+        num_steps_per_sample: Heun steps per sample window.
+        output_ode_count: Number of output ODE accumulator nodes (1 for
+            scalar y_hat). Sized for ``enable_temporal_readout=True``.
+        bidirectional: Whether hidden grid edges emit two directed edges
+            per pair (i->j and j->i).
+        edge_repeats: Parallel edges per hidden pair.
+        t_span: ODE integration window duration per sample. Defaults to
+            1.0 (vs SOLVER["t_span"]=7.0 used in static regression tasks).
+            The NARMA preset overrides the global setting because in
+            streaming tasks each integration covers ONE timestep, not the
+            full inference: with leak~0.05 and C_eff=1, t_span=7.0 gives
+            per-sample state decay exp(-0.05*7)~0.7 = ~3 sample memory
+            horizon (too short for NARMA-10). t_span=1.0 gives ~0.95
+            retention per sample = ~20 sample memory horizon.
+
+    Returns:
+        Fresh preset dict ready for ``build_net_from_preset``.
+    """
+    if hidden_dim < 4:
+        raise ValueError(
+            f"NARMA preset requires hidden_dim >= 4, got {hidden_dim}"
+        )
+    side = int(round(hidden_dim ** 0.5))
+    if side * side != hidden_dim:
+        raise ValueError(
+            f"NARMA preset: hidden_dim={hidden_dim} must be a perfect square "
+            f"for the torus family (5x5=25, 7x7=49, ...)."
+        )
+
+    stages_cfg = [{
+        "num_inputs": 1,
+        "num_hidden": hidden_dim,
+        "num_proj": 0,
+        "num_outputs": 0,
+        "hidden_family": "torus",
+        "hidden_kwargs": {
+            "height": side,
+            "width": side,
+            "kernel_size": 3,
+            "bidirectional": bidirectional,
+        },
+        "edge_repeats": edge_repeats,
+        "input_pattern": "none",
+        "output_pattern": "all_to_all",
+        "proj_pattern": "none",
+        "t_span": t_span,
+        "num_steps": num_steps_per_sample,
+    }] * num_stages
+
+    # Boundary-fan-out: drive the input V_u(n) into every hidden node so
+    # the OTA edges actually push current into the fabric. Targets cover
+    # the whole grid (every hidden node gets a boundary edge from input 0).
+    boundary_fan_out = {0: list(range(hidden_dim))}
+
+    return {
+        "stages": stages_cfg,
+        "use_robust_input": False,
+        "loss": "mse",
+        "out_dim": 1,
+        # write_mode must be one of the valid choices; in practice the
+        # input_mapper is bypassed (NullInputMapper) because boundary_fan_out
+        # is provided. The actual input signal enters via the boundary OTA
+        # edges. This is consistent with boundary-mode behaviour.
+        "write_mode": "one_to_one",
+        "boundary_fan_out": boundary_fan_out,
+        "enable_temporal_readout": True,
+        "output_ode_count": output_ode_count,
+        # Read slice for temporal readout is automatic (output_ode_count
+        # entries appended to the state vector). OutputMapper is replaced
+        # by OutputAffine in the temporal-readout path.
+        "read_idx": None,
+        # Narma order stored for the experiment script to read.
+        "narma_order": order,
+        "narma_x_max_rail": PHYS["x_max"],
+        # Mild regularizers; NARMA is a regression task so heavy gate
+        # pressure tends to over-prune. Keep the same defaults as the
+        # grid presets.
+        "lambdas": {
+            "sparsity": 1e-6,
+            "edge_gate": 0,
+            "node_gate": 0.0,
+            "power": 1e-6,
+            "capacitance": 0.0,
+            "rail": 0.1,
+        },
+        "tau_anneal": True,
+    }
+
+
+PRESET_NARMA10 = make_narma_preset(order=10, hidden_dim=25)
+PRESET_NARMA20 = make_narma_preset(order=20, hidden_dim=25)
+
+
 PRESETS = {
     "sinx": PRESET_SINX,
     "housing": PRESET_HOUSING,
@@ -1135,4 +1266,6 @@ PRESETS = {
     "friedman1": PRESET_FRIEDMAN1,
     "friedman2": PRESET_FRIEDMAN2,
     "friedman3": PRESET_FRIEDMAN3,
+    "narma10": PRESET_NARMA10,
+    "narma20": PRESET_NARMA20,
 }

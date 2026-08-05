@@ -4060,7 +4060,7 @@ def main():
     )
     with open(final_metrics_path, "w") as f:
         f.write(f"problem: {args.problem}\n")
-        f.write(f"loss: {args.loss}\n")
+        f.write(f"loss: {PRESETS[args.problem]['loss']}\n")
         f.write(f"best_epoch: {best_epoch}\n")
         f.write(f"best_val: {best_val:.6f}\n")
         if has_best_orig:
@@ -4076,6 +4076,7 @@ def main():
             f.write("best_mape_orig: nan\n")
         f.write(f"epochs_run: {len(history)}\n")
         f.write(f"elapsed_seconds: {elapsed:.2f}\n")
+        f.write(f"param_count: {n_params}\n")
 
     if best_state is not None:
         raw = net.module if isinstance(net, torch.nn.DataParallel) else net

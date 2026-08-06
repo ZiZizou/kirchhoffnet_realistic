@@ -1699,6 +1699,7 @@ def build_net_from_config(
     enable_temporal_readout: bool = False,
     vca_enabled: bool = False,
     vca_rank: int | None = None,
+    x_max: float | None = None,
 ):
     """Build a KirchhoffNetWithIO from a full config dict.
 
@@ -2099,6 +2100,7 @@ def build_net_from_config(
             vca_enabled=vca_enabled_effective,
             vca_rank=vca_rank_effective,
             vca_in_dim=in_dim,
+            x_max=x_max,
         )
         stage_modules.append(stage)
         stage_times.append(float(stages_cfg[stage_idx].get("t_span", 0.5)))

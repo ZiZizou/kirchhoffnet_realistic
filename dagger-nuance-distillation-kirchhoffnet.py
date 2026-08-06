@@ -1,114 +1,82 @@
-# ---
-# jupyter:
-#   jupytext:
-#     text_representation:
-#       extension: .py
-#       format_name: percent
-#       format_version: '1.3'
-#       jupytext_version: 1.19.5
-#   kernelspec:
-#     display_name: Python 3
-#     language: python
-#     name: python3
-# ---
+"""CTLE Inverse Design: KirchhoffNet Student (DAgger)
 
-# %% [markdown]
-#  # CTLE Inverse Design: KirchhoffNet Student (DAgger)
-#
-#
-#
-#  **Goal:** Train an ODE-based KirchhoffNet student that learns the inverse design policy
-#  from the teacher (RealNVP flow + ZIG critic) using the full DAgger distillation loop.
-#
-#
-#
-#  **This variant:** Uses the LOCAL KirchhoffNet codebase (an ODE-based fabric built
-#  via `topology.build_net_from_config`), wrapped to provide the same `forward` /
-#  `predict` / `log_lo` / `log_hi` API as the MLP student so the DAgger loop,
-#  RegimeAwareLoss, and StudentEvaluator work unchanged.
-#
-#
-#
-#  **Student architecture** (CLI-overridable below):
-#
-#  - input scaling: 4-dim Q75 normalization -> boundary terminal voltages
-#     (rail-clamped to [-3, 3] for FreeTanhLibrary x_max)
-#  - fabric: 3-stage KirchoffNetWithIO built with small_world (k=4, p=0.2) hidden
-#     topology, 23 hidden nodes per stage, edge_repeats=2, boundary fan-out map
-#     tying each input terminal to specific hidden nodes, temporal-readout
-#     appending 7 output ODE accumulators per stage routed through OutputAffine
-#  - circuit: FreeTanhLibrary edges per stage, non-programmable leak, freeze_read,
-#     interstage activation "residual-relu-tanh"
-#  - output: OutputAffine (gain/bias + tanh/relu residual branches) of the 7
-#     output-ODE node voltages -> bounded via sigmoid + log_lo/log_hi buffers
-#
-#
-#
-#  **Key design:**
-#
-#  - LocalKirchhoffStudentWrapper provides the MLP-compatible API (forward / predict /
-#     log_lo / log_hi / scale_input / get_bounded_output / count_params_by_component)
-#
-#  - Regime-aware loss preserved: imitation + ZIG forward-consistency + physics + invalid + manifold
-#
-#  - Adaptive teacher labeling (tiered candidate budget)
-#
-#  - Huber imitation + ZIG forward-consistency + physics loss
+Standalone training script (originally a jupytext `.py` of a notebook).
+Run directly: ``python dagger-nuance-distillation-kirchhoffnet.py`` after
+editing the path constants below to point at local teacher artifacts and
+data.
 
-# %%
+Goal: train an ODE-based KirchhoffNet student that learns the inverse
+design policy from the teacher (RealNVP flow + ZIG critic) using the full
+DAgger distillation loop.
+
+This variant uses the LOCAL KirchhoffNet codebase (an ODE-based fabric
+built via ``topology.build_net_from_config``), wrapped to provide the same
+``forward`` / ``predict`` / ``log_lo`` / ``log_hi`` API as the MLP student
+so the DAgger loop, RegimeAwareLoss, and StudentEvaluator work unchanged.
+
+Student architecture (configured via the ``KN_*`` constants below):
+- input scaling: per-dim log10 + min-max -> [-1, +1] (computed from the
+  empirical df with a 5% margin), rail-clamped to [-KN_INPUT_RAIL, +KN_INPUT_RAIL]
+  (= [-4, 4], matching the local x_max=4.0).
+- fabric: 3-stage KirchhoffNetWithIO built with small_world (k=4, p=0.2)
+  hidden topology, 23 hidden nodes per stage, edge_repeats=2, boundary
+  fan-out map tying each input terminal to specific hidden nodes,
+  temporal-readout appending 7 output ODE accumulators per stage.
+- circuit: FreeTanhLibrary edges per stage, non-programmable leak,
+  freeze_read, interstage activation "residual-relu-tanh".
+- output: gain/bias + tanh/relu residual branches of the 7 output-ODE
+  node voltages -> bounded via sigmoid + log_lo/log_hi buffers.
+
+Key design:
+- LocalKirchhoffStudentWrapper provides the MLP-compatible API
+  (forward / predict / log_lo / log_hi / scale_input /
+  get_bounded_output / count_params_by_component).
+- Regime-aware loss preserved: imitation + ZIG forward-consistency +
+  physics + invalid + manifold.
+- Adaptive teacher labeling (tiered candidate budget).
+- Huber imitation + ZIG forward-consistency + physics loss.
+"""
+
 import os
-# os.chdir('/home/annaik/Documents/train_ctle')
-
-TEACHER_DIR = '/kaggle/input/models/awekill/improved-zig-nf-spline/pytorch/default/2'
-DATA_DIR = '/kaggle/input/datasets/awekill/augmented-cvae-ctle'
-OUTPUT_DIR = '/kaggle/working/'
-
-
-# %%
-# !pip install torchdiffeq
-# !git clone https://github.com/zhengqigao/kirchhoffnet.git
-
-# %% [markdown]
-#  ## Phase 1: Setup and Imports
-
-# %%
 import sys
 import json
+import time
+import logging
+from functools import wraps
+
 import joblib
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributions as dist
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler, Subset
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.neighbors import NearestNeighbors
 import matplotlib.pyplot as plt
 import warnings
-from sklearn.neighbors import NearestNeighbors
 warnings.filterwarnings('ignore')
 
-# Make the local KirchhoffNet codebase importable.
-# On Kaggle the repo lives at /kaggle/working/<repo>; locally this file's
-# directory already IS the repo, so we add the repo root to sys.path.
-_LOCAL_KIRCHHOFF_CANDIDATES = [
-    os.environ.get("KIRCHHOFF_DIR", "").strip(),
-    "/kaggle/working/kirchhoffnet",
-    "/kaggle/working/kirchhoffnet_realistic",
-    os.path.dirname(os.path.abspath(__file__)),
-]
-for _candidate in _LOCAL_KIRCHHOFF_CANDIDATES:
-    if _candidate and os.path.isdir(_candidate) and _candidate not in sys.path:
-        sys.path.insert(0, _candidate)
-        break
+# Paths to edit for local runs (these default to Kaggle-mount paths).
+TEACHER_DIR = '/home/annaik/Documents/improved-zig-nf-spline-pytorch-default-v2/'
+DATA_DIR = '/home/annaik/Documents/augmented-cvae-ctle/'
+OUTPUT_DIR = '/home/annaik/Documents/dagger_output'
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Make the local KirchhoffNet codebase importable. This file lives in the
+# repo root, so adding the script directory is sufficient.
+_LOCAL_KIRCHHOFF_DIR = os.path.dirname(os.path.abspath(__file__))
+if _LOCAL_KIRCHHOFF_DIR not in sys.path:
+    sys.path.insert(0, _LOCAL_KIRCHHOFF_DIR)
+
+from config import SOLVER
+from cell_library import make_cell_library
+from topology import build_net_from_config
 
 np.random.seed(42)
 torch.manual_seed(42)
 
 DEVICE = torch.device('cuda', 0) if torch.cuda.is_available() else torch.device('cpu')
-
-import logging
-import time
-from functools import wraps
 
 _LOG_FMT = "%(asctime)s [%(levelname)s] %(message)s"
 _DATE_FMT = "%H:%M:%S"
@@ -135,7 +103,6 @@ class Timer:
 _logger.info(f"Using device: {DEVICE}")
 
 
-# %%
 """
 ===========================================================
 HYPERPARAMETERS — edit all DAgger / training knobs here
@@ -190,17 +157,17 @@ KN_CELL_LIBRARY     = "tanh_free"   # FreeTanhLibrary (per-edge tanh OTA)
 KN_LEAK_MODE        = "non-programmable"  # fixed leak_constant (config default 0.0486)
 KN_INTERSTAGE_ACTIVATION = "residual-relu-tanh"  # interstage StageTransfer activation
 KN_BOUNDARY_FAN_OUT = '{"0": [2, 12], "1": [7, 17], "2": [22, 5], "3": [10, 15]}'  # 4 inputs -> 8 boundary edges
-KN_INPUT_RAIL       = 3.0     # clamp normalized input to [-KN_INPUT_RAIL, KN_INPUT_RAIL] (x_max=3.0)
+KN_INPUT_RAIL       = 4.0     # clamp normalized input to [-KN_INPUT_RAIL, KN_INPUT_RAIL] (x_max=4.0)
+KN_X_MAX            = 4.0     # local knet rail (overrides PHYS["x_max"]=3.0 via build_net_from_config x_max kwarg)
 
+# Fallback per-dim log10 spec bounds used when historical data is unavailable.
+# Order: [power, jitter, height, width]. Rebound from df after data load below.
+KN_INPUT_LOG_MIN_DEFAULT = np.array([np.log10(1e-4), np.log10(1.0), np.log10(0.5), np.log10(1.0)], dtype=np.float32)
+KN_INPUT_LOG_MAX_DEFAULT = np.array([np.log10(1e-1), np.log10(1e3), np.log10(2e2), np.log10(5e2)], dtype=np.float32)
+KN_INPUT_LOG_MIN = KN_INPUT_LOG_MIN_DEFAULT
+KN_INPUT_LOG_MAX = KN_INPUT_LOG_MAX_DEFAULT
+KN_INPUT_LOG_PAD_FRAC = 0.05  # widen each bound by this fraction of the dim range
 
-
-# %%
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.distributions as dist
-import joblib
-from pathlib import Path
 
 LOG_BOUNDS = [-15.0, 8]
 
@@ -530,20 +497,6 @@ class ActNorm(nn.Module):
             return y, -self.log_scale.sum()
 
 
-class Permute(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        perm = torch.arange(dim - 1, -1, -1)
-        self.register_buffer('perm', perm)
-        self.register_buffer('inv_perm', torch.argsort(perm))
-
-    def forward(self, x, cond=None, reverse=False):
-        if not reverse:
-            return x[:, self.perm], 0.0
-        else:
-            return x[:, self.inv_perm], 0.0
-
-
 class ConditionalSplineFlow(nn.Module):
     """
     Conditional Spline Flow matching trained ctle_conditional_flow.pt.
@@ -800,22 +753,6 @@ class FlowInference:
 
         return best_phys, best_preds.cpu().numpy(), best_validity.cpu().numpy()
 
-    def _pred_specs_physical_from_scaled(self, pred_specs_scaled):
-        power_scaled = pred_specs_scaled[:, 0]
-        j_scaled = pred_specs_scaled[:, 1]
-        h_scaled = pred_specs_scaled[:, 2]
-        w_scaled = pred_specs_scaled[:, 3]
-        power_raw = 10 ** (power_scaled * self.scaler_y_p.scale_[0] + self.scaler_y_p.mean_[0])
-        j_raw = 10 ** (j_scaled * self._eye_scale_j)
-        h_raw = 10 ** (h_scaled * self._eye_scale_h)
-        w_raw = 10 ** (w_scaled * self._eye_scale_w)
-        if hasattr(power_raw, 'cpu'):
-            power_raw = power_raw.detach().cpu().numpy()
-            j_raw = j_raw.detach().cpu().numpy()
-            h_raw = h_raw.detach().cpu().numpy()
-            w_raw = w_raw.detach().cpu().numpy()
-        return np.stack([power_raw, j_raw, h_raw, w_raw], axis=1)
-
 
 def load_flow_inference(teacher_dir, device=None):
     """Load flow model, scalers, and ZIG wrapper for Q75 architecture."""
@@ -902,26 +839,9 @@ class FlowTeacherLabeler:
         return params
 
 
-
-# %%
-# Flow model already defined in Cell 4 above
-
-
-# %% [markdown]
-#  ## Phase 2: Load Teacher Artifacts
-
-# %% [markdown]
-#  ## Phase 3: Define ZIG Forward Model (Teacher Surrogate)
-
-# %%
-# ZIG model loaded above
-
-
-
-# %% [markdown]
-#  ## Phase 4: Load Scalers
-
-# %%
+# ----------------------------------------------------------------------------
+# Load teacher artifacts (flow + ZIG).
+# ----------------------------------------------------------------------------
 # Parameter scaler — flow model (used for flow inference only)
 flow_scaler_X = joblib.load(os.path.join(TEACHER_DIR, 'flow_scaler_X.pkl'))
 scaler_X = flow_scaler_X
@@ -945,8 +865,7 @@ eye_scale_w = float(zig_config['eye_scale_w'])
 eye_scale_j = float(zig_config['eye_scale_j'])
 PER_TARGET_HURDLE = bool(zig_config.get('per_target_hurdle', False))
 
-# ZIG-related functions (filter_by_zig_consistency, RegimeAwareLoss, compute_zig_score)
-# must use ZIG's own scalers, NOT flow's scalers.
+# ZIG-related code must use ZIG's own scalers, NOT flow's scalers.
 # Override globals: ZIG operations now use correct scalers.
 scaler_X = zig_scaler_X
 scaler_y_p = zig_scaler_y_p
@@ -972,8 +891,6 @@ for name, flow_val, zig_val in [
         _logger.warning(f"  eye_scale_{name} differs between flow_scaler_C and zig_config")
 
 
-
-# %%
 # Load the trained HybridHurdleModel as ZIG
 zig_model = HybridHurdleModel(dropout=0.0, per_target=PER_TARGET_HURDLE).to(DEVICE)
 zig_model.load_state_dict(torch.load(os.path.join(TEACHER_DIR, 'hybrid_hurdle_ctle_model.pt'),
@@ -984,23 +901,9 @@ for p in zig_model.parameters():
 _logger.info("HybridHurdleModel (ZIG) loaded from checkpoint")
 
 
-
-# %% [markdown]
-#  ## Phase 5: Define Spec Ranges and Output Bounds
-
-# %%
-# Spec ranges (from empirical ctle_ml_dataset.csv, 83k rows)
-SPEC_RANGES = {
-    'power': (0.0012, 0.012),
-    'stage_2_eye_max_height': (0.0, 88.4),
-    'stage_2_eye_max_width': (0.0, 98.5),
-    'stage_2_jitter': (1.57, 100.0),
-}
-
-# Input: [power, jitter, height, width]
-# These are the target specs we condition on
-SPEC_INPUT_COLS = ['power', 'stage_2_jitter', 'stage_2_eye_max_height', 'stage_2_eye_max_width']
-
+# ----------------------------------------------------------------------------
+# Output parameterization.
+# ----------------------------------------------------------------------------
 # Output: [fW, current, ind, Rd, Cs, Rs, VDD]
 PARAM_COLS = ['fW', 'current', 'ind', 'Rd', 'Cs', 'Rs', 'VDD']
 
@@ -1016,52 +919,17 @@ PARAM_LOG_BOUNDS = {
     'VDD':  (np.log10(0.6),   np.log10(1.2)),     # [−0.22, 0.08]
 }
 
-def params_from_logits(logits, param_log_bounds=PARAM_LOG_BOUNDS):
-    """Convert bounded logits to physical parameter values."""
-    # logits: shape (..., 7), unbounded
-    # Apply sigmoid to get [0, 1]
-    probs = torch.sigmoid(logits)
-    
-    results = {}
-    for i, (name, (log_lo, log_hi)) in enumerate(param_log_bounds.items()):
-        log_val = log_lo + (log_hi - log_lo) * probs[..., i]
-        results[name] = torch.pow(10, log_val)
-    
-    return results
-
-def params_to_log_logits(params_dict, param_log_bounds=PARAM_LOG_BOUNDS):
-    """Convert physical params back to unbounded logits (for loss computation)."""
-    logits = []
-    for name, (log_lo, log_hi) in param_log_bounds.items():
-        log_val = torch.log10(torch.clamp(params_dict[name], min=1e-12))
-        # Invert: prob = (log_val - log_lo) / (log_hi - log_lo)
-        prob = (log_val - log_lo) / (log_hi - log_lo)
-        prob = torch.clamp(prob, 0.0, 1.0)
-        # Inverse sigmoid
-        logits.append(torch.logit(prob.clamp(1e-6, 1-1e-6)))
-    return torch.stack(logits, dim=-1)
-
 _logger.info("Parameter log bounds defined:")
 for k, v in PARAM_LOG_BOUNDS.items():
     _logger.info(f"  {k}: [{v[0]:.2f}, {v[1]:.2f}] -> [10^{v[0]:.1f}, 10^{v[1]:.1f}]")
 
 
-# %% [markdown]
-#  ## Phase 6: Define Student (Local KirchhoffNet)
-
-# %%
 # =============================================================================
 # STUDENT MODEL: Local KirchhoffNet wrapper
 # =============================================================================
 # Provides MLP-compatible API (forward / predict / log_lo / log_hi /
 # get_bounded_output / scale_input / count_params_by_component) so the
 # DAgger loop, RegimeAwareLoss, and StudentEvaluator work unchanged.
-
-from config import SOLVER
-from cell_library import make_cell_library
-from topology import build_net_from_config
-from kirchhoff_net import KirchhoffNetWithIO
-from io_mapper import OutputAffine
 
 
 def _parse_boundary_fan_out(spec):
@@ -1088,7 +956,7 @@ class LocalKirchhoffStudentWrapper(nn.Module):
 
     Forward:
         specs (..., 4) raw physical units [power, jitter, height, width]
-            └─ scale_input(...)                                # Q75-normalize (4-dim), clamp to [-rail, rail]
+            └─ scale_input(...)                                # log10 + per-dim min-max -> [-1, +1], clamp to [-rail, rail]
                 └─ KirchhoffNetWithIO (boundary-mode)          # input -> 4-dim boundary voltages
                     └─ 3 ODE stages w/ interstage activation
                         └─ OutputAffine -> logits (..., 7)
@@ -1109,17 +977,21 @@ class LocalKirchhoffStudentWrapper(nn.Module):
                  boundary_fan_out=None,
                  enable_temporal_readout: bool = True,
                  num_targets: int = 7,
-                 input_rail: float = 3.0,
+                 input_rail: float = KN_INPUT_RAIL,
+                 x_max: float = KN_X_MAX,
                  param_log_bounds=None,
-                 scaler_C=None,
+                 input_log_min=None,
+                 input_log_max=None,
                  seed: int = 1,
                  stage_t_span: float | None = None,
                  stage_num_steps: int | None = None):
         super().__init__()
         if param_log_bounds is None:
             param_log_bounds = PARAM_LOG_BOUNDS
-        if scaler_C is None:
-            scaler_C = flow_scaler_C
+        if input_log_min is None:
+            input_log_min = KN_INPUT_LOG_MIN
+        if input_log_max is None:
+            input_log_max = KN_INPUT_LOG_MAX
 
         self.num_stages = int(num_stages)
         self.num_hidden = int(num_hidden)
@@ -1135,17 +1007,15 @@ class LocalKirchhoffStudentWrapper(nn.Module):
         self.enable_temporal_readout = bool(enable_temporal_readout)
         self.num_targets = int(num_targets)
         self.input_rail = float(input_rail)
+        self.x_max = float(x_max)
         self.param_log_bounds = param_log_bounds
         self._seed = int(seed)
 
-        # Q75 input scaling factors.
-        self.scaler_p_scale = float(scaler_C["scaler_y_p"].scale_[0])
-        self.scaler_p_mean = float(scaler_C["scaler_y_p"].mean_[0])
-        self._eye_scale_j = float(scaler_C["eye_scale_j"])
-        self._eye_scale_h = float(scaler_C["eye_scale_h"])
-        self._eye_scale_w = float(scaler_C["eye_scale_w"])
+        # Per-dim log10 spec bounds (4,) for log10 + min-max -> [-1, 1] input scaling.
+        self.register_buffer("input_log_min", torch.as_tensor(input_log_min, dtype=torch.float32))
+        self.register_buffer("input_log_max", torch.as_tensor(input_log_max, dtype=torch.float32))
 
-        # Bounded-output buffers (same scheme as RegimeAwareMoE / BoundedMLP).
+        # Bounded-output buffers.
         self.log_lo = nn.Parameter(torch.zeros(num_targets), requires_grad=False)
         self.log_hi = nn.Parameter(torch.zeros(num_targets), requires_grad=False)
         for i, (name, (lo, hi)) in enumerate(param_log_bounds.items()):
@@ -1192,27 +1062,31 @@ class LocalKirchhoffStudentWrapper(nn.Module):
             interstage_activation=interstage_activation,
             boundary_fan_out=self.boundary_fan_out,
             enable_temporal_readout=enable_temporal_readout,
+            x_max=self.x_max,
         )
         self._state_dim = num_hidden
         # local readout size is num_targets; the OutputAffine returns logits.
         self._output_dim = int(num_targets)
 
     def scale_input(self, x: torch.Tensor) -> torch.Tensor:
-        """Q75 scaling for the 4 raw spec dims -> boundary voltages.
+        """Per-dim log10 + min-max normalization for the 4 raw spec dims -> boundary voltages.
 
-        power: log10 -> StandardScaler(log10/52.5)
-        jitter / height / width: log10 / eye_scale
-        Result is rail-clamped to [-input_rail, +input_rail] (default 3.0)
-        so the boundary OTA gates stay in compliance.
+        For each of [power, jitter, height, width]:
+            u_i = 2 * (log10(x_i) - input_log_min[i]) / (input_log_max[i] - input_log_min[i]) - 1
+        so the empirical range maps linearly to [-1, +1] (with a small margin
+        applied to ``input_log_min/max`` at data-load time). Log space preserves
+        relative resolution across the wide multi-decade raw spec ranges.
+
+        Result is rail-clamped to [-input_rail, +input_rail] (default 4.0) as a
+        compliance guard so the boundary OTA gates stay well below the rail.
         """
         eps = 1e-12
-        power_log = torch.log10(x[..., 0].clamp(min=eps))
-        power_scaled = (power_log - self.scaler_p_mean) / self.scaler_p_scale
-        jitter_scaled = torch.log10(x[..., 1].clamp(min=eps)) / self._eye_scale_j
-        height_scaled = torch.log10(x[..., 2].clamp(min=eps)) / self._eye_scale_h
-        width_scaled = torch.log10(x[..., 3].clamp(min=eps)) / self._eye_scale_w
-        out = torch.stack([power_scaled, jitter_scaled, height_scaled, width_scaled], dim=-1)
-        return out.clamp(min=-self.input_rail, max=self.input_rail)
+        lo = self.input_log_min.to(x)
+        hi = self.input_log_max.to(x)
+        log_x = torch.log10(x.clamp(min=eps))
+        span = (hi - lo).clamp(min=1e-8)
+        u = 2.0 * (log_x - lo) / span - 1.0
+        return u.clamp(min=-self.input_rail, max=self.input_rail)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through KirchhoffNetWithIO. Returns unbounded 7 logits.
@@ -1223,48 +1097,9 @@ class LocalKirchhoffStudentWrapper(nn.Module):
         logits, _trajs = self.net(u, store_trajectory=False, solver="heun")
         return logits
 
-    def forward_ablated(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass with the OutputAffine tanh/relu residual branches
-        ablated (linear-only readout). Used by the per-component ablation
-        analysis in the diagnostics section.
-        """
-        u = self.scale_input(x)
-        affine = self.net.output_mapper
-        if not isinstance(affine, OutputAffine):
-            return self.forward(x)
-        # Boundary-mode initial ODE state = zeros(hidden) ++ zeros(output_ode).
-        # We run the core fabric directly with this x0_full so we can capture
-        # the pre-OutputAffine ``x_read`` and apply ``gain*x + bias``.
-        batch = u.size(0)
-        x0_full = u.new_zeros(batch, self.net.hid_count + self.net.output_ode_count)
-        with torch.no_grad():
-            x_final, _trajs = self.net.core(
-                x0_full,
-                store_trajectory=False,
-                solver="heun",
-                u=u,
-            )
-        if self.net.read_slice is not None:
-            x_read = x_final[:, self.net.read_slice]
-        else:
-            x_read = x_final
-        return affine.gain * x_read + affine.bias
-
     def predict(self, x: torch.Tensor) -> dict:
         """Returns dict of physical params (10**bounded_log) for the 7 targets."""
         logits = self.forward(x)
-        probs = torch.sigmoid(logits)
-        results = {}
-        for i, name in enumerate(self.param_log_bounds.keys()):
-            log_val = self.log_lo[i] + (self.log_hi[i] - self.log_lo[i]) * probs[..., i]
-            results[name] = torch.pow(10.0, log_val)
-        return results
-
-    def predict_ablated(self, x: torch.Tensor) -> dict:
-        """Returns dict of physical params using linear-only (output branches
-        ablated) forward.
-        """
-        logits = self.forward_ablated(x)
         probs = torch.sigmoid(logits)
         results = {}
         for i, name in enumerate(self.param_log_bounds.keys()):
@@ -1312,43 +1147,10 @@ class LocalKirchhoffStudentWrapper(nn.Module):
         }
 
 
-# Legacy MLP aliases: keep RegimeAwareMoE / BoundedMLP names bound as
-# no-ops so any reference in the rest of the notebook that wasn't
-# replaced still surfaces a clear error directing here.
-class _RegimeAwareMoEStub:
-    """Stub kept for backwards-compat with any code path still referencing the MLP name."""
-    def __init__(self, *a, **k):
-        raise RuntimeError(
-            "RegimeAwareMoE has been replaced by LocalKirchhoffStudentWrapper in this variant. "
-            "Instantiate `student = LocalKirchhoffStudentWrapper(...)` instead."
-        )
-
-
-class _BoundedMLPStub:
-    def __init__(self, *a, **k):
-        raise RuntimeError(
-            "BoundedMLP has been replaced by LocalKirchhoffStudentWrapper in this variant. "
-            "Instantiate `student = LocalKirchhoffStudentWrapper(...)` instead."
-        )
-
-
-RegimeAwareMoE = _RegimeAwareMoEStub
-BoundedMLP = _BoundedMLPStub
-
-# Constants kept for backward-compat with cells that still reference MOE_*.
-MOE_TRUNK_WIDTH     = None
-MOE_TRUNK_LAYERS    = None
-MOE_NUM_EXPERTS     = None
-MOE_TRUNK_ACTIVATION = None
-MOE_USE_LAYERNORM   = False
-
-
-# %%
-# Load historical data to get spec distributions
-# import zipfile
-
-CSV_PATHS = []
-history_dir = '/kaggle/input/datasets/awekill/augmented-cvae-ctle'
+# ----------------------------------------------------------------------------
+# Load historical data to get spec distributions.
+# ----------------------------------------------------------------------------
+history_dir = DATA_DIR
 
 csv_files = [
     'dataset_log_part_1_may3.csv', 'dataset_log_part_1_may4.csv',
@@ -1361,8 +1163,6 @@ csv_files = [
     'dataset_log_march12.csv','dataset_log_may_18.csv'
 ]
 
-# # Try loading from the backup zip
-# backup_zip = os.path.join(history_dir, 'history_csvs_backup.zip')
 dfs = []
 for fname in csv_files:
     fpath = os.path.join(history_dir, fname)
@@ -1378,7 +1178,6 @@ _logger.info(f"Total rows: {len(combined)}")
 _logger.info(f"Columns: {list(combined.columns)[:10]}...")
 
 
-# %%
 # Map column names from history CSV to our naming
 COL_MAPPING = {
     'eye_maxHeight_norm Vout_2 56G': 'stage_2_eye_max_height',
@@ -1407,62 +1206,34 @@ for col in ['power', 'stage_2_eye_max_height', 'stage_2_eye_max_width', 'stage_2
     _logger.info(f"{col}: n={len(nz)}, min={nz.min():.4f}, max={nz.max():.4f}, median={nz.median():.4f}")
 
 
-# %% [markdown]
-#  ## Phase 8: Implement Teacher Inference (Canonical Labeling)
-
-# %%
-def compute_zig_score(params_log, zig_model, scaler_X, target_specs,
-                         eye_scale_h, eye_scale_w, eye_scale_j, scaler_y_p):
-    """
-    Compute ZIG-based score for a candidate parameter set using Q75 scaler structure.
-
-    HybridHurdleModel outputs:
-      pred_h_soft, pred_w_soft, pred_j_soft: already in physical units (p_valid * expm1(log1p_pred))
-      mu_power: StandardScaler on log10(power) — needs StandardScaler inverse
-
-    Returns dict with predicted physical specs and validity score.
-    """
-    x_scaled = scaler_X.transform(params_log)
-    x_tensor = torch.from_numpy(x_scaled.astype(np.float32)).to(DEVICE)
-
-    with torch.no_grad():
-        out = zig_model(x_tensor)
-
-    # pred_h_soft/pred_w_soft/pred_j_soft are already in physical units (expm1 applied in model)
-    pred_h = out['pred_h_soft'].cpu().numpy()
-    pred_w = out['pred_w_soft'].cpu().numpy()
-    pred_j = out['pred_j_soft'].cpu().numpy()
-
-    # Power: StandardScaler inverse on log10 scale
-    power_scaled = out['mu_power'].cpu().numpy() * scaler_y_p.scale_[0] + scaler_y_p.mean_[0]
-    pred_p = 10 ** power_scaled
-
-    # Validity: product of per-metric validity probabilities
-    validity = out['p_valid'].cpu().numpy()
-
-    return {
-        'pred_height': pred_h,
-        'pred_width': pred_w,
-        'pred_jitter': pred_j,
-        'pred_power': pred_p,
-        'validity': validity,
-    }
+# Rebind KN_INPUT_LOG_MIN/MAX from the empirical spec distributions so
+# log10 + min-max -> [-1, 1] covers the full data range with small margin.
+if len(df) > 0:
+    _spec_log = np.log10(np.clip(
+        df[['power', 'stage_2_jitter', 'stage_2_eye_max_height', 'stage_2_eye_max_width']].values,
+        1e-12, None,
+    ))
+    _lo = _spec_log.min(axis=0)
+    _hi = _spec_log.max(axis=0)
+    _pad = KN_INPUT_LOG_PAD_FRAC * np.maximum(_hi - _lo, 1e-8)
+    KN_INPUT_LOG_MIN = (_lo - _pad).astype(np.float32)
+    KN_INPUT_LOG_MAX = (_hi + _pad).astype(np.float32)
+    for _i, _name in enumerate(['power', 'jitter', 'height', 'width']):
+        _logger.info(
+            f"KN input log bound [{_name}]: "
+            f"[{10 ** KN_INPUT_LOG_MIN[_i]:.4e}, {10 ** KN_INPUT_LOG_MAX[_i]:.4e}] "
+            f"(log10 [{KN_INPUT_LOG_MIN[_i]:.3f}, {KN_INPUT_LOG_MAX[_i]:.3f}])"
+        )
 
 
-
-# %% [markdown]
-#  ## Phase 9: Build Distillation Dataset with Adaptive Labeling
-
-# %%
-# Phase 9: Build Distillation Dataset with Flow-Generated Canonical Labels
-#
-# TWO-PHASE TRAINING:
-#   Phase 1 (primary):   Train on flow-generated canonical labels via FlowTeacherLabeler
-#   Phase 2 (fine-tune): Fine-tune on empirical data with tunable weight λ_fine
+# ----------------------------------------------------------------------------
+# Build distillation dataset with adaptive labeling.
 #
 # The flow generates diverse candidates for each target spec, ZIG ranks them,
-# and the best (canonical) candidate becomes the distillation label.
-# Target specs are still sampled from empirical distribution (preserves spec-space coverage).
+# and the best (canonical) candidate becomes the distillation label. Target
+# specs are sampled from the empirical distribution to preserve spec-space
+# coverage.
+# ----------------------------------------------------------------------------
 
 def sample_target_specs(df, n_samples, boundary_ratio=0.3):
     """Sample target specs with priority on boundary cases.
@@ -1500,76 +1271,6 @@ def sample_target_specs(df, n_samples, boundary_ratio=0.3):
         })
     
     return targets
-
-def is_boundary_case(specs):
-    """Identify if a target spec is a boundary case needing Cadence validation."""
-    if specs['height'] < 5 or specs['width'] < 5:
-        return True
-    if specs['jitter'] > 90:
-        return True
-    if specs['power'] > 0.011:
-        return True
-    return False
-
-def create_blended_distillation_dataset(df, teacher_labeler=None, n_samples=5000, n_candidates=5000,
-                                        boundary_ratio=0.3, tolerance=0.05):
-    """
-    Creates a dataset where labels are either:
-    - empirical (real) parameters if a noisy spec matches an existing design within `tolerance`,
-    - otherwise flow-generated canonical parameters.
-
-    tolerance: relative tolerance (e.g., 0.05 = 5%) in each spec dimension.
-    """
-
-    if teacher_labeler is None:
-        teacher_labeler = FlowTeacherLabeler(TEACHER_DIR, DEVICE)
-    
-    # 1. Sample target specs (clean) from empirical distribution
-    targets = sample_target_specs(df, n_samples, boundary_ratio)
-    
-    # 2. Build nearest-neighbor index on empirical specs (log10 transformed for relative distances)
-    emp_specs = df[['power', 'stage_2_jitter', 'stage_2_eye_max_height', 
-                    'stage_2_eye_max_width']].values.copy()
-    # Convert to log space so that relative differences become absolute differences
-    emp_specs_log = np.log10(emp_specs + 1e-12)
-    nn = NearestNeighbors(n_neighbors=1, metric='chebyshev')
-    nn.fit(emp_specs_log)
-    
-    # 3. For each target, apply noise and decide label source
-    data_list = []
-    for i, t in enumerate(targets):
-        # Generate noisy specs (same as in original create_flow_distillation_dataset)
-        noisy_power = t['power'] * np.random.uniform(0.95, 1.05)
-        noisy_height = t['height'] * np.random.uniform(0.9, 1.1) if t['height'] > 1 else np.random.uniform(0, 2)
-        noisy_width = t['width'] * np.random.uniform(0.9, 1.1) if t['width'] > 1 else np.random.uniform(0, 2)
-        noisy_jitter = np.clip(t['jitter'] * np.random.uniform(0.95, 1.05), 1.57, 100)
-        noisy_specs = np.array([noisy_power, noisy_jitter, noisy_height, noisy_width])
-        
-        # Convert noisy specs to log10 space and query nearest empirical point
-        noisy_specs_log = np.log10(noisy_specs + 1e-12)
-        distances, indices = nn.kneighbors(noisy_specs_log.reshape(1, -1))
-        # Chebyshev distance in log space = max relative difference in original space
-        if distances[0, 0] < tolerance:
-            # Close match → use empirical parameters (physical values)
-            row = df.iloc[indices[0, 0]]
-            params = row[PARAM_COLS].values
-        else:
-            # No close match → use flow teacher
-            params = teacher_labeler.label_single(noisy_specs, n_candidates=n_candidates,
-                                                  valid_threshold=0.9, top_k=1)
-            params = params[0]  # label_single with top_k=1 returns (1,7)
-        
-        data_list.append({
-            'power': noisy_specs[0],
-            'height': noisy_specs[2],
-            'width': noisy_specs[3],
-            'jitter': noisy_specs[1],
-            'params': params,
-        })
-    
-    _logger.info(f"Blended distillation dataset: {len(data_list)} samples "
-                 f"(empirical matches used where distance < {tolerance})")
-    return data_list
 
 def create_flow_distillation_dataset(df, n_samples=10000, n_candidates=5000,
                                     boundary_ratio=0.3, teacher_labeler=None):
@@ -1622,11 +1323,9 @@ def create_flow_distillation_dataset(df, n_samples=10000, n_candidates=5000,
     return data_list
 
 
-
-# %% [markdown]
-#  ## Phase 10: Regime-Aware Loss Function
-
-# %%
+# ----------------------------------------------------------------------------
+# Regime-aware loss function.
+# ----------------------------------------------------------------------------
 def huber_loss(pred, target, delta=1.0):
     """Huber loss - robust to outliers."""
     diff = torch.abs(pred - target)
@@ -1810,36 +1509,9 @@ class RegimeAwareLoss(nn.Module):
 _logger.info("Regime-aware loss defined (Q75 + HybridHurdleModel)")
 
 
-
-# %% [markdown]
-#  ## Phase 11: Dataset and DataLoader
-
-# %%
-def check_label_quality(teacher_labeler, specs, zig, scaler_X, threshold=0.10):
-    params = teacher_labeler.label_batch(specs, n_candidates=3000, top_k=1).squeeze(1)
-    params_log = np.log10(np.clip(params, 1e-12, None))
-    x_scaled = scaler_X.transform(params_log)
-    x_t = torch.from_numpy(x_scaled.astype(np.float32)).to(DEVICE)
-    with torch.no_grad():
-        out = zig(x_t)
-
-    pred_power = 10**(out['mu_power'].cpu().numpy() * scaler_y_p.scale_ + scaler_y_p.mean_)
-    pred_h = out['pred_h_soft'].cpu().numpy()   # already physical
-    pred_w = out['pred_w_soft'].cpu().numpy()
-    pred_j = out['pred_j_soft'].cpu().numpy()
-
-    target_p = specs[:, 0]; target_j = specs[:, 1]
-    target_h = specs[:, 2]; target_w = specs[:, 3]
-
-    err_p = np.abs(pred_power - target_p) / np.maximum(target_p, 1e-6)
-    err_h = np.abs(pred_h - target_h) / np.maximum(target_h, 1e-6)
-    err_w = np.abs(pred_w - target_w) / np.maximum(target_w, 1e-6)
-    err_j = np.abs(pred_j - target_j) / np.maximum(target_j, 1e-6)
-    max_err = np.maximum.reduce([err_p, err_h, err_w, err_j])
-    fail = max_err > threshold
-    return fail.mean(), max_err, params
-
-
+# ----------------------------------------------------------------------------
+# Dataset and DataLoader.
+# ----------------------------------------------------------------------------
 class DistillationDataset(Dataset):
     """Rolling distillation dataset that grows via DAgger iterations.
 
@@ -2036,124 +1708,6 @@ class StudentEvaluator:
                    'p_valid': p_valid.detach().cpu().numpy()}
         return failure_mask, metrics
 
-    def identify_failures_relaxed(self, val_specs, threshold=1.0):
-        """Compatibility wrapper for the adaptive validity-first metric."""
-        self.student.eval()
-
-        with torch.no_grad():
-            specs_t = torch.from_numpy(val_specs).float().to(self.device)
-            logits = self.student(specs_t)
-            probs = torch.sigmoid(logits)
-            log_lo = self.student.log_lo.unsqueeze(0)
-            log_hi = self.student.log_hi.unsqueeze(0)
-            bounded_log = log_lo + (log_hi - log_lo) * probs
-
-            x_mean_t = torch.from_numpy(self._scaler_X_mean).to(self.device)
-            x_scale_t = torch.from_numpy(self._scaler_X_scale).to(self.device)
-            x_scaled = (bounded_log - x_mean_t) / (x_scale_t + 1e-8)
-            x_scaled = torch.clamp(x_scaled, -10.0, 10.0)
-
-            out = self.zig(x_scaled)
-
-            pred_h = out['pred_h_soft'].clamp(min=1e-12, max=1e12)
-            pred_w = out['pred_w_soft'].clamp(min=1e-12, max=1e12)
-            pred_j = out['pred_j_soft'].clamp(min=1e-12, max=1e12)
-            power_scaled = out['mu_power'] * self._scaler_y_p_scale + self._scaler_y_p_mean
-            pred_p = torch.clamp(10.0 ** power_scaled, 1e-12, 1e12)
-            if 'p_valid' in out:
-                p_valid = out['p_valid'].clamp(1e-6, 1.0 - 1e-6)
-            else:
-                p_valid = (out['p_valid_h'] * out['p_valid_w'] * out['p_valid_j']).clamp(1e-6, 1.0 - 1e-6)
-
-            pred_specs = np.stack([
-                pred_p.detach().cpu().numpy(),
-                pred_j.detach().cpu().numpy(),
-                pred_h.detach().cpu().numpy(),
-                pred_w.detach().cpu().numpy(),
-            ], axis=1)
-            metric_dict = compute_forward_errors_relaxed(pred_specs, val_specs)
-            all_errors = np.stack([
-                metric_dict['err_p'],
-                metric_dict['err_j'],
-                metric_dict['err_h'],
-                metric_dict['err_w'],
-            ], axis=1)
-            nan_mask = np.isnan(all_errors).any(axis=1) | np.isnan(pred_specs).any(axis=1)
-            invalid_mask = p_valid.detach().cpu().numpy() < VALIDITY_THRESHOLD
-            failure_mask = nan_mask | invalid_mask | metric_dict['failure_mask']
-            all_errors = np.where(nan_mask[:, np.newaxis], np.inf, all_errors)
-
-            target_p = specs_t[:, 0]
-            target_j = specs_t[:, 1]
-            target_h = specs_t[:, 2]
-            target_w = specs_t[:, 3]
-            is_boundary = ((target_h < BOUNDARY_ABS_TOLERANCES['height'][0]) |
-                           (target_w < BOUNDARY_ABS_TOLERANCES['width'][0]) |
-                           (target_j > BOUNDARY_ABS_TOLERANCES['jitter'][0]) |
-                           (target_p < BOUNDARY_ABS_TOLERANCES['power'][0])).cpu().numpy()
-            boundary_failure = failure_mask & is_boundary
-            interior_failure = failure_mask & ~is_boundary
-
-        metrics = {'errors': all_errors, 'mean_errors': all_errors.mean(axis=1),
-                   'boundary_failure': boundary_failure, 'interior_failure': interior_failure,
-                   'is_boundary': is_boundary,
-                   'pred_specs': pred_specs,
-                   'target_specs': val_specs.copy(),
-                   'dim_fail_rates': (all_errors >= DEGRADE_REL_THRESHOLD).mean(axis=0),
-                   'degraded_dims': metric_dict['degraded_dims'],
-                   'failure_mask': failure_mask,
-                   'invalid_mask': invalid_mask,
-                   'p_valid': p_valid.detach().cpu().numpy()}
-        return failure_mask, metrics
-
-class TeacherLabeler:
-    """
-    Wrapper around FlowTeacherLabeler that adds ZIG validity filtering.
-    Accepts a FlowTeacherLabeler instance and uses it to generate labels
-    for failed specs, filtering by HybridHurdleModel validity.
-    """
-    def __init__(self, teacher_labeler, zig_model, scaler_X, device):
-        self.teacher_labeler = teacher_labeler
-        self.zig = zig_model
-        self.scaler_X = scaler_X
-        self.device = device
-
-    def compute_validity(self, params_log):
-        """Compute ZIG validity for params in log10 space using HybridHurdleModel."""
-        x_scaled = self.scaler_X.transform(params_log)
-        x_t = torch.from_numpy(x_scaled.astype(np.float32)).to(self.device)
-        with torch.no_grad():
-            out = self.zig(x_t)
-        if 'p_valid' in out:
-            validity = out['p_valid'].cpu().numpy()
-        else:
-            validity = (out['p_valid_h'] * out['p_valid_w'] * out['p_valid_j']).cpu().numpy()
-        return validity
-
-    def generate_labels(self, failed_specs, sample_budget=3000, validity_threshold=0.9):
-        """
-        Query FlowTeacherLabeler for canonical params and filter by ZIG validity.
-        Returns (specs_list, params_list).
-        """
-        failed_array = np.array(failed_specs)
-        raw_params = self.teacher_labeler.label_batch(
-            failed_array, n_candidates=sample_budget,
-            valid_threshold=0.9, top_k=1, verbose=True
-        ).squeeze(1)  # (N, 1, 7) -> (N, 7)
-        params_log = np.log10(np.clip(raw_params, 1e-12, None))
-        validities = self.compute_validity(params_log)
-
-        keep_mask = validities >= validity_threshold
-        kept_params = raw_params[keep_mask]
-        kept_specs = failed_array[keep_mask]
-
-        _logger.info(f"  TeacherLabeler: {keep_mask.sum()}/{len(failed_specs)} passed "
-                    f"ZIG validity >= {validity_threshold}")
-
-        result_specs = [spec for spec in kept_specs]
-        result_params = [params for params in kept_params]
-        return result_specs, result_params
-
 
 def sample_validation_specs(df, n_samples=2000, boundary_ratio=0.5):
     """Sample validation specs with heavy boundary emphasis for DAgger evaluation."""
@@ -2180,71 +1734,10 @@ def sample_validation_specs(df, n_samples=2000, boundary_ratio=0.5):
     return sampled[['power', 'stage_2_jitter', 'stage_2_eye_max_height', 'stage_2_eye_max_width']].values.astype(np.float32)
 
 
-def create_empirical_distillation_dataset(df, n_samples=10000, boundary_ratio=0.3):
-    """Create empirical fine-tune dataset (Phase 2 fine-tuning). Returns a list of dicts."""
-    targets = sample_target_specs(df, n_samples, boundary_ratio)
-    data_list = []
-    for t in targets:
-        noisy_specs = {
-            'power': t['power'] * np.random.uniform(0.95, 1.05),
-            'height': t['height'] * np.random.uniform(0.9, 1.1) if t['height'] > 1 else np.random.uniform(0, 2),
-            'width': t['width'] * np.random.uniform(0.9, 1.1) if t['width'] > 1 else np.random.uniform(0, 2),
-            'jitter': np.clip(t['jitter'] * np.random.uniform(0.95, 1.05), 1.57, 100),
-        }
-        noisy_params = t['params'] * np.random.uniform(0.98, 1.02)
-        phys_lo = np.array([10**v[0] for v in PARAM_LOG_BOUNDS.values()])
-        phys_hi = np.array([10**v[1] for v in PARAM_LOG_BOUNDS.values()])
-        noisy_params = np.clip(noisy_params, phys_lo, phys_hi)
-        data_list.append({
-            'power': noisy_specs['power'],
-            'height': noisy_specs['height'],
-            'width': noisy_specs['width'],
-            'jitter': noisy_specs['jitter'],
-            'params': noisy_params,
-        })
-    return data_list
-
-
 # =====================================================================
 # DAGGER DISTILLATION EXECUTION
 # =====================================================================
 
-
-# %%
-# =====================================================================
-def train_epoch(student, train_loader, optimizer, criterion, device, loss_weight=1.0):
-    student.train()
-    total_loss = 0
-    losses = {'total': 0, 'imit': 0, 'spec': 0, 'phys': 0, 'invalid': 0}
-    
-    for specs, params_target in train_loader:
-        specs = specs.to(device)
-        params_target = params_target.to(device)
-        
-        optimizer.zero_grad()
-        
-        spec_targets = {
-            'power': specs[:, 0],
-            'height': specs[:, 2],
-            'width': specs[:, 3],
-            'jitter': specs[:, 1],
-        }
-        
-        loss_dict = criterion(student, spec_targets, params_target)
-        
-        # Apply loss weight (for empirical fine-tune phase)
-        weighted_loss = loss_dict['total'] * loss_weight
-        weighted_loss.backward()
-        torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
-        optimizer.step()
-        
-        total_loss += loss_dict['total'].item()
-        losses['total'] += loss_dict['total'].item()
-        for k in ('imit', 'spec', 'phys', 'invalid'):
-            losses[k] += loss_dict[k]
-    
-    n = len(train_loader)
-    return {k: float(v/n) for k, v in losses.items()}
 
 def eval_epoch(student, val_loader, criterion, device):
     student.eval()
@@ -2275,7 +1768,6 @@ def eval_epoch(student, val_loader, criterion, device):
 _logger.info("Training functions defined (two-phase)")
 
 
-# %%
 def filter_by_zig_consistency(specs_arr, params_arr, zig_model, scaler_X, scaler_y_p, threshold=ERROR_THRESHOLD, device=DEVICE):
     """Keep only (spec, param) pairs that are valid and pass adaptive degradation checks."""
     params_log = np.log10(np.clip(params_arr, 1e-12, None))
@@ -2547,8 +2039,8 @@ student = LocalKirchhoffStudentWrapper(
     enable_temporal_readout=True,
     num_targets=7,
     input_rail=KN_INPUT_RAIL,
+    x_max=KN_X_MAX,
     param_log_bounds=PARAM_LOG_BOUNDS,
-    scaler_C=flow_scaler_C,
     seed=KN_SMALL_WORLD_SEED,
 ).to(DEVICE)
 
@@ -2566,7 +2058,8 @@ _logger.info(
     f"small_world_k={KN_SMALL_WORLD_K}, small_world_p={KN_SMALL_WORLD_P}, "
     f"edge_repeats={KN_EDGE_REPEATS}, cell_library={KN_CELL_LIBRARY}, "
     f"leak_mode={KN_LEAK_MODE}, interstage_activation={KN_INTERSTAGE_ACTIVATION}, "
-    f"freeze_read=True, temporal_readout=True, input_rail={KN_INPUT_RAIL})"
+    f"freeze_read=True, temporal_readout=True, input_rail={KN_INPUT_RAIL}, "
+    f"x_max={KN_X_MAX})"
 )
 
 # Optimizer and scheduler (defined once, reused across iterations).
@@ -2712,7 +2205,7 @@ def run_diagnostics(teacher_labeler, df, zig_model, scaler_X, scaler_y_p, device
     }
 
 # Run diagnostics
-diag_results = run_diagnostics(teacher_labeler, df, zig_model, scaler_X, scaler_y_p, DEVICE, n=200)
+run_diagnostics(teacher_labeler, df, zig_model, scaler_X, scaler_y_p, DEVICE, n=200)
 
 
 # ── Main DAgger loop ─────────────────────────────────────────────────
@@ -2975,8 +2468,6 @@ _logger.info("DAgger training complete")
 _logger.info("DAgger training complete - no Phase 2 fine-tuning (pure manifold-constrained distillation)")
 
 
-
-# %%
 def evaluate_student(student, df_eval, device, eye_scale_h, eye_scale_w, eye_scale_j,
                      scaler_y_p, scaler_X, zig_model):
     """Run final evaluation on a held-out set of specs."""
@@ -3004,10 +2495,9 @@ def evaluate_student(student, df_eval, device, eye_scale_h, eye_scale_w, eye_sca
     return metrics
 
 
-
-# %%
-# %%
-# DAgger loop has completed; plot failure-rate trajectory
+# ----------------------------------------------------------------------------
+# Final DAgger plots, evaluation, and artifact save.
+# ----------------------------------------------------------------------------
 fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 
 axes[0].plot(dagger_history['iteration'], dagger_history['failure_rate'], 'r-o', label='overall')
@@ -3049,38 +2539,13 @@ eval_results = evaluate_student(
 )
 
 # =====================================================================
-# Save model and export ONNX
+# Save model
 # =====================================================================
-#os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 MODEL_NAME = 'dagger_student_kirchhoff'
 torch.save(student.state_dict(), os.path.join(OUTPUT_DIR, f'{MODEL_NAME}.pt'))
 joblib.dump(scaler_X, os.path.join(OUTPUT_DIR, 'scaler_X.pkl'))
 joblib.dump(flow_scaler_C, os.path.join(OUTPUT_DIR, 'flow_scaler_C.pkl'))
-#import json as _json
-#with open(os.path.join(OUTPUT_DIR, 'param_log_bounds.json'), 'w') as _f:
-#    _json.dump({k: list(v) for k, v in PARAM_LOG_BOUNDS.items()}, _f, indent=2)
-#with open(os.path.join(OUTPUT_DIR, 'dagger_history.json'), 'w') as _f:
-#    _json.dump(dagger_history, _f, indent=2)
-#with open(os.path.join(OUTPUT_DIR, 'loss_history.json'), 'w') as _f:
-#    _json.dump(loss_history, _f, indent=2)
-#print(f"DAgger student model saved to {OUTPUT_DIR}")
-#
-#import subprocess
-#subprocess.run(["pip", "install", "-U", "onnxscript", "-q"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-#import torch.onnx
-#dummy_input = torch.zeros(1, 4).to(DEVICE)
-#onnx_path = os.path.join(OUTPUT_DIR, f'{MODEL_NAME}.onnx')
-#torch.onnx.export(
-#    student,
-#    dummy_input,
-#    onnx_path,
-#    input_names=['specs'],
-#    output_names=['logits'],
-#    dynamic_axes={'specs': {0: 'batch'}, 'logits': {0: 'batch'}},
-#    opset_version=13,
-#)
-#print(f"ONNX exported to {onnx_path}")
 
 # =====================================================================
 # Save test set predictions to CSV
@@ -3162,127 +2627,10 @@ with torch.no_grad():
 print(f"{'='*80}")
 
 print("\nInput scaling (LocalKirchhoffStudentWrapper.scale_input):")
-print(f"  power  : log10(raw) -> StandardScaler -> (log10 - mean) / scale, then clamp to [-{KN_INPUT_RAIL}, {KN_INPUT_RAIL}]")
-print(f"  jitter : log10(raw) -> Q75           -> log10 / eye_scale_j, clamp to [-{KN_INPUT_RAIL}, {KN_INPUT_RAIL}]")
-print(f"  height : log10(raw) -> Q75           -> log10 / eye_scale_h, clamp to [-{KN_INPUT_RAIL}, {KN_INPUT_RAIL}]")
-print(f"  width  : log10(raw) -> Q75           -> log10 / eye_scale_w, clamp to [-{KN_INPUT_RAIL}, {KN_INPUT_RAIL}]")
+print(f"  per dim: log10(raw) -> min-max -> 2*(log - lo)/(hi - lo) - 1, clamp to [-{KN_INPUT_RAIL}, {KN_INPUT_RAIL}]")
+for _i, _name in enumerate(['power', 'jitter', 'height', 'width']):
+    print(f"  {_name:<7}: log10 range [{KN_INPUT_LOG_MIN[_i]:.3f}, {KN_INPUT_LOG_MAX[_i]:.3f}] "
+          f"-> raw [{10 ** KN_INPUT_LOG_MIN[_i]:.4e}, {10 ** KN_INPUT_LOG_MAX[_i]:.4e}]")
 print(f"\nOutput (bounded log-space -> physical): 10^(log_lo + (log_hi - log_lo)*sigmoid)")
 for name, (lo, hi) in PARAM_LOG_BOUNDS.items():
     print(f"  {name:>8}: [{10**lo:.4e}, {10**hi:.4e}]")
-
-
-# %% [markdown]
-# # Ablation: What does the OutputAffine readout contribute?
-#
-# Compares full model predictions vs OutputAffine-ablated (gain*x + bias only,
-# with the tanh_gain and relu_gain residual branches zeroed) predictions.
-# The fabric is identical between the two paths — only the readout
-# nonlinearity differs. This reveals how much the analog output stage
-# depends on the learnable tanh/relu calibration branches.
-
-# %%
-# =====================================================================
-# Ablation: OutputAffine readout contribution analysis
-# =====================================================================
-
-student.eval()
-
-# Param count breakdown
-_pc = student.count_params_by_component()
-print(f"\n  Parameter breakdown: "
-      f"encoder={_pc['encoder']:,}, circuit={_pc['circuit']:,}, "
-      f"projector={_pc['projector']:,}, total={_pc['total']:,}")
-
-# OutputAffine readout param attribution.
-_affine = student.net.output_mapper
-if isinstance(_affine, OutputAffine):
-    _o_gain = int(_affine.gain.numel())
-    _o_bias = int(_affine.bias.numel())
-    _o_tanh = int(_affine.tanh_gain.numel())
-    _o_relu_g = int(_affine.relu_gain.numel())
-    _o_relu_th = int(_affine.relu_threshold.numel())
-    print(f"    └─ output readout (OutputAffine): gain={_o_gain}, bias={_o_bias}, "
-          f"tanh_gain={_o_tanh}, relu_gain={_o_relu_g}, relu_threshold={_o_relu_th}")
-
-# Per-stage circuit param breakdown (uses local knet's parameter_breakdown).
-_bd = student.net.parameter_breakdown()
-print(f"    Circuit ({KN_NUM_STAGES} stages, {KN_CELL_LIBRARY}, "
-      f"leak_mode={KN_LEAK_MODE}, freeze_read=True, "
-      f"interstage_activation={KN_INTERSTAGE_ACTIVATION}):")
-for stage_key in sorted(_bd.get("per_stage", {}).keys()):
-    stage_bucket = _bd["per_stage"][stage_key]
-    stage_idx = int(stage_key.split("_")[1])
-    # Core edge count via num_edges() on the stage module.
-    _layer = student.net.core.stages[stage_idx]
-    _n_edge = _layer.num_edges()
-    _p_sum = sum(stage_bucket.values())
-    print(f"      stage {stage_idx}: {_p_sum} params ({_n_edge} core edges, "
-          f"plus output_ode_z={stage_bucket.get('output_ode_z_logits', 0)}, "
-          f"boundary_z={stage_bucket.get('boundary_z_logits', 0)}, "
-          f"u={stage_bucket.get('u_logits', 0)})")
-
-# Use the same test specs from the evaluation above (df_eval)
-test_specs_t = torch.from_numpy(test_specs).to(DEVICE)
-
-with torch.no_grad():
-    pred_full = student.predict(test_specs_t)
-    pred_lin = student.predict_ablated(test_specs_t)
-
-param_names = list(PARAM_LOG_BOUNDS.keys())
-full_arr = np.stack([pred_full[name].cpu().numpy() for name in param_names], axis=1)
-lin_arr  = np.stack([pred_lin[name].cpu().numpy() for name in param_names], axis=1)
-
-# Relative difference: |full - linear| / (|full| + 1e-12)
-rel_diff = np.abs(full_arr - lin_arr) / (np.abs(full_arr) + 1e-12)
-
-# Output-branch contribution ratio: how much of the prediction comes from
-# the tanh/relu branches. 0 = purely linear, 1+ = dominated by branches.
-contrib = np.abs(full_arr - lin_arr) / (np.abs(lin_arr) + 1e-12)
-
-print("\n" + "=" * 80)
-print("OutputAffine Ablation: Linear-only vs Full Prediction")
-print("=" * 80)
-print(f"{'Param':>10} | {'Mean Full':>12} {'Mean Linear':>12} {'Mean |Δ|':>12} "
-      f"{'Median RelΔ':>12} {'Branch Contrib':>12}")
-print("-" * 80)
-for i, name in enumerate(param_names):
-    m_full = full_arr[:, i].mean()
-    m_lin  = lin_arr[:, i].mean()
-    m_abs  = np.abs(full_arr[:, i] - lin_arr[:, i]).mean()
-    m_reld = np.median(rel_diff[:, i])
-    m_ctrb = np.median(contrib[:, i])
-    print(f"{name:>10} | {m_full:>12.4e} {m_lin:>12.4e} {m_abs:>12.4e} "
-          f"{m_reld:>12.2%} {m_ctrb:>12.2f}")
-
-print("-" * 80)
-print(f"{'Mean':>10} | {full_arr.mean():>12.4e} {lin_arr.mean():>12.4e} "
-      f"{np.abs(full_arr - lin_arr).mean():>12.4e} "
-      f"{np.median(rel_diff):>12.2%} {np.median(contrib):>12.2f}")
-print("=" * 80)
-
-# Summary interpretation
-median_branch_contrib = np.median(contrib)
-print(f"\nInterpretation:")
-print(f"  Median output-branch contribution ratio: {median_branch_contrib:.2f}x")
-if median_branch_contrib < 0.1:
-    print(f"  → The tanh/relu branches contribute <10%. The gain*x + bias is doing most of the work.")
-elif median_branch_contrib < 0.5:
-    print(f"  → The tanh/relu branches contribute moderately (10-50%).")
-elif median_branch_contrib < 2.0:
-    print(f"  → The tanh/relu branches contribute significantly (50-200%). Both paths matter.")
-else:
-    print(f"  → The tanh/relu branches dominate (>200% of linear baseline). gain*x + bias is insufficient.")
-
-# Also show how predictions change for a few example specs
-print(f"\nExample predictions (first 6 test specs):")
-print(f"{'Spec':>8} {'Param':>10} {'Full':>12} {'Linear':>12} {'Δ%':>10}")
-print("-" * 56)
-for si in range(min(6, len(test_specs))):
-    for pi, name in enumerate(param_names):
-        fv = full_arr[si, pi]
-        lv = lin_arr[si, pi]
-        pct = (fv - lv) / (abs(lv) + 1e-12) * 100
-        print(f"{si:>8} {name:>10} {fv:>12.4e} {lv:>12.4e} {pct:>+9.2%}")
-    if si < min(6, len(test_specs)) - 1:
-        print("-" * 56)
-

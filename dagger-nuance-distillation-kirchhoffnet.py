@@ -42,6 +42,7 @@ import sys
 import json
 import time
 import logging
+import subprocess
 from functools import wraps
 
 import joblib
@@ -80,8 +81,116 @@ DEVICE = torch.device('cuda', 0) if torch.cuda.is_available() else torch.device(
 
 _LOG_FMT = "%(asctime)s [%(levelname)s] %(message)s"
 _DATE_FMT = "%H:%M:%S"
-logging.basicConfig(level=logging.INFO, format=_LOG_FMT, datefmt=_DATE_FMT, force=True)
+
+
+class _Tee:
+    """File-like stream that mirrors writes to an original stream and a log
+    file handle, flushing after every write so the log grows continuously
+    for live monitoring (e.g. `tail -f` / `Get-Content -Wait`).
+
+    Cross-platform: the log file is always UTF-8; console writes are
+    encoding-safe (replace on failure) so Windows cp1252 consoles and
+    redirected pipes never raise for non-ASCII chars (e.g. the `─`
+    literals at lines 1322 / 2197-2199 of this script).
+    """
+
+    def __init__(self, stream, log_fh):
+        self._stream = stream
+        self._log_fh = log_fh
+
+    def write(self, message):
+        try:
+            self._stream.write(message)
+        except UnicodeEncodeError:
+            enc = getattr(self._stream, "encoding", "ascii") or "ascii"
+            self._stream.write(
+                message.encode(enc, errors="replace").decode(enc, errors="replace")
+            )
+        try:
+            self._log_fh.write(message)
+            self._log_fh.flush()
+        except (ValueError, OSError):
+            pass
+        try:
+            self._stream.flush()
+        except (ValueError, OSError, AttributeError):
+            pass
+
+    def flush(self):
+        try:
+            self._log_fh.flush()
+        except (ValueError, OSError):
+            pass
+        try:
+            self._stream.flush()
+        except (ValueError, OSError, AttributeError):
+            pass
+
+    def isatty(self):
+        return bool(getattr(self._stream, "isatty", lambda: False)())
+
+    def fileno(self):
+        return self._stream.fileno()
+
+    @property
+    def encoding(self):
+        return getattr(self._stream, "encoding", None)
+
+    class _Buffer:
+        def __init__(self, tee):
+            self._tee = tee
+
+        def write(self, data):
+            if isinstance(data, (bytes, bytearray)):
+                try:
+                    msg = data.decode("utf-8", errors="replace")
+                except Exception:
+                    msg = data.decode("ascii", errors="replace")
+            else:
+                msg = data
+            self._tee.write(msg)
+            return len(data)
+
+        def flush(self):
+            self._tee.flush()
+
+    @property
+    def buffer(self):
+        return self._Buffer(self)
+
+
+_LOG_FILE = os.path.join(OUTPUT_DIR, "dagger_training.log")
+_log_fh = open(_LOG_FILE, "a", encoding="utf-8")
+sys.stdout = _Tee(sys.stdout, _log_fh)
+sys.stderr = _Tee(sys.stderr, _log_fh)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format=_LOG_FMT,
+    datefmt=_DATE_FMT,
+    force=True,
+    stream=sys.stderr,
+)
 _logger = logging.getLogger("ctle_dagger_kirchhoff")
+
+# Run-header banner: marks each run's block in the appended log file.
+try:
+    _git_commit = subprocess.check_output(
+        ["git", "rev-parse", "--short", "HEAD"],
+        stderr=subprocess.DEVNULL,
+    ).decode("utf-8", errors="replace").strip()
+except Exception:
+    _git_commit = None
+
+_logger.info("=" * 80)
+_logger.info(
+    f"=== Run started {time.strftime('%Y-%m-%d %H:%M:%S')} "
+    f"(pid {os.getpid()}, platform={sys.platform}) ==="
+)
+if _git_commit:
+    _logger.info(f"git_commit={_git_commit}")
+_logger.info(f"log_file={_LOG_FILE}")
+_logger.info("=" * 80)
 
 class Timer:
     """Context manager for timing code blocks."""
@@ -99,6 +208,95 @@ class Timer:
         self.logger.info(f"[TIMER] {self.name} done ({self.elapsed:.1f}s)")
     def __str__(self):
         return f"{self.elapsed:.1f}s" if self.elapsed is not None else "incomplete"
+
+
+def _log_hyperparameters():
+    """Emit a full per-run hyperparameter dump to the log file.
+
+    Both human-readable ``[CFG] name=value`` lines and one machine-readable
+    ``[CFG_JSON] {...}`` line are written so runs in the appended log file
+    can be eyeballed and programmatically diffed. Captures KN_INPUT_LOG_MIN/MAX
+    at call time (after the df-driven rebind) and the regime-aware loss
+    weights promoted to module-level constants.
+    """
+    _HYPERPARAMS = [
+        # --- Paths / runtime context ---
+        ("TEACHER_DIR", TEACHER_DIR),
+        ("DATA_DIR", DATA_DIR),
+        ("OUTPUT_DIR", OUTPUT_DIR),
+        ("DEVICE", str(DEVICE)),
+        ("dataset_rows", len(globals()["df"])) if "df" in globals() else ("dataset_rows", "n/a"),
+        # --- DAgger / training knobs ---
+        ("DAGGER_ITERATIONS", DAGGER_ITERATIONS),
+        ("EPOCHS_PER_ITER", EPOCHS_PER_ITER),
+        ("BATCH_SIZE", BATCH_SIZE),
+        ("ERROR_THRESHOLD", ERROR_THRESHOLD),
+        ("VALIDATION_SIZE", VALIDATION_SIZE),
+        ("BOUNDARY_RATIO", BOUNDARY_RATIO),
+        ("N_CANDIDATES_PER_SPEC", N_CANDIDATES_PER_SPEC),
+        ("N_CANDIDATES_BOUNDARY", N_CANDIDATES_BOUNDARY),
+        ("VALIDITY_THRESHOLD", VALIDITY_THRESHOLD),
+        ("DEGRADE_REL_THRESHOLD", DEGRADE_REL_THRESHOLD),
+        ("MIN_DEGRADED_DIMS", MIN_DEGRADED_DIMS),
+        ("LR_INITIAL", LR_INITIAL),
+        ("LR_DECAY_AFTER_ITER", LR_DECAY_AFTER_ITER),
+        ("LR_FLOOR", LR_FLOOR),
+        ("FAILURE_CAP_RATIO", FAILURE_CAP_RATIO),
+        ("CONVERGENCE_THRESHOLD", CONVERGENCE_THRESHOLD),
+        ("N_EMPIRICAL_SAMPLES", N_EMPIRICAL_SAMPLES),
+        ("N_CANDIDATES_INITIAL", N_CANDIDATES_INITIAL),
+        ("WEIGHT_DECAY", WEIGHT_DECAY),
+        ("LOSS_WEIGHT_EMPIRIC", LOSS_WEIGHT_EMPIRIC),
+        ("HARD_BUFFER_WEIGHT", HARD_BUFFER_WEIGHT),
+        ("BOUNDARY_ABS_TOLERANCES", BOUNDARY_ABS_TOLERANCES),
+        ("BOUNDARY_ABS_TOLERANCES_RELAXED", BOUNDARY_ABS_TOLERANCES_RELAXED),
+        # --- Regime-aware loss weights ---
+        ("ALPHA_SPEC", ALPHA_SPEC),
+        ("BETA_PHYS", BETA_PHYS),
+        ("GAMMA_MONO", GAMMA_MONO),
+        ("ALPHA_INVALID", ALPHA_INVALID),
+        ("K_MANIFOLD", K_MANIFOLD),
+        ("ALPHA_MANIFOLD", ALPHA_MANIFOLD),
+        ("WARMUP_EPOCHS", WARMUP_EPOCHS),
+        ("PER_TARGET_HURDLE", PER_TARGET_HURDLE),
+        # --- Local KirchhoffNet topology ---
+        ("KN_NUM_STAGES", KN_NUM_STAGES),
+        ("KN_NUM_HIDDEN", KN_NUM_HIDDEN),
+        ("KN_SMALL_WORLD_K", KN_SMALL_WORLD_K),
+        ("KN_SMALL_WORLD_P", KN_SMALL_WORLD_P),
+        ("KN_SMALL_WORLD_SEED", KN_SMALL_WORLD_SEED),
+        ("KN_EDGE_REPEATS", KN_EDGE_REPEATS),
+        ("KN_CELL_LIBRARY", KN_CELL_LIBRARY),
+        ("KN_LEAK_MODE", KN_LEAK_MODE),
+        ("KN_INTERSTAGE_ACTIVATION", KN_INTERSTAGE_ACTIVATION),
+        ("KN_BOUNDARY_FAN_OUT", KN_BOUNDARY_FAN_OUT),
+        ("KN_INPUT_RAIL", KN_INPUT_RAIL),
+        ("KN_X_MAX", KN_X_MAX),
+        ("KN_INPUT_LOG_PAD_FRAC", KN_INPUT_LOG_PAD_FRAC),
+        ("KN_INPUT_LOG_MIN", KN_INPUT_LOG_MIN),
+        ("KN_INPUT_LOG_MAX", KN_INPUT_LOG_MAX),
+        ("LOG_BOUNDS", LOG_BOUNDS),
+    ]
+
+    def _coerce(v):
+        if isinstance(v, np.ndarray):
+            return v.tolist()
+        return v
+
+    _logger.info("-" * 80)
+    _logger.info("[CFG] Run hyperparameters:")
+    _cfg_dict = {}
+    for _name, _val in _HYPERPARAMS:
+        _val_coerced = _coerce(_val)
+        _cfg_dict[_name] = _val_coerced
+        try:
+            _val_repr = json.dumps(_val_coerced, default=str)
+        except (TypeError, ValueError):
+            _val_repr = repr(_val_coerced)
+        _logger.info(f"[CFG] {_name}={_val_repr}")
+    _logger.info("[CFG_JSON] " + json.dumps(_cfg_dict, default=str))
+    _logger.info("-" * 80)
+
 
 _logger.info(f"Using device: {DEVICE}")
 
@@ -141,6 +339,17 @@ BOUNDARY_ABS_TOLERANCES_RELAXED = {
     'jitter': (90.0, 0.20),
     'power':  (0.003, 0.0005),
 }
+
+# ---------------------------------------------------------------
+# Regime-aware loss weights (used by RegimeAwareLoss + RampedRegimeLoss)
+# ---------------------------------------------------------------
+ALPHA_SPEC      = 1.5    # weight on L_spec (target-spec regression)
+BETA_PHYS       = 0.1    # weight on L_phys (power / RC physics priors)
+GAMMA_MONO      = 0.01   # weight on L_mono (monotonicity penalty)
+ALPHA_INVALID   = 1.5    # weight on L_invalid (invalid-zone penalty)
+K_MANIFOLD      = 5      # k-NN neighbor count for manifold regularization
+ALPHA_MANIFOLD  = 0.1    # weight on L_manifold (k-NN empirical pull)
+WARMUP_EPOCHS   = 5      # epochs over which L_spec/L_phys/L_invalid ramp from 0
 
 # ---------------------------------------------------------------
 # Local KirchhoffNet student topology
@@ -2141,15 +2350,18 @@ criterion = RegimeAwareLoss(
     eye_scale_w=eye_scale_w,
     eye_scale_j=eye_scale_j,
     scaler_y_p=scaler_y_p,
-    alpha_spec=1.5,
-    beta_phys=0.1,
-    gamma_mono=0.01,
-    alpha_invalid=1.5,
+    alpha_spec=ALPHA_SPEC,
+    beta_phys=BETA_PHYS,
+    gamma_mono=GAMMA_MONO,
+    alpha_invalid=ALPHA_INVALID,
     empirical_df=df,
-    k_manifold=5,
-    alpha_manifold=0.1,
+    k_manifold=K_MANIFOLD,
+    alpha_manifold=ALPHA_MANIFOLD,
 )
-ramped_criterion = RampedRegimeLoss(criterion, warmup_epochs=5)
+ramped_criterion = RampedRegimeLoss(criterion, warmup_epochs=WARMUP_EPOCHS)
+
+# Dump the full hyperparameter set to the log file at the start of each run.
+_log_hyperparameters()
 
 # =====================================================================
 # DIAGNOSTIC SCRIPT — run before training to identify the bottleneck

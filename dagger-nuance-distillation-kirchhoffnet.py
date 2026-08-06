@@ -2081,7 +2081,9 @@ class StudentEvaluator:
                    'degraded_dims': metric_dict['degraded_dims'],
                    'failure_mask': failure_mask,
                    'invalid_mask': invalid_mask,
-                   'p_valid': p_valid.detach().cpu().numpy()}
+                   'p_valid': p_valid.detach().cpu().numpy(),
+                   'probs': probs.detach().cpu().numpy(),
+                   'logits': logits.detach().cpu().numpy()}
         return failure_mask, metrics
 
 
@@ -2361,6 +2363,144 @@ def log_label_quality_summary(name, specs_arr, params_arr, zig_model, scaler_X, 
     )
 
 
+def log_param_bound_feasibility(name, params_arr, log_lo=None, log_hi=None,
+                                param_cols=PARAM_COLS, edge_eps=0.02):
+    """Log per-param buckets of where teacher labels sit within [log_lo, log_hi].
+
+    For each output param i, computes ``frac = (log10(p) - log_lo[i]) / (log_hi[i] - log_lo[i])``
+    (clipped to 1e-12 for log10) and reports the fraction of labels in five buckets:
+
+      * ``below``  — frac < 0           (label cannot be represented)
+      * ``at_lo``  — frac in [0, edge_eps]
+      * ``mid``    — frac in (edge_eps, 1 - edge_eps)
+      * ``at_hi``  — frac in [1 - edge_eps, 1]
+      * ``above``  — frac > 1           (label cannot be represented)
+
+    Any non-zero ``below`` or ``above`` bucket is a strong signal that the
+    output ``log_lo/log_hi`` bounds are too tight for the task.
+    """
+    if params_arr is None or len(params_arr) == 0:
+        _logger.info(f"[BOUNDS] {name}: no samples")
+        return
+    try:
+        if log_lo is None or log_hi is None:
+            lo_arr = np.array([PARAM_LOG_BOUNDS[k][0] for k in param_cols], dtype=np.float64)
+            hi_arr = np.array([PARAM_LOG_BOUNDS[k][1] for k in param_cols], dtype=np.float64)
+        else:
+            lo_arr = np.asarray(log_lo, dtype=np.float64).flatten()
+            hi_arr = np.asarray(log_hi, dtype=np.float64).flatten()
+        if len(lo_arr) != len(param_cols) or len(hi_arr) != len(param_cols):
+            raise ValueError(f"log_lo/log_hi length {len(lo_arr)}/{len(hi_arr)} != #param_cols {len(param_cols)}")
+        params = np.asarray(params_arr, dtype=np.float64)
+        if params.ndim != 2 or params.shape[1] != len(param_cols):
+            raise ValueError(f"params_arr shape {params.shape} does not match #param_cols {len(param_cols)}")
+        safe = np.clip(params, 1e-12, None)
+        log_p = np.log10(safe)
+        span = (hi_arr - lo_arr)
+        if np.any(span <= 0):
+            raise ValueError("non-positive log span in PARAM_LOG_BOUNDS")
+        frac = (log_p - lo_arr) / span
+        frac = np.nan_to_num(frac, nan=0.5, posinf=1.0, neginf=0.0)
+        below = (frac < 0).mean(axis=0) * 100
+        at_lo = ((frac >= 0) & (frac <= edge_eps)).mean(axis=0) * 100
+        mid = ((frac > edge_eps) & (frac < 1 - edge_eps)).mean(axis=0) * 100
+        at_hi = ((frac >= 1 - edge_eps) & (frac <= 1)).mean(axis=0) * 100
+        above = (frac > 1).mean(axis=0) * 100
+        _logger.info(
+            f"[BOUNDS] {name} feasibility (frac in [log_lo, log_hi], edges={edge_eps:.2f}):"
+        )
+        for i, pname in enumerate(param_cols):
+            _logger.info(
+                f"  {pname:>8}: below={below[i]:4.1f}%  at_lo={at_lo[i]:4.1f}%  "
+                f"mid={mid[i]:5.1f}%  at_hi={at_hi[i]:4.1f}%  above={above[i]:4.1f}%"
+            )
+    except Exception as e:
+        _logger.warning(f"[BOUNDS] Failed to compute feasibility for {name}: {e}")
+
+
+def log_saturation_breakdown(metrics, prefix="  val/", param_cols=PARAM_COLS, edge_eps=0.02):
+    """Log how close the student's sigmoid outputs are to the log_lo/log_hi edges.
+
+    Reads ``metrics['probs']`` (sigmoid outputs) and ``metrics['logits']``
+    (pre-sigmoid) — both added to the metrics dict by ``identify_failures``.
+    Reports per-param sigmoid mean/median, fraction pinned near 0 / 1, and
+    ``max |logit|`` as a proxy for how hard the readout is being driven.
+    """
+    try:
+        probs = metrics.get('probs') if metrics else None
+        logits = metrics.get('logits') if metrics else None
+        if probs is None:
+            _logger.info(f"{prefix}saturation: (no probs in metrics — skipping)")
+            return
+        probs = np.asarray(probs, dtype=np.float64)
+        if probs.ndim != 2 or probs.shape[1] != len(param_cols):
+            _logger.info(f"{prefix}saturation: unexpected probs shape {probs.shape} — skipping")
+            return
+        probs = np.nan_to_num(probs, nan=0.5)
+        if logits is not None:
+            logits = np.asarray(logits, dtype=np.float64)
+            logits = np.nan_to_num(logits, nan=0.0)
+            max_abs = np.abs(logits).max(axis=0)
+        else:
+            max_abs = np.full(len(param_cols), float('nan'))
+        mean = probs.mean(axis=0)
+        med = np.median(probs, axis=0)
+        sat_lo = (probs <= edge_eps).mean(axis=0) * 100
+        sat_hi = (probs >= 1 - edge_eps).mean(axis=0) * 100
+        _logger.info(f"{prefix}saturation (sigmoid -> 0=log_lo, 1=log_hi, edges={edge_eps:.2f}):")
+        for i, pname in enumerate(param_cols):
+            _logger.info(
+                f"  {pname:>8}: mean={mean[i]:.3f}  med={med[i]:.3f}  "
+                f"sat_lo={sat_lo[i]:4.1f}%  sat_hi={sat_hi[i]:4.1f}%  max|logit|={max_abs[i]:.2f}"
+            )
+    except Exception as e:
+        _logger.warning(f"{prefix}saturation logging failed: {e}")
+
+
+def log_rail_probe(student, specs_arr, n=256, x_max=None, device=DEVICE):
+    """Forward a subsample with trajectory storage; log node-voltage magnitude vs x_max.
+
+    Per ODE stage, reports ``max|x|/x_max`` and the fraction of node-timepoints
+    with ``|x| > 0.9*x_max`` (i.e., the tanh cells saturating against the local
+    rail). A high rail fraction means the circuit dynamics are clamped and the
+    effective expressivity is bounded by ``x_max``.
+    """
+    if x_max is None:
+        x_max = KN_X_MAX
+    if student is None or specs_arr is None or len(specs_arr) == 0:
+        _logger.info(f"[RAIL] no specs — skipping (x_max={x_max})")
+        return
+    try:
+        subsample = specs_arr[: min(n, len(specs_arr))]
+        specs_t = torch.from_numpy(subsample.astype(np.float32)).to(device)
+        was_training = student.training
+        student.eval()
+        with torch.no_grad():
+            u = student.scale_input(specs_t)
+            _, trajs = student.net(u, store_trajectory=True, solver="heun")
+        if was_training:
+            student.train()
+        if not trajs:
+            _logger.info(f"[RAIL] no per-stage trajectories returned (x_max={x_max})")
+            return
+        _logger.info(f"[RAIL] node-voltage saturation vs x_max={x_max} (n={len(subsample)}):")
+        for s, traj in enumerate(trajs):
+            if traj is None:
+                _logger.info(f"  stage {s}: (no trajectory)")
+                continue
+            v = traj.detach().abs()
+            v_flat = torch.nan_to_num(v.reshape(-1), nan=0.0)
+            max_v = v_flat.max().item()
+            max_ratio = max_v / x_max if x_max > 0 else float('inf')
+            frac = (v_flat > 0.9 * x_max).float().mean().item() * 100
+            _logger.info(
+                f"  stage {s}: max|x|/x_max={max_ratio:.2f}  "
+                f"frac(|x|>0.9*x_max)={frac:4.1f}%"
+            )
+    except Exception as e:
+        _logger.warning(f"[RAIL] probe failed: {e}")
+
+
 # =====================================================================
 #  DAgger DISTILLATION LOOP
 # =====================================================================
@@ -2531,6 +2671,7 @@ else:
     _logger.info(f"Initial dataset forward-consistency (strict): {keep_strict.mean()*100:.1f}%  ({keep_strict.sum()}/{len(keep_strict)})")
     _logger.info(f"Initial dataset forward-consistency (relaxed): {keep_relaxed.mean()*100:.1f}%  ({keep_relaxed.sum()}/{len(keep_relaxed)})")
     log_label_quality_summary("Initial dataset labels", all_specs, all_params, zig_model, scaler_X, scaler_y_p, device=DEVICE)
+    log_param_bound_feasibility("Initial dataset", all_params)
 
     # Carve out 10% validation split (never augmented by DAgger)
     train_subset, val_subset = distillation_dataset.split_train_val(val_frac=0.1)
@@ -2801,6 +2942,9 @@ for dagger_iter in range(_start_iter, DAGGER_ITERATIONS):
     _logger.info(f"  boundary: {boundary_failure_rate*100:.1f}%  "
                 f"interior: {interior_failure_rate*100:.1f}%")
     log_failure_breakdown(metrics, prefix="  val/")
+    log_saturation_breakdown(metrics, prefix="  val/")
+    log_param_bound_feasibility("Rolling dataset", np.array([d['params'] for d in distillation_dataset.data]))
+    log_rail_probe(student, val_specs_arr)
 
     # ── 3c. Convergence check ───────────────────────────────────────
     dagger_history['iteration'].append(dagger_iter + 1)
@@ -2935,6 +3079,7 @@ for dagger_iter in range(_start_iter, DAGGER_ITERATIONS):
     # ── 3h. Dataset aggregation ──────────────────────────────────────
     if len(final_specs) > 0:
         log_label_quality_summary("  DAgger labels", final_specs, final_labels, zig_model, scaler_X, scaler_y_p, device=DEVICE)
+        log_param_bound_feasibility("DAgger labels", final_labels)
         distillation_dataset.append_samples(final_specs, final_labels)
         _logger.info(f"  Added {len(final_labels)} labeled failures.  Dataset now: "
                      f"{len(distillation_dataset)}")
@@ -2981,6 +3126,7 @@ def evaluate_student(student, df_eval, device, eye_scale_h, eye_scale_w, eye_sca
                  f"jitter: {metrics['errors'][:,1].mean():.4f}, "
                  f"height: {metrics['errors'][:,2].mean():.4f}, "
                  f"width: {metrics['errors'][:,3].mean():.4f}")
+    log_saturation_breakdown(metrics, prefix="  test/")
     return metrics
 
 

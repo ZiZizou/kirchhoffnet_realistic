@@ -43,6 +43,7 @@ import json
 import time
 import logging
 import subprocess
+import hashlib
 from functools import wraps
 
 import joblib
@@ -64,6 +65,169 @@ DATA_DIR = '/home/annaik/Documents/augmented-cvae-ctle/'
 OUTPUT_DIR = '/home/annaik/Documents/dagger_output'
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+
+# ----------------------------------------------------------------------------
+# Checkpoint / resume helpers.
+#
+# Two complementary mechanisms:
+# 1. ``dagger_checkpoint.pt`` — a rolling, atomic checkpoint saved at the
+#    baseline (after initial dataset build) and at the end of every DAgger
+#    iteration. Contains full dataset, student/optimizer/scheduler state,
+#    histories, and RNG state. On startup it's loaded and the run resumes at
+#    ``dagger_iter = dagger_iter + 1`` from the latest checkpoint.
+# 2. ``initial_dataset_<hash>.pkl`` — a joblib cache of the ~20k-sample
+#    initial distillation dataset, keyed by a hash of the labeling-relevant
+#    hyperparams + df fingerprint. Consulted only on a *fresh* start (no
+#    checkpoint) so the most expensive single step is never re-run.
+#
+# A crash mid-iteration loses at most that one iteration (per the
+# iteration-end-only granularity choice); the dataset is only mutated at
+# iteration end, so there is no double-append risk on resume.
+# ----------------------------------------------------------------------------
+CHECKPOINT_PATH = os.path.join(OUTPUT_DIR, 'dagger_checkpoint.pt')
+_CKPT_VERSION = 1
+
+
+def _config_hash():
+    """sha256 over the labeling-relevant hyperparams + df fingerprint.
+
+    Hash inputs include the dataset-length bounds so a stale cache can never
+    be silently reused after the underlying historical CSV changes.
+    """
+    try:
+        df_n = int(len(df))
+    except Exception:
+        df_n = -1
+    try:
+        spec_cols = ['power', 'stage_2_jitter', 'stage_2_eye_max_height', 'stage_2_eye_max_width']
+        if 'df' in globals() and df_n > 0:
+            spec_log = np.log10(np.clip(df[spec_cols].values, 1e-12, None))
+            spec_min = np.round(spec_log.min(axis=0), 6).tolist()
+            spec_max = np.round(spec_log.max(axis=0), 6).tolist()
+        else:
+            spec_min, spec_max = [], []
+    except Exception:
+        spec_min, spec_max = [], []
+    payload = {
+        'N_EMPIRICAL_SAMPLES': N_EMPIRICAL_SAMPLES,
+        'N_CANDIDATES_INITIAL': N_CANDIDATES_INITIAL,
+        'BOUNDARY_RATIO': BOUNDARY_RATIO,
+        'N_CANDIDATES_PER_SPEC': N_CANDIDATES_PER_SPEC,
+        'N_CANDIDATES_BOUNDARY': N_CANDIDATES_BOUNDARY,
+        'np_seed': _NP_SEED,
+        'torch_seed': _TORCH_SEED,
+        'PARAM_COLS': list(PARAM_COLS),
+        'df_n': df_n,
+        'spec_min': spec_min,
+        'spec_max': spec_max,
+        'TEACHER_DIR': TEACHER_DIR,
+    }
+    h = hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode('utf-8')).hexdigest()
+    return h[:16]
+
+
+def _initial_dataset_cache_path():
+    return os.path.join(OUTPUT_DIR, f'initial_dataset_{_config_hash()}.pkl')
+
+
+def load_checkpoint():
+    """Load the latest checkpoint, returning ``None`` if missing or corrupt."""
+    if not os.path.exists(CHECKPOINT_PATH):
+        return None
+    try:
+        return torch.load(CHECKPOINT_PATH, map_location='cpu', weights_only=False)
+    except Exception as e:
+        _logger.warning(f"[CKPT] Failed to load checkpoint at {CHECKPOINT_PATH}: {e}; ignoring")
+        return None
+
+
+def save_checkpoint(ckpt):
+    """Atomically save checkpoint to ``CHECKPOINT_PATH`` (tmp + replace)."""
+    tmp = CHECKPOINT_PATH + '.tmp'
+    torch.save(ckpt, tmp)
+    os.replace(tmp, CHECKPOINT_PATH)
+
+
+def _capture_rng():
+    states = {
+        'np': np.random.get_state(),
+        'torch': torch.random.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        try:
+            states['torch_cuda'] = torch.cuda.get_rng_state_all()
+        except Exception:
+            states['torch_cuda'] = None
+    else:
+        states['torch_cuda'] = None
+    return states
+
+
+def _restore_rng(states):
+    if states is None:
+        return
+    try:
+        np.random.set_state(states['np'])
+    except Exception as e:
+        _logger.warning(f"[CKPT] Failed to restore numpy RNG state: {e}")
+    try:
+        torch.random.set_rng_state(states['torch'])
+    except Exception as e:
+        _logger.warning(f"[CKPT] Failed to restore torch RNG state: {e}")
+    cuda_states = states.get('torch_cuda')
+    if cuda_states is not None and torch.cuda.is_available():
+        try:
+            torch.cuda.set_rng_state_all(cuda_states)
+        except Exception as e:
+            _logger.warning(f"[CKPT] Failed to restore cuda RNG state: {e}")
+
+
+def _ckpt_baseline_payload(dagger_iter=0, converged=False):
+    """Build a baseline checkpoint dict (called after initial build + split)."""
+    return {
+        'format_version': _CKPT_VERSION,
+        'dagger_iter': int(dagger_iter),
+        'converged': bool(converged),
+        'student_state': student.state_dict(),
+        'optimizer_state': optimizer.state_dict(),
+        'scheduler_state': scheduler.state_dict(),
+        'dataset': list(distillation_dataset.data),
+        'train_indices': list(distillation_dataset._train_indices) if distillation_dataset._train_indices is not None else None,
+        'val_indices': list(distillation_dataset._val_indices) if distillation_dataset._val_indices is not None else None,
+        'hard_buffer_start_idx': int(distillation_dataset._hard_buffer_start_idx),
+        'hard_indices': list(distillation_dataset._hard_indices),
+        'dagger_history': {k: list(v) for k, v in dagger_history.items()},
+        'loss_history': {k: list(v) for k, v in loss_history.items()},
+        'rng': _capture_rng(),
+        'saved_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+    }
+
+
+def _restore_dataset_from_ckpt(ckpt):
+    """Rebuild the DistillationDataset from a checkpoint and restore indices."""
+    distillation_dataset.data = list(ckpt['dataset'])
+    distillation_dataset._train_indices = list(ckpt['train_indices']) if ckpt['train_indices'] is not None else None
+    distillation_dataset._val_indices = list(ckpt['val_indices']) if ckpt['val_indices'] is not None else None
+    distillation_dataset._hard_buffer_start_idx = int(ckpt['hard_buffer_start_idx'])
+    distillation_dataset._hard_indices = list(ckpt['hard_indices'])
+    distillation_dataset._loader = None
+    distillation_dataset._val_loader = None
+
+
+def _restore_histories_from_ckpt(ckpt):
+    """Restore the dagger_history / loss_history dicts from a checkpoint.
+
+    Only updates keys that are present in the checkpoint payload so a
+    newer schema (extra metric) still gets its empty list from the
+    module-level initializers.
+    """
+    for hist_name, target in (('dagger_history', dagger_history), ('loss_history', loss_history)):
+        saved = ckpt.get(hist_name)
+        if not isinstance(saved, dict):
+            continue
+        for k, v in saved.items():
+            target[k] = list(v)
+
 # Make the local KirchhoffNet codebase importable. This file lives in the
 # repo root, so adding the script directory is sufficient.
 _LOCAL_KIRCHHOFF_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -74,8 +238,11 @@ from config import SOLVER
 from cell_library import make_cell_library
 from topology import build_net_from_config
 
-np.random.seed(42)
-torch.manual_seed(42)
+_NP_SEED = 42
+_TORCH_SEED = 42
+
+np.random.seed(_NP_SEED)
+torch.manual_seed(_TORCH_SEED)
 
 DEVICE = torch.device('cuda', 0) if torch.cuda.is_available() else torch.device('cpu')
 
@@ -2279,32 +2446,107 @@ scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
     optimizer, T_max=EPOCHS_PER_ITER, eta_min=LR_FLOOR
 )
 
-# ── Initial dataset ──────────────────────────────────────────────────
-with Timer("build initial flow distillation dataset"):
-    initial_data = create_flow_distillation_dataset(
-        df,
-        n_samples=N_EMPIRICAL_SAMPLES,
-        n_candidates=N_CANDIDATES_INITIAL,
-        boundary_ratio=BOUNDARY_RATIO,
-        teacher_labeler=teacher_labeler,
-    )
-_logger.info(f"Initial dataset (flow teacher labels): {len(initial_data)} samples")
-distillation_dataset = DistillationDataset(initial_data)
-all_specs = np.array([[d['power'], d['jitter'], d['height'], d['width']] for d in distillation_dataset.data])
-all_params = np.array([d['params'] for d in distillation_dataset.data])
-with Timer("ZIG forward-consistency check on initial dataset"):
-    keep_strict = filter_by_zig_consistency(all_specs, all_params, zig_model, scaler_X, scaler_y_p, threshold=ERROR_THRESHOLD, device=DEVICE)
-    keep_relaxed = filter_by_zig_consistency_relaxed(all_specs, all_params, zig_model, scaler_X, scaler_y_p, device=DEVICE)
-_logger.info(f"Initial dataset: {len(distillation_dataset)} samples")
-_logger.info(f"Initial dataset forward-consistency (strict): {keep_strict.mean()*100:.1f}%  ({keep_strict.sum()}/{len(keep_strict)})")
-_logger.info(f"Initial dataset forward-consistency (relaxed): {keep_relaxed.mean()*100:.1f}%  ({keep_relaxed.sum()}/{len(keep_relaxed)})")
-log_label_quality_summary("Initial dataset labels", all_specs, all_params, zig_model, scaler_X, scaler_y_p, device=DEVICE)
+# Load any existing checkpoint BEFORE the initial-build guard so we can either
+# resume from it (skipping the expensive initial labeling and re-splitting)
+# or fall through to the fresh-start path. The entire resume restore —
+# model/optimizer/scheduler state, RNG, dataset, and histories — is wrapped
+# in one try/except so any legacy/incompatible field gracefully degrades to
+# a fresh start instead of crashing.
+ckpt = load_checkpoint()
+distillation_dataset = None
+if ckpt is not None:
+    try:
+        student.load_state_dict(ckpt['student_state'])
+        student.to(DEVICE)
+        optimizer.load_state_dict(ckpt['optimizer_state'])
+        scheduler.load_state_dict(ckpt['scheduler_state'])
+        if 'rng' in ckpt:
+            _restore_rng(ckpt['rng'])
+        distillation_dataset = DistillationDataset([])
+        _restore_dataset_from_ckpt(ckpt)
+        _restore_histories_from_ckpt(ckpt)
+        _logger.info(
+            f"[CKPT] Resumed from {CHECKPOINT_PATH}  "
+            f"next_iter={int(ckpt['dagger_iter'])}, "
+            f"dataset_size={len(ckpt.get('dataset', []))}, "
+            f"format_version={ckpt.get('format_version')}"
+        )
+        _logger.info(f"[CKPT] Restored DistillationDataset from checkpoint: "
+                     f"{len(distillation_dataset)} samples, "
+                     f"train={len(distillation_dataset._train_indices)}, "
+                     f"val={len(distillation_dataset._val_indices)}, "
+                     f"hard_buffer_start_idx={distillation_dataset._hard_buffer_start_idx}")
+    except Exception as e:
+        _logger.warning(f"[CKPT] Failed to restore from checkpoint: {e}; "
+                        f"starting fresh and overwriting checkpoint")
+        ckpt = None
+        distillation_dataset = None
 
-# Carve out 10% validation split (never augmented by DAgger)
-train_subset, val_subset = distillation_dataset.split_train_val(val_frac=0.1)
+# ── Initial dataset ──────────────────────────────────────────────────
+if ckpt is not None:
+    pass  # already restored above
+else:
+    # Fresh-start path: consult the initial-dataset cache (config-hashed),
+    # else run the (expensive) teacher labeling and write the cache. The cache
+    # load is guarded because a corrupt or partial file (from an interrupted
+    # prior write) must not crash the script; the dump is atomic so a kill
+    # mid-write leaves the prior valid file untouched.
+    _cache_path = _initial_dataset_cache_path()
+    initial_data = None
+    if os.path.exists(_cache_path):
+        try:
+            with Timer("load initial distillation dataset from cache"):
+                initial_data = joblib.load(_cache_path)
+            _logger.info(f"[CKPT] Initial dataset loaded from cache: {_cache_path} "
+                         f"({len(initial_data)} samples, hash={os.path.basename(_cache_path)})")
+        except Exception as e:
+            _logger.warning(f"[CKPT] Failed to load initial-dataset cache ({_cache_path}): "
+                            f"{e}; rebuilding from scratch")
+            initial_data = None
+    if initial_data is None:
+        with Timer("build initial flow distillation dataset"):
+            initial_data = create_flow_distillation_dataset(
+                df,
+                n_samples=N_EMPIRICAL_SAMPLES,
+                n_candidates=N_CANDIDATES_INITIAL,
+                boundary_ratio=BOUNDARY_RATIO,
+                teacher_labeler=teacher_labeler,
+            )
+        try:
+            _cache_tmp = _cache_path + '.tmp'
+            joblib.dump(initial_data, _cache_tmp)
+            os.replace(_cache_tmp, _cache_path)
+            _logger.info(f"[CKPT] Initial dataset cached at {_cache_path} "
+                         f"(hash={os.path.basename(_cache_path)})")
+        except Exception as e:
+            _logger.warning(f"[CKPT] Failed to write initial dataset cache: {e}")
+    _logger.info(f"Initial dataset (flow teacher labels): {len(initial_data)} samples")
+    distillation_dataset = DistillationDataset(initial_data)
+    all_specs = np.array([[d['power'], d['jitter'], d['height'], d['width']] for d in distillation_dataset.data])
+    all_params = np.array([d['params'] for d in distillation_dataset.data])
+    with Timer("ZIG forward-consistency check on initial dataset"):
+        keep_strict = filter_by_zig_consistency(all_specs, all_params, zig_model, scaler_X, scaler_y_p, threshold=ERROR_THRESHOLD, device=DEVICE)
+        keep_relaxed = filter_by_zig_consistency_relaxed(all_specs, all_params, zig_model, scaler_X, scaler_y_p, device=DEVICE)
+    _logger.info(f"Initial dataset: {len(distillation_dataset)} samples")
+    _logger.info(f"Initial dataset forward-consistency (strict): {keep_strict.mean()*100:.1f}%  ({keep_strict.sum()}/{len(keep_strict)})")
+    _logger.info(f"Initial dataset forward-consistency (relaxed): {keep_relaxed.mean()*100:.1f}%  ({keep_relaxed.sum()}/{len(keep_relaxed)})")
+    log_label_quality_summary("Initial dataset labels", all_specs, all_params, zig_model, scaler_X, scaler_y_p, device=DEVICE)
+
+    # Carve out 10% validation split (never augmented by DAgger)
+    train_subset, val_subset = distillation_dataset.split_train_val(val_frac=0.1)
+
+    # Baseline checkpoint: anchors the run at dagger_iter=0 so a crash during
+    # the first iteration's training or teacher labeling can resume cleanly.
+    try:
+        save_checkpoint(_ckpt_baseline_payload(dagger_iter=0))
+        _logger.info(f"[CKPT] Baseline checkpoint saved to {CHECKPOINT_PATH}")
+    except Exception as e:
+        _logger.warning(f"[CKPT] Failed to write baseline checkpoint: {e}")
+
 train_loader = distillation_dataset.get_loader(batch_size=BATCH_SIZE, shuffle=True, hard_weight=10.0)
 val_loader = distillation_dataset.get_val_loader(batch_size=BATCH_SIZE)
-_logger.info(f"Train: {len(train_subset)}, Val: {len(val_subset)}")
+_logger.info(f"Train: {len(distillation_dataset._train_indices)}, "
+             f"Val: {len(distillation_dataset._val_indices)}")
 
 # ── Warmup wrapper for ZIG-dependent losses ─────────────────────────
 class RampedRegimeLoss(nn.Module):
@@ -2416,12 +2658,24 @@ def run_diagnostics(teacher_labeler, df, zig_model, scaler_X, scaler_y_p, device
         'zig_real_acc': keep_real.mean(),
     }
 
-# Run diagnostics
-run_diagnostics(teacher_labeler, df, zig_model, scaler_X, scaler_y_p, DEVICE, n=200)
+# Run diagnostics (skip on resume: already logged in the prior run, and the
+# teacher-labeling call inside is expensive — we don't want to re-pay it).
+if ckpt is None:
+    run_diagnostics(teacher_labeler, df, zig_model, scaler_X, scaler_y_p, DEVICE, n=200)
+else:
+    _logger.info("[CKPT] Skipping run_diagnostics on resume")
 
 
 # ── Main DAgger loop ─────────────────────────────────────────────────
-for dagger_iter in range(DAGGER_ITERATIONS):
+_start_iter = int(ckpt['dagger_iter']) if ckpt is not None else 0
+if ckpt is not None and ckpt.get('converged', False):
+    _logger.info(f"[CKPT] Resumed checkpoint has converged=True; skipping training loop "
+                 f"and regenerating final artifacts")
+    _start_iter = DAGGER_ITERATIONS
+if _start_iter >= DAGGER_ITERATIONS:
+    _logger.info(f"[CKPT] Resumed dagger_iter={_start_iter} >= DAGGER_ITERATIONS="
+                 f"{DAGGER_ITERATIONS}; skipping training loop")
+for dagger_iter in range(_start_iter, DAGGER_ITERATIONS):
     _logger.info(f"{'='*60}")
     _logger.info(f"  DAgger Iteration {dagger_iter + 1}/{DAGGER_ITERATIONS}")
     _logger.info(f"{'='*60}")
@@ -2580,93 +2834,103 @@ for dagger_iter in range(DAGGER_ITERATIONS):
     _logger.info(f"  Iter {dagger_iter+1} loss summary: train_total={avg_train_total:.3f}(imit={avg_train_imit:.3f},spec={avg_train_spec:.3f},phys={avg_train_phys:.3f},invalid={avg_train_invalid:.3f},manifold={avg_train_manifold:.3f})  "
                  f"val_total={val_losses['total']:.3f}(imit={val_losses['imit']:.3f},spec={val_losses['spec']:.3f},phys={val_losses['phys']:.3f},invalid={val_losses['invalid']:.3f},manifold={val_losses['manifold']:.3f})")
 
+    # Use flags instead of break/continue so the iteration-end checkpoint
+    # below always runs (regardless of path through the body).
+    converged = False
+    skip_labeling = False
+
     if failure_rate < CONVERGENCE_THRESHOLD:
         _logger.info(f"CONVERGENCE MET (failure_rate={failure_rate*100:.2f}% < "
                      f"{CONVERGENCE_THRESHOLD*100}%)")
-        break
+        converged = True
 
     # ── 3d. Skip teacher labeling if no failures ────────────────────
-    if len(failed_specs_arr) == 0:
+    if not converged and len(failed_specs_arr) == 0:
         _logger.info("No failures detected — skipping teacher labeling.")
-        continue
+        skip_labeling = True
 
     # ── 3e. Data imbalance check ────────────────────────────────────
-    cap = int(len(distillation_dataset) * FAILURE_CAP_RATIO)
-    if len(failed_specs_arr) > cap:
-        top_k_idx = np.argsort(failure_errors[failure_mask])[-cap:]
-        failed_specs_arr = failed_specs_arr[top_k_idx]
-        _logger.info(f"  Capped failures to top {cap} highest-error cases")
+    if not converged and not skip_labeling:
+        cap = int(len(distillation_dataset) * FAILURE_CAP_RATIO)
+        if len(failed_specs_arr) > cap:
+            top_k_idx = np.argsort(failure_errors[failure_mask])[-cap:]
+            failed_specs_arr = failed_specs_arr[top_k_idx]
+            _logger.info(f"  Capped failures to top {cap} highest-error cases")
 
     # ── 3f. Reset optimizer LR and apply decay (floor at 1e-4) ─────
-    new_lr = LR_INITIAL * (0.5 ** max(0, dagger_iter - LR_DECAY_AFTER_ITER))
-    new_lr = max(new_lr, 1e-4)
-    for pg in optimizer.param_groups:
-        pg['lr'] = new_lr
-    _logger.info(f"  LR reset to {new_lr:.2e}")
+    if not converged and not skip_labeling:
+        new_lr = LR_INITIAL * (0.5 ** max(0, dagger_iter - LR_DECAY_AFTER_ITER))
+        new_lr = max(new_lr, 1e-4)
+        for pg in optimizer.param_groups:
+            pg['lr'] = new_lr
+        _logger.info(f"  LR reset to {new_lr:.2e}")
 
     # ── 3g. Teacher labeling with k-NN empirical fallback ─────────────
-    _logger.info(f"  Querying teacher for {len(failed_specs_arr)} failed specs ...")
+    final_specs = np.empty((0, 4), dtype=np.float32)
+    final_labels = np.empty((0, 7), dtype=np.float32)
+    if not converged and not skip_labeling:
+        _logger.info(f"  Querying teacher for {len(failed_specs_arr)} failed specs ...")
 
-    # Separate boundary and interior specs for tiered teacher budget
-    boundary_mask = np.array([is_boundary_spec(s) for s in failed_specs_arr])
-    boundary_specs = failed_specs_arr[boundary_mask]
-    interior_specs = failed_specs_arr[~boundary_mask]
+        # Separate boundary and interior specs for tiered teacher budget
+        boundary_mask = np.array([is_boundary_spec(s) for s in failed_specs_arr])
+        boundary_specs = failed_specs_arr[boundary_mask]
+        interior_specs = failed_specs_arr[~boundary_mask]
 
-    new_labels = np.zeros((len(failed_specs_arr), 7))  # (N, 7) params
-    label_source = np.zeros(len(failed_specs_arr), dtype=int)  # 0=unlabeled, 1=flow, 2=knn
+        new_labels = np.zeros((len(failed_specs_arr), 7))  # (N, 7) params
+        label_source = np.zeros(len(failed_specs_arr), dtype=int)  # 0=unlabeled, 1=flow, 2=knn
 
-    # Interior specs: standard flow labeling
-    if len(interior_specs) > 0:
-        _logger.info(f"  Interior specs ({len(interior_specs)}): using flow teacher")
-        new_labels_int = teacher_labeler.label_batch(
-            interior_specs,
-            n_candidates=N_CANDIDATES_PER_SPEC,
-            valid_threshold=0.9,
-            top_k=1,
-            verbose=False,
-        )
-        keep_int = filter_by_zig_validity(
-            new_labels_int.squeeze(), zig_model, scaler_X, threshold=0.5, device=DEVICE
-        )
-        idx_int = np.where(~boundary_mask)[0]
-        if keep_int.sum() > 0:
-            new_labels[idx_int[keep_int]] = new_labels_int[keep_int]
-            label_source[idx_int[keep_int]] = 1
+        # Interior specs: standard flow labeling
+        if len(interior_specs) > 0:
+            _logger.info(f"  Interior specs ({len(interior_specs)}): using flow teacher")
+            new_labels_int = teacher_labeler.label_batch(
+                interior_specs,
+                n_candidates=N_CANDIDATES_PER_SPEC,
+                valid_threshold=0.9,
+                top_k=1,
+                verbose=False,
+            )
+            keep_int = filter_by_zig_validity(
+                new_labels_int.squeeze(), zig_model, scaler_X, threshold=0.5, device=DEVICE
+            )
+            idx_int = np.where(~boundary_mask)[0]
+            if keep_int.sum() > 0:
+                new_labels[idx_int[keep_int]] = new_labels_int[keep_int]
+                label_source[idx_int[keep_int]] = 1
 
-    # Boundary specs: high-budget flow + empirical k-NN fallback
-    if len(boundary_specs) > 0:
-        _logger.info(f"  Boundary specs ({len(boundary_specs)}): high-budget flow + k-NN fallback")
-        new_labels_bnd = teacher_labeler.label_batch(
-            boundary_specs,
-            n_candidates=10000,
-            valid_threshold=0.5,
-            top_k=1,
-            verbose=False,
-        )
-        keep_bnd = filter_by_zig_validity(
-            new_labels_bnd.squeeze(), zig_model, scaler_X, threshold=0.5, device=DEVICE
-        )
-        idx_bnd = np.where(boundary_mask)[0]
-        if keep_bnd.sum() > 0:
-            new_labels[idx_bnd[keep_bnd]] = new_labels_bnd[keep_bnd]
-            label_source[idx_bnd[keep_bnd]] = 1
+        # Boundary specs: high-budget flow + empirical k-NN fallback
+        if len(boundary_specs) > 0:
+            _logger.info(f"  Boundary specs ({len(boundary_specs)}): high-budget flow + k-NN fallback")
+            new_labels_bnd = teacher_labeler.label_batch(
+                boundary_specs,
+                n_candidates=10000,
+                valid_threshold=0.5,
+                top_k=1,
+                verbose=False,
+            )
+            keep_bnd = filter_by_zig_validity(
+                new_labels_bnd.squeeze(), zig_model, scaler_X, threshold=0.5, device=DEVICE
+            )
+            idx_bnd = np.where(boundary_mask)[0]
+            if keep_bnd.sum() > 0:
+                new_labels[idx_bnd[keep_bnd]] = new_labels_bnd[keep_bnd]
+                label_source[idx_bnd[keep_bnd]] = 1
 
-        still_failed_bnd = idx_bnd[~keep_bnd] if keep_bnd.sum() > 0 else idx_bnd
-        if len(still_failed_bnd) > 0:
-            _logger.info(f"  k-NN fallback for {len(still_failed_bnd)} boundary specs where flow failed")
-            for i, fi in enumerate(still_failed_bnd):
-                spec = failed_specs_arr[fi]
-                fallback_params = empirical_fallback_label(spec, df, k=3)
-                new_labels[fi] = fallback_params
-                label_source[fi] = 2
-            _logger.info(f"  k-NN fallback: {(label_source[still_failed_bnd] == 2).sum()}/{len(still_failed_bnd)} labeled")
+            still_failed_bnd = idx_bnd[~keep_bnd] if keep_bnd.sum() > 0 else idx_bnd
+            if len(still_failed_bnd) > 0:
+                _logger.info(f"  k-NN fallback for {len(still_failed_bnd)} boundary specs where flow failed")
+                for i, fi in enumerate(still_failed_bnd):
+                    spec = failed_specs_arr[fi]
+                    fallback_params = empirical_fallback_label(spec, df, k=3)
+                    new_labels[fi] = fallback_params
+                    label_source[fi] = 2
+                _logger.info(f"  k-NN fallback: {(label_source[still_failed_bnd] == 2).sum()}/{len(still_failed_bnd)} labeled")
 
-    _logger.info(f"  Teacher labels: flow={int((label_source==1).sum())}, "
-                 f"k-NN={int((label_source==2).sum())}, total={int((label_source>0).sum())}/{len(label_source)}")
+        _logger.info(f"  Teacher labels: flow={int((label_source==1).sum())}, "
+                     f"k-NN={int((label_source==2).sum())}, total={int((label_source>0).sum())}/{len(label_source)}")
 
-    final_keep_mask = label_source > 0
-    final_specs = failed_specs_arr[final_keep_mask]
-    final_labels = new_labels[final_keep_mask]
+        final_keep_mask = label_source > 0
+        final_specs = failed_specs_arr[final_keep_mask]
+        final_labels = new_labels[final_keep_mask]
 
     # ── 3h. Dataset aggregation ──────────────────────────────────────
     if len(final_specs) > 0:
@@ -2674,6 +2938,19 @@ for dagger_iter in range(DAGGER_ITERATIONS):
         distillation_dataset.append_samples(final_specs, final_labels)
         _logger.info(f"  Added {len(final_labels)} labeled failures.  Dataset now: "
                      f"{len(distillation_dataset)}")
+
+    # ── 3i. Iteration-end checkpoint ─────────────────────────────────
+    # Save unconditionally at the end of every iteration (normal path,
+    # no-failure skip, and convergence). Next resume starts at dagger_iter+1.
+    try:
+        save_checkpoint(_ckpt_baseline_payload(dagger_iter=dagger_iter + 1, converged=converged))
+        _logger.info(f"[CKPT] Iteration {dagger_iter+1} checkpoint saved "
+                     f"(next_iter={dagger_iter+1}, dataset={len(distillation_dataset)})")
+    except Exception as e:
+        _logger.warning(f"[CKPT] Failed to write iteration-end checkpoint: {e}")
+
+    if converged:
+        break
 
 _logger.info("DAgger training complete")
 

@@ -603,7 +603,7 @@ class KirchhoffNetWithIO(nn.Module):
                     stage_bucket["output_ode_z_logits"] += n; matched = True
                 elif tail.startswith("output_ode_cell_lib."):
                     stage_bucket["output_ode_cell_lib"] += n; matched = True
-                elif tail == "vca_W":
+                elif tail == "vca_W" or tail == "vca_W_core":
                     stage_bucket["vca_W"] += n; matched = True
                 elif tail.startswith("vca_v_"):
                     stage_bucket["vca_v"] += n; matched = True

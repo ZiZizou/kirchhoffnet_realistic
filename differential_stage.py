@@ -148,6 +148,9 @@ output_ode_src: list[int] | None = None,
         vca_enabled: bool = False,
         vca_rank: int = 2,
         vca_in_dim: int = 0,
+        vca_core_enabled: bool = False,
+        vca_gate_shunt: bool = False,
+        vca_separate_core_bus: bool = False,
     ) -> None:
         super().__init__()
         self.num_nodes = int(num_nodes)
@@ -389,41 +392,60 @@ output_ode_src: list[int] | None = None,
             self._has_output_ode = False
 
         # Low-rank input-driven VCA (Voltage-Controlled Amplifier) gating.
-        # When enabled, builds per-edge embeddings for boundary and
-        # temporal-readout edges plus a shared input projection. The VCA
-        # gate per gated edge is ``sigma(u^T W v_e)`` where ``W``
-        # (in_dim x rank) is the shared projection and ``v_e`` (rank) is
-        # the per-edge embedding. ``W[:, 0]`` is initialized to zero
-        # (input-independent bus) so the VCA gate starts as a no-op
-        # (``sigma(0 * v_e) = 0.5``) and the optimizer can gradually
-        # activate the input-dependent modulation. Incompatible with
-        # --vca-rank < VCA['min_rank']; requires at least one of
-        # boundary or temporal-readout edges.
+        # When enabled, builds per-edge embeddings for boundary,
+        # temporal-readout, and optionally core edges plus a shared input
+        # projection. The VCA gate per gated edge is
+        #   gate_e = 2 * sigma( (u @ W) @ v_e.T )
+        # where ``W`` (in_dim x rank) is the shared projection and
+        # ``v_e`` (rank) is the per-edge embedding. The 2-sigma gain
+        # range (vs 1-sigma) lets the network amplify AND attenuate.
+        #
+        # At init, ``vca_W`` is set to ALL-ZERO so ``u @ W = 0`` for every
+        # input, hence ``z_e = 0`` for every edge regardless of ``v_e``.
+        # Therefore ``gate_e = 2 * sigma(0) = 1.0`` at init and the VCA
+        # multiplies edge currents by 1.0 — bit-identical to VCA-off
+        # baseline at epoch 0 (the correct null hypothesis). Per-edge
+        # embeddings are random at init so ``dL/dW`` receives signal at
+        # step 0 via the ``u ⊗ v_e`` path; ``v_e`` itself receives signal
+        # once ``W`` moves (zero at step 0 by construction).
+        #
+        # Requires rank >= VCA['min_rank']. Requires at least one of
+        # boundary / temporal-readout / core edge families.
         if self.vca_enabled:
             n_b = int(self.boundary_src.numel())
             n_r = int(self.output_ode_src.numel())
-            if n_b == 0 and n_r == 0:
+            n_c = int(self.src.numel())
+            # Core gating is auto-enabled when VCA is on but neither
+            # boundary nor temporal-readout edges exist (run C ablation).
+            self._vca_core_enabled = bool(
+                vca_core_enabled or (n_b == 0 and n_r == 0)
+            )
+            if not self._vca_core_enabled and n_b == 0 and n_r == 0:
                 raise ValueError(
-                    "DifferentialStage: --vca requires boundary_src or "
-                    "output_ode_src to be non-empty (VCA only modulates "
-                    "unfrozen edges that read the input)."
+                    "DifferentialStage: --vca requires at least one gated "
+                    "edge family (boundary, temporal-readout, or core)."
                 )
             if self._vca_in_dim <= 0:
                 raise ValueError(
                     "DifferentialStage: vca_in_dim must be > 0 when "
                     "vca_enabled=True"
                 )
+            self.vca_gate_shunt = bool(vca_gate_shunt)
+            self.vca_separate_core_bus = bool(vca_separate_core_bus)
             init_scale = float(VCA["scale_init"])
+            # Shared input projection: ALL ZERO at init ensures
+            # gate_e = 1.0 exactly at epoch 0.
             self.vca_W = nn.Parameter(
                 torch.zeros(self._vca_in_dim, self.vca_rank)
             )
-            with torch.no_grad():
-                if self.vca_rank > 1:
-                    nn.init.normal_(
-                        self.vca_W[:, 1:],
-                        std=init_scale,
-                    )
-                self.vca_W[:, 0].zero_()
+            # Optional separate bus for core edge family
+            # (--vca-separate-core-bus ablation). Same zero-init rule.
+            if self.vca_separate_core_bus and self._vca_core_enabled:
+                self.vca_W_core = nn.Parameter(
+                    torch.zeros(self._vca_in_dim, self.vca_rank)
+                )
+            else:
+                self.vca_W_core = None
             if n_b > 0:
                 self.vca_v_boundary = nn.Parameter(
                     torch.empty(n_b, self.vca_rank).normal_(std=init_scale)
@@ -436,10 +458,21 @@ output_ode_src: list[int] | None = None,
                 )
             else:
                 self.vca_v_readout = None
+            if self._vca_core_enabled:
+                self.vca_v_core = nn.Parameter(
+                    torch.empty(n_c, self.vca_rank).normal_(std=init_scale)
+                )
+            else:
+                self.vca_v_core = None
         else:
             self.vca_W = None
+            self.vca_W_core = None
             self.vca_v_boundary = None
             self.vca_v_readout = None
+            self.vca_v_core = None
+            self._vca_core_enabled = False
+            self.vca_gate_shunt = False
+            self.vca_separate_core_bus = False
 
     def num_edges(self) -> int:
         return int(self.src.numel())
@@ -638,10 +671,16 @@ output_ode_src: list[int] | None = None,
     ) -> torch.Tensor:
         """Low-rank VCA gate for one edge set.
 
-        Computes ``sigma( (u @ W) @ v_e.T )`` of shape ``[batch, E]`` where
-        ``W`` is the shared input projection ``(in_dim, rank)``, ``v_e``
-        is the per-edge embedding ``(E, rank)``, and ``u`` is the input
-        feature batch ``(batch, in_dim)``.
+        Computes ``2 * sigma( (u @ W) @ v_e.T )`` of shape ``[batch, E]``
+        where ``W`` is the shared input projection ``(in_dim, rank)``,
+        ``v_e`` is the per-edge embedding ``(E, rank)``, and ``u`` is the
+        input feature batch ``(batch, in_dim)``.
+
+        The 2-sigma gain range puts the identity (``gate = 1.0``) at the
+        center of the dynamic range, so the optimizer can amplify or
+        attenuate edge currents symmetrically. With ``vca_W`` zero-init
+        (identity-at-init contract), ``u @ W = 0`` so the gate is
+        exactly ``1.0`` at epoch 0 regardless of ``v_e``.
 
         Caller is responsible for ensuring ``vca_enabled=True``,
         ``u`` is not None and has the expected in_dim, and that the
@@ -650,13 +689,30 @@ output_ode_src: list[int] | None = None,
         """
         u_proj = u @ self.vca_W              # [batch, rank]
         vca_logits = u_proj @ v_e.T          # [batch, E]
-        return torch.sigmoid(vca_logits)
+        return 2.0 * torch.sigmoid(vca_logits)
+
+    def _compute_core_gate(self, u: torch.Tensor) -> torch.Tensor:
+        """Core VCA gate for the freeze_read-OFF and shunt gating paths.
+
+        Computes ``2 * sigma( (u @ W_bus) @ v_c.T )`` of shape
+        ``[batch, E_core]``. Uses ``vca_W_core`` when the separate-core-
+        bus ablation is active, otherwise the shared ``vca_W``.
+
+        Caller is responsible for ensuring ``vca_enabled=True`` and
+        ``self._vca_core_enabled=True``, ``u`` is not None, and the
+        relevant projection and embedding have been built.
+        """
+        W = self.vca_W_core if self.vca_separate_core_bus else self.vca_W
+        u_proj = u @ W                       # [batch, rank]
+        vca_logits = u_proj @ self.vca_v_core.T  # [batch, E_core]
+        return 2.0 * torch.sigmoid(vca_logits)
 
     def rhs(self, x: torch.Tensor,
             u: torch.Tensor | None = None,
             x_drive: torch.Tensor | None = None, drive_scale: float = 0.0,
             leak_floor: float | None = None,
-            i_edge_const: torch.Tensor | None = None) -> torch.Tensor:
+            i_edge_const: torch.Tensor | None = None,
+            vca_gate_core: torch.Tensor | None = None) -> torch.Tensor:
         """Compute dx/dt at state x. x: [batch, num_nodes].
 
         Gate application:
@@ -717,6 +773,12 @@ output_ode_src: list[int] | None = None,
                 x_max=self.x_max,
             )
             i_edge = i_edge * edge_mask.unsqueeze(0)  # [B, E]
+            # Core VCA gate (freeze_read OFF): multiplied per-substep
+            # from the cached gate (constant per sample). Semantically,
+            # scales the entire nonlinear I-V curve per sample, like a
+            # real VCA. No-op when vca_gate_core is None.
+            if vca_gate_core is not None:
+                i_edge = i_edge * vca_gate_core                # [B, E]
 
             # KCL scatter-add: accumulate in float32 for AMP robustness.
             # Under torch.autocast the node/edge gate multiplications promote
@@ -732,7 +794,8 @@ output_ode_src: list[int] | None = None,
             acc = acc.to(dtype=x.dtype)
         else:
             # Frozen path: i_edge_const is the precomputed KCL contribution
-            # [batch, num_nodes] in x's dtype. The tanh contribution was
+            # [batch, num_nodes] in x's dtype. The tanh contribution (with
+            # the core VCA gate already folded in at precompute time) was
             # computed from x0 and held constant. The resistive shunt (if
             # any) is added below from evolving voltages.
             acc = i_edge_const
@@ -743,6 +806,12 @@ output_ode_src: list[int] | None = None,
         if self._has_resistive:
             i_res = self.cell_lib.resistive_current(x_src, x_dst)
             i_res = i_res * edge_mask.unsqueeze(0)              # [B, E]
+            # Core VCA gate on the resistive shunt (--vca-gate-shunt).
+            # Makes M(u) input-dependent: input-dependent routing of
+            # current flow, not just scaling. Passivity preserved as long
+            # as gate is in (0, 2) (it is). Disabled by default.
+            if vca_gate_core is not None and self.vca_gate_shunt:
+                i_res = i_res * vca_gate_core                  # [B, E]
             i_res_f32 = i_res.float()
             # Clone when freeze_read is active so we don't mutate the
             # shared ``i_edge_const`` tensor across rhs calls.
@@ -914,12 +983,23 @@ output_ode_src: list[int] | None = None,
         num_steps = int(num_steps if num_steps is not None else SOLVER["num_steps"])
         dt = t_span / float(num_steps)
 
+        # Compute the core VCA gate cache once per forward (u is constant
+        # per sample). Hoisted out of the Heun loop to avoid recomputing
+        # the matmul per substep (zero extra cost in the freeze_read path
+        # — gate folds into i_edge_const).
+        gate_core_cached = None
+        if self._vca_core_enabled and u is not None and self.vca_v_core is not None:
+            gate_core_cached = self._compute_core_gate(u)
+        # Diagnostic attribute (not read inside compiled rhs — rhs
+        # receives the gate via the explicit kwarg below).
+        self._gate_core_cached = gate_core_cached
+
         # freeze_read: precompute edge currents (cell_lib + edge gate + budget
-        # gate + KCL scatter-add) once from x0 and hold them constant across
-        # all sub-steps. Leak, clip, drive, and boundary-edge currents still
-        # read the current x (boundary terminals are fixed but the dynamic
-        # target node voltage evolves, so the OTA current is per-step).
-        # For cell libraries with a parallel resistive shunt, use
+        # gate + VCA core gate + KCL scatter-add) once from x0 and hold them
+        # constant across all sub-steps. Leak, clip, drive, and boundary-edge
+        # currents still read the current x (boundary terminals are fixed but
+        # the dynamic target node voltage evolves, so the OTA current is
+        # per-step). For cell libraries with a parallel resistive shunt, use
         # ``forward_tanh`` here so the resistive term stays dynamic in ``rhs``
         # (the resistive current is added per-step from evolving voltages).
         i_edge_const = None
@@ -934,6 +1014,12 @@ output_ode_src: list[int] | None = None,
             if self.budget_enabled:
                 edge_mask = edge_mask * self._compute_budget_gate()
             i_edge = i_edge * edge_mask.unsqueeze(0)
+            # Fold the core VCA gate into the frozen KCL contribution
+            # when core VCA is enabled. Per-sample, so b(u) becomes
+            # input-dependent and the matrix-exponential integrator
+            # precompute survives per-sample (just not once-per-stage).
+            if gate_core_cached is not None:
+                i_edge = i_edge * gate_core_cached
             i_edge_f32 = i_edge.float()
             acc_const = torch.zeros_like(x0, dtype=torch.float32)
             acc_const.index_add_(1, self.dst, i_edge_f32)
@@ -946,10 +1032,12 @@ output_ode_src: list[int] | None = None,
 
         for _ in range(num_steps):
             k1 = self.rhs(x, u=u, x_drive=x_drive, drive_scale=drive_scale,
-                          i_edge_const=i_edge_const)
+                          i_edge_const=i_edge_const,
+                          vca_gate_core=gate_core_cached)
             x_pred = x + dt * k1
             k2 = self.rhs(x_pred, u=u, x_drive=x_drive, drive_scale=drive_scale,
-                          i_edge_const=i_edge_const)
+                          i_edge_const=i_edge_const,
+                          vca_gate_core=gate_core_cached)
             x = x + 0.5 * dt * (k1 + k2)
             if store_trajectory:
                 traj_chunks.append(x)
@@ -1018,9 +1106,18 @@ output_ode_src: list[int] | None = None,
                 else:
                     u_t = u_seq[:, t, :]  # (B, 1)
 
+            # Compute the core VCA gate cache per sample (u_t changes
+            # every sample, so gate is per-sample in this path).
+            gate_core_cached = None
+            if self._vca_core_enabled and u_t is not None and self.vca_v_core is not None:
+                gate_core_cached = self._compute_core_gate(u_t)
+            self._gate_core_cached = gate_core_cached
+
             # freeze_read: precompute edge currents from the current state
             # (each sample window freezes from its own starting state, matching
-            # the per-sample _forward_heun semantics).
+            # the per-sample _forward_heun semantics). Fold the core VCA gate
+            # into the frozen KCL contribution (per-sample precompute, so the
+            # matrix-exponential integrator survives per-sample).
             i_edge_const = None
             if self.freeze_read:
                 x_src0 = x[:, self.src]
@@ -1033,6 +1130,8 @@ output_ode_src: list[int] | None = None,
                 if self.budget_enabled:
                     edge_mask = edge_mask * self._compute_budget_gate()
                 i_edge = i_edge * edge_mask.unsqueeze(0)
+                if gate_core_cached is not None:
+                    i_edge = i_edge * gate_core_cached
                 i_edge_f32 = i_edge.float()
                 acc_const = torch.zeros_like(x, dtype=torch.float32)
                 acc_const.index_add_(1, self.dst, i_edge_f32)
@@ -1040,7 +1139,8 @@ output_ode_src: list[int] | None = None,
                     acc_const.index_add_(1, self.src, -i_edge_f32)
                 i_edge_const = acc_const.to(dtype=x.dtype)
 
-            x = self._call_heun_steps(x, u_t, dt, num_steps, i_edge_const)
+            x = self._call_heun_steps(x, u_t, dt, num_steps, i_edge_const,
+                                      gate_core_cached)
             states[t] = x
 
         return states
@@ -1052,6 +1152,7 @@ output_ode_src: list[int] | None = None,
         dt: float,
         num_steps: int,
         i_edge_const: torch.Tensor | None,
+        vca_gate_core: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Dispatch to compiled or uncompiled Heun steps with fallback.
 
@@ -1063,15 +1164,21 @@ output_ode_src: list[int] | None = None,
         """
         if getattr(self, "_heun_steps_compiled", False):
             try:
-                return self._heun_steps_compiled_fn(x, u_t, dt, num_steps, i_edge_const)
+                return self._heun_steps_compiled_fn(
+                    x, u_t, dt, num_steps, i_edge_const, vca_gate_core,
+                )
             except Exception as e:
                 print(
                     f"  [torch.compile] runtime compilation failed: {e}\n"
                     f"  [torch.compile] falling back to uncompiled Heun steps."
                 )
                 self._heun_steps_compiled = False
-                return self._heun_steps(x, u_t, dt, num_steps, i_edge_const)
-        return self._heun_steps(x, u_t, dt, num_steps, i_edge_const)
+                return self._heun_steps(
+                    x, u_t, dt, num_steps, i_edge_const, vca_gate_core,
+                )
+        return self._heun_steps(
+            x, u_t, dt, num_steps, i_edge_const, vca_gate_core,
+        )
 
     def _heun_steps(
         self,
@@ -1080,6 +1187,7 @@ output_ode_src: list[int] | None = None,
         dt: float,
         num_steps: int,
         i_edge_const: torch.Tensor | None,
+        vca_gate_core: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run ``num_steps`` Heun integration steps (predictor-corrector).
 
@@ -1091,10 +1199,12 @@ output_ode_src: list[int] | None = None,
         """
         for _ in range(num_steps):
             k1 = self.rhs(x, u=u_t, x_drive=None, drive_scale=0.0,
-                          i_edge_const=i_edge_const)
+                          i_edge_const=i_edge_const,
+                          vca_gate_core=vca_gate_core)
             x_pred = x + dt * k1
             k2 = self.rhs(x_pred, u=u_t, x_drive=None, drive_scale=0.0,
-                          i_edge_const=i_edge_const)
+                          i_edge_const=i_edge_const,
+                          vca_gate_core=vca_gate_core)
             x = x + 0.5 * dt * (k1 + k2)
         return x
 
@@ -1153,9 +1263,17 @@ output_ode_src: list[int] | None = None,
         lf = float(cfg.get("leak_floor", 0.0))
         dt = float(cfg.get("deq_step", 0.1))
 
+        # Compute the core VCA gate cache once per forward (constant
+        # per sample). Hoisted out of the DEQ fixed-point iterations so
+        # the matmul is paid once, not per iteration.
+        gate_core_cached = None
+        if self._vca_core_enabled and u is not None and self.vca_v_core is not None:
+            gate_core_cached = self._compute_core_gate(u)
+        self._gate_core_cached = gate_core_cached
+
         # freeze_read: precompute edge currents (cell_lib + edge gate + budget
-        # gate + KCL scatter-add) once from x0 and hold them constant across
-        # all fixed-point iterations.
+        # gate + core VCA gate + KCL scatter-add) once from x0 and hold them
+        # constant across all fixed-point iterations.
         i_edge_const = None
         if self.freeze_read:
             x_src0 = x0[:, self.src]
@@ -1165,6 +1283,8 @@ output_ode_src: list[int] | None = None,
             if self.budget_enabled:
                 edge_mask = edge_mask * self._compute_budget_gate()
             i_edge = i_edge * edge_mask.unsqueeze(0)
+            if gate_core_cached is not None:
+                i_edge = i_edge * gate_core_cached
             i_edge_f32 = i_edge.float()
             acc_const = torch.zeros_like(x0, dtype=torch.float32)
             acc_const.index_add_(1, self.dst, i_edge_f32)
@@ -1178,7 +1298,8 @@ output_ode_src: list[int] | None = None,
                 return x + dt * self.rhs(x, u=u,
                                         x_drive=x_drive, drive_scale=drive_scale,
                                         leak_floor=lf,
-                                        i_edge_const=i_edge_const)
+                                        i_edge_const=i_edge_const,
+                                        vca_gate_core=gate_core_cached)
 
             x_star, info = solve_equilibrium(phi, x0, cfg)
             self.last_deq_info = {
@@ -1388,11 +1509,15 @@ output_ode_src: list[int] | None = None,
                 if hasattr(self.output_ode_cell_lib, "kappa_raw"):
                     out_dev += int(self.output_ode_cell_lib.kappa_raw.numel())
         vca_proj_n = int(self.vca_W.numel()) if self.vca_W is not None else 0
+        if getattr(self, "vca_W_core", None) is not None:
+            vca_proj_n += int(self.vca_W_core.numel())
         vca_embed_n = 0
         if self.vca_v_boundary is not None:
             vca_embed_n += int(self.vca_v_boundary.numel())
         if self.vca_v_readout is not None:
             vca_embed_n += int(self.vca_v_readout.numel())
+        if getattr(self, "vca_v_core", None) is not None:
+            vca_embed_n += int(self.vca_v_core.numel())
         return {
             "raw_leak": raw_leak_n,
             "z_logits": int(self.z_logits.numel()),

@@ -1952,6 +1952,14 @@ def compute_update_norms(
             g = "mapper"
         elif name.endswith(".z_logits"):
             g = "struct"
+        elif (
+            name.endswith(".vca_W")
+            or name.endswith(".vca_W_core")
+            or name.endswith(".vca_v_boundary")
+            or name.endswith(".vca_v_readout")
+            or name.endswith(".vca_v_core")
+        ):
+            g = "struct"
         elif name.endswith(".raw_leak") or name.endswith(".raw_drive_g"):
             g = "dyn"
         else:
@@ -2035,6 +2043,71 @@ def log_update_norms(
         parts.append(f"{d['rel_update']:.6e}")
     with open(path, "a") as f:
         f.write("\t".join(parts) + "\n")
+
+def _vca_stages(net):
+    """Return net (unwrapped) and its VCA-core-enabled stages, if any."""
+    raw = net.module if isinstance(net, torch.nn.DataParallel) else net
+    stages = [s for s in raw.core.stages if getattr(s, "_vca_core_enabled", False)]
+    return raw, stages
+
+
+def log_vca_gates(path: Path, epoch: int, net, val_loader,
+                  device, *, phase: str = "", retrain: bool = False,
+                  max_batches: int = 8):
+    """Append one row of per-epoch VCA gate diagnostics to ``path``.
+
+    For each VCA-enabled stage, on up to ``max_batches`` validation batches:
+      * gate distribution (mean/std/min/max over [B, E_core]) — collapse of
+        the gate to a constant across samples means the mechanism is unused;
+      * input-dependent operating point: std across samples of the per-node
+        core-bias magnitude ``|b_j(u)|`` where b_j(u) is the sum of the
+        frozen tanh currents folded with the core gate. If the gate is
+        constant the std collapses to ~0.
+
+    Stale-cache note: ``_gate_core_cached`` is overwritten by every stage
+    forward, so we capture it right after each ``net(u)`` call.
+    """
+    raw, stages = _vca_stages(net)
+    if not stages:
+        return
+    if not path.exists():
+        cols = ["epoch", "phase", "stage", "gate_mean", "gate_std",
+                "gate_min", "gate_max", "bj_std"]
+        with open(path, "w") as f:
+            f.write("\t".join(cols) + "\n")
+    prefix = "retrain_" if retrain else ""
+    with torch.no_grad():
+        seen = 0
+        gate_rows = {i: [] for i in range(len(stages))}
+        for u, _target in val_loader:
+            u = u.to(device)
+            net(u, store_trajectory=False)
+            for si, s in enumerate(stages):
+                g = getattr(s, "_gate_core_cached", None)
+                if g is not None:
+                    gate_rows[si].append(g)
+            seen += 1
+            if seen >= max_batches:
+                break
+    with open(path, "a") as f:
+        for si, s in enumerate(stages):
+            gs = gate_rows.get(si, [])
+            if not gs:
+                continue
+            G = torch.cat(gs, dim=0)          # [B_total, E_core]
+            gmean = float(G.mean().item())
+            gstd = float(G.std().item())
+            gmin = float(G.min().item())
+            gmax = float(G.max().item())
+            # Input-dependent operating-point proxy: std over samples of
+            # the per-edge gate. If the gate collapsed to a constant the
+            # spread goes to ~0 (mechanism unused).
+            edge_gstd = G.std(dim=0)          # [E]
+            bj = float(edge_gstd.mean().item()) if edge_gstd.numel() > 0 else 0.0
+            f.write(
+                f"{prefix}{epoch}\t{phase}\t{si}\t{gmean:.6e}\t{gstd:.6e}\t"
+                f"{gmin:.6e}\t{gmax:.6e}\t{bj:.6e}\n"
+            )
 
 def make_static_ctx_factory():
     """Build a ctx_factory that always returns a default (variation-off) context."""
@@ -2352,6 +2425,11 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
         help="Log gradient norms every N epochs (default: 10). Only used "
              "when --grad-log is enabled.")
     parser.add_argument(
+        "--vca-diag", dest="vca_diag", action="store_true", default=False,
+        help="Per-epoch log of core-gate distributions and input-dependent "
+             "operating-point measures (vca_gates.txt). No-op when no stage "
+             "has core VCA enabled (default: off).")
+    parser.add_argument(
         "--schedule", choices=["legacy", "three_phase", "four_phase"], default=None,
         help="Training schedule mode (default: from preset['schedule'], "
              "fallback 'legacy'). 'three_phase' implements the phased "
@@ -2507,6 +2585,31 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "with per-edge scalar gain; larger r gives the optimizer more "
              "axes to express input-edge alignment. Must be >= "
              f"{VCA['min_rank']}.")
+    parser.add_argument(
+        "--vca-core", action="store_true", default=False,
+        dest="vca_core",
+        help="Enable VCA gating on core (hidden) edges in addition to "
+             "boundary/temporal-readout edges. Computed once per sample at "
+             "stage entry (u is constant per sample across all Heun/DEQ "
+             "sub-iterations), so the gate folds into the freeze_read "
+             "precompute with zero extra cost in the Heun loop. "
+             "Auto-enabled when --vca is on but neither --boundary-fan-out "
+             "nor --temporal-readout are present. Default: disabled "
+             "unless no other gated family exists.")
+    parser.add_argument(
+        "--vca-gate-shunt", action="store_true", default=False,
+        dest="vca_gate_shunt",
+        help="Also gate the parallel resistive shunt with the core VCA "
+             "gate, making M(u) input-dependent (input-dependent routing "
+             "of current flow, not just scaling). Passivity preserved "
+             "(gain in (0, 2) is dissipative). Default: disabled (evaluate "
+             "last).")
+    parser.add_argument(
+        "--vca-separate-core-bus", action="store_true", default=False,
+        dest="vca_separate_core_bus",
+        help="Give the core edge family its own input projection (vca_W_core) "
+             "instead of sharing vca_W with boundary/readout edges. "
+             "Ablation only; default off (shared bus).")
     parser.add_argument(
         "--leak", choices=["programmable", "non-programmable"],
         default="programmable", dest="leak",
@@ -3269,19 +3372,14 @@ def main():
                 f"(got --write-mode {args.write_mode!r})"
             )
 
-    # VCA (input-driven attention gating): requires at least one of
-    # --boundary-fan-out or --temporal-readout to have any gated edges.
+    # VCA (input-driven attention gating): requires at least one gated
+    # edge family (boundary, temporal-readout, or core). With --vca-core
+    # (or when no other family exists), the core edge family is gated.
     if args.vca:
         vca_rank_eff = args.vca_rank if args.vca_rank is not None else VCA["rank"]
         if vca_rank_eff < VCA["min_rank"]:
             raise ValueError(
                 f"--vca-rank must be >= {VCA['min_rank']}, got {vca_rank_eff}"
-            )
-        if boundary_fan_out_parsed is None and not args.enable_temporal_readout:
-            raise ValueError(
-                "--vca requires at least one of --boundary-fan-out or "
-                "--temporal-readout: VCA only modulates unfrozen edges that "
-                "have access to the input features."
             )
 
     net = build_net_from_preset(
@@ -3308,7 +3406,10 @@ def main():
         enable_ref_edges=args.enable_ref_edges,
         enable_temporal_readout=args.enable_temporal_readout,
         vca_enabled=args.vca,
-        vca_rank=args.vca_rank)
+        vca_rank=args.vca_rank,
+        vca_core_enabled=args.vca_core,
+        vca_gate_shunt=args.vca_gate_shunt,
+        vca_separate_core_bus=args.vca_separate_core_bus)
     net.to(device)
 
     if args.no_edge_gates:
@@ -3611,6 +3712,7 @@ def main():
 
     grad_log_path = out_dir / "grad_norms.txt" if args.grad_log else None
     update_norms_path = out_dir / "update_norms.txt" if args.grad_log else None
+    vca_gates_path = out_dir / "vca_gates.txt" if getattr(args, "vca_diag", False) else None
     solid_log_path = out_dir / "solidification_metrics.txt" if schedule_mode in ("three_phase", "four_phase") else None
 
     # ---------- Determine effective training scope ----------
@@ -3948,6 +4050,10 @@ def main():
                 update_norms = compute_update_norms(param_snapshots, net)
                 log_update_norms(update_norms_path, epoch, update_norms, phase=phase)
                 param_snapshots = None  # free snapshot memory
+
+        if vca_gates_path is not None and epoch % args.grad_log_every == 0:
+            log_vca_gates(vca_gates_path, epoch, net, val_loader, device,
+                          phase=phase)
 
         _lrs = [g["lr"] for g in optimizer.param_groups]
         lr_str = f"{min(_lrs):.1e}..{max(_lrs):.1e}" if len(_lrs) > 1 else f"{_lrs[0]:.2e}"

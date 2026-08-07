@@ -1003,6 +1003,18 @@ def make_optimizer(
                 mapper_params.append(p)
             elif name.endswith(".z_logits"):
                 struct_params.append(p)
+            elif (
+                name.endswith(".vca_W")
+                or name.endswith(".vca_W_core")
+                or name.endswith(".vca_v_boundary")
+                or name.endswith(".vca_v_readout")
+                or name.endswith(".vca_v_core")
+            ):
+                # VCA routing-structure params: shared input projection +
+                # per-edge tap embeddings for each gated family. Allocated
+                # to the structural LR group (4x base by convention) so the
+                # gate signal can learn alongside z_logits.
+                struct_params.append(p)
             elif name.endswith(".raw_leak") or name.endswith(".raw_drive_g"):
                 dyn_params.append(p)
             else:

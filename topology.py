@@ -1311,6 +1311,9 @@ def topology_to_stage(
     vca_enabled: bool = False,
     vca_rank: int = 2,
     vca_in_dim: int = 0,
+    vca_core_enabled: bool = False,
+    vca_gate_shunt: bool = False,
+    vca_separate_core_bus: bool = False,
 ) -> tuple[DifferentialStage, list[int], dict[int, int]]:
     """Convert a SparseTopology into a DifferentialStage.
 
@@ -1548,6 +1551,9 @@ def topology_to_stage(
         vca_enabled=vca_enabled,
         vca_rank=vca_rank,
         vca_in_dim=vca_in_dim,
+        vca_core_enabled=vca_core_enabled,
+        vca_gate_shunt=vca_gate_shunt,
+        vca_separate_core_bus=vca_separate_core_bus,
     )
     return stage, active_nodes, id_map
 
@@ -1579,6 +1585,9 @@ def build_net_from_preset(
     enable_temporal_readout: bool = False,
     vca_enabled: bool = False,
     vca_rank: int | None = None,
+    vca_core_enabled: bool = False,
+    vca_gate_shunt: bool = False,
+    vca_separate_core_bus: bool = False,
 ):
     """Build a full KirchhoffNetWithIO from a config.PRESETS entry.
 
@@ -1679,6 +1688,9 @@ def build_net_from_preset(
         enable_temporal_readout=enable_temporal_readout,
         vca_enabled=vca_enabled,
         vca_rank=vca_rank,
+        vca_core_enabled=vca_core_enabled,
+        vca_gate_shunt=vca_gate_shunt,
+        vca_separate_core_bus=vca_separate_core_bus,
     )
 
 
@@ -1699,6 +1711,9 @@ def build_net_from_config(
     enable_temporal_readout: bool = False,
     vca_enabled: bool = False,
     vca_rank: int | None = None,
+    vca_core_enabled: bool = False,
+    vca_gate_shunt: bool = False,
+    vca_separate_core_bus: bool = False,
 ):
     """Build a KirchhoffNetWithIO from a full config dict.
 
@@ -2099,6 +2114,9 @@ def build_net_from_config(
             vca_enabled=vca_enabled_effective,
             vca_rank=vca_rank_effective,
             vca_in_dim=in_dim,
+            vca_core_enabled=vca_core_enabled,
+            vca_gate_shunt=vca_gate_shunt,
+            vca_separate_core_bus=vca_separate_core_bus,
         )
         stage_modules.append(stage)
         stage_times.append(float(stages_cfg[stage_idx].get("t_span", 0.5)))

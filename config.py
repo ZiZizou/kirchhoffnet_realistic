@@ -558,23 +558,32 @@ DEGREE_BUDGET = {
 }
 
 # Low-rank input-driven VCA (Voltage-Controlled Amplifier) gating.
-# Applied to boundary and temporal-readout edges (the unfrozen edges that
-# already read ``u``). VCA gate per edge is
-#   vca_e = sigma( u^T W v_e )
+# Applied to boundary, temporal-readout, and (with --vca-core) core
+# edges. VCA gate per edge is
+#   gate_e = 2 * sigma( (u^T W) v_e )
 # where ``W`` (in_dim x rank) is a shared input projection and ``v_e``
 # (rank) is a per-edge embedding. Physically: ``rank`` global control
-# buses broadcast from the input terminals, each unfrozen edge taps into
+# buses broadcast from the input terminals, each gated edge taps into
 # them with a programmable weight.
 #
-# Default rank=2 keeps the parameter cost small (e.g. rank=2 with 52
-# boundary edges and in_dim=13 = 130 params per stage) while still
-# letting the network express content-dependent cross-node interaction.
-# Compatible with --freeze-read because ``u`` is constant per sample
-# across all Heun/DEQ sub-iterations, so the VCA gate can be co-frozen
-# with the unfrozen edge currents that depend on it.
+# Identity-at-init: ``vca_W`` is initialized to all-zero so ``u^T W = 0``
+# and ``gate_e = 2 * sigma(0) = 1.0`` at epoch 0 regardless of v_e.
+# Bit-identical to VCA-off baseline at step 0 — the correct null
+# hypothesis. Per-edge embeddings are random at init so ``dL/dW`` receives
+# signal at step 0 via the u ⊗ v_e path; v_e itself receives signal once
+# W moves.
+#
+# The 2-sigma gain range (vs 1-sigma) lets the network amplify AND
+# attenuate edge currents symmetrically.
+#
+# Default rank=2 keeps the parameter cost small. Compatible with
+# --freeze-read because ``u`` is constant per sample across all Heun/DEQ
+# sub-iterations, so the VCA gate is computed once per sample at stage
+# entry and either folded into the frozen KCL contribution (freeze_read
+# ON) or passed as a kwarg to rhs (freeze_read OFF).
 VCA = {
-    "rank": 2,                # projection rank r; must be >= 1
-    "scale_init": 0.01,       # std for both W (excluding first column) and v_e init
+    "rank": 2,                # projection rank r; must be >= VCA['min_rank']
+    "scale_init": 0.01,       # std for v_e init (W is init to all-zero)
     "min_rank": 1,
 }
 

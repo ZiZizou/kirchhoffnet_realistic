@@ -487,6 +487,9 @@ MIN_DEGRADED_DIMS     = 2        # fail only when 2+ dimensions degrade meaningf
 LR_INITIAL            = 1e-3     # AdamW initial learning rate
 LR_DECAY_AFTER_ITER   = 3        # iteration index (0-based) after which LR *= 0.5
 LR_FLOOR             = 1e-4      # minimum LR during decay (was eta_min in scheduler)
+MAPPER_LR_SCALE       = 1.0      # I/O mapper + OutputAffine readout (base * 1.0)
+STRUCT_LR_SCALE       = 4.0      # structural core params: name.endswith('.z_logits')
+DYN_LR_SCALE          = 1.0      # sensitive dynamical params: raw_leak, raw_drive_g
 FAILURE_CAP_RATIO     = 0.40     # max new failures / existing dataset size per iter
 CONVERGENCE_THRESHOLD = 0.02     # early-stop if failure_rate < 2%
 N_EMPIRICAL_SAMPLES   = 20000    # initial empirical distillation samples (was 5000)
@@ -2470,6 +2473,11 @@ def log_rail_probe(student, specs_arr, n=256, x_max=None, device=DEVICE):
     if student is None or specs_arr is None or len(specs_arr) == 0:
         _logger.info(f"[RAIL] no specs — skipping (x_max={x_max})")
         return
+    # Output ODE accumulators are the last ``output_ode_count`` entries of each
+    # stage's ODE state vector (differential_stage.py:334). The readout is the
+    # accumulator value at the final timepoint (t_span); if it is still changing
+    # there, the effective output is a mid-transient integral (unsettled readout).
+    out_dim = int(getattr(student.net, "output_ode_count", 0))
     try:
         subsample = specs_arr[: min(n, len(specs_arr))]
         specs_t = torch.from_numpy(subsample.astype(np.float32)).to(device)
@@ -2497,8 +2505,50 @@ def log_rail_probe(student, specs_arr, n=256, x_max=None, device=DEVICE):
                 f"  stage {s}: max|x|/x_max={max_ratio:.2f}  "
                 f"frac(|x|>0.9*x_max)={frac:4.1f}%"
             )
+            _log_readout_settling(traj, out_dim=out_dim, s=s)
     except Exception as e:
         _logger.warning(f"[RAIL] probe failed: {e}")
+
+
+def _log_readout_settling(traj, out_dim, s, first_frac=0.25, last_frac=0.25):
+    """Report whether the output ODE accumulator readout is still in flight.
+
+    Estimates the accumulator time-derivative over the early window vs the
+    final window of each stage's trajectory. ``vel_last/vel_first`` near 1
+    means the accumulator is still integrating (readout is a mid-transient
+    value); a small ratio means it has settled before ``t_span``. Uses only the
+    last ``output_ode_count`` columns, which are the accumulator nodes.
+    """
+    if out_dim <= 0:
+        return
+    try:
+        a = traj[..., -out_dim:, :].float()  # (B, out_dim, T)
+        if a.dim() == 2:
+            a = a.unsqueeze(0)
+        B, Oc, T = a.shape
+        if T < 4 or Oc < 1:
+            _logger.info("  readout: too few time steps to measure settling")
+            return
+        abs_a = torch.nan_to_num(a.detach().abs(), nan=0.0)
+        mean_acc = abs_a.mean().item()
+        max_acc = abs_a.max().item()
+        # finite-difference derivative magnitudes
+        d = torch.diff(a, dim=2).abs()  # (B, Oc, T-1)
+        i_first = max(1, int(first_frac * (T - 1)))
+        i_last = max(1, int(last_frac * (T - 1)))
+        vel_first = d[..., :i_first].mean().item()
+        vel_last = d[..., -i_last:].mean().item()
+        ratio = (vel_last / (vel_first + 1e-12)) if vel_first > 0 else float('inf')
+        state = "SETTLED" if ratio < 0.5 else ("RISING" if ratio > 1.0 else "MIXED")
+        # fraction of (sample,accumulator) entries still moving in the last window
+        any_move = (d[..., -i_last:].abs() > 1e-6).float().mean().item() * 100
+        _logger.info(
+            f"    readout: mean|acc|={mean_acc:.4f}  max={max_acc:.4f}  "
+            f"vel_first={vel_first:.2e}  vel_last={vel_last:.2e}  "
+            f"ratio={ratio:.2f} [{state}]  %moving_last={any_move:.1f}"
+        )
+    except Exception as e:
+        _logger.warning(f"  [readout] settling probe failed on stage {s}: {e}")
 
 
 # =====================================================================
@@ -2580,8 +2630,48 @@ _logger.info(
 
 # Optimizer and scheduler (defined once, reused across iterations).
 # Wrapper's parameters() exposes the entire local KirchhoffNetWithIO
-# (fabric stages, transfers, InputMapper, OutputAffine).
-optimizer = torch.optim.AdamW(student.parameters(), lr=LR_INITIAL, weight_decay=WEIGHT_DECAY)
+# (fabric stages, transfers, InputMapper, OutputAffine). Per-group LR scales
+# mirror train.py:make_optimizer classification (train.py:1001-1017):
+#   - mapper: InputMapper + OutputAffine (output_mapper)
+#   - struct: name.endswith('.z_logits') (per-stage edge-gate logits)
+#   - dyn:    name.endswith('.raw_leak') or '.raw_drive_g'
+#   - other:  everything else (stages/transfers/vref/etc.)
+# The 'lr_scale' key is stored in each group dict so the per-iteration LR
+# reset at dagger:3004-3010 can multiply the base LR by the group's scale.
+def _make_dagger_optimizer(student, lr, weight_decay):
+    _mapper, _struct, _dyn, _other = [], [], [], []
+    for _name, _p in student.named_parameters():
+        if not _p.requires_grad:
+            continue
+        if "input_mapper" in _name or "output_mapper" in _name:
+            _mapper.append(_p)
+        elif _name.endswith(".z_logits"):
+            _struct.append(_p)
+        elif _name.endswith(".raw_leak") or _name.endswith(".raw_drive_g"):
+            _dyn.append(_p)
+        else:
+            _other.append(_p)
+    groups = []
+    if _other:
+        groups.append({"params": _other, "lr": lr, "lr_scale": 1.0})
+    if _mapper:
+        groups.append({"params": _mapper, "lr": lr * MAPPER_LR_SCALE, "lr_scale": MAPPER_LR_SCALE})
+    if _struct:
+        groups.append({"params": _struct, "lr": lr * STRUCT_LR_SCALE, "lr_scale": STRUCT_LR_SCALE})
+    if _dyn:
+        groups.append({"params": _dyn, "lr": lr * DYN_LR_SCALE, "lr_scale": DYN_LR_SCALE})
+    _logger.info(f"[OPT] Param groups: other={sum(p.numel() for p in _other)} "
+                 f"({len(_other)} tensors, lr={lr:.2e}); "
+                 f"mapper={sum(p.numel() for p in _mapper)} "
+                 f"({len(_mapper)} tensors, lr={lr*MAPPER_LR_SCALE:.2e}); "
+                 f"struct={sum(p.numel() for p in _struct)} "
+                 f"({len(_struct)} tensors, lr={lr*STRUCT_LR_SCALE:.2e}); "
+                 f"dyn={sum(p.numel() for p in _dyn)} "
+                 f"({len(_dyn)} tensors, lr={lr*DYN_LR_SCALE:.2e})")
+    return torch.optim.AdamW(groups, lr=lr, weight_decay=weight_decay)
+
+
+optimizer = _make_dagger_optimizer(student, LR_INITIAL, WEIGHT_DECAY)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
     optimizer, T_max=EPOCHS_PER_ITER, eta_min=LR_FLOOR
 )
@@ -3006,8 +3096,9 @@ for dagger_iter in range(_start_iter, DAGGER_ITERATIONS):
         new_lr = LR_INITIAL * (0.5 ** max(0, dagger_iter - LR_DECAY_AFTER_ITER))
         new_lr = max(new_lr, 1e-4)
         for pg in optimizer.param_groups:
-            pg['lr'] = new_lr
-        _logger.info(f"  LR reset to {new_lr:.2e}")
+            pg['lr'] = new_lr * pg.get('lr_scale', 1.0)
+        _lr_per_group = ', '.join('{:.2e}'.format(pg['lr']) for pg in optimizer.param_groups)
+        _logger.info(f"  LR reset to {new_lr:.2e} (per-group: {_lr_per_group})")
 
     # ── 3g. Teacher labeling with k-NN empirical fallback ─────────────
     final_specs = np.empty((0, 4), dtype=np.float32)

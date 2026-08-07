@@ -436,6 +436,8 @@ def _log_hyperparameters():
         ("KN_CELL_LIBRARY", KN_CELL_LIBRARY),
         ("KN_LEAK_MODE", KN_LEAK_MODE),
         ("KN_INTERSTAGE_ACTIVATION", KN_INTERSTAGE_ACTIVATION),
+        ("KN_FREEZE_READ", KN_FREEZE_READ),
+        ("KN_TEMPORAL_READOUT", KN_TEMPORAL_READOUT),
         ("KN_BOUNDARY_FAN_OUT", KN_BOUNDARY_FAN_OUT),
         ("KN_INPUT_RAIL", KN_INPUT_RAIL),
         ("KN_X_MAX", KN_X_MAX),
@@ -535,6 +537,8 @@ KN_EDGE_REPEATS     = 2       # parallel edges per unique hidden pair
 KN_CELL_LIBRARY     = "tanh_free"   # FreeTanhLibrary (per-edge tanh OTA)
 KN_LEAK_MODE        = "non-programmable"  # fixed leak_constant (config default 0.0486)
 KN_INTERSTAGE_ACTIVATION = "residual-relu-tanh"  # interstage StageTransfer activation
+KN_FREEZE_READ          = True      # precompute edge currents once from state (frozen OTA read core)
+KN_TEMPORAL_READOUT     = True      # append per-stage output ODE accumulators (temporal-readout readout)
 KN_BOUNDARY_FAN_OUT = '{"0": [2, 12], "1": [7, 17], "2": [22, 5], "3": [10, 15]}'  # 4 inputs -> 8 boundary edges
 KN_INPUT_RAIL       = 4.0     # clamp normalized input to [-KN_INPUT_RAIL, KN_INPUT_RAIL] (x_max=4.0)
 KN_X_MAX            = 4.0     # local knet rail (overrides PHYS["x_max"]=3.0 via build_net_from_config x_max kwarg)
@@ -2600,9 +2604,9 @@ student = LocalKirchhoffStudentWrapper(
     cell_library=KN_CELL_LIBRARY,
     leak_mode=KN_LEAK_MODE,
     interstage_activation=KN_INTERSTAGE_ACTIVATION,
-    freeze_read=True,
+    freeze_read=KN_FREEZE_READ,
     boundary_fan_out=KN_BOUNDARY_FAN_OUT,
-    enable_temporal_readout=True,
+    enable_temporal_readout=KN_TEMPORAL_READOUT,
     num_targets=7,
     input_rail=KN_INPUT_RAIL,
     x_max=KN_X_MAX,
@@ -2624,7 +2628,7 @@ _logger.info(
     f"small_world_k={KN_SMALL_WORLD_K}, small_world_p={KN_SMALL_WORLD_P}, "
     f"edge_repeats={KN_EDGE_REPEATS}, cell_library={KN_CELL_LIBRARY}, "
     f"leak_mode={KN_LEAK_MODE}, interstage_activation={KN_INTERSTAGE_ACTIVATION}, "
-    f"freeze_read=True, temporal_readout=True, input_rail={KN_INPUT_RAIL}, "
+    f"freeze_read={KN_FREEZE_READ}, temporal_readout={KN_TEMPORAL_READOUT}, input_rail={KN_INPUT_RAIL}, "
     f"x_max={KN_X_MAX})"
 )
 

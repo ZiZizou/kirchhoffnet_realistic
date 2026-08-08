@@ -1714,6 +1714,7 @@ def build_net_from_config(
     vca_core_enabled: bool = False,
     vca_gate_shunt: bool = False,
     vca_separate_core_bus: bool = False,
+    x_max: float | None = None,
 ):
     """Build a KirchhoffNetWithIO from a full config dict.
 
@@ -2117,6 +2118,7 @@ def build_net_from_config(
             vca_core_enabled=vca_core_enabled,
             vca_gate_shunt=vca_gate_shunt,
             vca_separate_core_bus=vca_separate_core_bus,
+            x_max=x_max,
         )
         stage_modules.append(stage)
         stage_times.append(float(stages_cfg[stage_idx].get("t_span", 0.5)))

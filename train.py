@@ -37,6 +37,7 @@ from cell_library import (
     RealisticTanhUpgradeLibrary,
     SimpleEdgeLibrary,
 )
+from io_mapper import OutputAffine
 
 
 __all__ = [
@@ -149,6 +150,94 @@ def _stage_tanh_sat_loss(stage, traj: torch.Tensor) -> torch.Tensor:
     u = gm_e * pre                                              # [B, E, T]
 
     return torch.tanh(u).pow(2).mean()
+
+
+def _device_l2_penalty(net) -> torch.Tensor:
+    """Scale-invariant L2 penalty over the ``tanh_free`` device-family params.
+
+    Walks the unwrapped KirchhoffNetWithIO and sums the squared raw params of
+    every partition the user asked us to keep small:
+
+      - ``FreeTanhLibrary`` cell params: ``a_raw``, ``b_raw``, ``gm_raw``,
+        ``isat_raw``, ``theta_raw``, ``g_resistive_raw`` on ``cell_lib``,
+        ``boundary_cell_lib``, ``output_ode_cell_lib``, and ``ref_cell_lib``
+        (when each exists and is a ``FreeTanhLibrary``). ``s_raw`` is skipped
+        because it is a discrete ±1 sign with STE; penalizing it would push
+        ``sign(0) = 0`` and kill edges.
+      - VCA params: ``vca_W``, ``vca_W_core``, ``vca_v_boundary``,
+        ``vca_v_readout``, ``vca_v_core``.
+      - Interstage residual transfer: ``StageTransfer.residual_w1/w2/w3/vth``
+        (only present when the activation is a residual variant).
+      - Temporal-readout decoder: ``OutputAffine.gain/bias/tanh_gain/
+        relu_gain/relu_threshold`` (only when the readout uses OutputAffine).
+
+    Returns the *mean* of ``p.pow(2)`` over the union of penalized tensors
+    (so the pressure per parameter is independent of how many params the
+    active configuration has). Returns 0 when no penalized params exist.
+    Unwraps ``DataParallel`` and the ``KirchhoffNetNoiseWrapper`` so the
+    same call site works with or without multi-GPU / noise-aware training.
+    """
+    raw = net
+    if isinstance(raw, torch.nn.DataParallel):
+        raw = raw.module
+    if hasattr(raw, "base") and hasattr(raw, "_stage_noise_std"):
+        raw = raw.base
+
+    sum_sq = None
+    num = 0
+    device = None
+    dtype = None
+
+    def _accum(p: torch.Tensor) -> None:
+        nonlocal sum_sq, num, device, dtype
+        if p is None:
+            return
+        s = p.pow(2).sum()
+        sum_sq = s if sum_sq is None else sum_sq + s
+        num += int(p.numel())
+        if device is None:
+            device = p.device
+            dtype = p.dtype
+
+    stages = getattr(getattr(raw, "core", raw), "stages", [])
+    for stage in stages:
+        for lib in (
+            getattr(stage, "cell_lib", None),
+            getattr(stage, "boundary_cell_lib", None),
+            getattr(stage, "output_ode_cell_lib", None),
+            getattr(stage, "ref_cell_lib", None),
+        ):
+            if isinstance(lib, FreeTanhLibrary):
+                for name, p in lib.named_parameters():
+                    if name == "s_raw":
+                        continue
+                    _accum(p)
+        for vca_name in (
+            "vca_W",
+            "vca_W_core",
+            "vca_v_boundary",
+            "vca_v_readout",
+            "vca_v_core",
+        ):
+            _accum(getattr(stage, vca_name, None))
+
+    transfers = getattr(getattr(raw, "core", raw), "transfers", [])
+    for tr in transfers:
+        for name in ("residual_w1", "residual_w2", "residual_w3", "residual_vth"):
+            _accum(getattr(tr, name, None))
+
+    om = getattr(raw, "output_mapper", None)
+    if isinstance(om, OutputAffine):
+        for name in ("gain", "bias", "tanh_gain", "relu_gain", "relu_threshold"):
+            _accum(getattr(om, name, None))
+
+    if sum_sq is None or num == 0:
+        try:
+            ref = next(raw.parameters())
+            return torch.zeros((), device=ref.device, dtype=ref.dtype)
+        except StopIteration:
+            return torch.zeros(())
+    return sum_sq / float(num)
 
 
 def _compute_regularizers(
@@ -588,6 +677,7 @@ def compute_loss(
     deq_cfg: dict | None = None,
     teacher: KirchhoffNetWithIO | KirchhoffNet | None = None,
     kd_lambda: float = 0.0,
+    device_l2_lambda: float = 0.0,
 ):
     """Compute total loss = task (optionally + KD) + regularizers.
 
@@ -649,11 +739,16 @@ def compute_loss(
                     + (p.bias.pow(2).sum() if p.bias is not None else torch.zeros((), device=p.weight.device))
                 )
 
+        loss_device_l2 = 0.0
+        device_l2_lambda = float(device_l2_lambda)
+        if device_l2_lambda > 0:
+            loss_device_l2 = device_l2_lambda * _device_l2_penalty(net)
+
         total_task = loss_task + float(lambdas.get("rail", 0.0)) * loss_rail
         structural = reg_scale * (
             float(lambdas.get("edge_gate", 0.0)) * loss_edge_gate
             + float(lambdas.get("tanh_sat", 0.0)) * loss_tanh_sat
-        ) + loss_skip_l2
+        ) + loss_skip_l2 + loss_device_l2
 
     if return_parts:
         parts = {
@@ -662,6 +757,7 @@ def compute_loss(
             "rail": float(loss_rail.item()),
             "tanh_sat": float(loss_tanh_sat.item()),
             "skip_linear_l2": float(loss_skip_l2.item()) if torch.is_tensor(loss_skip_l2) else float(loss_skip_l2),
+            "device_l2": float(loss_device_l2.item()) if torch.is_tensor(loss_device_l2) else float(loss_device_l2),
             "reg_scale": float(reg_scale),
             "total": float((total_task + structural).item()),
         }

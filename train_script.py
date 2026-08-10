@@ -2271,6 +2271,21 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "so the skip projection is incentivized to be small. Default: "
              "off (no skip connection).")
     parser.add_argument(
+        "--device-l2-lambda", type=float, default=0.0,
+        dest="device_l2_lambda",
+        help="Lambda for the scale-invariant L2 penalty on the 'tanh_free' "
+             "device-family parameters: FreeTanhLibrary cell params "
+             "(a_raw/b_raw/gm_raw/isat_raw/theta_raw/g_resistive_raw on "
+             "core/boundary/output_ode cell libs; s_raw is excluded as a "
+             "discrete sign), interstage residual transfer weights "
+             "(residual_w1/w2/w3/vth), temporal-readout OutputAffine params "
+             "(gain/bias/tanh_gain/relu_gain/relu_threshold), and VCA params "
+             "(vca_W[/vca_W_core], vca_v_boundary/vca_v_readout/vca_v_core). "
+             "Computed as lambda * mean(p.pow(2)) over the union of penalized "
+             "tensors so pressure per parameter is invariant to model size. "
+             "Always-on (not multiplied by reg_schedule warm-up). Default: 0.0 "
+             "(disabled).")
+    parser.add_argument(
         "--struct-lr-scale", type=float, default=2.0,
         help="LR multiplier for structural core params (z_logits, cell logits, "
              "raw_mult). Default 2.0 (modest boost). These combinatorial-ish "
@@ -3477,6 +3492,30 @@ def main():
             f"shape={net.skip_linear_in_dim}->{net.skip_linear_out_dim}, "
             f"L2 lambda={skip_l2_lambda}"
         )
+    if args.device_l2_lambda > 0.0:
+        from cell_library import FreeTanhLibrary as _FreeTanhLibrary
+        n_tanh_free = sum(
+            getattr(s, "cell_lib", None) is not None
+            and isinstance(s.cell_lib, _FreeTanhLibrary)
+            for s in net.core.stages
+        )
+        n_boundary = sum(
+            getattr(s, "boundary_cell_lib", None) is not None
+            and isinstance(s.boundary_cell_lib, _FreeTanhLibrary)
+            for s in net.core.stages
+        )
+        n_temporal = sum(
+            getattr(s, "output_ode_cell_lib", None) is not None
+            and isinstance(s.output_ode_cell_lib, _FreeTanhLibrary)
+            for s in net.core.stages
+        )
+        print(
+            f"[train] device L2 penalty ENABLED: lambda={args.device_l2_lambda:.2e} "
+            f"(scale-invariant mean over FreeTanh cell params, "
+            f"interstage residual weights, OutputAffine, VCA; s_raw skipped). "
+            f"tanh_free cell_lib families: core={n_tanh_free}, "
+            f"boundary={n_boundary}, temporal-readout={n_temporal}"
+        )
     if getattr(net, "enable_vca", False):
         vca_rank_eff = net.vca_rank if hasattr(net, "vca_rank") else VCA["rank"]
         n_b_edges = sum(
@@ -3916,7 +3955,8 @@ def main():
                 lambdas=effective_lambdas, return_parts=True,
                 amp=amp_enabled, amp_dtype=amp_dtype, reg_scale=reg_scale,
                 solver=solver, deq_cfg=deq_cfg,
-                teacher=kd_teacher, kd_lambda=kd_lambda)
+                teacher=kd_teacher, kd_lambda=kd_lambda,
+                device_l2_lambda=args.device_l2_lambda)
             if scaler is not None and scaler._enabled:
                 ( scaler.scale(loss_task) + scaler.scale(loss_structural) ).backward()
                 scaler.unscale_(optimizer)
@@ -4615,7 +4655,8 @@ def main():
                     loss_task, loss_structural, _ = compute_loss(
                         pruned_net, u_b, tgt_b, ctx, task_fn,
                         lambdas=effective_c_lambdas_r, return_parts=True,
-                        amp=amp_enabled, amp_dtype=amp_dtype, reg_scale=reg_r)
+                        amp=amp_enabled, amp_dtype=amp_dtype, reg_scale=reg_r,
+                        device_l2_lambda=args.device_l2_lambda)
                     if retrain_scaler is not None and retrain_scaler._enabled:
                         ( retrain_scaler.scale(loss_task) + retrain_scaler.scale(loss_structural) ).backward()
                         retrain_scaler.unscale_(retrain_optimizer)

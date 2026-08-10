@@ -234,9 +234,11 @@ _LOCAL_KIRCHHOFF_DIR = os.path.dirname(os.path.abspath(__file__))
 if _LOCAL_KIRCHHOFF_DIR not in sys.path:
     sys.path.insert(0, _LOCAL_KIRCHHOFF_DIR)
 
-from config import SOLVER
+from config import SOLVER, VCA
 from cell_library import make_cell_library
 from topology import build_net_from_config
+
+
 
 _NP_SEED = 42
 _TORCH_SEED = 42
@@ -441,6 +443,11 @@ def _log_hyperparameters():
         ("KN_BOUNDARY_FAN_OUT", KN_BOUNDARY_FAN_OUT),
         ("KN_INPUT_RAIL", KN_INPUT_RAIL),
         ("KN_X_MAX", KN_X_MAX),
+        ("KN_VCA", KN_VCA),
+        ("KN_VCA_RANK", KN_VCA_RANK if KN_VCA_RANK is not None else int(VCA["rank"])),
+        ("KN_VCA_CORE", KN_VCA_CORE),
+        ("KN_VCA_GATE_SHUNT", KN_VCA_GATE_SHUNT),
+        ("KN_VCA_SEPARATE_CORE_BUS", KN_VCA_SEPARATE_CORE_BUS),
         ("KN_INPUT_LOG_PAD_FRAC", KN_INPUT_LOG_PAD_FRAC),
         ("KN_INPUT_LOG_MIN", KN_INPUT_LOG_MIN),
         ("KN_INPUT_LOG_MAX", KN_INPUT_LOG_MAX),
@@ -541,7 +548,19 @@ KN_FREEZE_READ          = True      # precompute edge currents once from state (
 KN_TEMPORAL_READOUT     = True      # append per-stage output ODE accumulators (temporal-readout readout)
 KN_BOUNDARY_FAN_OUT = '{"0": [2, 12], "1": [7, 17], "2": [22, 5], "3": [10, 15]}'  # 4 inputs -> 8 boundary edges
 KN_INPUT_RAIL       = 4.0     # clamp normalized input to [-KN_INPUT_RAIL, KN_INPUT_RAIL] (x_max=4.0)
+
 KN_X_MAX            = 4.0     # local knet rail (overrides PHYS["x_max"]=3.0 via build_net_from_config x_max kwarg)
+
+# VCA (Voltage-Controlled Amplifier) gating knobs — mirrored from train_script.py
+# argparse flags so the DAgger student matches the canonical train.py surface.
+# Identity-at-init is preserved: with --vca on, vca_W is zero-init and the
+# 2-sigma gate evaluates to 1.0 at step 0, so the VCA-off baseline behavior is
+# reproduced bit-for-bit at epoch 0 regardless of the chosen flags.
+KN_VCA                   = False  # --vca: enable low-rank input-driven VCA on boundary / temporal-readout edges
+KN_VCA_CORE              = False  # --vca-core: also gate core (hidden) edges (auto-enabled if no boundary / readout families)
+KN_VCA_GATE_SHUNT        = False  # --vca-gate-shunt: also gate parallel resistive shunt with the core VCA gate (input-dependent routing)
+KN_VCA_SEPARATE_CORE_BUS = False  # --vca-separate-core-bus: give core family its own vca_W_core projection (ablation)
+KN_VCA_RANK              = None   # projection rank r; None -> config.VCA['rank'] (must be >= VCA['min_rank'])
 
 # Fallback per-dim log10 spec bounds used when historical data is unavailable.
 # Order: [power, jitter, height, width]. Rebound from df after data load below.
@@ -1365,10 +1384,16 @@ class LocalKirchhoffStudentWrapper(nn.Module):
                  param_log_bounds=None,
                  input_log_min=None,
                  input_log_max=None,
-                 seed: int = 1,
                  stage_t_span: float | None = None,
-                 stage_num_steps: int | None = None):
+                 stage_num_steps: int | None = None,
+                 seed: int | None = None,
+                 vca_enabled: bool = False,
+                 vca_rank: int | None = None,
+                 vca_core_enabled: bool = False,
+                 vca_gate_shunt: bool = False,
+                 vca_separate_core_bus: bool = False):
         super().__init__()
+
         if param_log_bounds is None:
             param_log_bounds = PARAM_LOG_BOUNDS
         if input_log_min is None:
@@ -1392,9 +1417,28 @@ class LocalKirchhoffStudentWrapper(nn.Module):
         self.input_rail = float(input_rail)
         self.x_max = float(x_max)
         self.param_log_bounds = param_log_bounds
-        self._seed = int(seed)
 
-        # Per-dim log10 spec bounds (4,) for log10 + min-max -> [-1, 1] input scaling.
+        self._seed = int(seed if seed is not None else small_world_seed)
+
+        # VCA gating (mirrors train_script.py --vca / --vca-core /
+        # --vca-gate-shunt / --vca-separate-core-bus / --vca-rank).
+        # Rank resolution mirrors train_script.py: explicit kwarg >
+        # config.VCA['rank']. Rank is only validated when vca_enabled=True
+        # (matches train_script.py:3393-3398); when vca_enabled=False the
+        # rank is unused and no validation is performed.
+        self.vca_enabled = bool(vca_enabled)
+        self.vca_rank = (
+            int(vca_rank) if vca_rank is not None else int(VCA["rank"])
+        )
+        if self.vca_enabled and self.vca_rank < VCA["min_rank"]:
+            raise ValueError(
+                f"vca_rank must be >= {VCA['min_rank']}, got {self.vca_rank}"
+            )
+        self.vca_core_enabled = bool(vca_core_enabled)
+        self.vca_gate_shunt = bool(vca_gate_shunt)
+        self.vca_separate_core_bus = bool(vca_separate_core_bus)
+
+
         self.register_buffer("input_log_min", torch.as_tensor(input_log_min, dtype=torch.float32))
         self.register_buffer("input_log_max", torch.as_tensor(input_log_max, dtype=torch.float32))
 
@@ -1445,7 +1489,13 @@ class LocalKirchhoffStudentWrapper(nn.Module):
             interstage_activation=interstage_activation,
             boundary_fan_out=self.boundary_fan_out,
             enable_temporal_readout=enable_temporal_readout,
+
             x_max=self.x_max,
+            vca_enabled=self.vca_enabled,
+            vca_rank=self.vca_rank,
+            vca_core_enabled=self.vca_core_enabled,
+            vca_gate_shunt=self.vca_gate_shunt,
+            vca_separate_core_bus=self.vca_separate_core_bus,
         )
         self._state_dim = num_hidden
         # local readout size is num_targets; the OutputAffine returns logits.
@@ -1505,6 +1555,10 @@ class LocalKirchhoffStudentWrapper(nn.Module):
                 f"freeze_read={self.freeze_read}, "
                 f"interstage_activation={self.interstage_activation}, "
                 f"temporal_readout={self.enable_temporal_readout}, "
+                f"vca_enabled={self.vca_enabled}, vca_rank={self.vca_rank}, "
+                f"vca_core={self.vca_core_enabled}, "
+                f"vca_gate_shunt={self.vca_gate_shunt}, "
+                f"vca_separate_core_bus={self.vca_separate_core_bus}, "
                 f"out_dim={self._output_dim}")
 
     def count_params_by_component(self):
@@ -2612,7 +2666,21 @@ student = LocalKirchhoffStudentWrapper(
     x_max=KN_X_MAX,
     param_log_bounds=PARAM_LOG_BOUNDS,
     seed=KN_SMALL_WORLD_SEED,
+    vca_enabled=KN_VCA,
+    vca_rank=KN_VCA_RANK,
+    vca_core_enabled=KN_VCA_CORE,
+    vca_gate_shunt=KN_VCA_GATE_SHUNT,
+    vca_separate_core_bus=KN_VCA_SEPARATE_CORE_BUS,
 ).to(DEVICE)
+
+_logger.info(
+    f"Student VCA config: enabled={KN_VCA}, rank="
+    f"{int(KN_VCA_RANK) if KN_VCA_RANK is not None else int(VCA['rank'])}, "
+    f"core={KN_VCA_CORE}, gate_shunt={KN_VCA_GATE_SHUNT}, "
+    f"separate_core_bus={KN_VCA_SEPARATE_CORE_BUS} "
+    f"(mirrors train_script.py --vca/--vca-core/--vca-gate-shunt/"
+    f"--vca-separate-core-bus)"
+)
 
 # No `student.prepare(...)` step needed — local KirchhoffNetWithIO
 # builds its src/dst indices eagerly inside build_net_from_config.
@@ -2635,9 +2703,10 @@ _logger.info(
 # Optimizer and scheduler (defined once, reused across iterations).
 # Wrapper's parameters() exposes the entire local KirchhoffNetWithIO
 # (fabric stages, transfers, InputMapper, OutputAffine). Per-group LR scales
-# mirror train.py:make_optimizer classification (train.py:1001-1017):
 #   - mapper: InputMapper + OutputAffine (output_mapper)
 #   - struct: name.endswith('.z_logits') (per-stage edge-gate logits)
+#             + .vca_W / .vca_W_core / .vca_v_{boundary,readout,core}
+#             (VCA routing-structure params, train.py:1102-1108)
 #   - dyn:    name.endswith('.raw_leak') or '.raw_drive_g'
 #   - other:  everything else (stages/transfers/vref/etc.)
 # The 'lr_scale' key is stored in each group dict so the per-iteration LR
@@ -2650,6 +2719,19 @@ def _make_dagger_optimizer(student, lr, weight_decay):
         if "input_mapper" in _name or "output_mapper" in _name:
             _mapper.append(_p)
         elif _name.endswith(".z_logits"):
+            _struct.append(_p)
+        elif (
+            _name.endswith(".vca_W")
+            or _name.endswith(".vca_W_core")
+            or _name.endswith(".vca_v_boundary")
+            or _name.endswith(".vca_v_readout")
+            or _name.endswith(".vca_v_core")
+        ):
+            # VCA routing-structure params (shared input projection +
+            # per-edge tap embeddings for each gated family). Mirrors
+            # train.py make_optimizer classification (train.py:1102-1108):
+            # routed to the structural LR group (4x base by convention)
+            # so the gate signal learns alongside z_logits.
             _struct.append(_p)
         elif _name.endswith(".raw_leak") or _name.endswith(".raw_drive_g"):
             _dyn.append(_p)

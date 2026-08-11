@@ -237,6 +237,7 @@ if _LOCAL_KIRCHHOFF_DIR not in sys.path:
 from config import SOLVER, VCA
 from cell_library import make_cell_library
 from topology import build_net_from_config
+from kirchhoff_net import format_parameter_breakdown
 
 
 
@@ -2699,6 +2700,10 @@ _logger.info(
     f"freeze_read={KN_FREEZE_READ}, temporal_readout={KN_TEMPORAL_READOUT}, input_rail={KN_INPUT_RAIL}, "
     f"x_max={KN_X_MAX})"
 )
+_n_trainable = sum(p.numel() for p in student.parameters() if p.requires_grad)
+_logger.info(f"Student trainable params: {_n_trainable:,}")
+_bd = student.net.parameter_breakdown()
+_logger.info(f"Student param breakdown:\n{format_parameter_breakdown(_bd)}")
 
 # Optimizer and scheduler (defined once, reused across iterations).
 # Wrapper's parameters() exposes the entire local KirchhoffNetWithIO

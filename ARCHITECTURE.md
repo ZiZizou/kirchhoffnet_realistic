@@ -760,8 +760,34 @@ Outputs per run: `loss_history.txt`, `loss_curve.png`, `model.pt`, `config_snaps
 ### `mlp_benchmark_housing.py`
 **Housing MLP baseline** — MLPRegressor(8→H→1) for California Housing task. Matches the `housing_grid` KirchhoffNet in parameter count (~2000) and training hyperparameters (AdamW, Huber loss, CosineAnnealingWarmRestarts). The number of linear layers is configurable via `--num-layers` (default 2, must be >= 2): the architecture is `Linear(in, h) -> Act -> [Linear(h, h) -> Act] x (num_layers-2) -> Linear(h, out)`. Outputs loss history, curve, model, and final metrics in original USD × 100k units.
 
-### `xgb_benchmark_housing.py`
-**Housing XGBoost baseline** — SOTA gradient-boosted tree baseline for California Housing task, matching the `mlp_benchmark_housing.py` data pipeline and metric format. Reuses the same `_load_california_housing_data` and `_make_data_split` (seed=42) for identical train/val splits, but uses RAW (unscaled) features AND raw targets in USD × 100k units: tree models are invariant to monotonic feature transforms, and the MLP's min-max feature scaling combined with standardized targets actively hurts XGBoost performance (we measured val RMSE 1.02 with min-max+standardized vs 0.45 with raw+raw on the same split). SOTA hyperparams: n_estimators=1000, max_depth=6, learning_rate=0.05, subsample=0.8, colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=1.0, min_child_weight=5, gamma=0.1, tree_method=hist, early_stopping_rounds=30. Huber loss is reported in standardized space (denormalized from raw predictions) for direct comparability with the MLP/KirchhoffNet. Outputs the same artifact set as `mlp_benchmark_housing.py` (loss_history.txt, loss_curve.png, model.json, config_snapshot.txt, output_fit.png, final_metrics.txt) plus MAE/RMSE in original units.
+### `mlp_benchmark_friedman1.py` / `mlp_benchmark_friedman2.py` / `mlp_benchmark_friedman3.py`
+**Friedman MLP baselines** — MLPRegressor(10→H→1) for Friedman #1 and MLPRegressor(4→H→1) for Friedman #2 / #3, matching the KirchhoffNet baselines in capacity and training hyperparameters (AdamW, Huber loss, CosineAnnealingWarmRestarts, LHS 20k train + 4k uniform val, σ=1.0, normalized inputs). Same `MLPRegressor` definition as `mlp_benchmark_housing.py` and configurable depth via `--num-layers` (default 2). Outputs share the same artifact set as `mlp_benchmark_housing.py`.
+
+### `mlp_bayes_opt.py`
+**Optuna Bayesian hyperparameter search for MLP baselines** — runs N trials of `mlp_benchmark_{housing,friedman1,friedman2,friedman3}.py`, each under a **fixed parameter budget** and **fixed epoch budget**, and minimizes a chosen objective (`best_val` Huber by default). Designed for Kaggle (parallel subprocess execution across Kaggle's CPU cores; single GPU on CUDA sessions).
+
+- **Param budget**: `hidden_dim` is **derived** per trial by solving the MLP param-count formula `(L-2)·h² + (in + L - 1 + out)·h + out = budget` for the nearest integer h, so every trial has the same approximate parameter count. The optimizer explores the depth/width degeneracy at constant params (problem-statement §9b).
+- **Epoch budget**: `--epochs` is fixed and `--patience=epochs` so early stopping never curtails the run.
+- **Search space**: `num_layers ∈ {2, …, --n-layers-max}`, `lr` log-uniform [1e-4, 1e-2], `weight_decay` log-uniform [1e-6, 1e-2], `batch_size ∈ {512, 1024, 2048, 4096}`, `activation ∈ {relu, tanh}`, `loss` fixed to `huber` (matches KNet, overridable). Default param budgets per dataset: housing 2000, friedman1 6600, friedman2/3 7000.
+- **Parallelism**: optuna `n_jobs` ThreadPoolExecutor spawns up to `--n-workers` trial subprocesses concurrently. Default: 1 if CUDA is available (each subprocess grabs the GPU), else `os.cpu_count()`.
+- **Trial contract**: each trial invokes `mlp_benchmark_{dataset}.py` via `subprocess.run` (stdout/stderr to `trial_<NNNN>/log.txt`) and parses the resulting `final_metrics.txt` for the objective. Subprocess env forces `PYTHONIOENCODING=utf-8` for cross-platform reproducibility (the Friedman scripts write a `π` character in `config_snapshot.txt`).
+- **Outputs** in `outputs/mlp_bayes_opt/<dataset>_budget<P>_e<E>/`: `<study_name>.db` (sqlite, resumable via `--resume`), `best_hyperparams.txt`, `results.csv` (every trial's HPs + metrics + actual param count), `objective_history.png`, and per-trial `trial_<NNNN>/` (log, model, final_metrics, etc., inherited from the benchmark script).
+
+CLI: `python mlp_bayes_opt.py --dataset housing --param-budget 2000 --epochs 800 --n-trials 30 --n-workers 2 --seed 0 [--resume]`.
+
+### `tree_benchmark.py`
+**Tree / gradient-boosting benchmark** — a single parameterized benchmark for tree-based classical estimators on the same housing + Friedman 1/2/3 datasets as the MLP and KirchhoffNet baselines. Replaces the previous `xgb_benchmark_housing.py` (only XGBoost for housing) and folds in the full grid:
+
+- **Methods** (select via `--method`): `xgboost`, `lightgbm`, `catboost`, `gradient_boosting` (sklearn), `hist_gradient_boosting` (sklearn), `random_forest`, `extra_trees`.
+- **Datasets** (select via `--dataset`): `housing`, `friedman1`, `friedman2`, `friedman3`.
+
+Data pipeline:
+- **housing**: reuses `train_script._load_california_housing_data` + `_make_data_split` (seed=42, 80/20) for a byte-identical split to `mlp_benchmark_housing.py`. Tree models are trained on RAW (un-normalized) features AND raw targets (USD × 100k) per the finding in the now-removed `xgb_benchmark_housing.py`: tree models are invariant to monotone feature transforms, and the MLP's min-max+standardized scaling actively hurts tree performance (we measured val RMSE 1.02 with min-max+standardized vs 0.45 with raw+raw on the same split).
+- **friedman1/2/3**: reuses `train_script.make_data_friedman{1,2,3}` (20k LHS train + 4k uniform val, seed=42, σ=1.0) for a byte-identical split to `mlp_benchmark_friedman{1,2,3}.py`. Tree models are trained on min-max-normalized [0,1] inputs (monotone per-feature transform — splits are invariant) and raw (denormalized) targets.
+
+Capacity is controlled via standard knobs (`--max-depth`, `--max-leaf-nodes`, `--n-estimators`, `--min-samples-leaf`, `--max-features`, regularization via `--reg-alpha`/`--reg-lambda`). The approximate parameter count (total internal split nodes across all trees, computed from native API dumps for each method) is reported as `approx_node_count` in `final_metrics.txt`, matching the XGBoost benchmark's "node_count" proxy. Models are saved per method (`model.json` for XGBoost, `model.txt` for LightGBM, `model.cbm` for CatBoost, `model.pkl` for sklearn estimators).
+
+SOTA-style defaults (overridable): XGBoost n_estimators=1000, max_depth=6, lr=0.05, subsample=0.8, colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=1.0, min_child_weight=5, gamma=0.1; LightGBM/CatBoost mirror XGBoost; sklearn HistGradientBoosting uses 31 max leaf nodes with early stopping; RandomForest/ExtraTrees use 300 trees with `max_features=1.0`. Huber loss is reported in standardized space (denormalized from raw predictions) for direct comparability with the MLP/KirchhoffNet. Outputs `config_snapshot.txt`, `loss_history.txt`, `loss_curve.png`, `output_fit.png`, `final_metrics.txt`, and a method-specific `model.*` artifact (default dir `./output/{method}_{dataset}`).
 
 ### `train_ctle.py`
 **CTLE inverse design distillation** — Trains a 3-stage KirchhoffNet student (4 inputs → 7 CTLE logits) via 4-phase knowledge distillation from a pre-trained `RegimeAwareMoE` teacher (loaded from `dagger_student_moe.pt`). Supports both `grid` and `cluster` hidden families, `--q75-input` for 8-dim Q75-scaled features, `--persistent-drive`, `--bidirectional`, `--edge-repeats`, per-dim diagnostics with logging/plotting, readiness-gated pruning, and physical-domain evaluation at the end. Not a standard preset — invoked directly via `python train_ctle.py --teacher-path ...`.
@@ -1322,8 +1348,28 @@ kirchhoff_redesign/ideal/
 ├── mlp_benchmark.py               # MLPRegressor baseline for smooth2d Franke task
 ├── mlp_benchmark_housing.py       # MLPRegressor baseline for California Housing task
 │                                  #   (--num-layers N for configurable depth; default 2)
-├── xgb_benchmark_housing.py       # SOTA XGBoost baseline for California Housing task
-│                                  #   (raw features, raw targets, SOTA hyperparams)
+├── mlp_benchmark_friedman1.py     # MLPRegressor baseline for Friedman #1 (in_dim=10)
+├── mlp_benchmark_friedman2.py     # MLPRegressor baseline for Friedman #2 (in_dim=4)
+├── mlp_benchmark_friedman3.py     # MLPRegressor baseline for Friedman #3 (in_dim=4)
+├── mlp_bayes_opt.py              # Optuna Bayesian hyperparameter search for the four
+│                                  #   mlp_benchmark_*.py baselines under a fixed param
+│                                  #   budget (hidden_dim derived from num_layers via
+│                                  #   the MLP param-count formula) and fixed epoch
+│                                  #   budget (--patience=epochs). Per-trial subprocess
+│                                  #   of the benchmark script; optuna n_jobs runs N
+│                                  #   trials concurrently for Kaggle; outputs sqlite
+│                                  #   study + best_hyperparams.txt + results.csv
+│                                  #   + objective_history.png + per-trial artifacts.
+├── tree_benchmark.py             # Tree / gradient-boosting benchmark across housing +
+│                                  #   Friedman 1/2/3: 7 methods (xgboost, lightgbm,
+│                                  #   catboost, sklearn gradient_boosting /
+│                                  #   hist_gradient_boosting / random_forest /
+│                                  #   extra_trees) via --method x --dataset y;
+│                                  #   raw features + raw targets for housing
+│                                  #   (tree-invariant scaling), min-max inputs +
+│                                  #   raw targets for Friedman; mirrored splits
+│                                  #   with mlp_benchmark_*.py for direct comparison.
+│                                  #   Replaces the now-removed xgb_benchmark_housing.py.
 ├── train_ctle.py                  # CTLE inverse design: 4-phase KD from RegimeAwareMoE
 │                                  #   teacher; grid + cluster families; per-dim diagnostics;
 │                                  #   persistent drive; q75-input; gradient logging

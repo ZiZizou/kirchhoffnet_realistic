@@ -719,6 +719,8 @@ def prune_stage(
     leak_mode: str = "programmable",
     leak_constant: float | None = None,
     freeze_read: bool | None = None,
+    freeze_boundary: bool | None = None,
+    freeze_temporal_read: bool | None = None,
 ) -> tuple["DifferentialStage", dict[int, int]]:
     """Rebuild a DifferentialStage with edges and nodes removed.
 
@@ -1024,6 +1026,8 @@ def prune_stage(
         leak_mode=leak_mode,
         leak_constant=leak_constant,
         freeze_read=stage.freeze_read if freeze_read is None else freeze_read,
+        freeze_boundary=stage.freeze_boundary if freeze_boundary is None else freeze_boundary,
+        freeze_temporal_read=stage.freeze_temporal_read if freeze_temporal_read is None else freeze_temporal_read,
         boundary_cell_lib=stage.boundary_cell_lib,
         enable_ref_edges=has_ref,
         ref_cell_lib=new_ref_lib,
@@ -1156,6 +1160,8 @@ def prune_network(
     min_read_nodes: int = 1,
     prune_nodes_by_gate: bool = False,
     freeze_read: bool | None = None,
+    freeze_boundary: bool | None = None,
+    freeze_temporal_read: bool | None = None,
 ) -> tuple["KirchhoffNet", list[dict[int, int]]]:
     """Apply prune_stage to every stage of a KirchhoffNet core.
 
@@ -1217,6 +1223,8 @@ def prune_network(
             min_read_nodes=min_read_nodes,
             prune_nodes_by_gate=prune_nodes_by_gate,
             freeze_read=freeze_read,
+            freeze_boundary=freeze_boundary,
+            freeze_temporal_read=freeze_temporal_read,
         )
         new_stages.append(new_s)
         stage_remaps.append(remap)
@@ -1300,6 +1308,8 @@ def topology_to_stage(
     leak_constant: float | None = None,
     read_only_source: bool = False,
     freeze_read: bool = False,
+    freeze_boundary: bool = False,
+    freeze_temporal_read: bool = False,
     boundary_src: list[int] | None = None,
     boundary_dst: list[int] | None = None,
     boundary_cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | AntiParallelFreeTanhLibrary | None = None,
@@ -1540,6 +1550,8 @@ def topology_to_stage(
         leak_constant=leak_constant,
         read_only_source=read_only_source,
         freeze_read=freeze_read,
+        freeze_boundary=freeze_boundary,
+        freeze_temporal_read=freeze_temporal_read,
         boundary_src=boundary_src,
         boundary_dst=boundary_dst,
         boundary_cell_lib=boundary_cell_lib,
@@ -1579,6 +1591,8 @@ def build_net_from_preset(
     interstage_activation: str = "none",
     interstage_residual_rank: int = -1,
     freeze_read: bool = False,
+    freeze_boundary: bool = False,
+    freeze_temporal_read: bool = False,
     enable_skip_linear: bool = False,
     boundary_fan_out: dict[int, list[int]] | None = None,
     enable_ref_edges: bool = False,
@@ -1624,6 +1638,19 @@ def build_net_from_preset(
     * freeze_read: When ``True``, edge currents are computed once from the
                     initial state and held constant across all Heun / DEQ
                     iterations inside every stage. Defaults to ``False``.
+    * freeze_boundary: When ``True``, boundary fan-out tanh edge currents
+                    are computed once from ``(u, x0)`` and held constant
+                    across all Heun / DEQ iterations. The family's resistive
+                    shunt (when present) stays dynamic. Independent of
+                    ``freeze_read``. No-op when boundary fan-out is not
+                    configured. Defaults to ``False``.
+    * freeze_temporal_read: When ``True``, temporal-readout tanh edge
+                    currents are computed once from ``x0`` and held
+                    constant across all Heun / DEQ iterations. The
+                    family's resistive shunt (when present) stays
+                    dynamic. Independent of ``freeze_read`` and
+                    ``freeze_boundary``. No-op when temporal readout is
+                    not configured. Defaults to ``False``.
     * boundary_fan_out: dict mapping input indices to lists of target
                     hidden-node indices. When provided, the input signal
                     is treated as fixed-voltage boundary terminals with
@@ -1670,6 +1697,10 @@ def build_net_from_preset(
         cfg["decoder_hidden_dim"] = int(decoder_hidden_dim)
     if freeze_read:
         cfg["freeze_read"] = True
+    if freeze_boundary:
+        cfg["freeze_boundary"] = True
+    if freeze_temporal_read:
+        cfg["freeze_temporal_read"] = True
     if vca_enabled:
         cfg["vca_enabled"] = True
         if vca_rank is not None:
@@ -1682,6 +1713,8 @@ def build_net_from_preset(
         interstage_activation=interstage_activation,
         interstage_residual_rank=interstage_residual_rank,
         freeze_read=freeze_read,
+        freeze_boundary=freeze_boundary,
+        freeze_temporal_read=freeze_temporal_read,
         enable_skip_linear=enable_skip_linear,
         boundary_fan_out=boundary_fan_out,
         enable_ref_edges=enable_ref_edges,
@@ -1705,6 +1738,8 @@ def build_net_from_config(
     interstage_activation: str = "none",
     interstage_residual_rank: int = -1,
     freeze_read: bool = False,
+    freeze_boundary: bool = False,
+    freeze_temporal_read: bool = False,
     enable_skip_linear: bool = False,
     boundary_fan_out: dict[int, list[int]] | None = None,
     enable_ref_edges: bool = False,
@@ -1728,6 +1763,14 @@ def build_net_from_config(
 
     ``freeze_read`` can be specified either explicitly or via
     ``cfg['freeze_read']``. Explicit kwargs take precedence.
+
+    ``freeze_boundary`` can be specified either explicitly or via
+    ``cfg['freeze_boundary']``. Explicit kwargs take precedence. No-op when
+    boundary fan-out is not configured.
+
+    ``freeze_temporal_read`` can be specified either explicitly or via
+    ``cfg['freeze_temporal_read']``. Explicit kwargs take precedence.
+    No-op when temporal readout is not configured.
 
     ``vca_enabled`` (``False`` default): enable low-rank input-driven VCA
     (Voltage-Controlled Amplifier) gating on boundary and temporal-readout
@@ -1765,6 +1808,8 @@ def build_net_from_config(
     if leak_constant is None:
         leak_constant = cfg.get("leak_constant", None)
     freeze_read = bool(cfg.get("freeze_read", freeze_read))
+    freeze_boundary = bool(cfg.get("freeze_boundary", freeze_boundary))
+    freeze_temporal_read = bool(cfg.get("freeze_temporal_read", freeze_temporal_read))
     if drive_mode not in ("fan_out", "projection"):
         raise ValueError(
             f"drive_mode must be 'fan_out' or 'projection', got {drive_mode!r}"
@@ -2104,6 +2149,8 @@ def build_net_from_config(
             leak_mode=leak_mode, leak_constant=leak_constant,
             read_only_source=read_only_source,
             freeze_read=freeze_read,
+            freeze_boundary=freeze_boundary,
+            freeze_temporal_read=freeze_temporal_read,
             boundary_src=boundary_src,
             boundary_dst=boundary_dst,
             boundary_cell_lib=boundary_cell_lib,

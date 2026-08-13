@@ -75,6 +75,23 @@ class DifferentialStage(nn.Module):
             throughout all Heun / DEQ sub-iterations. Leak, clip, and drive
             current still read the evolving ``x`` at each step. Default
             ``False`` (standard behavior: read and write at the same time).
+        freeze_boundary: When ``True``, boundary fan-out edge currents (the
+            tanh cell contribution with edge gate + VCA gate folded in) are
+            computed **once** from ``(u, x0)`` and held constant across all
+            Heun / DEQ sub-iterations, while the family's resistive shunt
+            (when present) remains dynamic per-step. Mirrors the
+            ``freeze_read`` semantics for the boundary edge family.
+            Independent of ``freeze_read`` (can be combined). No-op when the
+            stage has no boundary edges. Default ``False``.
+        freeze_temporal_read: When ``True``, temporal-readout edge currents
+            (the tanh cell contribution with edge gate + VCA gate folded
+            in) are computed **once** from ``x0`` and held constant across
+            all Heun / DEQ sub-iterations, while the family's resistive
+            shunt (when present) remains dynamic per-step. Mirrors the
+            ``freeze_read`` semantics for the temporal-readout edge family.
+            Independent of ``freeze_read`` and ``freeze_boundary`` (can be
+            combined). No-op when the stage has no temporal-readout edges.
+            Default ``False``.
         boundary_src: List of input-terminal indices for sparse OTA edges
             from fixed-voltage boundary terminals into the dynamic fabric.
             Length must equal ``len(boundary_dst)``. ``None`` (default)
@@ -137,6 +154,8 @@ class DifferentialStage(nn.Module):
         leak_constant: float | None = None,
         read_only_source: bool = False,
         freeze_read: bool = False,
+        freeze_boundary: bool = False,
+        freeze_temporal_read: bool = False,
         boundary_src: list[int] | None = None,
         boundary_dst: list[int] | None = None,
         boundary_cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | AntiParallelFreeTanhLibrary | None = None,
@@ -157,6 +176,8 @@ output_ode_src: list[int] | None = None,
         self.cell_lib = cell_lib
         self.read_only_source = read_only_source
         self.freeze_read = bool(freeze_read)
+        self.freeze_boundary = bool(freeze_boundary)
+        self.freeze_temporal_read = bool(freeze_temporal_read)
         if leak_mode not in ("programmable", "non-programmable"):
             raise ValueError(f"leak_mode must be 'programmable' or 'non-programmable', got {leak_mode!r}")
         self.leak_mode = leak_mode
@@ -707,11 +728,89 @@ output_ode_src: list[int] | None = None,
         vca_logits = u_proj @ self.vca_v_core.T  # [batch, E_core]
         return 2.0 * torch.sigmoid(vca_logits)
 
+    def _compute_frozen_boundary(self, u: torch.Tensor, x0: torch.Tensor) -> torch.Tensor | None:
+        """Precompute the frozen boundary-fan-out tanh KCL contribution.
+
+        Computed once from ``(u, x0)`` at stage entry (or per sample in
+        the sequence path): the tanh cell evaluation via ``forward_tanh``
+        when the boundary cell library exposes it (else full ``forward``),
+        multiplied by the per-edge gate ``sigmoid(boundary_z_logits)`` and
+        — when VCA is enabled — the per-edge VCA gate. The result is
+        scattered into a ``[batch, num_nodes]`` per-node accumulator in
+        ``x0``'s dtype, suitable for adding into ``acc`` each rhs call.
+
+        The family's resistive shunt is intentionally NOT folded into this
+        tensor; it is recomputed from evolving voltages each rhs call,
+        mirroring the Heun-path ``freeze_read`` behavior for the core
+        family. Returns ``None`` when boundary edges are absent (so
+        ``freeze_boundary`` becomes a no-op as expected).
+        """
+        if not self._has_boundary or u is None or self.boundary_src.numel() == 0:
+            return None
+        u_src0 = u[:, self.boundary_src]
+        x_dst0 = x0[:, self.boundary_dst]
+        cell_lib = self.boundary_cell_lib
+        if hasattr(cell_lib, "forward_tanh"):
+            i_edge = cell_lib.forward_tanh(
+                x_src=u_src0, x_dst=x_dst0, x_max=self.x_max,
+            )
+        else:
+            i_edge = cell_lib(
+                x_src=u_src0, x_dst=x_dst0, x_max=self.x_max,
+            )
+        b_mask = torch.sigmoid(self.boundary_z_logits)  # [Eb]
+        i_edge = i_edge * b_mask.unsqueeze(0)
+        if self.vca_enabled and self.vca_v_boundary is not None:
+            i_edge = i_edge * self._compute_vca_gate(u, self.vca_v_boundary)
+        acc_b = torch.zeros_like(x0, dtype=torch.float32)
+        acc_b.index_add_(1, self.boundary_dst, i_edge.float())
+        return acc_b.to(dtype=x0.dtype)
+
+    def _compute_frozen_readout(self, u: torch.Tensor | None, x0: torch.Tensor) -> torch.Tensor | None:
+        """Precompute the frozen temporal-readout tanh KCL contribution.
+
+        Computed once from ``(u, x0)`` at stage entry (or per sample in
+        the sequence path): the tanh cell evaluation via ``forward_tanh``
+        when the readout cell library exposes it (else full ``forward``),
+        multiplied by the per-edge gate ``sigmoid(output_ode_z_logits)``
+        and — when VCA is enabled — the per-edge VCA gate (which requires
+        ``u``). The result is scattered into a ``[batch, num_nodes]``
+        per-node accumulator in ``x0``'s dtype.
+
+        The family's resistive shunt is intentionally NOT folded into this
+        tensor; it is recomputed from evolving voltages each rhs call,
+        mirroring the Heun-path ``freeze_read`` behavior for the core
+        family. Returns ``None`` when readout edges are absent (so
+        ``freeze_temporal_read`` becomes a no-op as expected).
+        """
+        if not self._has_output_ode or self.output_ode_src.numel() == 0:
+            return None
+        x_src0 = x0[:, self.output_ode_src]
+        x_dst0 = x0[:, self.output_ode_dst]
+        cell_lib = self.output_ode_cell_lib
+        if hasattr(cell_lib, "forward_tanh"):
+            i_edge = cell_lib.forward_tanh(
+                x_src=x_src0, x_dst=x_dst0, x_max=self.x_max,
+            )
+        else:
+            i_edge = cell_lib(
+                x_src=x_src0, x_dst=x_dst0, x_max=self.x_max,
+            )
+        o_mask = torch.sigmoid(self.output_ode_z_logits)  # [Eo]
+        i_edge = i_edge * o_mask.unsqueeze(0)
+        if self.vca_enabled and self.vca_v_readout is not None and u is not None:
+            i_edge = i_edge * self._compute_vca_gate(u, self.vca_v_readout)
+        acc_o = torch.zeros_like(x0, dtype=torch.float32)
+        acc_o.index_add_(1, self.output_ode_dst, i_edge.float())
+        return acc_o.to(dtype=x0.dtype)
+
     def rhs(self, x: torch.Tensor,
             u: torch.Tensor | None = None,
             x_drive: torch.Tensor | None = None, drive_scale: float = 0.0,
             leak_floor: float | None = None,
             i_edge_const: torch.Tensor | None = None,
+            i_boundary_const: torch.Tensor | None = None,
+            i_readout_const: torch.Tensor | None = None,
             vca_gate_core: torch.Tensor | None = None) -> torch.Tensor:
         """Compute dx/dt at state x. x: [batch, num_nodes].
 
@@ -732,7 +831,11 @@ output_ode_src: list[int] | None = None,
           into the destination nodes only (no source drain — terminals
           are fixed voltages). They are NOT frozen by ``freeze_read``:
           the destination voltage evolves, so the OTA current is
-          recomputed every step.
+          recomputed every step. When ``i_boundary_const`` is provided
+          (the ``freeze_boundary=True`` path) the tanh cell contribution
+          + edge gate + VCA gate are precomputed once from ``(u, x0)``
+          and the per-step block only recomputes the family's resistive
+          shunt (when present).
 
         Reference edges (unary nonlinearities via OTA-to-Vref plan):
         - When ``self._has_ref``, every node gets one OTA edge to a
@@ -748,7 +851,11 @@ output_ode_src: list[int] | None = None,
           ODE accumulator) only. The source (hidden/projection) is a
           read-only voltage — no current is drained from it. Like boundary
           and reference edges, the temporal-readout current is NOT frozen
-          by ``freeze_read`` (the destination voltage evolves).
+          by ``freeze_read`` (the destination voltage evolves). When
+          ``i_readout_const`` is provided (the ``freeze_temporal_read=True``
+          path) the tanh cell contribution + edge gate + VCA gate are
+          precomputed once from ``x0`` and the per-step block only
+          recomputes the family's resistive shunt (when present).
         """
         x_src = x[:, self.src]
         x_dst = x[:, self.dst]
@@ -828,25 +935,48 @@ output_ode_src: list[int] | None = None,
         if self._has_boundary and u is not None and self.boundary_src.numel() > 0:
             u_src = u[:, self.boundary_src]
             x_dst_b = x[:, self.boundary_dst]
-            i_boundary = self.boundary_cell_lib(
-                x_src=u_src, x_dst=x_dst_b, x_max=self.x_max,
-            )
             boundary_mask = torch.sigmoid(self.boundary_z_logits)  # [Eb]
-            i_boundary = i_boundary * boundary_mask.unsqueeze(0)   # [B, Eb]
-            if self.vca_enabled and self.vca_v_boundary is not None:
-                i_boundary = i_boundary * self._compute_vca_gate(
-                    u, self.vca_v_boundary,
-                )  # [B, Eb]
-            i_boundary_f32 = i_boundary.float()
-            # Clone when freeze_read is active so we don't mutate the shared
-            # ``acc`` (= i_edge_const) tensor.
-            if i_edge_const is not None:
-                acc = acc.clone()
-            acc_b = torch.zeros_like(x, dtype=torch.float32)
-            acc_b.index_add_(1, self.boundary_dst, i_boundary_f32)
-            # NOTE: no `acc_b.index_add_(1, boundary_src, -i_boundary_f32)` —
-            # boundary terminals are fixed voltages, never drained.
-            acc = (acc.float() + acc_b).to(dtype=x.dtype)
+            if i_boundary_const is None:
+                # Dynamic path: full cell forward (tanh + resistive shunt).
+                i_boundary = self.boundary_cell_lib(
+                    x_src=u_src, x_dst=x_dst_b, x_max=self.x_max,
+                )
+                i_boundary = i_boundary * boundary_mask.unsqueeze(0)   # [B, Eb]
+                if self.vca_enabled and self.vca_v_boundary is not None:
+                    i_boundary = i_boundary * self._compute_vca_gate(
+                        u, self.vca_v_boundary,
+                    )  # [B, Eb]
+                i_boundary_f32 = i_boundary.float()
+                # Clone when freeze_read is active so we don't mutate the shared
+                # ``acc`` (= i_edge_const) tensor.
+                if i_edge_const is not None:
+                    acc = acc.clone()
+                acc_b = torch.zeros_like(x, dtype=torch.float32)
+                acc_b.index_add_(1, self.boundary_dst, i_boundary_f32)
+                # NOTE: no `acc_b.index_add_(1, boundary_src, -i_boundary_f32)` —
+                # boundary terminals are fixed voltages, never drained.
+                acc = (acc.float() + acc_b).to(dtype=x.dtype)
+            else:
+                # Frozen-tanh path (freeze_boundary=True): the tanh cell
+                # contribution (edge gate + VCA gate already folded in at
+                # precompute time) is added directly. The family's resistive
+                # shunt, if present, is recomputed per-step from evolving
+                # voltages so it remains dynamic — mirrors the Heun-path
+                # freeze_read behavior for the core family.
+                acc = (acc.float() + i_boundary_const.float()).to(dtype=x.dtype)
+                if hasattr(self.boundary_cell_lib, "resistive_current"):
+                    i_res_b = self.boundary_cell_lib.resistive_current(
+                        u_src, x_dst_b,
+                    )  # [B, Eb]
+                    i_res_b = i_res_b * boundary_mask.unsqueeze(0)
+                    if self.vca_enabled and self.vca_v_boundary is not None:
+                        i_res_b = i_res_b * self._compute_vca_gate(
+                            u, self.vca_v_boundary,
+                        )  # [B, Eb]
+                    acc_b_res = torch.zeros_like(x, dtype=torch.float32)
+                    acc_b_res.index_add_(1, self.boundary_dst, i_res_b.float())
+                    # NOTE: no source drain — boundary terminals are fixed.
+                    acc = (acc.float() + acc_b_res).to(dtype=x.dtype)
 
         # Reference edges (unary nonlinearities via OTA-to-Vref plan).
         # For each node j: I_ref = I_OTA(Vref, x_j), injected into dst only.
@@ -878,23 +1008,46 @@ output_ode_src: list[int] | None = None,
         if self._has_output_ode and self.output_ode_src.numel() > 0:
             x_src_o = x[:, self.output_ode_src]  # hidden (read-only)
             x_dst_o = x[:, self.output_ode_dst]  # output ODE (writable)
-            i_out = self.output_ode_cell_lib(
-                x_src=x_src_o, x_dst=x_dst_o, x_max=self.x_max,
-            )
             out_mask = torch.sigmoid(self.output_ode_z_logits)  # [Eo]
-            i_out = i_out * out_mask.unsqueeze(0)  # [B, Eo]
-            if self.vca_enabled and self.vca_v_readout is not None and u is not None:
-                i_out = i_out * self._compute_vca_gate(
-                    u, self.vca_v_readout,
-                )  # [B, Eo]
-            i_out_f32 = i_out.float()
-            if i_edge_const is not None:
-                acc = acc.clone()
-            acc_out = torch.zeros_like(x, dtype=torch.float32)
-            acc_out.index_add_(1, self.output_ode_dst, i_out_f32)
-            # NOTE: no source drain on output_ode_src — the hidden/projection
-            # grid is untouched, only the output accumulator receives current.
-            acc = (acc.float() + acc_out).to(dtype=x.dtype)
+            if i_readout_const is None:
+                # Dynamic path: full cell forward (tanh + resistive shunt).
+                i_out = self.output_ode_cell_lib(
+                    x_src=x_src_o, x_dst=x_dst_o, x_max=self.x_max,
+                )
+                i_out = i_out * out_mask.unsqueeze(0)  # [B, Eo]
+                if self.vca_enabled and self.vca_v_readout is not None and u is not None:
+                    i_out = i_out * self._compute_vca_gate(
+                        u, self.vca_v_readout,
+                    )  # [B, Eo]
+                i_out_f32 = i_out.float()
+                if i_edge_const is not None:
+                    acc = acc.clone()
+                acc_out = torch.zeros_like(x, dtype=torch.float32)
+                acc_out.index_add_(1, self.output_ode_dst, i_out_f32)
+                # NOTE: no source drain on output_ode_src — the hidden/projection
+                # grid is untouched, only the output accumulator receives current.
+                acc = (acc.float() + acc_out).to(dtype=x.dtype)
+            else:
+                # Frozen-tanh path (freeze_temporal_read=True): the tanh cell
+                # contribution (edge gate + VCA gate already folded in at
+                # precompute time) is added directly. The family's resistive
+                # shunt, if present, is recomputed per-step from evolving
+                # voltages — mirrors the Heun-path freeze_read behavior for
+                # the core family.
+                acc = (acc.float() + i_readout_const.float()).to(dtype=x.dtype)
+                if hasattr(self.output_ode_cell_lib, "resistive_current"):
+                    i_res_o = self.output_ode_cell_lib.resistive_current(
+                        x_src_o, x_dst_o,
+                    )  # [B, Eo]
+                    i_res_o = i_res_o * out_mask.unsqueeze(0)
+                    if self.vca_enabled and self.vca_v_readout is not None and u is not None:
+                        i_res_o = i_res_o * self._compute_vca_gate(
+                            u, self.vca_v_readout,
+                        )  # [B, Eo]
+                    acc_out_res = torch.zeros_like(x, dtype=torch.float32)
+                    acc_out_res.index_add_(1, self.output_ode_dst, i_res_o.float())
+                    # NOTE: no source drain on output_ode_src.
+                    acc = (acc.float() + acc_out_res).to(dtype=x.dtype)
 
         leak = self._effective_leak(leak_floor=leak_floor).unsqueeze(0).to(x.device)  # [1, N]
         leak_term = leak * x
@@ -1027,16 +1180,34 @@ output_ode_src: list[int] | None = None,
                 acc_const.index_add_(1, self.src, -i_edge_f32)
             i_edge_const = acc_const.to(dtype=x0.dtype)
 
+        # freeze_boundary: precompute the boundary tanh KCL contribution once
+        # from (u, x0). Mirrors the freeze_read pattern for this edge family.
+        # The family's resistive shunt is NOT folded in — rhs recomputes it
+        # per-step. Independent of freeze_read (core edges may still be
+        # dynamic). No-op when boundary edges are absent.
+        i_boundary_const = None
+        if self.freeze_boundary:
+            i_boundary_const = self._compute_frozen_boundary(u, x0)
+
+        # freeze_temporal_read: same pattern for the temporal-readout family.
+        i_readout_const = None
+        if self.freeze_temporal_read:
+            i_readout_const = self._compute_frozen_readout(u, x0)
+
         x = x0
         traj_chunks = [x] if store_trajectory else None
 
         for _ in range(num_steps):
             k1 = self.rhs(x, u=u, x_drive=x_drive, drive_scale=drive_scale,
                           i_edge_const=i_edge_const,
+                          i_boundary_const=i_boundary_const,
+                          i_readout_const=i_readout_const,
                           vca_gate_core=gate_core_cached)
             x_pred = x + dt * k1
             k2 = self.rhs(x_pred, u=u, x_drive=x_drive, drive_scale=drive_scale,
                           i_edge_const=i_edge_const,
+                          i_boundary_const=i_boundary_const,
+                          i_readout_const=i_readout_const,
                           vca_gate_core=gate_core_cached)
             x = x + 0.5 * dt * (k1 + k2)
             if store_trajectory:
@@ -1139,7 +1310,19 @@ output_ode_src: list[int] | None = None,
                     acc_const.index_add_(1, self.src, -i_edge_f32)
                 i_edge_const = acc_const.to(dtype=x.dtype)
 
+            # freeze_boundary / freeze_temporal_read: per-sample precompute so
+            # the frozen boundary/readout contributions track the running
+            # starting state (matching freeze_read semantics here). No-op when
+            # the family is absent on this stage.
+            i_boundary_const = None
+            if self.freeze_boundary:
+                i_boundary_const = self._compute_frozen_boundary(u_t, x)
+            i_readout_const = None
+            if self.freeze_temporal_read:
+                i_readout_const = self._compute_frozen_readout(u_t, x)
+
             x = self._call_heun_steps(x, u_t, dt, num_steps, i_edge_const,
+                                      i_boundary_const, i_readout_const,
                                       gate_core_cached)
             states[t] = x
 
@@ -1152,6 +1335,8 @@ output_ode_src: list[int] | None = None,
         dt: float,
         num_steps: int,
         i_edge_const: torch.Tensor | None,
+        i_boundary_const: torch.Tensor | None = None,
+        i_readout_const: torch.Tensor | None = None,
         vca_gate_core: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Dispatch to compiled or uncompiled Heun steps with fallback.
@@ -1165,7 +1350,9 @@ output_ode_src: list[int] | None = None,
         if getattr(self, "_heun_steps_compiled", False):
             try:
                 return self._heun_steps_compiled_fn(
-                    x, u_t, dt, num_steps, i_edge_const, vca_gate_core,
+                    x, u_t, dt, num_steps,
+                    i_edge_const, i_boundary_const, i_readout_const,
+                    vca_gate_core,
                 )
             except Exception as e:
                 print(
@@ -1174,10 +1361,14 @@ output_ode_src: list[int] | None = None,
                 )
                 self._heun_steps_compiled = False
                 return self._heun_steps(
-                    x, u_t, dt, num_steps, i_edge_const, vca_gate_core,
+                    x, u_t, dt, num_steps,
+                    i_edge_const, i_boundary_const, i_readout_const,
+                    vca_gate_core,
                 )
         return self._heun_steps(
-            x, u_t, dt, num_steps, i_edge_const, vca_gate_core,
+            x, u_t, dt, num_steps,
+            i_edge_const, i_boundary_const, i_readout_const,
+            vca_gate_core,
         )
 
     def _heun_steps(
@@ -1187,6 +1378,8 @@ output_ode_src: list[int] | None = None,
         dt: float,
         num_steps: int,
         i_edge_const: torch.Tensor | None,
+        i_boundary_const: torch.Tensor | None = None,
+        i_readout_const: torch.Tensor | None = None,
         vca_gate_core: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run ``num_steps`` Heun integration steps (predictor-corrector).
@@ -1200,10 +1393,14 @@ output_ode_src: list[int] | None = None,
         for _ in range(num_steps):
             k1 = self.rhs(x, u=u_t, x_drive=None, drive_scale=0.0,
                           i_edge_const=i_edge_const,
+                          i_boundary_const=i_boundary_const,
+                          i_readout_const=i_readout_const,
                           vca_gate_core=vca_gate_core)
             x_pred = x + dt * k1
             k2 = self.rhs(x_pred, u=u_t, x_drive=None, drive_scale=0.0,
                           i_edge_const=i_edge_const,
+                          i_boundary_const=i_boundary_const,
+                          i_readout_const=i_readout_const,
                           vca_gate_core=vca_gate_core)
             x = x + 0.5 * dt * (k1 + k2)
         return x
@@ -1292,6 +1489,17 @@ output_ode_src: list[int] | None = None,
                 acc_const.index_add_(1, self.src, -i_edge_f32)
             i_edge_const = acc_const.to(dtype=x0.dtype)
 
+        # freeze_boundary / freeze_temporal_read: precompute once from (u, x0).
+        # No-op when the family is absent on this stage. Captured by the phi
+        # closure below so torchdeq's IFT re-evaluates with the same frozen
+        # values during the backward pass.
+        i_boundary_const = None
+        if self.freeze_boundary:
+            i_boundary_const = self._compute_frozen_boundary(u, x0)
+        i_readout_const = None
+        if self.freeze_temporal_read:
+            i_readout_const = self._compute_frozen_readout(u, x0)
+
         self.set_leak_floor(lf)
         try:
             def phi(x):
@@ -1299,6 +1507,8 @@ output_ode_src: list[int] | None = None,
                                         x_drive=x_drive, drive_scale=drive_scale,
                                         leak_floor=lf,
                                         i_edge_const=i_edge_const,
+                                        i_boundary_const=i_boundary_const,
+                                        i_readout_const=i_readout_const,
                                         vca_gate_core=gate_core_cached)
 
             x_star, info = solve_equilibrium(phi, x0, cfg)

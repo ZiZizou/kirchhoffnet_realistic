@@ -2687,6 +2687,26 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "constant across all Heun/DEQ iterations inside every stage. "
              "Disentangles node-voltage reads from same-step writes "
              "(experimental).")
+    parser.add_argument(
+        "--freeze-boundary", dest="freeze_boundary", action="store_true",
+        default=False,
+        help="Compute boundary fan-out edge currents (tanh + edge gate + VCA "
+             "gate) once from (u, x0) and hold them constant across all "
+             "Heun/DEQ iterations inside every stage. The family's resistive "
+             "shunt (when present) remains dynamic per-step, mirroring the "
+             "--freeze-read behavior for the core graph. Independent of "
+             "--freeze-read (combine freely). No-op when --boundary-fan-out "
+             "is not set.")
+    parser.add_argument(
+        "--freeze-temporal-read", dest="freeze_temporal_read",
+        action="store_true", default=False,
+        help="Compute temporal-readout edge currents (tanh + edge gate + VCA "
+             "gate) once from x0 and hold them constant across all Heun/DEQ "
+             "iterations inside every stage. The family's resistive shunt "
+             "(when present) remains dynamic per-step, mirroring the "
+             "--freeze-read behavior for the core graph. Independent of "
+             "--freeze-read and --freeze-boundary (combine freely). No-op "
+             "when --temporal-readout is not set.")
 
     # --- Interstage activation: pointwise non-linearity between stages ---
     parser.add_argument(
@@ -3414,6 +3434,8 @@ def main():
         decoder_hidden_dim=args.decoder_hidden_dim,
         read_only_source=args.read_only_source,
         freeze_read=args.freeze_read,
+        freeze_boundary=args.freeze_boundary,
+        freeze_temporal_read=args.freeze_temporal_read,
         interstage_activation=args.interstage_activation,
         interstage_residual_rank=args.interstage_residual_rank,
         enable_skip_linear=args.skip_linear,
@@ -3478,7 +3500,10 @@ def main():
         f"input_mapper={in_mapper_name} output_mapper={out_mapper_name} "
         f"hid_count={net.hid_count} proj_count={net.proj_count} "
         f"write_idx={list(net.write_idx) if net.write_idx is not None else None} "
-        f"read_idx={list(net.read_idx) if net.read_idx is not None else None}"
+        f"read_idx={list(net.read_idx) if net.read_idx is not None else None} "
+        f"freeze_read={args.freeze_read} "
+        f"freeze_boundary={args.freeze_boundary} "
+        f"freeze_temporal_read={args.freeze_temporal_read}"
     )
     n_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
     print(f"[train] trainable params: {n_params:,}")

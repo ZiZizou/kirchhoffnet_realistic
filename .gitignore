@@ -15,3 +15,6 @@ docs
 _count_params.py
 kirchhofftoken.txt
 dagger_output/
+*.out
+*ipynb*
+*.sh

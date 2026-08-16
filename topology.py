@@ -1602,6 +1602,8 @@ def build_net_from_preset(
     vca_core_enabled: bool = False,
     vca_gate_shunt: bool = False,
     vca_separate_core_bus: bool = False,
+    x_max: float | None = None,
+    c_eff: float | None = None,
 ):
     """Build a full KirchhoffNetWithIO from a config.PRESETS entry.
 
@@ -1724,6 +1726,8 @@ def build_net_from_preset(
         vca_core_enabled=vca_core_enabled,
         vca_gate_shunt=vca_gate_shunt,
         vca_separate_core_bus=vca_separate_core_bus,
+        x_max=x_max,
+        c_eff=c_eff,
     )
 
 
@@ -1750,6 +1754,7 @@ def build_net_from_config(
     vca_gate_shunt: bool = False,
     vca_separate_core_bus: bool = False,
     x_max: float | None = None,
+    c_eff: float | None = None,
 ):
     """Build a KirchhoffNetWithIO from a full config dict.
 
@@ -2086,7 +2091,8 @@ def build_net_from_config(
                 f"for one_to_one mode"
             )
         input_mapper = SparseInputMapper(
-            in_dim=in_dim, out_dim=n_first_hid, write_idx=preset_write_idx
+            in_dim=in_dim, out_dim=n_first_hid, write_idx=preset_write_idx,
+            x_max=x_max,
         )
         write_idx_arg = list(preset_write_idx)
     elif write_mode == "fan_out":
@@ -2097,7 +2103,8 @@ def build_net_from_config(
                 "dict mapping input index to list of target hidden-node indices"
             )
         input_mapper = FanOutInputMapper(
-            in_dim=in_dim, out_dim=n_first_hid, fan_out_map=fan_out_map
+            in_dim=in_dim, out_dim=n_first_hid, fan_out_map=fan_out_map,
+            x_max=x_max,
         )
         write_idx_arg = sorted(
             {t for targets in fan_out_map.values() for t in targets}
@@ -2115,7 +2122,8 @@ def build_net_from_config(
                 f"got len(write_idx)={len(preset_write_idx)}, in_dim={in_dim}"
             )
         input_mapper = ProjectedSparseInputMapper(
-            in_dim=in_dim, out_dim=n_first_hid, write_idx=preset_write_idx
+            in_dim=in_dim, out_dim=n_first_hid, write_idx=preset_write_idx,
+            x_max=x_max,
         )
         write_idx_arg = list(preset_write_idx)
     else:
@@ -2125,9 +2133,11 @@ def build_net_from_config(
                 in_dim=in_dim,
                 hidden_dim=encoder_hidden_dim,
                 out_dim=n_first_hid,
+                x_max=x_max,
             )
         else:
-            input_mapper = MapperCls(in_dim=in_dim, out_dim=n_first_hid)
+            input_mapper = MapperCls(in_dim=in_dim, out_dim=n_first_hid,
+                                     x_max=x_max)
         write_idx_arg = None
         if enable_drive:
             raise ValueError(
@@ -2166,6 +2176,7 @@ def build_net_from_config(
             vca_gate_shunt=vca_gate_shunt,
             vca_separate_core_bus=vca_separate_core_bus,
             x_max=x_max,
+            c_eff=c_eff,
         )
         stage_modules.append(stage)
         stage_times.append(float(stages_cfg[stage_idx].get("t_span", 0.5)))
@@ -2213,6 +2224,7 @@ def build_net_from_config(
                     in_dim=in_dim,
                     out_dim=len(first_hid),
                     fan_out_map=fan_out_map,
+                    x_max=x_max,
                 )
                 for _ in range(len(stages_cfg))
             ]
@@ -2227,6 +2239,7 @@ def build_net_from_config(
                         in_dim=in_dim,
                         out_dim=len(first_hid),
                         write_idx=list(write_idx_arg),
+                        x_max=x_max,
                     )
                     for _ in range(len(stages_cfg))
                 ]
@@ -2240,6 +2253,7 @@ def build_net_from_config(
                         in_dim=in_dim,
                         out_dim=len(first_hid),
                         fan_out_map=drive_fan_out,
+                        x_max=x_max,
                     )
                     for _ in range(len(stages_cfg))
                 ]
@@ -2254,6 +2268,7 @@ def build_net_from_config(
                         in_dim=in_dim,
                         out_dim=len(first_hid),
                         write_idx=list(write_idx_arg),
+                        x_max=x_max,
                     )
                     for _ in range(len(stages_cfg))
                 ]
@@ -2265,6 +2280,7 @@ def build_net_from_config(
                         in_dim=in_dim,
                         out_dim=len(first_hid),
                         fan_out_map=drive_fan_out,
+                        x_max=x_max,
                     )
                     for _ in range(len(stages_cfg))
                 ]

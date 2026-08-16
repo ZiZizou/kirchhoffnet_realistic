@@ -504,7 +504,12 @@ class AntiParallelFreeTanhLibrary(nn.Module):
 
 
 def make_cell_library(
-    library_name: str, num_edges: int | None = None
+    library_name: str,
+    num_edges: int | None = None,
+    gm_min: float | None = None,
+    gm_max: float | None = None,
+    isat_min: float | None = None,
+    isat_max: float | None = None,
 ) -> SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | AntiParallelFreeTanhLibrary:
     """Factory: returns the appropriate edge-library class.
 
@@ -513,6 +518,13 @@ def make_cell_library(
     ``tanh_realistic_upgrade`` → ``RealisticTanhUpgradeLibrary``.
     ``tanh_free`` → ``FreeTanhLibrary``.
     ``tanh_anti`` → ``AntiParallelFreeTanhLibrary``.
+
+    ``gm_min`` / ``gm_max`` / ``isat_min`` / ``isat_max`` override the
+    bounded sigmoid parameterization rails for the ``tanh_realistic_upgrade``,
+    ``tanh_free``, and ``tanh_anti`` libraries (defaults from config
+    ``TANH_REALISTIC_*`` / ``ANTI_PARALLEL_*``). When any of the four is
+    given, all others fall back to their config defaults; the library
+    constructors validate ``max > min``.
 
     The factory reads ``BIAS_ENABLED`` from the corresponding
     ``CELL_LIBRARIES[library_name]`` entry (default ``False``) and passes
@@ -534,7 +546,10 @@ def make_cell_library(
         return RealisticTanhLibrary(num_edges=n, bias_enabled=bias_enabled)
     if library_name == "tanh_realistic_upgrade":
         bias_enabled = bool(CELL_LIBRARIES[library_name].get("BIAS_ENABLED", False))
-        return RealisticTanhUpgradeLibrary(num_edges=n, bias_enabled=bias_enabled)
+        return RealisticTanhUpgradeLibrary(
+            num_edges=n, bias_enabled=bias_enabled,
+            gm_min=gm_min, gm_max=gm_max,
+            isat_min=isat_min, isat_max=isat_max)
     if library_name == "tanh_free":
         bias_enabled = bool(CELL_LIBRARIES[library_name].get("BIAS_ENABLED", False))
         parallel_tanh_mult_enabled = bool(
@@ -544,10 +559,15 @@ def make_cell_library(
             num_edges=n,
             bias_enabled=bias_enabled,
             parallel_tanh_mult_enabled=parallel_tanh_mult_enabled,
+            gm_min=gm_min, gm_max=gm_max,
+            isat_min=isat_min, isat_max=isat_max,
         )
     if library_name == "tanh_anti":
         theta_enabled = bool(CELL_LIBRARIES[library_name].get("THETA_ENABLED", False))
-        return AntiParallelFreeTanhLibrary(num_edges=n, theta_enabled=theta_enabled)
+        return AntiParallelFreeTanhLibrary(
+            num_edges=n, theta_enabled=theta_enabled,
+            gm_min=gm_min, gm_max=gm_max,
+            isat_min=isat_min, isat_max=isat_max)
     raise ValueError(
         f"Unknown cell library: {library_name!r}. "
         f"Available: 'relu', 'tanh', 'tanh_realistic', "

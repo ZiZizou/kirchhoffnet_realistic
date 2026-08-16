@@ -152,6 +152,76 @@ def _stage_tanh_sat_loss(stage, traj: torch.Tensor) -> torch.Tensor:
     return torch.tanh(u).pow(2).mean()
 
 
+def _stage_sparsity_loss(stage, traj: torch.Tensor) -> torch.Tensor:
+    """Mean |cell device param| over FreeTanhLibrary families (weight sparsity).
+
+    L1 weight-sparsity penalty on the tanh_free device parameters. For each
+    stage, walks ``cell_lib``, ``boundary_cell_lib``, ``output_ode_cell_lib``,
+    and ``ref_cell_lib`` (when each is a ``FreeTanhLibrary``) and averages
+    ``|p|`` over the non-sign parameters (``s_raw`` is a discrete ±1 with STE
+    and is excluded). Returns zero for stages with no FreeTanh library.
+
+    Complements ``edge_gate`` (active-edge *count*) by applying magnitude
+    pressure to the device weights themselves. ``reg_scale`` from the caller
+    applies the staged warm-up.
+    """
+    seed = traj.new_zeros(())
+    parts = []
+    for lib in (
+        getattr(stage, "cell_lib", None),
+        getattr(stage, "boundary_cell_lib", None),
+        getattr(stage, "output_ode_cell_lib", None),
+        getattr(stage, "ref_cell_lib", None),
+    ):
+        if lib is None or not isinstance(lib, FreeTanhLibrary):
+            continue
+        total = None
+        num = 0
+        for name, p in lib.named_parameters(recurse=False):
+            if name == "s_raw":
+                continue
+            v = p.abs().sum()
+            total = v if total is None else total + v
+            num += int(p.numel())
+        if total is not None:
+            parts.append(total / max(1, num))
+    if not parts:
+        return seed
+    out = parts[0]
+    for v in parts[1:]:
+        out = out + v
+    return out / len(parts)
+
+
+def _stage_entropy_loss(stage, traj: torch.Tensor) -> torch.Tensor:
+    """Mean binary entropy of edge gate probabilities (crisp-selection pressure).
+
+    ``H(p) = -p·log2(p) - (1-p)·log2(1-p)`` averaged over the soft gate
+    values ``p = σ(z_logits)`` of the core, boundary, and temporal-readout
+    edges. Gate entropy is maximized at ``p = 0.5`` (all gates half-open) and
+    goes to zero as gates commit to 0 or 1. Penalizing ``H`` pushes the gates
+    toward crisp 0/1 selection, which pairs with ``edge_gate`` for pruning.
+    """
+    seed = traj.new_zeros(())
+    gates = []
+    if getattr(stage, "z_logits", None) is not None:
+        gates.append(torch.sigmoid(stage.z_logits))
+    if getattr(stage, "boundary_z_logits", None) is not None:
+        gates.append(torch.sigmoid(stage.boundary_z_logits))
+    if getattr(stage, "output_ode_z_logits", None) is not None:
+        gates.append(torch.sigmoid(stage.output_ode_z_logits))
+    if not gates:
+        return seed
+    eps = 1e-6
+    h = seed
+    count = 0
+    for p in gates:
+        pc = p.clamp(eps, 1.0 - eps)
+        h = h + (-(pc * torch.log2(pc)) - ((1.0 - pc) * torch.log2(1.0 - pc))).mean()
+        count += 1
+    return h / count
+
+
 def _device_l2_penalty(net) -> torch.Tensor:
     """Scale-invariant L2 penalty over the ``tanh_free`` device-family params.
 
@@ -244,19 +314,24 @@ def _compute_regularizers(
     net: KirchhoffNetWithIO | KirchhoffNet,
     trajs: list[torch.Tensor],
     lambdas: dict,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Shared regularizer computation: edge_gate, rail, tanh_sat.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor,
+           torch.Tensor, torch.Tensor]:
+    """Shared regularizer computation: edge_gate, rail, tanh_sat, sparsity, entropy.
 
     Complexity terms:
       - edge_gate   : Σ_e σ(z_logits) over core, boundary, ref, and
                        temporal-readout (output_ode) edges (active edge count).
       - rail        : ReLU²(|x| - x_max).mean()        (voltage excursion)
       - tanh_sat    : tanh(u)².mean()                  (FreeTanhLibrary saturation)
+      - sparsity    : mean |device cell param| over FreeTanhLibrary families
+      - entropy     : mean binary entropy of the soft edge gates
 
-    Returns ``(loss_edge_gate, loss_rail, loss_tanh_sat)``.
+    Returns ``(loss_edge_gate, loss_rail, loss_tanh_sat,
+    loss_sparsity, loss_entropy)``.
     """
     stages = net.core.stages if isinstance(net, KirchhoffNetWithIO) else net.stages
     loss_edge_gate = loss_rail = loss_tanh_sat = trajs[0].new_zeros(())
+    loss_sparsity = loss_entropy = trajs[0].new_zeros(())
     for stage, traj in zip(stages, trajs):
         z = _stage_edge_gates(stage)
 
@@ -275,8 +350,11 @@ def _compute_regularizers(
             ).sum()
         loss_rail = loss_rail + _stage_rail_loss(stage, traj)
         loss_tanh_sat = loss_tanh_sat + _stage_tanh_sat_loss(stage, traj)
+        loss_sparsity = loss_sparsity + _stage_sparsity_loss(stage, traj)
+        loss_entropy = loss_entropy + _stage_entropy_loss(stage, traj)
 
-    return (loss_edge_gate, loss_rail, loss_tanh_sat)
+    return (loss_edge_gate, loss_rail, loss_tanh_sat,
+            loss_sparsity, loss_entropy)
 
 
 # ---------- regularizer warm-up schedule (RR-A + CP) ----------
@@ -284,6 +362,8 @@ def _compute_regularizers(
 _REG_KEYS = (
     "edge_gate",
     "tanh_sat",
+    "sparsity",
+    "entropy",
 )
 
 
@@ -722,7 +802,8 @@ def compute_loss(
                 return loss_task, zero, {"task": float(loss_task.item())}
             return loss_task, zero
 
-        loss_edge_gate, loss_rail, loss_tanh_sat = _compute_regularizers(net, trajs, lambdas)
+        loss_edge_gate, loss_rail, loss_tanh_sat, \
+            loss_sparsity, loss_entropy = _compute_regularizers(net, trajs, lambdas)
 
         loss_skip_l2 = 0.0
         skip_l2_lambda = float(lambdas.get("skip_linear_l2", 0.0))
@@ -748,6 +829,8 @@ def compute_loss(
         structural = reg_scale * (
             float(lambdas.get("edge_gate", 0.0)) * loss_edge_gate
             + float(lambdas.get("tanh_sat", 0.0)) * loss_tanh_sat
+            + float(lambdas.get("sparsity", 0.0)) * loss_sparsity
+            + float(lambdas.get("entropy", 0.0)) * loss_entropy
         ) + loss_skip_l2 + loss_device_l2
 
     if return_parts:
@@ -756,6 +839,8 @@ def compute_loss(
             "edge_gate": float(loss_edge_gate.item()),
             "rail": float(loss_rail.item()),
             "tanh_sat": float(loss_tanh_sat.item()),
+            "sparsity": float(loss_sparsity.item()),
+            "entropy": float(loss_entropy.item()),
             "skip_linear_l2": float(loss_skip_l2.item()) if torch.is_tensor(loss_skip_l2) else float(loss_skip_l2),
             "device_l2": float(loss_device_l2.item()) if torch.is_tensor(loss_device_l2) else float(loss_device_l2),
             "reg_scale": float(reg_scale),
@@ -844,7 +929,8 @@ def compute_solver_loss(
                 }
             return loss_task, loss_task.new_zeros(())
 
-        loss_edge_gate, loss_rail, loss_tanh_sat = _compute_regularizers(net, trajs, lambdas)
+        loss_edge_gate, loss_rail, loss_tanh_sat, \
+            loss_sparsity, loss_entropy = _compute_regularizers(net, trajs, lambdas)
 
         total_task = (
             loss_task
@@ -853,6 +939,8 @@ def compute_solver_loss(
         structural = reg_scale * (
             float(lambdas.get("edge_gate", 0.0)) * loss_edge_gate
             + float(lambdas.get("tanh_sat", 0.0)) * loss_tanh_sat
+            + float(lambdas.get("sparsity", 0.0)) * loss_sparsity
+            + float(lambdas.get("entropy", 0.0)) * loss_entropy
         )
 
     if return_parts:
@@ -863,6 +951,8 @@ def compute_solver_loss(
             "edge_gate": float(loss_edge_gate.item()),
             "rail": float(loss_rail.item()),
             "tanh_sat": float(loss_tanh_sat.item()),
+            "sparsity": float(loss_sparsity.item()),
+            "entropy": float(loss_entropy.item()),
             "reg_scale": float(reg_scale),
             "total": float((total_task + structural).item()),
         }

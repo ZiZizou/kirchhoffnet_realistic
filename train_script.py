@@ -545,7 +545,9 @@ def _make_dynamic_preset(
     small_world_p: float = 0.3,
     small_world_seed: int | None = None,
     leak_mode: str | None = None,
-    leak_constant: float | None = None) -> dict:
+    leak_constant: float | None = None,
+    t_span: float | None = None,
+    num_steps: int | None = None) -> dict:
     """Build a fresh preset dict that overrides the topology of the named
     problem. Preserves problem-specific fields (num_inputs, loss, out_dim,
     use_robust_input, schedule, lambdas, tau_anneal, write_idx default).
@@ -670,8 +672,10 @@ Args:
         "input_pattern": "all_to_all",
         "output_pattern": "all_to_all",
         "proj_pattern": "all_to_all",
-        "t_span": SOLVER["t_span"] / n_stages,
-        "num_steps": round(SOLVER["num_steps"] / n_stages)}
+        "t_span": (t_span if t_span is not None else SOLVER["t_span"]) / n_stages,
+        "num_steps": round(
+            (num_steps if num_steps is not None else SOLVER["num_steps"]) / n_stages
+        )}
 
     new_preset = dict(base)
     new_preset["stages"] = [stage_cfg] * n_stages
@@ -731,6 +735,17 @@ def _save_config_snapshot(out_dir: Path, problem: str, args, lambdas: dict,
         f.write(f"\nLAMBDAS (effective for {problem}, preset overrides applied):\n")
         for k, v in lambdas.items():
             f.write(f"  {k}: {v}\n")
+        f.write("\nPHYS (effective):\n")
+        from config import PHYS
+        for k in ("x_max", "C_eff"):
+            cli_val = getattr(args, "c_eff" if k == "C_eff" else "x_max", None)
+            f.write(f"  {k}: {cli_val if cli_val is not None else PHYS[k]}\n")
+        f.write("\nCELL LIBRARY:\n")
+        f.write(f"  name: {getattr(args, 'cell_library', None) or 'preset'}\n")
+        f.write(f"  gm_min: {getattr(args, 'gm_min', None) or 'config'}\n")
+        f.write(f"  gm_max: {getattr(args, 'gm_max', None) or 'config'}\n")
+        f.write(f"  isat_min: {getattr(args, 'isat_min', None) or 'config'}\n")
+        f.write(f"  isat_max: {getattr(args, 'isat_max', None) or 'config'}\n")
         f.write("\nOPTIM:\n")
         for k, v in OPTIM.items():
             f.write(f"  {k}: {v}\n")
@@ -2147,6 +2162,47 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "i>=0 and exactly zero at Vsrc=Vdst). "
              "Overrides the preset's cell_library key if present.")
     parser.add_argument(
+        "--gm-min", type=float, default=None, dest="gm_min",
+        help="Lower rail of the bounded sigmoid gm parameterization for "
+             "tanh_realistic_upgrade / tanh_free / tanh_anti cell libraries "
+             "(default: config TANH_REALISTIC_GM_MIN=0.01). "
+             "kn-bayes-opt uses this as an optimization dimension.")
+    parser.add_argument(
+        "--gm-max", type=float, default=None, dest="gm_max",
+        help="Upper rail of the bounded sigmoid gm parameterization "
+             "(default: config TANH_REALISTIC_GM_MAX=10.0). Must be > --gm-min. "
+             "kn-bayes-opt uses this as an optimization dimension.")
+    parser.add_argument(
+        "--isat-min", type=float, default=None, dest="isat_min",
+        help="Lower rail of the bounded sigmoid Isat parameterization "
+             "(default: config TANH_REALISTIC_ISAT_MIN=0.01). "
+             "kn-bayes-opt uses this as an optimization dimension.")
+    parser.add_argument(
+        "--isat-max", type=float, default=None, dest="isat_max",
+        help="Upper rail of the bounded sigmoid Isat parameterization "
+             "(default: config TANH_REALISTIC_ISAT_MAX=10.0). Must be > --isat-min. "
+             "kn-bayes-opt uses this as an optimization dimension.")
+    parser.add_argument(
+        "--c-eff", type=float, default=None, dest="c_eff",
+        help="Effective node capacitance C_eff (default: config PHYS['C_eff']=1.0). "
+             "Scales the ODE integration: dx_j/dt = (ΣI - leak - clip) / C_eff. "
+             "kn-bayes-opt uses this as an optimization dimension.")
+    parser.add_argument(
+        "--x-max", type=float, default=None, dest="x_max",
+        help="Differential rail limit x_max for stage ODE states and the "
+             "input/output mappers (default: config PHYS['x_max']=3.0). "
+             "kn-bayes-opt uses this as an optimization dimension.")
+    parser.add_argument(
+        "--sparsity-lambda", type=float, default=None, dest="sparsity_lambda",
+        help="Override the sparsity regularizer weight (L1 over FreeTanhLibrary "
+             "device cell params). Default from LAMBDAS / schedule. "
+             "kn-bayes-opt uses this as an optimization dimension.")
+    parser.add_argument(
+        "--entropy-lambda", type=float, default=None, dest="entropy_lambda",
+        help="Override the gate-entropy regularizer weight (binary entropy of "
+             "the soft edge gates). Default from LAMBDAS / schedule. "
+             "kn-bayes-opt uses this as an optimization dimension.")
+    parser.add_argument(
         "--hidden-family", type=str, default=None, dest="hidden_family",
         choices=["grid", "small_world", "torus"],
         help="Hidden-node topology family (default: from preset). "
@@ -2208,6 +2264,29 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--lr", type=float, default=None,
         help=f"Learning rate (default: {OPTIM['lr']})")
+    parser.add_argument(
+        "--weight-decay", type=float, default=None,
+        dest="weight_decay",
+        help=f"Weight decay (default: {OPTIM['weight_decay']}). "
+             "Forwarded to AdamW. kn-bayes-opt uses this as an optimization "
+             "dimension.")
+    parser.add_argument(
+        "--batch-size", type=int, default=None,
+        dest="batch_size",
+        help=f"Batch size (default: {OPTIM['batch_size']}). "
+             "kn-bayes-opt uses this as an optimization dimension.")
+    parser.add_argument(
+        "--t-span", type=float, default=None,
+        dest="t_span",
+        help=f"Total ODE integration horizon across all stages "
+             f"(default: {SOLVER['t_span']}); per-stage t_span = total / num_stages. "
+             "kn-bayes-opt uses this as an optimization dimension.")
+    parser.add_argument(
+        "--num-steps", type=int, default=None,
+        dest="num_steps",
+        help=f"Total Heun steps across all stages "
+             f"(default: {SOLVER['num_steps']}); per-stage num_steps = round(total / num_stages). "
+             "kn-bayes-opt uses this as an optimization dimension.")
     parser.add_argument(
         "--stage-lr-scale", type=float, default=1.0,
         help="Per-stage geometric LR multiplier (stage-lr-scaling). "
@@ -3126,7 +3205,12 @@ def main():
 
     epochs = args.epochs if args.epochs is not None else OPTIM["epochs"]
     lr = args.lr if args.lr is not None else OPTIM["lr"]
-    batch_size = int(OPTIM["batch_size"])
+    weight_decay = (
+        args.weight_decay if args.weight_decay is not None
+        else float(OPTIM["weight_decay"]))
+    batch_size = (
+        int(args.batch_size) if args.batch_size is not None
+        else int(OPTIM["batch_size"]))
 
     out_dir = _ensure_dir(args.output.resolve())
     lambdas = _resolve_lambdas(args.problem)
@@ -3145,6 +3229,29 @@ def main():
     if getattr(args, "tanh_sat_lambda", None) is not None:
         lambdas["tanh_sat"] = float(args.tanh_sat_lambda)
         print(f"[train] tanh_sat lambda overridden via CLI: {lambdas['tanh_sat']}")
+    # sparsity/entropy lambda CLI overrides (kn-bayes-opt dims). The schedule
+    # functions (three_phase_lambdas / four_phase_lambdas) read sparsity and
+    # entropy from the schedule config's lambdas_b/b1/b2/c, NOT from the base
+    # lambdas dict. To make the CLI value effective under every schedule, we
+    # patch the base lambdas AND the schedule phase targets.
+    for _reg_key, _cli_name in (("sparsity", "sparsity_lambda"),
+                               ("entropy", "entropy_lambda")):
+        if getattr(args, _cli_name, None) is not None:
+            _v = float(getattr(args, _cli_name))
+            lambdas[_reg_key] = _v
+            print(f"[train] {_reg_key} lambda overridden via CLI: {_v}")
+            from config import SCHEDULE_THREE_PHASE, SCHEDULE_FOUR_PHASE
+            for _phase_key, _map in (
+                ("lambdas_b", SCHEDULE_THREE_PHASE),
+                ("lambdas_c", SCHEDULE_THREE_PHASE),
+            ):
+                if _phase_key in _map:
+                    _map[_phase_key].setdefault(_reg_key, 0.0)
+                    _map[_phase_key][_reg_key] = _v
+            for _phase_key in ("lambdas_b1", "lambdas_b2", "lambdas_c"):
+                if _phase_key in SCHEDULE_FOUR_PHASE:
+                    SCHEDULE_FOUR_PHASE[_phase_key].setdefault(_reg_key, 0.0)
+                    SCHEDULE_FOUR_PHASE[_phase_key][_reg_key] = _v
     schedule_mode = _resolve_schedule(args.problem, args.schedule)
     # four-phase-redesign/Phase 1c: apply diagnostic ablation preset
     # overrides BEFORE any other flag is consumed (e.g. before the
@@ -3249,7 +3356,10 @@ def main():
         lib_name = PRESETS[args.problem].get("cell_library", "legacy")
     if args.cell_library is not None:
         lib_name = args.cell_library
-    cell_lib = make_cell_library(lib_name)
+    cell_lib = make_cell_library(
+        lib_name,
+        gm_min=args.gm_min, gm_max=args.gm_max,
+        isat_min=args.isat_min, isat_max=args.isat_max)
     # Per-problem grid-size default (grid7-gate0: smooth2d_grid=7, housing_grid=5).
     # Explicit --grid-size N overrides either.
     if args.problem == "smooth2d_grid":
@@ -3294,7 +3404,9 @@ def main():
             small_world_p=args.small_world_p,
             small_world_seed=args.small_world_seed,
             leak_mode=args.leak,
-            leak_constant=args.leak_constant)
+            leak_constant=args.leak_constant,
+            t_span=args.t_span,
+            num_steps=args.num_steps)
         PRESETS[args.problem] = new_preset
         print(
             f"[train] dynamic preset (hidden_family={args.hidden_family}): "
@@ -3316,6 +3428,23 @@ def main():
     if args.edge_repeats is not None:
         for stage in active_preset.get("stages", []):
             stage["edge_repeats"] = int(args.edge_repeats)
+    # Propagate --t-span / --num-steps into every stage of the preset so the
+    # CLI overrides apply even when --hidden-family is NOT specified (the
+    # dynamic preset path above already wires them). Total-budget semantics:
+    # per-stage t_span = args.t_span / num_stages, num_steps = round(total/n).
+    # kn-bayes-opt uses these as optimization dimensions.
+    stages_list = active_preset.get("stages", [])
+    n_stages_eff = len(stages_list) if stages_list else 1
+    if n_stages_eff < 1:
+        n_stages_eff = 1
+    if args.t_span is not None:
+        per_stage_t_span = float(args.t_span) / n_stages_eff
+        for stage in stages_list:
+            stage["t_span"] = per_stage_t_span
+    if args.num_steps is not None:
+        per_stage_num_steps = round(int(args.num_steps) / n_stages_eff)
+        for stage in stages_list:
+            stage["num_steps"] = per_stage_num_steps
     if args.write_fan_out is not None:
         try:
             raw = json.loads(args.write_fan_out)
@@ -3446,7 +3575,9 @@ def main():
         vca_rank=args.vca_rank,
         vca_core_enabled=args.vca_core,
         vca_gate_shunt=args.vca_gate_shunt,
-        vca_separate_core_bus=args.vca_separate_core_bus)
+        vca_separate_core_bus=args.vca_separate_core_bus,
+        x_max=args.x_max,
+        c_eff=args.c_eff)
     net.to(device)
 
     if args.no_edge_gates:
@@ -3722,6 +3853,7 @@ def main():
 
     optimizer = make_optimizer(
         net, lr=lr,
+        weight_decay=weight_decay,
         stage_lr_scale=args.stage_lr_scale,
         mapper_lr_scale=args.mapper_lr_scale,
         struct_lr_scale=args.struct_lr_scale,
@@ -4576,6 +4708,7 @@ def main():
                 )
             retrain_optimizer = make_optimizer(
                 pruned_net, lr=c_lr,
+                weight_decay=weight_decay,
                 stage_lr_scale=args.retrain_stage_lr_scale,
                 mapper_lr_scale=args.retrain_mapper_lr_scale,
                 struct_lr_scale=args.struct_lr_scale,

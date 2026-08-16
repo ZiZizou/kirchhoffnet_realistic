@@ -17,8 +17,10 @@ benchmark is preserved and the only artefact contract is the
 ``final_metrics.txt`` file. Parallelism is provided by optuna's
 ``n_jobs`` (ThreadPoolExecutor) which concurrently spawns up to ``n_workers``
 trial subprocesses - this is the recommended mode on Kaggle (CPU cores or
-single GPU). When ``torch.cuda.is_available()`` the default is ``n_workers=1``
-because each subprocess grabs the GPU.
+GPUs). When ``torch.cuda.is_available()`` the default is ``n_workers`` =
+number of visible CUDA GPUs, and trials are pinned round-robin to individual
+GPUs via per-subprocess ``CUDA_VISIBLE_DEVICES`` so multi-GPU hosts (e.g.
+Kaggle 2xT4) use every GPU instead of stacking all workers on GPU 0.
 
 Dataset-in / -out dimensions are hardcoded per dataset (housing=8,
 friedman1=10, friedman2/3=4, smooth2d=2, all out_dim=1). Default param
@@ -246,8 +248,10 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0,
                         help="Seed shared across all trials (default: 0).")
     parser.add_argument("--n-workers", type=int, default=None,
-                        help="Concurrent trial subprocesses. Default: 1 if "
-                             "CUDA is available, else os.cpu_count().")
+                        help="Concurrent trial subprocesses. Default: number of "
+                             "visible CUDA GPUs when available, else "
+                             "os.cpu_count(). Trials are pinned round-robin to "
+                             "GPUs via CUDA_VISIBLE_DEVICES.")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto",
                         help="Device 'auto' | 'cpu' | 'cuda' (default: auto-detect). "
                              "'auto' uses CUDA when available and is forwarded to each "
@@ -291,11 +295,6 @@ def main() -> None:
                   or f"{args.dataset}_budget{param_budget}_e{args.epochs}")
     storage = f"sqlite:///{run_dir / (study_name + '.db')}"
 
-    if args.n_workers is None:
-        n_workers = 1 if torch.cuda.is_available() else max(1, os.cpu_count() or 1)
-    else:
-        n_workers = max(1, args.n_workers)
-
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if args.device == "cpu":
         device = "cpu"
@@ -306,6 +305,16 @@ def main() -> None:
             print("[mlp_bayes_opt] WARNING: --device cuda requested but no CUDA GPU "
                   "detected; falling back to CPU")
             device = "cpu"
+
+    n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+
+    if args.n_workers is None:
+        if device == "cuda" and n_gpus >= 1:
+            n_workers = n_gpus
+        else:
+            n_workers = max(1, os.cpu_count() or 1)
+    else:
+        n_workers = max(1, args.n_workers)
 
     patience = args.epochs  # full fixed-budget run, no early stopping
 
@@ -327,7 +336,7 @@ def main() -> None:
           f"n_workers={n_workers} objective={args.objective} loss={args.loss} "
           f"device={device}")
     print(f"[mlp_bayes_opt] cuda_available={torch.cuda.is_available()} "
-          f"study_name={study_name} storage={storage}")
+          f"n_gpus={n_gpus} study_name={study_name} storage={storage}")
     print(f"[mlp_bayes_opt] run_dir={run_dir}")
     print(f"[mlp_bayes_opt] script={script_path}")
 
@@ -362,6 +371,10 @@ def main() -> None:
         sub_env = os.environ.copy()
         sub_env.setdefault("PYTHONIOENCODING", "utf-8")
         sub_env.setdefault("PYTHONUTF8", "1")
+        gpu_idx = -1
+        if device == "cuda" and n_gpus >= 1:
+            gpu_idx = trial.number % n_gpus
+            sub_env["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
         with open(log_path, "w", encoding="utf-8") as logf:
             logf.write(f"$ {' '.join(cmd)}\n")
             logf.flush()
@@ -389,10 +402,11 @@ def main() -> None:
         trial.set_user_attr("hidden_dim", hidden_dim)
         trial.set_user_attr("actual_params", int(metrics.get("param_count", -1)))
         trial.set_user_attr("subprocess_seconds", elapsed)
+        trial.set_user_attr("gpu", gpu_idx)
         print(f"[mlp_bayes_opt] trial {trial.number:04d} "
               f"L={num_layers} h={hidden_dim} params={int(metrics.get('param_count',-1))} "
               f"lr={lr:.2e} wd={weight_decay:.2e} bs={batch_size} act={activation} "
-              f"-> {args.objective}={metrics[args.objective]:.6f} "
+              f"gpu={gpu_idx} -> {args.objective}={metrics[args.objective]:.6f} "
               f"({elapsed:.1f}s)")
         return float(metrics[args.objective])
 
@@ -417,6 +431,7 @@ def main() -> None:
         f.write(f"n_trials: {args.n_trials}\n")
         f.write(f"n_workers: {n_workers}\n")
         f.write(f"device: {device}\n")
+        f.write(f"n_gpus: {n_gpus}\n")
         if completed:
             bt = study.best_trial
             f.write(f"best_trial_number: {bt.number}\n")
@@ -424,6 +439,7 @@ def main() -> None:
             f.write(f"hidden_dim: {bt.user_attrs.get('hidden_dim')}\n")
             f.write(f"actual_params: {bt.user_attrs.get('actual_params')}\n")
             f.write(f"subprocess_seconds: {bt.user_attrs.get('subprocess_seconds')}\n")
+            f.write(f"gpu: {bt.user_attrs.get('gpu', -1)}\n")
             f.write("params:\n")
             for k, v in bt.params.items():
                 f.write(f"  {k}: {v}\n")
@@ -438,7 +454,7 @@ def main() -> None:
         w.writerow([
             "trial", "state", "hidden_dim", "actual_params", "num_layers",
             "lr", "weight_decay", "batch_size", "activation", "loss",
-            "device", "objective", "objective_value",
+            "device", "gpu", "objective", "objective_value",
             "best_val", "best_epoch", "best_rmse_orig", "best_mae_orig",
             "best_mape_orig", "final_val", "elapsed_seconds",
         ])
@@ -455,6 +471,7 @@ def main() -> None:
                 t.params.get("activation"),
                 args.loss,
                 device,
+                t.user_attrs.get("gpu", -1),
                 args.objective, t.value if t.value is not None else float("inf"),
                 t.user_attrs.get("best_val"),
                 t.user_attrs.get("best_epoch"),

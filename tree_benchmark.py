@@ -115,6 +115,18 @@ _MODEL_EXT = {
 COUNT_TREE_PARAMS = True
 
 
+def _resolve_device(choice: str) -> str:
+    """Resolve a ``--device`` choice ('auto' | 'cpu' | 'cuda') to a concrete
+    device string. ``auto`` returns 'cuda' when a CUDA GPU is available,
+    otherwise 'cpu'. An explicit 'cuda' on a GPU-less machine is honored here;
+    the caller decides whether to warn + fall back to CPU."""
+    if choice == "cuda":
+        return "cuda"
+    if choice == "cpu":
+        return "cpu"
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
 # ============================================================================
 # Metrics / plotting helpers
 # ============================================================================
@@ -519,6 +531,8 @@ def _train_xgboost(
         tree_method="hist",
         seed=args.seed,
     )
+    if args.gpu_available:
+        params["device"] = "cuda"
 
     dtrain = xgb.DMatrix(X_train, label=y_train_orig)
     dval = xgb.DMatrix(X_val, label=y_val_orig)
@@ -645,16 +659,33 @@ def _train_lightgbm(
     callbacks.append(lgb.record_evaluation(eval_log))
 
     params = {k: v for k, v in base_kwargs.items() if k != "n_estimators"}
+    if args.gpu_available:
+        params["device"] = "gpu"
 
     start = time.time()
-    booster = lgb.train(
-        params,
-        dtrain,
-        num_boost_round=args.n_estimators,
-        valid_sets=[dtrain, dval],
-        valid_names=["train", "val"],
-        callbacks=callbacks,
-    )
+    try:
+        booster = lgb.train(
+            params,
+            dtrain,
+            num_boost_round=args.n_estimators,
+            valid_sets=[dtrain, dval],
+            valid_names=["train", "val"],
+            callbacks=callbacks,
+        )
+    except Exception:
+        if params.get("device") == "gpu":
+            print("[tree_benchmark] WARNING: LightGBM GPU build unavailable; falling back to CPU")
+            params["device"] = "cpu"
+            booster = lgb.train(
+                params,
+                dtrain,
+                num_boost_round=args.n_estimators,
+                valid_sets=[dtrain, dval],
+                valid_names=["train", "val"],
+                callbacks=callbacks,
+            )
+        else:
+            raise
     res.elapsed_s = time.time() - start
 
     rounds_run = booster.current_iteration()
@@ -727,20 +758,40 @@ def _train_catboost(
             eval_metric="RMSE",
             use_best_model=True,
         )
+    if args.gpu_available:
+        train_kwargs.update(task_type="GPU", devices="0")
 
     res = TreeFitResult()
     res.extra["params"] = {k: v for k, v in train_kwargs.items() if k != "verbose"}
 
     start = time.time()
     model = cb.CatBoostRegressor(**train_kwargs)
-    if args.early_stopping_rounds and args.early_stopping_rounds > 0:
-        model.fit(
-            X_train,
-            y_train_orig,
-            eval_set=(X_val, y_val_orig),
-        )
-    else:
-        model.fit(X_train, y_train_orig)
+    try:
+        if args.early_stopping_rounds and args.early_stopping_rounds > 0:
+            model.fit(
+                X_train,
+                y_train_orig,
+                eval_set=(X_val, y_val_orig),
+            )
+        else:
+            model.fit(X_train, y_train_orig)
+    except Exception:
+        if train_kwargs.get("task_type") == "GPU":
+            print("[tree_benchmark] WARNING: CatBoost GPU unavailable; falling back to CPU")
+            train_kwargs["task_type"] = "CPU"
+            train_kwargs.pop("devices", None)
+            res.extra["params"] = {k: v for k, v in train_kwargs.items() if k != "verbose"}
+            model = cb.CatBoostRegressor(**train_kwargs)
+            if args.early_stopping_rounds and args.early_stopping_rounds > 0:
+                model.fit(
+                    X_train,
+                    y_train_orig,
+                    eval_set=(X_val, y_val_orig),
+                )
+            else:
+                model.fit(X_train, y_train_orig)
+        else:
+            raise
     res.elapsed_s = time.time() - start
 
     # CatBoost exposes staged_predict via get_metric_on_step? No. Use a loop
@@ -1133,6 +1184,11 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Output directory (default: ./output/{method}_{dataset}).")
     parser.add_argument("--seed", type=int, default=0,
                         help="Random seed (default: 0).")
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto",
+                        help="Device 'auto' | 'cpu' | 'cuda' (default: auto-detect). "
+                             "'auto' uses CUDA when available. Only xgboost, lightgbm "
+                             "and catboost support GPU; sklearn methods always run on "
+                             "CPU. A requested 'cuda' falls back to CPU if unavailable.")
     parser.add_argument("--huber-delta", type=float, default=1.0,
                         help="Delta for Huber loss on standardized targets (default: 1.0).")
     parser.add_argument("--min-delta", type=float, default=1e-4,
@@ -1194,13 +1250,32 @@ def main():
     if args.dataset not in DATASET_LOADERS:
         parser.error(f"unknown dataset: {args.dataset}")
 
+    device = _resolve_device(args.device)
+    if args.device == "cuda" and not torch.cuda.is_available():
+        print("[tree_benchmark] WARNING: --device cuda requested but no CUDA GPU "
+              "detected; falling back to CPU")
+        device = "cpu"
+    args.device = device
+    args.gpu_available = device == "cuda"
+
     X_train, y_train, X_val, y_val, y_mean_f, y_std_f, meta = DATASET_LOADERS[args.dataset]()
 
     print(
         f"[tree_benchmark] method={args.method} dataset={args.dataset} "
         f"n_train={meta['n_train']} n_val={meta['n_val']} "
-        f"n_features={meta['n_features']} output={out_dir}"
+        f"n_features={meta['n_features']} device={device} output={out_dir}"
     )
+
+    if device == "cuda" and args.method in (
+        "gradient_boosting",
+        "hist_gradient_boosting",
+        "random_forest",
+        "extra_trees",
+    ):
+        print(
+            f"[tree_benchmark] NOTE: {args.method} has no GPU support "
+            "(sklearn); running on CPU"
+        )
 
     with open(out_dir / "config_snapshot.txt", "w") as f:
         f.write(f"model: {args.method}\n")
@@ -1216,7 +1291,7 @@ def main():
             "subsample", "colsample_bytree", "reg_alpha", "reg_lambda",
             "min_child_weight", "gamma", "early_stopping_rounds",
             "min_samples_leaf", "max_features", "seed", "huber_delta",
-            "validate_every", "min_delta", "history_points",
+            "validate_every", "min_delta", "history_points", "device",
         ]
         for k in keys:
             v = getattr(args, k, None)
@@ -1276,6 +1351,7 @@ def main():
     with open(out_dir / "final_metrics.txt", "w") as f:
         f.write(f"model: {args.method}\n")
         f.write(f"dataset: {args.dataset}\n")
+        f.write(f"device: {args.device}\n")
         f.write(f"approx_node_count: {n_params}\n")
         f.write(f"rounds_run: {res.rounds_run}\n")
         f.write(f"best_round: {res.best_round}\n")

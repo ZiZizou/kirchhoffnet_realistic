@@ -11,20 +11,36 @@ Permanently-on flags (every trial):
     --cell-library tanh_free --hidden-family small_world
     --boundary-fan-out <json>
 
-Search dimensions (per trial):
-    num_hidden (small_world node count; min bounded by in_dim * fanout_count)
-    small_world_k (even categorical in [2, min(14, num_hidden-1)])
-    small_world_p (continuous [0, 1])
-    num_stages (int [1, 3])
-    t_span (total ODE horizon [0.5, 10.0])
-    num_steps (total Heun steps [10, 150])
-    fanout_count (categorical {1, 2}; fixed-spread target map)
-    lr, weight_decay, batch_size (optimizer knob cluster)
+Search dimensions (18 dims per trial):
+    Topology:    num_hidden, small_world_k, small_world_p, num_stages,
+                 fanout_count
+    Solver:      t_span, num_steps
+    Optimizer:   lr, weight_decay, batch_size
+    Physics:     x_max
+    Cell bounds: gm_max, isat_max        (gm_min / isat_min fixed at config default)
+    Regularizer: sparsity_lambda, entropy_lambda, device_l2_lambda
+    Freeze:      freeze_boundary, freeze_temporal_read
 
 Validity:
     num_hidden >= in_dim * fanout_count (enough distinct fanout targets)
     small_world_k even, 2 <= k < num_hidden, capped at 14
     TrialPruned on any invalid combo
+
+Seed trial (trial 0):
+    For datasets listed in ``START_POINTS`` (friedman1, friedman2, smooth2d)
+    the user's validated 800-epoch config is enqueued as trial 0 via
+    ``study.enqueue_trial``. Trial 0 therefore runs the exact boundary
+    fan-out map, fixed flags, and config defaults that were used to
+    produce the reference numbers; subsequent trials explore the 18-dim
+    space around it.
+
+    Fixed flags for friedman1 / friedman2 / smooth2d (all trials on those
+    datasets):
+        --solver heun
+        --interstage-activation residual-relu-tanh
+        --mapper-lr-scale 1.0  --struct-lr-scale 4  --dyn-lr-scale 1.0
+        --grad-log --grad-log-every 10  --validate-every 10
+        --seed 100
 
 Each trial is a subprocess of ``train_script.py``, so the GPU/CPU isolation
 of the original training script is preserved. Optuna ``n_jobs`` concurrently
@@ -86,7 +102,7 @@ DATASETS: dict[str, dict[str, Any]] = {
     "friedman2": {
         "in_dim": 4,
         "out_dim": 1,
-        "num_hidden_range": (8, 24),
+        "num_hidden_range": (8, 32),
         "max_fanout_count": 2,
     },
     "friedman3": {
@@ -99,8 +115,84 @@ DATASETS: dict[str, dict[str, Any]] = {
 
 BATCH_SIZE_CHOICES = [512, 1024, 2048, 4096]
 FANOUT_COUNT_CHOICES = [1, 2]
-NUM_STAGES_CHOICES = [1, 2, 3]
 SMALL_WORLD_K_MAX = 14
+
+START_POINTS: dict[str, dict[str, Any]] = {
+    "friedman1": {
+        "boundary_fan_out": {
+            "0": [2, 12], "1": [7, 17], "2": [22, 5], "3": [10, 15],
+            "4": [4, 14], "5": [8, 19], "6": [6, 16], "7": [9, 23],
+            "8": [1, 13], "9": [11, 24],
+        },
+        "num_hidden": 25, "small_world_k": 4, "small_world_p": 0.2,
+        "num_stages": 5, "fanout_count": 2,
+        "t_span": 7.0, "num_steps": 70,
+        "lr": 1.2e-3, "weight_decay": 1e-4, "batch_size": 4096,
+        "x_max": 3.0, "gm_max": 10.0, "isat_max": 10.0,
+        "sparsity_lambda": 1e-6, "entropy_lambda": 1e-4,
+        "device_l2_lambda": 0.0, "freeze_boundary": 0,
+        "freeze_temporal_read": 0,
+    },
+    "friedman2": {
+        "boundary_fan_out": {
+            "0": [2, 12], "1": [7, 17], "2": [22, 5], "3": [10, 15],
+        },
+        "num_hidden": 25, "small_world_k": 4, "small_world_p": 0.2,
+        "num_stages": 5, "fanout_count": 2,
+        "t_span": 7.0, "num_steps": 70,
+        "lr": 1.2e-3, "weight_decay": 1e-4, "batch_size": 4096,
+        "x_max": 3.0, "gm_max": 10.0, "isat_max": 10.0,
+        "sparsity_lambda": 1e-6, "entropy_lambda": 1e-4,
+        "device_l2_lambda": 0.0, "freeze_boundary": 0,
+        "freeze_temporal_read": 0,
+    },
+    "smooth2d": {
+        "boundary_fan_out": {
+            "0": [0, 1], "1": [3, 4],
+        },
+        "num_hidden": 14, "small_world_k": 4, "small_world_p": 0.2,
+        "num_stages": 10, "fanout_count": 2,
+        "t_span": 7.0, "num_steps": 70,
+        "lr": 1.2e-3, "weight_decay": 1e-4, "batch_size": 4096,
+        "x_max": 3.0, "gm_max": 10.0, "isat_max": 10.0,
+        "sparsity_lambda": 1e-6, "entropy_lambda": 1e-4,
+        "device_l2_lambda": 0.0, "freeze_boundary": 0,
+        "freeze_temporal_read": 0,
+    },
+}
+
+EXTRA_FLAGS_FOR_PROBLEM: dict[str, list[str]] = {
+    "friedman1": [
+        "--solver", "heun",
+        "--interstage-activation", "residual-relu-tanh",
+        "--mapper-lr-scale", "1.0",
+        "--struct-lr-scale", "4",
+        "--dyn-lr-scale", "1.0",
+        "--grad-log",
+        "--grad-log-every", "10",
+        "--validate-every", "10",
+    ],
+    "friedman2": [
+        "--solver", "heun",
+        "--interstage-activation", "residual-relu-tanh",
+        "--mapper-lr-scale", "1.0",
+        "--struct-lr-scale", "4",
+        "--dyn-lr-scale", "1.0",
+        "--grad-log",
+        "--grad-log-every", "10",
+        "--validate-every", "10",
+    ],
+    "smooth2d": [
+        "--solver", "heun",
+        "--interstage-activation", "residual-relu-tanh",
+        "--mapper-lr-scale", "1.0",
+        "--struct-lr-scale", "4",
+        "--dyn-lr-scale", "1.0",
+        "--grad-log",
+        "--grad-log-every", "10",
+        "--validate-every", "10",
+    ],
+}
 
 OBJECTIVE_KEYS = {
     "best_val",
@@ -203,22 +295,24 @@ def _build_command(
     lr: float,
     weight_decay: float,
     batch_size: int,
-    c_eff: float,
     x_max: float,
-    gm_min: float,
     gm_max: float,
-    isat_min: float,
     isat_max: float,
     sparsity_lambda: float,
     entropy_lambda: float,
+    device_l2_lambda: float,
+    freeze_boundary: int,
+    freeze_temporal_read: int,
     output: Path,
     device: str,
+    boundary_fan_out: dict | None = None,
 ) -> list[str]:
-    boundary_fan_out = build_boundary_fan_out(
-        in_dim=DATASETS[problem]["in_dim"],
-        fanout_count=fanout_count,
-        num_hidden=num_hidden,
-    )
+    if boundary_fan_out is None:
+        boundary_fan_out = build_boundary_fan_out(
+            in_dim=DATASETS[problem]["in_dim"],
+            fanout_count=fanout_count,
+            num_hidden=num_hidden,
+        )
     cmd = [
         python,
         script,
@@ -243,18 +337,22 @@ def _build_command(
         "--lr", f"{lr:.6e}",
         "--weight-decay", f"{weight_decay:.6e}",
         "--batch-size", str(batch_size),
-        "--c-eff", f"{c_eff:.6e}",
         "--x-max", f"{x_max:.6e}",
-        "--gm-min", f"{gm_min:.6e}",
         "--gm-max", f"{gm_max:.6e}",
-        "--isat-min", f"{isat_min:.6e}",
         "--isat-max", f"{isat_max:.6e}",
         "--sparsity-lambda", f"{sparsity_lambda:.6e}",
         "--entropy-lambda", f"{entropy_lambda:.6e}",
-        "--seed", str(seed),
+        "--device-l2-lambda", f"{device_l2_lambda:.6e}",
         "--device", device,
         "--output", str(output),
     ]
+    if freeze_boundary:
+        cmd += ["--freeze-boundary"]
+    if freeze_temporal_read:
+        cmd += ["--freeze-temporal-read"]
+    if problem in EXTRA_FLAGS_FOR_PROBLEM:
+        cmd += EXTRA_FLAGS_FOR_PROBLEM[problem]
+    cmd += ["--seed", str(seed)]
     if problem.startswith("friedman"):
         cmd += ["--target-noise-std", "1.0"]
     return cmd
@@ -306,9 +404,12 @@ def main() -> None:
     parser.add_argument("--n-trials", type=int, default=30)
     parser.add_argument("--timeout", type=float, default=None,
                         help="Optional wall-clock timeout in seconds.")
-    parser.add_argument("--seed", type=int, default=0,
-                        help="Seed shared across all trials (default: 0). "
-                             "Also seeds the small_world rewiring RNG.")
+    parser.add_argument("--seed", type=int, default=100,
+                        help="Seed used for both the Optuna TPE sampler and "
+                             "every train_script.py subprocess (last-wins). "
+                             "Overrides per-problem defaults. "
+                             "Default: 100 (matches validated START_POINTS "
+                             "runs).")
     parser.add_argument("--n-workers", type=int, default=None,
                         help="Concurrent trial subprocesses. Default: number "
                              "of visible CUDA GPUs when available, else "
@@ -320,7 +421,8 @@ def main() -> None:
                         choices=sorted(OBJECTIVE_KEYS),
                         help="Metric to minimize (default: best_val).")
     parser.add_argument("--num-hidden-min", type=int, default=None,
-                        help="Override min num_hidden (default: max(2, "
+                        help="Override min num_hidden (default: "
+                             "max(default_min_from_DATASETS, "
                              "in_dim * fanout_count_min)).")
     parser.add_argument("--num-hidden-max", type=int, default=None,
                         help="Override max num_hidden (default: per-dataset).")
@@ -332,41 +434,26 @@ def main() -> None:
     parser.add_argument("--lr-max", type=float, default=1e-2)
     parser.add_argument("--wd-min", type=float, default=1e-6)
     parser.add_argument("--wd-max", type=float, default=1e-2)
-    parser.add_argument("--num-stages-max", type=int, default=3,
-                        help="Upper bound on num_stages (default: 3).")
-    parser.add_argument("--c-eff-min", type=float, default=0.1,
-                        help="Lower bound for log-uniform C_eff search "
-                             "(default: 0.1).")
-    parser.add_argument("--c-eff-max", type=float, default=10.0,
-                        help="Upper bound for log-uniform C_eff search "
-                             "(default: 10.0).")
+    parser.add_argument("--num-stages-max", type=int, default=10,
+                        help="Upper bound on num_stages (default: 10; smooth2d "
+                             "start = 10).")
     parser.add_argument("--x-max-min", type=float, default=0.5,
                         help="Lower bound for x_max (ODE rail) search "
                              "(default: 0.5; config default is 3.0).")
     parser.add_argument("--x-max-max", type=float, default=8.0,
                         help="Upper bound for x_max (ODE rail) search "
                              "(default: 8.0; config default is 3.0).")
-    parser.add_argument("--gm-min-min", type=float, default=0.001,
-                        help="Lower bound for log-uniform gm_min search "
-                             "(default: 0.001; config default is 0.01).")
-    parser.add_argument("--gm-min-max", type=float, default=0.1,
-                        help="Upper bound for log-uniform gm_min search "
-                             "(default: 0.1).")
     parser.add_argument("--gm-max-min", type=float, default=1.0,
                         help="Lower bound for log-uniform gm_max search "
-                             "(default: 1.0; config default is 10.0).")
+                             "(default: 1.0; config default is 10.0). gm_min "
+                             "is fixed at config default (0.01).")
     parser.add_argument("--gm-max-max", type=float, default=50.0,
                         help="Upper bound for log-uniform gm_max search "
                              "(default: 50.0).")
-    parser.add_argument("--isat-min-min", type=float, default=0.001,
-                        help="Lower bound for log-uniform isat_min search "
-                             "(default: 0.001; config default is 0.01).")
-    parser.add_argument("--isat-min-max", type=float, default=0.1,
-                        help="Upper bound for log-uniform isat_min search "
-                             "(default: 0.1).")
     parser.add_argument("--isat-max-min", type=float, default=1.0,
                         help="Lower bound for log-uniform isat_max search "
-                             "(default: 1.0; config default is 10.0).")
+                             "(default: 1.0; config default is 10.0). "
+                             "isat_min is fixed at config default (0.01).")
     parser.add_argument("--isat-max-max", type=float, default=50.0,
                         help="Upper bound for log-uniform isat_max search "
                              "(default: 50.0).")
@@ -382,6 +469,14 @@ def main() -> None:
     parser.add_argument("--entropy-lambda-max", type=float, default=1e-2,
                         help="Upper bound for log-uniform entropy lambda "
                              "search (default: 1e-2).")
+    parser.add_argument("--device-l2-lambda-min", type=float, default=0.0,
+                        help="Deprecated; ignored. The device_l2_lambda search "
+                             "range is always linear [0.0, --device-l2-lambda-max] "
+                             "so that 0.0 (penalty off) is representable. "
+                             "Default: 0.0.")
+    parser.add_argument("--device-l2-lambda-max", type=float, default=1e-3,
+                        help="Upper bound for linear device_l2_lambda "
+                             "search (default: 1e-3).")
     parser.add_argument("--output", type=Path,
                         default=Path("./outputs/kn_bayes_opt"))
     parser.add_argument("--study-name", default=None,
@@ -390,6 +485,10 @@ def main() -> None:
     parser.add_argument("--resume", action="store_true",
                         help="Resume an existing study from <run_dir>/"
                              "<study_name>.db")
+    parser.add_argument("--no-seed-trial", action="store_true",
+                        help="Skip enqueueing the START_POINTS seed trial "
+                             "(trial 0 explores the search space from a "
+                             "random TPE sample instead).")
     args = parser.parse_args()
 
     cfg = DATASETS[args.dataset]
@@ -398,7 +497,7 @@ def main() -> None:
     default_min, default_max = cfg["num_hidden_range"]
     num_hidden_min = (
         args.num_hidden_min if args.num_hidden_min is not None
-        else max(2, in_dim * min(FANOUT_COUNT_CHOICES))
+        else max(default_min, in_dim * min(FANOUT_COUNT_CHOICES))
     )
     num_hidden_max = (
         args.num_hidden_max if args.num_hidden_max is not None
@@ -446,6 +545,20 @@ def main() -> None:
     else:
         study = optuna.create_study(study_name=study_name, storage=storage,
                                     sampler=sampler, direction="minimize")
+    seed_trial_number: int | None = None
+    if (args.dataset in START_POINTS
+            and not args.no_seed_trial):
+        seed_already_complete = any(
+            t.user_attrs.get("seed_trial") is True
+            and t.state == optuna.trial.TrialState.COMPLETE
+            for t in study.trials
+        )
+        if not seed_already_complete:
+            next_number = (
+                max([t.number for t in study.trials] + [-1]) + 1
+            )
+            study.enqueue_trial(START_POINTS[args.dataset])
+            seed_trial_number = next_number
 
     repo_dir = Path(__file__).resolve().parent
     script_path = repo_dir / "train_script.py"
@@ -460,8 +573,14 @@ def main() -> None:
           f"n_gpus={n_gpus} study_name={study_name} storage={storage}")
     print(f"[kn_bayes_opt] run_dir={run_dir}")
     print(f"[kn_bayes_opt] script={script_path}")
+    print(f"[kn_bayes_opt] seed_trial_number={seed_trial_number}")
 
     def objective(trial: optuna.Trial) -> float:
+        is_seed_trial = (
+            seed_trial_number is not None
+            and trial.number == seed_trial_number
+        )
+
         fanout_count = trial.suggest_categorical("fanout_count",
                                                   FANOUT_COUNT_CHOICES)
         min_hidden_for_fanout = in_dim * fanout_count
@@ -493,16 +612,10 @@ def main() -> None:
         batch_size = trial.suggest_categorical("batch_size",
                                                 BATCH_SIZE_CHOICES)
 
-        c_eff = trial.suggest_float(
-            "c_eff", args.c_eff_min, args.c_eff_max, log=True)
         x_max = trial.suggest_float(
             "x_max", args.x_max_min, args.x_max_max)
-        gm_min = trial.suggest_float(
-            "gm_min", args.gm_min_min, args.gm_min_max, log=True)
         gm_max = trial.suggest_float(
             "gm_max", args.gm_max_min, args.gm_max_max, log=True)
-        isat_min = trial.suggest_float(
-            "isat_min", args.isat_min_min, args.isat_min_max, log=True)
         isat_max = trial.suggest_float(
             "isat_max", args.isat_max_min, args.isat_max_max, log=True)
         sparsity_lambda = trial.suggest_float(
@@ -511,12 +624,16 @@ def main() -> None:
         entropy_lambda = trial.suggest_float(
             "entropy_lambda", args.entropy_lambda_min,
             args.entropy_lambda_max, log=True)
-        if gm_max <= gm_min:
-            raise optuna.TrialPruned(
-                f"gm_max={gm_max} must be > gm_min={gm_min}")
-        if isat_max <= isat_min:
-            raise optuna.TrialPruned(
-                f"isat_max={isat_max} must be > isat_min={isat_min}")
+        device_l2_lambda = trial.suggest_float(
+            "device_l2_lambda", 0.0, args.device_l2_lambda_max)
+        freeze_boundary = trial.suggest_categorical(
+            "freeze_boundary", [0, 1])
+        freeze_temporal_read = trial.suggest_categorical(
+            "freeze_temporal_read", [0, 1])
+
+        seed_boundary_map: dict | None = None
+        if is_seed_trial:
+            seed_boundary_map = START_POINTS[args.dataset]["boundary_fan_out"]
 
         trial_dir = run_dir / f"trial_{trial.number:04d}"
         log_path = run_dir / f"trial_{trial.number:04d}.log.txt"
@@ -530,12 +647,22 @@ def main() -> None:
             small_world_p=small_world_p, num_stages=num_stages,
             t_span=t_span, num_steps=num_steps,
             fanout_count=fanout_count, lr=lr, weight_decay=weight_decay,
-            batch_size=batch_size, c_eff=c_eff, x_max=x_max,
-            gm_min=gm_min, gm_max=gm_max, isat_min=isat_min,
-            isat_max=isat_max, sparsity_lambda=sparsity_lambda,
+            batch_size=batch_size, x_max=x_max,
+            gm_max=gm_max, isat_max=isat_max,
+            sparsity_lambda=sparsity_lambda,
             entropy_lambda=entropy_lambda,
+            device_l2_lambda=device_l2_lambda,
+            freeze_boundary=freeze_boundary,
+            freeze_temporal_read=freeze_temporal_read,
             output=trial_dir, device=device,
+            boundary_fan_out=seed_boundary_map,
         )
+        if is_seed_trial:
+            trial.set_user_attr("seed_trial", True)
+            trial.set_user_attr("start_point",
+                                json.dumps(START_POINTS[args.dataset]))
+        else:
+            trial.set_user_attr("seed_trial", False)
 
         t0 = time.time()
         sub_env = os.environ.copy()
@@ -583,15 +710,24 @@ def main() -> None:
                                 str(resolved_trial_dir))
         trial.set_user_attr("subprocess_seconds", elapsed)
         trial.set_user_attr("gpu", gpu_idx)
-        trial.set_user_attr("boundary_fan_out",
-                            json.dumps(build_boundary_fan_out(
-                                in_dim=in_dim, fanout_count=fanout_count,
-                                num_hidden=num_hidden)))
-        print(f"[kn_bayes_opt] trial {trial.number:04d} "
+        if seed_boundary_map is not None:
+            trial.set_user_attr("boundary_fan_out",
+                                json.dumps(seed_boundary_map))
+        else:
+            trial.set_user_attr("boundary_fan_out",
+                                json.dumps(build_boundary_fan_out(
+                                    in_dim=in_dim,
+                                    fanout_count=fanout_count,
+                                    num_hidden=num_hidden)))
+        seed_tag = " [SEED]" if is_seed_trial else ""
+        print(f"[kn_bayes_opt] trial {trial.number:04d}{seed_tag} "
               f"nh={num_hidden} k={small_world_k} p={small_world_p:.2f} "
               f"st={num_stages} ts={t_span:.2f} ns={num_steps} "
               f"fc={fanout_count} lr={lr:.2e} wd={weight_decay:.2e} "
-              f"bs={batch_size} params={int(metrics.get('param_count',-1))} "
+              f"bs={batch_size} xmx={x_max:.2f} gm={gm_max:.2f} "
+              f"isat={isat_max:.2f} d2l={device_l2_lambda:.2e} "
+              f"fb={freeze_boundary} ftr={freeze_temporal_read} "
+              f"params={int(metrics.get('param_count',-1))} "
               f"gpu={gpu_idx} -> {args.objective}={metrics[args.objective]:.6f} "
               f"({elapsed:.1f}s)")
         return float(metrics[args.objective])
@@ -618,9 +754,20 @@ def main() -> None:
         f.write(f"n_workers: {n_workers}\n")
         f.write(f"device: {device}\n")
         f.write(f"n_gpus: {n_gpus}\n")
+        f.write(f"search_dims: 18 (fanout_count, num_hidden, small_world_k, "
+                "small_world_p, num_stages, t_span, num_steps, lr, "
+                "weight_decay, batch_size, x_max, gm_max, isat_max, "
+                "sparsity_lambda, entropy_lambda, device_l2_lambda, "
+                "freeze_boundary, freeze_temporal_read)\n")
+        f.write(f"has_start_point: {args.dataset in START_POINTS}\n")
+        if args.dataset in START_POINTS:
+            f.write(f"start_point: {json.dumps(START_POINTS[args.dataset])}\n")
+            f.write(f"extra_flags_for_problem: "
+                    f"{json.dumps(EXTRA_FLAGS_FOR_PROBLEM.get(args.dataset, []))}\n")
         if completed:
             bt = study.best_trial
             f.write(f"best_trial_number: {bt.number}\n")
+            f.write(f"best_trial_is_seed: {bt.user_attrs.get('seed_trial', False)}\n")
             f.write(f"best_value: {study.best_value:.6f}\n")
             f.write(f"actual_params: {bt.user_attrs.get('actual_params')}\n")
             f.write(f"subprocess_seconds: "
@@ -640,17 +787,20 @@ def main() -> None:
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow([
-            "trial", "state", "num_hidden", "small_world_k", "small_world_p",
-            "num_stages", "t_span", "num_steps", "fanout_count",
-            "boundary_fan_out", "lr", "weight_decay", "batch_size",
-            "device", "gpu", "objective", "objective_value",
-            "actual_params", "best_val", "best_epoch", "best_rmse_orig",
-            "best_mae_orig", "best_mape_orig", "epochs_run",
-            "elapsed_seconds",
+            "trial", "state", "seed_trial", "num_hidden", "small_world_k",
+            "small_world_p", "num_stages", "t_span", "num_steps",
+            "fanout_count", "boundary_fan_out", "lr", "weight_decay",
+            "batch_size", "x_max", "gm_max", "isat_max", "sparsity_lambda",
+            "entropy_lambda", "device_l2_lambda", "freeze_boundary",
+            "freeze_temporal_read", "device", "gpu", "objective",
+            "objective_value", "actual_params", "best_val", "best_epoch",
+            "best_rmse_orig", "best_mae_orig", "best_mape_orig",
+            "epochs_run", "elapsed_seconds",
         ])
         for t in study.trials:
             w.writerow([
                 t.number, t.state.name,
+                t.user_attrs.get("seed_trial", False),
                 t.params.get("num_hidden"),
                 t.params.get("small_world_k"),
                 t.params.get("small_world_p"),
@@ -662,6 +812,14 @@ def main() -> None:
                 t.params.get("lr"),
                 t.params.get("weight_decay"),
                 t.params.get("batch_size"),
+                t.params.get("x_max"),
+                t.params.get("gm_max"),
+                t.params.get("isat_max"),
+                t.params.get("sparsity_lambda"),
+                t.params.get("entropy_lambda"),
+                t.params.get("device_l2_lambda"),
+                t.params.get("freeze_boundary"),
+                t.params.get("freeze_temporal_read"),
                 device, t.user_attrs.get("gpu", -1),
                 args.objective, t.value if t.value is not None else float("inf"),
                 t.user_attrs.get("actual_params"),

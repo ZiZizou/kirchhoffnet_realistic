@@ -167,6 +167,7 @@ def _build_command(
     patience: int,
     validate_every: int,
     dataset: str,
+    device: str,
 ) -> list[str]:
     cmd = [
         python,
@@ -182,6 +183,7 @@ def _build_command(
         "--seed", str(seed),
         "--patience", str(patience),
         "--validate-every", str(validate_every),
+        "--device", device,
         "--output", str(output),
     ]
     if dataset.startswith("friedman"):
@@ -240,8 +242,13 @@ def main() -> None:
     parser.add_argument("--n-workers", type=int, default=None,
                         help="Concurrent trial subprocesses. Default: 1 if "
                              "CUDA is available, else os.cpu_count().")
-    parser.add_argument("--n-layers-max", type=int, default=4,
-                        help="Upper bound on num_layers (default: 4).")
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto",
+                        help="Device 'auto' | 'cpu' | 'cuda' (default: auto-detect). "
+                             "'auto' uses CUDA when available and is forwarded to each "
+                             "trial subprocess. An explicit 'cuda' with no GPU falls "
+                             "back to CPU.")
+    parser.add_argument("--n-layers-max", type=int, default=6,
+                        help="Upper bound on num_layers (default: 6).")
     parser.add_argument("--lr-min", type=float, default=1e-4)
     parser.add_argument("--lr-max", type=float, default=1e-2)
     parser.add_argument("--wd-min", type=float, default=1e-6)
@@ -283,6 +290,17 @@ def main() -> None:
     else:
         n_workers = max(1, args.n_workers)
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if args.device == "cpu":
+        device = "cpu"
+    elif args.device == "cuda":
+        if torch.cuda.is_available():
+            device = "cuda"
+        else:
+            print("[mlp_bayes_opt] WARNING: --device cuda requested but no CUDA GPU "
+                  "detected; falling back to CPU")
+            device = "cpu"
+
     patience = args.epochs  # full fixed-budget run, no early stopping
 
     sampler = TPESampler(seed=args.seed)
@@ -300,7 +318,8 @@ def main() -> None:
 
     print(f"[mlp_bayes_opt] dataset={args.dataset} in_dim={in_dim} out_dim={out_dim} "
           f"budget={param_budget} epochs={args.epochs} n_trials={args.n_trials} "
-          f"n_workers={n_workers} objective={args.objective} loss={args.loss}")
+          f"n_workers={n_workers} objective={args.objective} loss={args.loss} "
+          f"device={device}")
     print(f"[mlp_bayes_opt] cuda_available={torch.cuda.is_available()} "
           f"study_name={study_name} storage={storage}")
     print(f"[mlp_bayes_opt] run_dir={run_dir}")
@@ -331,6 +350,7 @@ def main() -> None:
             batch_size=batch_size, activation=activation, loss=args.loss,
             seed=args.seed, output=trial_dir, patience=patience,
             validate_every=args.validate_every, dataset=args.dataset,
+            device=device,
         )
         t0 = time.time()
         sub_env = os.environ.copy()
@@ -390,6 +410,7 @@ def main() -> None:
         f.write(f"seed: {args.seed}\n")
         f.write(f"n_trials: {args.n_trials}\n")
         f.write(f"n_workers: {n_workers}\n")
+        f.write(f"device: {device}\n")
         if completed:
             bt = study.best_trial
             f.write(f"best_trial_number: {bt.number}\n")
@@ -411,7 +432,7 @@ def main() -> None:
         w.writerow([
             "trial", "state", "hidden_dim", "actual_params", "num_layers",
             "lr", "weight_decay", "batch_size", "activation", "loss",
-            "objective", "objective_value",
+            "device", "objective", "objective_value",
             "best_val", "best_epoch", "best_rmse_orig", "best_mae_orig",
             "best_mape_orig", "final_val", "elapsed_seconds",
         ])
@@ -427,6 +448,7 @@ def main() -> None:
                 t.params.get("batch_size"),
                 t.params.get("activation"),
                 args.loss,
+                device,
                 args.objective, t.value if t.value is not None else float("inf"),
                 t.user_attrs.get("best_val"),
                 t.user_attrs.get("best_epoch"),

@@ -21,9 +21,9 @@ single GPU). When ``torch.cuda.is_available()`` the default is ``n_workers=1``
 because each subprocess grabs the GPU.
 
 Dataset-in / -out dimensions are hardcoded per dataset (housing=8,
-friedman1=10, friedman2/3=4, all out_dim=1). Default param budgets match the
-problem-statement scales (housing 2000, friedman1 6600, friedman2/3 7000)
-and are overridable via ``--param-budget``.
+friedman1=10, friedman2/3=4, smooth2d=2, all out_dim=1). Default param
+budgets match the problem-statement scales (housing 2000, friedman1 6600,
+friedman2/3 7000, smooth2d 1842) and are overridable via ``--param-budget``.
 
 Outputs (in ``--output/<dataset>_budget<P>_e<E>/``):
   - ``<study_name>.db``              optuna sqlite (resumable via ``--resume``)
@@ -79,6 +79,12 @@ DATASETS: dict[str, dict[str, Any]] = {
         "in_dim": 4,
         "out_dim": 1,
         "default_budget": 7000,
+    },
+    "smooth2d": {
+        "script": "mlp_benchmark.py",
+        "in_dim": 2,
+        "out_dim": 1,
+        "default_budget": 1842,
     },
 }
 

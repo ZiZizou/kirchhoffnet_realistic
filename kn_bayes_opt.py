@@ -11,14 +11,13 @@ Permanently-on flags (every trial):
     --cell-library tanh_free --hidden-family small_world
     --boundary-fan-out <json>
 
-Search dimensions (18 dims per trial):
-    Topology:    num_hidden, small_world_k, small_world_p, num_stages,
-                 fanout_count
-    Solver:      t_span, num_steps
+Search dimensions (15 dims per trial):
+    Topology:    num_hidden, small_world_k, num_stages, fanout_count
+    Solver:      t_span (num_steps is derived at a fixed resolution)
     Optimizer:   lr, weight_decay, batch_size
     Physics:     x_max
     Cell bounds: gm_max, isat_max        (gm_min / isat_min fixed at config default)
-    Regularizer: sparsity_lambda, entropy_lambda, device_l2_lambda
+    Regularizer: device_l2_lambda (sparsity=0, entropy=1e-6 fixed)
     Freeze:      freeze_boundary, freeze_temporal_read
 
 Validity:
@@ -117,6 +116,11 @@ DATASETS: dict[str, dict[str, Any]] = {
 BATCH_SIZE_CHOICES = [512, 1024, 2048, 4096]
 FANOUT_COUNT_CHOICES = [1, 2]
 SMALL_WORLD_K_MAX = 14
+SMALL_WORLD_K_CHOICES = (2, 4, 6, 8)
+SMALL_WORLD_P_FIXED = 0.2
+STEPS_PER_T_SPAN = 10.0
+SPARSITY_LAMBDA_FIXED = 0.0
+ENTROPY_LAMBDA_FIXED = 1e-6
 
 START_POINTS: dict[str, dict[str, Any]] = {
     "friedman1": {
@@ -130,7 +134,7 @@ START_POINTS: dict[str, dict[str, Any]] = {
         "t_span": 7.0, "num_steps": 70,
         "lr": 1.2e-3, "weight_decay": 1e-4, "batch_size": 4096,
         "x_max": 3.0, "gm_max": 10.0, "isat_max": 10.0,
-        "sparsity_lambda": 1e-6, "entropy_lambda": 1e-4,
+        "sparsity_lambda": 0.0, "entropy_lambda": 1e-6,
         "device_l2_lambda": 0.0, "freeze_boundary": 0,
         "freeze_temporal_read": 0,
     },
@@ -143,7 +147,7 @@ START_POINTS: dict[str, dict[str, Any]] = {
         "t_span": 7.0, "num_steps": 70,
         "lr": 1.2e-3, "weight_decay": 1e-4, "batch_size": 4096,
         "x_max": 3.0, "gm_max": 10.0, "isat_max": 10.0,
-        "sparsity_lambda": 1e-6, "entropy_lambda": 1e-4,
+        "sparsity_lambda": 0.0, "entropy_lambda": 1e-6,
         "device_l2_lambda": 0.0, "freeze_boundary": 0,
         "freeze_temporal_read": 0,
     },
@@ -156,7 +160,7 @@ START_POINTS: dict[str, dict[str, Any]] = {
         "t_span": 7.0, "num_steps": 70,
         "lr": 1.2e-3, "weight_decay": 1e-4, "batch_size": 4096,
         "x_max": 3.0, "gm_max": 10.0, "isat_max": 10.0,
-        "sparsity_lambda": 1e-6, "entropy_lambda": 1e-4,
+        "sparsity_lambda": 0.0, "entropy_lambda": 1e-6,
         "device_l2_lambda": 0.0, "freeze_boundary": 0,
         "freeze_temporal_read": 0,
     },
@@ -253,9 +257,8 @@ def build_boundary_fan_out(in_dim: int, fanout_count: int, num_hidden: int) -> d
 
 
 def valid_small_world_k_choices(num_hidden: int) -> list[int]:
-    """Even k values in [2, min(SMALL_WORLD_K_MAX, num_hidden-1)]."""
-    upper = min(SMALL_WORLD_K_MAX, num_hidden - 1)
-    return [k for k in range(2, upper + 1) if k % 2 == 0]
+    """Meaningful even k values that are valid for ``num_hidden``."""
+    return [k for k in SMALL_WORLD_K_CHOICES if k < num_hidden]
 
 
 def _resolve_trial_dir(run_dir: Path, trial_number: int) -> Path | None:
@@ -316,6 +319,7 @@ def _build_command(
     num_stages: int,
     t_span: float,
     num_steps: int,
+    vca_rank: int,
     fanout_count: int,
     lr: float,
     weight_decay: float,
@@ -349,6 +353,7 @@ def _build_command(
         "--num-stages", str(num_stages),
         "--t-span", f"{t_span:.6f}",
         "--num-steps", str(num_steps),
+        "--vca-rank", str(vca_rank),
         "--boundary-fan-out", json.dumps(boundary_fan_out),
         "--cell-library", "tanh_free",
         "--leak", "non-programmable",
@@ -472,6 +477,10 @@ def main() -> None:
     parser.add_argument("--t-span-max", type=float, default=10.0)
     parser.add_argument("--num-steps-min", type=int, default=10)
     parser.add_argument("--num-steps-max", type=int, default=150)
+    parser.add_argument("--vca-rank-min", type=int, default=1,
+                        help="Minimum VCA projection rank (default: 1).")
+    parser.add_argument("--vca-rank-max", type=int, default=8,
+                        help="Maximum VCA projection rank (default: 8).")
     parser.add_argument("--lr-min", type=float, default=1e-4)
     parser.add_argument("--lr-max", type=float, default=1e-2)
     parser.add_argument("--wd-min", type=float, default=1e-6)
@@ -537,6 +546,8 @@ def main() -> None:
         raise ValueError("--param-budget must be >= 1")
     if args.param_tolerance < 0.0:
         raise ValueError("--param-tolerance must be >= 0")
+    if args.vca_rank_min < 1 or args.vca_rank_min > args.vca_rank_max:
+        raise ValueError("Invalid VCA rank range")
     if args.invalid_param_objective <= 0.0:
         raise ValueError("--invalid-param-objective must be > 0")
 
@@ -646,18 +657,19 @@ def main() -> None:
             )
         num_hidden = trial.suggest_int("num_hidden", nh_low, num_hidden_max)
         small_world_k = trial.suggest_categorical(
-            "small_world_k", valid_small_world_k_choices(SMALL_WORLD_K_MAX + 1))
+            "small_world_k", valid_small_world_k_choices(num_hidden))
         if small_world_k >= num_hidden:
             raise optuna.TrialPruned(
                 f"small_world_k={small_world_k} must be < num_hidden={num_hidden}"
             )
-        small_world_p = trial.suggest_float("small_world_p", 0.0, 1.0)
+        small_world_p = SMALL_WORLD_P_FIXED
         num_stages = trial.suggest_int(
             "num_stages", 1, args.num_stages_max)
         t_span = trial.suggest_float(
             "t_span", args.t_span_min, args.t_span_max)
-        num_steps = trial.suggest_int(
-            "num_steps", args.num_steps_min, args.num_steps_max)
+        num_steps = max(1, round(STEPS_PER_T_SPAN * t_span))
+        vca_rank = trial.suggest_int(
+            "vca_rank", args.vca_rank_min, args.vca_rank_max)
         lr = trial.suggest_float("lr", args.lr_min, args.lr_max, log=True)
         weight_decay = trial.suggest_float("weight_decay",
                                            args.wd_min, args.wd_max,
@@ -671,12 +683,8 @@ def main() -> None:
             "gm_max", args.gm_max_min, args.gm_max_max, log=True)
         isat_max = trial.suggest_float(
             "isat_max", args.isat_max_min, args.isat_max_max, log=True)
-        sparsity_lambda = trial.suggest_float(
-            "sparsity_lambda", args.sparsity_lambda_min,
-            args.sparsity_lambda_max, log=True)
-        entropy_lambda = trial.suggest_float(
-            "entropy_lambda", args.entropy_lambda_min,
-            args.entropy_lambda_max, log=True)
+        sparsity_lambda = SPARSITY_LAMBDA_FIXED
+        entropy_lambda = ENTROPY_LAMBDA_FIXED
         device_l2_lambda = trial.suggest_float(
             "device_l2_lambda", 0.0, args.device_l2_lambda_max)
         freeze_boundary = trial.suggest_categorical(
@@ -698,7 +706,7 @@ def main() -> None:
             epochs=args.epochs,
             num_hidden=num_hidden, small_world_k=small_world_k,
             small_world_p=small_world_p, num_stages=num_stages,
-            t_span=t_span, num_steps=num_steps,
+            t_span=t_span, num_steps=num_steps, vca_rank=vca_rank,
             fanout_count=fanout_count, lr=lr, weight_decay=weight_decay,
             batch_size=batch_size, x_max=x_max,
             gm_max=gm_max, isat_max=isat_max,
@@ -840,6 +848,7 @@ def main() -> None:
         print(f"[kn_bayes_opt] trial {trial.number:04d}{seed_tag} "
               f"nh={num_hidden} k={small_world_k} p={small_world_p:.2f} "
               f"st={num_stages} ts={t_span:.2f} ns={num_steps} "
+              f"vca_rank={vca_rank} "
               f"fc={fanout_count} lr={lr:.2e} wd={weight_decay:.2e} "
               f"bs={batch_size} xmx={x_max:.2f} gm={gm_max:.2f} "
               f"isat={isat_max:.2f} d2l={device_l2_lambda:.2e} "
@@ -878,10 +887,11 @@ def main() -> None:
         f.write(f"n_workers: {n_workers}\n")
         f.write(f"device: {device}\n")
         f.write(f"n_gpus: {n_gpus}\n")
-        f.write(f"search_dims: 18 (fanout_count, num_hidden, small_world_k, "
-                "small_world_p, num_stages, t_span, num_steps, lr, "
+        f.write(f"search_dims: 15 (fanout_count, num_hidden, small_world_k, "
+                "num_stages, t_span, lr, "
+                "vca_rank, "
                 "weight_decay, batch_size, x_max, gm_max, isat_max, "
-                "sparsity_lambda, entropy_lambda, device_l2_lambda, "
+                "device_l2_lambda, "
                 "freeze_boundary, freeze_temporal_read)\n")
         f.write(f"has_start_point: {args.dataset in START_POINTS}\n")
         if args.dataset in START_POINTS:
@@ -915,7 +925,7 @@ def main() -> None:
         w.writerow([
             "trial", "state", "seed_trial", "num_hidden", "small_world_k",
             "small_world_p", "num_stages", "t_span", "num_steps",
-            "fanout_count", "boundary_fan_out", "lr", "weight_decay",
+            "vca_rank", "fanout_count", "boundary_fan_out", "lr", "weight_decay",
             "batch_size", "x_max", "gm_max", "isat_max", "sparsity_lambda",
             "entropy_lambda", "device_l2_lambda", "freeze_boundary",
             "freeze_temporal_read", "device", "gpu", "objective",
@@ -931,10 +941,12 @@ def main() -> None:
                 t.user_attrs.get("seed_trial", False),
                 t.params.get("num_hidden"),
                 t.params.get("small_world_k"),
-                t.params.get("small_world_p"),
+                SMALL_WORLD_P_FIXED,
                 t.params.get("num_stages"),
                 t.params.get("t_span"),
-                t.params.get("num_steps"),
+                (max(1, round(STEPS_PER_T_SPAN * t.params.get("t_span")))
+                 if t.params.get("t_span") is not None else None),
+                t.params.get("vca_rank"),
                 t.params.get("fanout_count"),
                 t.user_attrs.get("boundary_fan_out"),
                 t.params.get("lr"),
@@ -943,8 +955,8 @@ def main() -> None:
                 t.params.get("x_max"),
                 t.params.get("gm_max"),
                 t.params.get("isat_max"),
-                t.params.get("sparsity_lambda"),
-                t.params.get("entropy_lambda"),
+                SPARSITY_LAMBDA_FIXED,
+                ENTROPY_LAMBDA_FIXED,
                 t.params.get("device_l2_lambda"),
                 t.params.get("freeze_boundary"),
                 t.params.get("freeze_temporal_read"),

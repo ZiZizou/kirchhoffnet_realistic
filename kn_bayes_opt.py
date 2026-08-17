@@ -51,7 +51,8 @@ hardcoded in ``DATASETS``. Default ranges favor the existing small_world
 configurations used in recent friedman2 grid runs.
 
 Outputs (in ``--output/<dataset>_knet_e<E>/``):
-    <study_name>.db   optuna sqlite (resumable via --resume)
+    <study_name>.db   optuna sqlite (resumed automatically if it exists;
+                       --resume is retained as a backwards-compatible flag)
     best_hyperparams.txt best config + metrics + actual param count
     results.csv        every trial: HPs + metrics + param_count
     objective_history.png  trial values + best-so-far curve
@@ -423,6 +424,55 @@ def _plot_history(study: optuna.Study, path: Path, *, title: str,
     plt.close(fig)
 
 
+def _recover_unfinished_trials(
+    study: optuna.Study, dataset: str,
+) -> tuple[list[dict[str, Any]], set[int]]:
+    """Recover trials abandoned when the previous allocation expired.
+
+    Optuna stores a trial as RUNNING while its objective is executing.  If
+    Slurm kills the allocation, that state can remain in SQLite forever and
+    ``study.optimize`` will not execute the trial again.  Convert those
+    abandoned trials to FAIL and enqueue their exact parameters so the next
+    allocation retries them.  The returned set identifies retries of the
+    special START_POINTS trial, whose boundary map is not an Optuna param.
+
+    This is intentionally a startup operation: a RUNNING trial is assumed to
+    belong to an older allocation.  Do not start two jobs against the same
+    study at the same time.
+    """
+    running = [
+        t for t in study.trials
+        if t.state == optuna.trial.TrialState.RUNNING
+    ]
+    if not running:
+        return [], set()
+
+    retry_params: list[dict[str, Any]] = []
+    recovered_seed_indices: set[int] = set()
+    for trial in running:
+        params = dict(trial.params)
+        if trial.user_attrs.get("seed_trial") is True:
+            # boundary_fan_out is supplied by START_POINTS rather than
+            # suggested by Optuna, so recover the complete seed configuration.
+            retry_params.append(dict(START_POINTS[dataset]))
+            recovered_seed_indices.add(len(retry_params) - 1)
+        else:
+            retry_params.append(params)
+
+        try:
+            # Optuna has no public transition for an already-running trial;
+            # this is the storage-level operation used to finalize it.
+            study._storage.set_trial_state_values(  # type: ignore[attr-defined]
+                trial._trial_id, optuna.trial.TrialState.FAIL, None
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not mark abandoned trial {trial.number} as FAIL"
+            ) from exc
+
+    return retry_params, recovered_seed_indices
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -534,8 +584,8 @@ def main() -> None:
                         help="Optuna study name. Default: "
                              "<dataset>_knet_e<E>.")
     parser.add_argument("--resume", action="store_true",
-                        help="Resume an existing study from <run_dir>/"
-                             "<study_name>.db")
+                        help="Accepted for backwards compatibility. Existing "
+                             "studies are resumed automatically.")
     parser.add_argument("--no-seed-trial", action="store_true",
                         help="Skip enqueueing the START_POINTS seed trial "
                              "(trial 0 explores the search space from a "
@@ -598,14 +648,37 @@ def main() -> None:
     else:
         n_workers = max(1, args.n_workers)
 
+    db_path = run_dir / (study_name + ".db")
     sampler = TPESampler(seed=args.seed)
-    if args.resume and (run_dir / (study_name + ".db")).exists():
+    study_was_resumed = db_path.exists()
+    if study_was_resumed:
         study = optuna.load_study(study_name=study_name, storage=storage,
                                   sampler=sampler)
+        retry_params, recovered_seed_indices = _recover_unfinished_trials(
+            study, args.dataset
+        )
+        if retry_params:
+            print(f"[kn_bayes_opt] recovered {len(retry_params)} unfinished "
+                  "trial(s); they will be retried before new trials")
+        else:
+            recovered_seed_indices = set()
     else:
         study = optuna.create_study(study_name=study_name, storage=storage,
                                     sampler=sampler, direction="minimize")
-    seed_trial_number: int | None = None
+        retry_params = []
+        recovered_seed_indices = set()
+
+    # Enqueue recovered parameter sets after the old RUNNING rows have been
+    # finalized. Optuna will assign each retry a new trial number.
+    for retry_index, params in enumerate(retry_params):
+        study.enqueue_trial(
+            params,
+            user_attrs={
+                "recovered_trial": True,
+                "recovered_seed_trial": retry_index in recovered_seed_indices,
+            },
+        )
+
     if (args.dataset in START_POINTS
             and not args.no_seed_trial):
         seed_already_complete = any(
@@ -613,12 +686,19 @@ def main() -> None:
             and t.state == optuna.trial.TrialState.COMPLETE
             for t in study.trials
         )
-        if not seed_already_complete:
-            next_number = (
-                max([t.number for t in study.trials] + [-1]) + 1
+        seed_already_queued = any(
+            t.state == optuna.trial.TrialState.WAITING
+            and (
+                t.user_attrs.get("seed_trial") is True
+                or t.user_attrs.get("recovered_seed_trial") is True
             )
-            study.enqueue_trial(START_POINTS[args.dataset])
-            seed_trial_number = next_number
+            for t in study.trials
+        )
+        if not seed_already_complete and not seed_already_queued:
+            study.enqueue_trial(
+                START_POINTS[args.dataset],
+                user_attrs={"seed_trial": True},
+            )
 
     repo_dir = Path(__file__).resolve().parent
     script_path = repo_dir / "train_script.py"
@@ -633,7 +713,7 @@ def main() -> None:
           f"n_gpus={n_gpus} study_name={study_name} storage={storage}")
     print(f"[kn_bayes_opt] run_dir={run_dir}")
     print(f"[kn_bayes_opt] script={script_path}")
-    print(f"[kn_bayes_opt] seed_trial_number={seed_trial_number}")
+    print(f"[kn_bayes_opt] study_resumed={study_was_resumed}")
     param_reference = (args.param_budget if args.param_budget is not None
                        else args.param_reference)
     param_limit = (args.param_budget * (1.0 + args.param_tolerance)
@@ -641,8 +721,8 @@ def main() -> None:
 
     def objective(trial: optuna.Trial) -> float:
         is_seed_trial = (
-            seed_trial_number is not None
-            and trial.number == seed_trial_number
+            trial.user_attrs.get("seed_trial") is True
+            or trial.user_attrs.get("recovered_seed_trial") is True
         )
 
         fanout_count = trial.suggest_categorical("fanout_count",

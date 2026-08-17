@@ -736,8 +736,12 @@ def main() -> None:
                 f"but max={num_hidden_max}"
             )
         num_hidden = trial.suggest_int("num_hidden", nh_low, num_hidden_max)
+        # Keep this distribution fixed across all trials. Optuna/RDBStorage
+        # rejects a parameter whose categorical choices change between trials
+        # (for example, num_hidden=8 makes k=8 invalid while num_hidden=25
+        # allows it). Invalid combinations are pruned below instead.
         small_world_k = trial.suggest_categorical(
-            "small_world_k", valid_small_world_k_choices(num_hidden))
+            "small_world_k", SMALL_WORLD_K_CHOICES)
         if small_world_k >= num_hidden:
             raise optuna.TrialPruned(
                 f"small_world_k={small_world_k} must be < num_hidden={num_hidden}"

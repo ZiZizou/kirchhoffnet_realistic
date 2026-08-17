@@ -2262,6 +2262,10 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
         "--epochs", type=int, default=None,
         help=f"Number of epochs (default: {OPTIM['epochs']})")
     parser.add_argument(
+        "--count-params-only", action="store_true",
+        help="Build the network, print its trainable parameter count, and "
+             "exit before loading data or training.")
+    parser.add_argument(
         "--lr", type=float, default=None,
         help=f"Learning rate (default: {OPTIM['lr']})")
     parser.add_argument(
@@ -3638,6 +3642,8 @@ def main():
     )
     n_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
     print(f"[train] trainable params: {n_params:,}")
+    if args.count_params_only:
+        return
     breakdown = net.parameter_breakdown()
     print(f"[train] param breakdown:\n{format_parameter_breakdown(breakdown)}")
     if getattr(net, "skip_linear_enabled", False):

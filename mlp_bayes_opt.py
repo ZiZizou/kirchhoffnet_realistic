@@ -102,6 +102,15 @@ OBJECTIVE_KEYS = {
 }
 
 
+def _penalized_objective(metric: float, actual_params: int,
+                         reference_params: int, strength: float) -> float:
+    """Scale the metric upward in proportion to the model size."""
+    if actual_params < 0:
+        return float("inf")
+    normalized_params = actual_params / max(1, reference_params)
+    return metric * (1.0 + strength * normalized_params)
+
+
 def _param_count(h: int, num_layers: int, in_dim: int, out_dim: int) -> int:
     """Closed-form MLP parameter count.
 
@@ -266,6 +275,11 @@ def main() -> None:
     parser.add_argument("--objective", default="best_val",
                         choices=sorted(OBJECTIVE_KEYS),
                         help="Metric to minimize (default: best_val).")
+    parser.add_argument("--param-penalty", type=float, default=0.25,
+                        help="Dimensionless multiplier for the parameter-count "
+                             "penalty (default: 0.25; 0 disables it). The BO "
+                             "objective is metric * (1 + penalty * params / "
+                             "param-budget).")
     parser.add_argument("--loss", choices=["huber", "mse"], default="huber",
                         help="Training loss (default: huber, matches KNet).")
     parser.add_argument("--validate-every", type=int, default=5)
@@ -400,15 +414,23 @@ def main() -> None:
         for k, v in metrics.items():
             trial.set_user_attr(k, v)
         trial.set_user_attr("hidden_dim", hidden_dim)
-        trial.set_user_attr("actual_params", int(metrics.get("param_count", -1)))
+        actual_params = int(metrics.get("param_count", -1))
+        raw_objective = float(metrics[args.objective])
+        normalized_params = actual_params / max(1, param_budget)
+        objective_value = _penalized_objective(
+            raw_objective, actual_params, param_budget, args.param_penalty)
+        trial.set_user_attr("raw_objective", raw_objective)
+        trial.set_user_attr("normalized_param_count", normalized_params)
+        trial.set_user_attr("param_penalty", objective_value - raw_objective)
         trial.set_user_attr("subprocess_seconds", elapsed)
         trial.set_user_attr("gpu", gpu_idx)
         print(f"[mlp_bayes_opt] trial {trial.number:04d} "
               f"L={num_layers} h={hidden_dim} params={int(metrics.get('param_count',-1))} "
               f"lr={lr:.2e} wd={weight_decay:.2e} bs={batch_size} act={activation} "
-              f"gpu={gpu_idx} -> {args.objective}={metrics[args.objective]:.6f} "
+              f"gpu={gpu_idx} -> {args.objective}={raw_objective:.6f} "
+              f"penalized={objective_value:.6f} "
               f"({elapsed:.1f}s)")
-        return float(metrics[args.objective])
+        return objective_value
 
     study.optimize(objective, n_trials=args.n_trials, n_jobs=n_workers,
                    timeout=args.timeout, show_progress_bar=False)
@@ -427,6 +449,7 @@ def main() -> None:
         f.write(f"epochs: {args.epochs}\n")
         f.write(f"loss: {args.loss}\n")
         f.write(f"objective: {args.objective}\n")
+        f.write(f"param_penalty: {args.param_penalty}\n")
         f.write(f"seed: {args.seed}\n")
         f.write(f"n_trials: {args.n_trials}\n")
         f.write(f"n_workers: {n_workers}\n")
@@ -438,6 +461,8 @@ def main() -> None:
             f.write(f"best_value: {study.best_value:.6f}\n")
             f.write(f"hidden_dim: {bt.user_attrs.get('hidden_dim')}\n")
             f.write(f"actual_params: {bt.user_attrs.get('actual_params')}\n")
+            f.write(f"raw_objective: {bt.user_attrs.get('raw_objective')}\n")
+            f.write(f"normalized_param_count: {bt.user_attrs.get('normalized_param_count')}\n")
             f.write(f"subprocess_seconds: {bt.user_attrs.get('subprocess_seconds')}\n")
             f.write(f"gpu: {bt.user_attrs.get('gpu', -1)}\n")
             f.write("params:\n")
@@ -457,6 +482,7 @@ def main() -> None:
             "device", "gpu", "objective", "objective_value",
             "best_val", "best_epoch", "best_rmse_orig", "best_mae_orig",
             "best_mape_orig", "final_val", "elapsed_seconds",
+            "raw_objective", "normalized_param_count", "param_penalty",
         ])
         for t in study.trials:
             actual_params = t.user_attrs.get("actual_params", -1)
@@ -480,6 +506,9 @@ def main() -> None:
                 t.user_attrs.get("best_mape_orig"),
                 t.user_attrs.get("final_val"),
                 t.user_attrs.get("subprocess_seconds"),
+                t.user_attrs.get("raw_objective"),
+                t.user_attrs.get("normalized_param_count"),
+                t.user_attrs.get("param_penalty"),
             ])
 
     _plot_history(

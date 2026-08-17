@@ -69,6 +69,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -203,6 +204,22 @@ OBJECTIVE_KEYS = {
 }
 
 
+def _penalized_objective(metric: float, actual_params: int,
+                         reference_params: int, strength: float) -> float:
+    """Scale the metric upward in proportion to the model size."""
+    if actual_params < 0:
+        return float("inf")
+    normalized_params = actual_params / max(1, reference_params)
+    return metric * (1.0 + strength * normalized_params)
+
+
+def _over_budget_objective(actual_params: int, budget: int,
+                           base: float) -> float:
+    """Return a finite, graded objective for an over-budget architecture."""
+    ratio = actual_params / max(1, budget)
+    return base * ratio * ratio
+
+
 def build_boundary_fan_out(in_dim: int, fanout_count: int, num_hidden: int) -> dict:
     """Fixed-spread boundary fanout map.
 
@@ -276,6 +293,14 @@ def _parse_final_metrics(path: Path) -> dict[str, float]:
             except ValueError:
                 continue
     return out
+
+
+def _parse_trainable_param_count(text: str) -> int | None:
+    """Extract train_script.py's pre-training trainable-parameter count."""
+    match = re.search(r"trainable params:\s*([0-9][0-9,]*)", text)
+    if match is None:
+        return None
+    return int(match.group(1).replace(",", ""))
 
 
 def _build_command(
@@ -420,6 +445,20 @@ def main() -> None:
     parser.add_argument("--objective", default="best_val",
                         choices=sorted(OBJECTIVE_KEYS),
                         help="Metric to minimize (default: best_val).")
+    parser.add_argument("--param-penalty", type=float, default=0.25,
+                        help="Dimensionless multiplier for the parameter-count "
+                             "penalty (default: 0.25; 0 disables it).")
+    parser.add_argument("--param-budget", type=int, default=None,
+                        help="Optional hard maximum on trainable parameters. "
+                             "Trials exceeding it receive a finite graded "
+                             "objective before training.")
+    parser.add_argument("--invalid-param-objective", type=float, default=1e6,
+                        help="Base objective for over-budget models. Their "
+                             "finite penalty is this value times the squared "
+                             "parameter-count/budget ratio (default: 1e6).")
+    parser.add_argument("--param-reference", type=int, default=10000,
+                        help="Parameter count corresponding to normalized size "
+                             "1.0 for the penalty (default: 10000).")
     parser.add_argument("--num-hidden-min", type=int, default=None,
                         help="Override min num_hidden (default: "
                              "max(default_min_from_DATASETS, "
@@ -490,6 +529,11 @@ def main() -> None:
                              "(trial 0 explores the search space from a "
                              "random TPE sample instead).")
     args = parser.parse_args()
+
+    if args.param_budget is not None and args.param_budget < 1:
+        raise ValueError("--param-budget must be >= 1")
+    if args.invalid_param_objective <= 0.0:
+        raise ValueError("--invalid-param-objective must be > 0")
 
     cfg = DATASETS[args.dataset]
     in_dim: int = cfg["in_dim"]
@@ -574,6 +618,8 @@ def main() -> None:
     print(f"[kn_bayes_opt] run_dir={run_dir}")
     print(f"[kn_bayes_opt] script={script_path}")
     print(f"[kn_bayes_opt] seed_trial_number={seed_trial_number}")
+    param_reference = (args.param_budget if args.param_budget is not None
+                       else args.param_reference)
 
     def objective(trial: optuna.Trial) -> float:
         is_seed_trial = (
@@ -664,7 +710,6 @@ def main() -> None:
         else:
             trial.set_user_attr("seed_trial", False)
 
-        t0 = time.time()
         sub_env = os.environ.copy()
         sub_env.setdefault("PYTHONIOENCODING", "utf-8")
         sub_env.setdefault("PYTHONUTF8", "1")
@@ -672,7 +717,42 @@ def main() -> None:
         if device == "cuda" and n_gpus >= 1:
             gpu_idx = trial.number % n_gpus
             sub_env["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
+        preflight_cmd = cmd + ["--count-params-only", "--device", "cpu"]
         with open(log_path, "w", encoding="utf-8") as logf:
+            logf.write(f"$ {' '.join(preflight_cmd)}\n")
+            logf.flush()
+            preflight = subprocess.run(
+                preflight_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, cwd=str(repo_dir), creationflags=creationflags,
+                env=sub_env)
+            logf.write(preflight.stdout)
+            logf.flush()
+        preflight_params = _parse_trainable_param_count(preflight.stdout)
+        if preflight.returncode != 0 or preflight_params is None:
+            trial.set_user_attr("subprocess_failed", True)
+            trial.set_user_attr("preflight_failed", True)
+            trial.set_user_attr("preflight_returncode", preflight.returncode)
+            return float("inf")
+        trial.set_user_attr("preflight_params", preflight_params)
+        if (args.param_budget is not None
+                and preflight_params > args.param_budget):
+            invalid_objective = _over_budget_objective(
+                preflight_params, args.param_budget,
+                args.invalid_param_objective)
+            trial.set_user_attr("param_budget_exceeded", True)
+            trial.set_user_attr("param_budget", args.param_budget)
+            trial.set_user_attr("normalized_param_count",
+                                preflight_params / args.param_budget)
+            trial.set_user_attr("invalid_param_objective", invalid_objective)
+            print(f"[kn_bayes_opt] trial {trial.number:04d} rejected before "
+                  f"training: params={preflight_params} > "
+                  f"param_budget={args.param_budget}; "
+                  f"objective={invalid_objective:.6g}")
+            return invalid_objective
+
+        t0 = time.time()
+        with open(log_path, "a", encoding="utf-8") as logf:
+            logf.write("[preflight completed; launching training]\n")
             logf.write(f"$ {' '.join(cmd)}\n")
             logf.flush()
             proc = subprocess.run(cmd, stdout=logf, stderr=subprocess.STDOUT,
@@ -704,7 +784,31 @@ def main() -> None:
 
         for k, v in metrics.items():
             trial.set_user_attr(k, v)
-        trial.set_user_attr("actual_params", int(metrics.get("param_count", -1)))
+        actual_params = int(metrics.get("param_count", -1))
+        if (args.param_budget is not None
+                and actual_params > args.param_budget):
+            invalid_objective = _over_budget_objective(
+                actual_params, args.param_budget,
+                args.invalid_param_objective)
+            trial.set_user_attr("param_budget_exceeded", True)
+            trial.set_user_attr("param_budget", args.param_budget)
+            trial.set_user_attr("normalized_param_count",
+                                actual_params / args.param_budget)
+            trial.set_user_attr("invalid_param_objective", invalid_objective)
+            print(f"[kn_bayes_opt] trial {trial.number:04d} rejected after "
+                  f"training: params={actual_params} > "
+                  f"param_budget={args.param_budget}; "
+                  f"objective={invalid_objective:.6g}")
+            return invalid_objective
+        raw_objective = float(metrics[args.objective])
+        normalized_params = actual_params / max(1, param_reference)
+        objective_value = _penalized_objective(
+            raw_objective, actual_params, param_reference,
+            args.param_penalty)
+        trial.set_user_attr("actual_params", actual_params)
+        trial.set_user_attr("raw_objective", raw_objective)
+        trial.set_user_attr("normalized_param_count", normalized_params)
+        trial.set_user_attr("param_penalty", objective_value - raw_objective)
         if resolved_trial_dir is not None:
             trial.set_user_attr("resolved_trial_dir",
                                 str(resolved_trial_dir))
@@ -727,10 +831,11 @@ def main() -> None:
               f"bs={batch_size} xmx={x_max:.2f} gm={gm_max:.2f} "
               f"isat={isat_max:.2f} d2l={device_l2_lambda:.2e} "
               f"fb={freeze_boundary} ftr={freeze_temporal_read} "
-              f"params={int(metrics.get('param_count',-1))} "
-              f"gpu={gpu_idx} -> {args.objective}={metrics[args.objective]:.6f} "
+              f"params={actual_params} "
+              f"gpu={gpu_idx} -> {args.objective}={raw_objective:.6f} "
+              f"penalized={objective_value:.6f} "
               f"({elapsed:.1f}s)")
-        return float(metrics[args.objective])
+        return objective_value
 
     study.optimize(objective, n_trials=args.n_trials, n_jobs=n_workers,
                    timeout=args.timeout, show_progress_bar=False)
@@ -749,6 +854,10 @@ def main() -> None:
         f.write(f"out_dim: {out_dim}\n")
         f.write(f"epochs: {args.epochs}\n")
         f.write(f"objective: {args.objective}\n")
+        f.write(f"param_penalty: {args.param_penalty}\n")
+        f.write(f"param_budget: {args.param_budget}\n")
+        f.write(f"invalid_param_objective: {args.invalid_param_objective}\n")
+        f.write(f"param_reference: {args.param_reference}\n")
         f.write(f"seed: {args.seed}\n")
         f.write(f"n_trials: {args.n_trials}\n")
         f.write(f"n_workers: {n_workers}\n")
@@ -770,6 +879,8 @@ def main() -> None:
             f.write(f"best_trial_is_seed: {bt.user_attrs.get('seed_trial', False)}\n")
             f.write(f"best_value: {study.best_value:.6f}\n")
             f.write(f"actual_params: {bt.user_attrs.get('actual_params')}\n")
+            f.write(f"raw_objective: {bt.user_attrs.get('raw_objective')}\n")
+            f.write(f"normalized_param_count: {bt.user_attrs.get('normalized_param_count')}\n")
             f.write(f"subprocess_seconds: "
                     f"{bt.user_attrs.get('subprocess_seconds')}\n")
             f.write(f"gpu: {bt.user_attrs.get('gpu', -1)}\n")
@@ -795,7 +906,9 @@ def main() -> None:
             "freeze_temporal_read", "device", "gpu", "objective",
             "objective_value", "actual_params", "best_val", "best_epoch",
             "best_rmse_orig", "best_mae_orig", "best_mape_orig",
-            "epochs_run", "elapsed_seconds",
+            "epochs_run", "elapsed_seconds", "raw_objective",
+            "normalized_param_count", "param_penalty",
+            "invalid_param_objective",
         ])
         for t in study.trials:
             w.writerow([
@@ -830,6 +943,10 @@ def main() -> None:
                 t.user_attrs.get("best_mape_orig"),
                 t.user_attrs.get("epochs_run"),
                 t.user_attrs.get("elapsed_seconds"),
+                t.user_attrs.get("raw_objective"),
+                t.user_attrs.get("normalized_param_count"),
+                t.user_attrs.get("param_penalty"),
+                t.user_attrs.get("invalid_param_objective"),
             ])
 
     _plot_history(

@@ -270,7 +270,7 @@ def _resolve_trial_dir(run_dir: Path, trial_number: int) -> Path | None:
         The resolved directory Path, or ``None`` if no matching dir found.
     """
     exact = run_dir / f"trial_{trial_number:04d}"
-    if exact.is_dir():
+    if exact.is_dir() and (exact / "final_metrics.txt").exists():
         return exact
     candidates = sorted(
         run_dir.glob(f"trial_{trial_number:04d}*"),
@@ -452,6 +452,9 @@ def main() -> None:
                         help="Optional hard maximum on trainable parameters. "
                              "Trials exceeding it receive a finite graded "
                              "objective before training.")
+    parser.add_argument("--param-tolerance", type=float, default=0.10,
+                        help="Allowed fractional overage above param-budget "
+                             "before rejection (default: 0.10 = 10%%).")
     parser.add_argument("--invalid-param-objective", type=float, default=1e6,
                         help="Base objective for over-budget models. Their "
                              "finite penalty is this value times the squared "
@@ -532,6 +535,8 @@ def main() -> None:
 
     if args.param_budget is not None and args.param_budget < 1:
         raise ValueError("--param-budget must be >= 1")
+    if args.param_tolerance < 0.0:
+        raise ValueError("--param-tolerance must be >= 0")
     if args.invalid_param_objective <= 0.0:
         raise ValueError("--invalid-param-objective must be > 0")
 
@@ -620,6 +625,8 @@ def main() -> None:
     print(f"[kn_bayes_opt] seed_trial_number={seed_trial_number}")
     param_reference = (args.param_budget if args.param_budget is not None
                        else args.param_reference)
+    param_limit = (args.param_budget * (1.0 + args.param_tolerance)
+                   if args.param_budget is not None else None)
 
     def objective(trial: optuna.Trial) -> float:
         is_seed_trial = (
@@ -717,7 +724,11 @@ def main() -> None:
         if device == "cuda" and n_gpus >= 1:
             gpu_idx = trial.number % n_gpus
             sub_env["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
-        preflight_cmd = cmd + ["--count-params-only", "--device", "cpu"]
+        preflight_cmd = cmd.copy()
+        preflight_output = trial_dir / "_preflight"
+        output_arg_index = preflight_cmd.index("--output") + 1
+        preflight_cmd[output_arg_index] = str(preflight_output)
+        preflight_cmd += ["--count-params-only", "--device", "cpu"]
         with open(log_path, "w", encoding="utf-8") as logf:
             logf.write(f"$ {' '.join(preflight_cmd)}\n")
             logf.flush()
@@ -734,19 +745,20 @@ def main() -> None:
             trial.set_user_attr("preflight_returncode", preflight.returncode)
             return float("inf")
         trial.set_user_attr("preflight_params", preflight_params)
-        if (args.param_budget is not None
-                and preflight_params > args.param_budget):
+        if (param_limit is not None and preflight_params > param_limit):
             invalid_objective = _over_budget_objective(
-                preflight_params, args.param_budget,
+                preflight_params, int(param_limit),
                 args.invalid_param_objective)
             trial.set_user_attr("param_budget_exceeded", True)
             trial.set_user_attr("param_budget", args.param_budget)
+            trial.set_user_attr("param_limit", param_limit)
+            trial.set_user_attr("actual_params", preflight_params)
             trial.set_user_attr("normalized_param_count",
                                 preflight_params / args.param_budget)
             trial.set_user_attr("invalid_param_objective", invalid_objective)
             print(f"[kn_bayes_opt] trial {trial.number:04d} rejected before "
                   f"training: params={preflight_params} > "
-                  f"param_budget={args.param_budget}; "
+                  f"param_limit={param_limit:.0f}; "
                   f"objective={invalid_objective:.6g}")
             return invalid_objective
 
@@ -785,19 +797,20 @@ def main() -> None:
         for k, v in metrics.items():
             trial.set_user_attr(k, v)
         actual_params = int(metrics.get("param_count", -1))
-        if (args.param_budget is not None
-                and actual_params > args.param_budget):
+        if (param_limit is not None and actual_params > param_limit):
             invalid_objective = _over_budget_objective(
-                actual_params, args.param_budget,
+                actual_params, int(param_limit),
                 args.invalid_param_objective)
             trial.set_user_attr("param_budget_exceeded", True)
             trial.set_user_attr("param_budget", args.param_budget)
+            trial.set_user_attr("param_limit", param_limit)
+            trial.set_user_attr("actual_params", actual_params)
             trial.set_user_attr("normalized_param_count",
                                 actual_params / args.param_budget)
             trial.set_user_attr("invalid_param_objective", invalid_objective)
             print(f"[kn_bayes_opt] trial {trial.number:04d} rejected after "
                   f"training: params={actual_params} > "
-                  f"param_budget={args.param_budget}; "
+                  f"param_limit={param_limit:.0f}; "
                   f"objective={invalid_objective:.6g}")
             return invalid_objective
         raw_objective = float(metrics[args.objective])
@@ -856,6 +869,8 @@ def main() -> None:
         f.write(f"objective: {args.objective}\n")
         f.write(f"param_penalty: {args.param_penalty}\n")
         f.write(f"param_budget: {args.param_budget}\n")
+        f.write(f"param_tolerance: {args.param_tolerance}\n")
+        f.write(f"param_limit: {param_limit}\n")
         f.write(f"invalid_param_objective: {args.invalid_param_objective}\n")
         f.write(f"param_reference: {args.param_reference}\n")
         f.write(f"seed: {args.seed}\n")

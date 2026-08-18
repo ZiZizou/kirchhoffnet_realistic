@@ -820,7 +820,10 @@ def main() -> None:
         preflight_output = trial_dir / "_preflight"
         output_arg_index = preflight_cmd.index("--output") + 1
         preflight_cmd[output_arg_index] = str(preflight_output)
-        preflight_cmd += ["--count-params-only", "--device", "cpu"]
+        # Keep the same auto-detected device for the preflight.  Appending a
+        # second ``--device cpu`` here used to override the selected CUDA
+        # device on Alliance, making the run appear CPU-only.
+        preflight_cmd += ["--count-params-only"]
         with open(log_path, "w", encoding="utf-8") as logf:
             logf.write(f"$ {' '.join(preflight_cmd)}\n")
             logf.flush()

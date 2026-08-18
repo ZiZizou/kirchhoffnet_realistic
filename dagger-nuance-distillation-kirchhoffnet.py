@@ -413,6 +413,11 @@ def _log_hyperparameters():
         ("LR_FLOOR", LR_FLOOR),
         ("FAILURE_CAP_RATIO", FAILURE_CAP_RATIO),
         ("CONVERGENCE_THRESHOLD", CONVERGENCE_THRESHOLD),
+        ("EARLYSTOP_EVAL_SIZE", EARLYSTOP_EVAL_SIZE),
+        ("EARLYSTOP_EVAL_EVERY", EARLYSTOP_EVAL_EVERY),
+        ("EARLYSTOP_LOG_EVERY", EARLYSTOP_LOG_EVERY),
+        ("EARLYSTOP_EVAL_SEED_BASE", EARLYSTOP_EVAL_SEED_BASE),
+        ("EARLYSTOP_PATIENCE_EPOCHS", EARLYSTOP_PATIENCE_EPOCHS),
         ("N_EMPIRICAL_SAMPLES", N_EMPIRICAL_SAMPLES),
         ("N_CANDIDATES_INITIAL", N_CANDIDATES_INITIAL),
         ("WEIGHT_DECAY", WEIGHT_DECAY),
@@ -502,6 +507,16 @@ STRUCT_LR_SCALE       = 4.0      # structural core params: name.endswith('.z_log
 DYN_LR_SCALE          = 1.0      # sensitive dynamical params: raw_leak, raw_drive_g
 FAILURE_CAP_RATIO     = 0.40     # max new failures / existing dataset size per iter
 CONVERGENCE_THRESHOLD = 0.02     # early-stop if failure_rate < 2%
+# Per-epoch early-stop failure-rate tracking (plan dagger-best-checkpoint):
+# a fixed seeded set of EARLYSTOP_EVAL_SIZE specs is sampled once per DAgger iteration
+# and evaluated every EARLYSTOP_EVAL_EVERY epochs, so the best-state selection is
+# apples-to-apples (no sampling noise) and catches within-epoch bests.
+EARLYSTOP_EVAL_SIZE   = 300      # specs per early-stop check (fixed per iteration via seed)
+EARLYSTOP_EVAL_EVERY  = 1        # evaluate failure rate every N epochs (1 = every epoch)
+EARLYSTOP_LOG_EVERY   = 10       # emit verbose earlystop log every N epochs
+EARLYSTOP_EVAL_SEED_BASE = 1234567  # per-iteration seed: base + dagger_iter * 7919
+EARLYSTOP_PATIENCE_EPOCHS = 30  # scaled patience horizon in epochs; preserves ~30-epoch no-improvement
+                                 # budget from prior every-10-epoch check × patience=3 design
 N_EMPIRICAL_SAMPLES   = 20000    # initial empirical distillation samples (was 5000)
 N_CANDIDATES_INITIAL  = 5000     # candidates per spec for initial dataset build
 WEIGHT_DECAY          = 1e-4     # AdamW weight decay
@@ -2149,8 +2164,14 @@ class StudentEvaluator:
         return failure_mask, metrics
 
 
-def sample_validation_specs(df, n_samples=2000, boundary_ratio=0.5):
-    """Sample validation specs with heavy boundary emphasis for DAgger evaluation."""
+def sample_validation_specs(df, n_samples=2000, boundary_ratio=0.5, seed=None):
+    """Sample validation specs with heavy boundary emphasis for DAgger evaluation.
+
+    If ``seed`` is not None, every random draw (boundary/interior row selection and
+    final shuffle) is deterministic, so repeating the call with the same seed yields
+    the exact same spec set. ``seed=None`` preserves the historical unseeded behavior
+    used by the per-iteration final validation.
+    """
     n_boundary = int(n_samples * boundary_ratio)
     n_interior = n_samples - n_boundary
     boundary_mask = (
@@ -2167,10 +2188,15 @@ def sample_validation_specs(df, n_samples=2000, boundary_ratio=0.5):
     if len(interior_df) == 0:
         interior_df = df
 
-    boundary_rows = boundary_df.sample(n_boundary, replace=len(boundary_df) < n_boundary)
-    interior_rows = interior_df.sample(n_interior, replace=len(interior_df) < n_interior)
+    if seed is not None:
+        boundary_rows = boundary_df.sample(n_boundary, replace=len(boundary_df) < n_boundary, random_state=seed)
+        interior_rows = interior_df.sample(n_interior, replace=len(interior_df) < n_interior, random_state=seed)
+    else:
+        boundary_rows = boundary_df.sample(n_boundary, replace=len(boundary_df) < n_boundary)
+        interior_rows = interior_df.sample(n_interior, replace=len(interior_df) < n_interior)
     sampled = pd.concat([boundary_rows, interior_rows], ignore_index=True)
-    sampled = sampled.sample(frac=1.0, random_state=42).reset_index(drop=True)
+    shuffle_seed = seed if seed is not None else 42
+    sampled = sampled.sample(frac=1.0, random_state=shuffle_seed).reset_index(drop=True)
     return sampled[['power', 'stage_2_jitter', 'stage_2_eye_max_height', 'stage_2_eye_max_width']].values.astype(np.float32)
 
 
@@ -3013,6 +3039,19 @@ for dagger_iter in range(_start_iter, DAGGER_ITERATIONS):
     best_state = None
     best_failure_state = None
 
+    # Fixed seeded early-stop validation set: same 300 specs every check this
+    # iteration (plan dagger-best-checkpoint) so failure-rate comparisons are
+    # apples-to-apples and within-epoch bests are captured.
+    earlystop_seed = EARLYSTOP_EVAL_SEED_BASE + dagger_iter * 7919
+    earlystop_specs = sample_validation_specs(
+        df,
+        n_samples=EARLYSTOP_EVAL_SIZE,
+        boundary_ratio=BOUNDARY_RATIO,
+        seed=earlystop_seed,
+    )
+    _logger.info(f"  Early-stop eval set: {len(earlystop_specs)} specs (seed={earlystop_seed}, "
+                 f"every={EARLYSTOP_EVAL_EVERY}ep, log_every={EARLYSTOP_LOG_EVERY}ep)")
+
     epoch_losses = {'total': [], 'imit': [], 'spec': [], 'phys': [], 'invalid': [], 'manifold': []}
     n_batches = 0
     for epoch in range(EPOCHS_PER_ITER):
@@ -3074,30 +3113,44 @@ for dagger_iter in range(_start_iter, DAGGER_ITERATIONS):
             best_val_loss = val_losses['total']
             best_state = {k: v.cpu().clone() for k, v in student.state_dict().items()}
 
-        # Early stopping on failure rate: evaluate every 10 epochs
-        if (epoch + 1) % 10 == 0 or epoch == EPOCHS_PER_ITER - 1:
+        # Early stopping on failure rate: evaluate every EARLYSTOP_EVAL_EVERY epochs
+        # on the FIXED seeded earlystop_specs set (built once per iteration above).
+        if (epoch + 1) % EARLYSTOP_EVAL_EVERY == 0 or epoch == EPOCHS_PER_ITER - 1:
             evaluator.student = student
-            val_specs_check = sample_validation_specs(df, n_samples=1000, boundary_ratio=BOUNDARY_RATIO)
-            failure_mask_check, metrics_check = evaluator.identify_failures(val_specs_check, threshold=ERROR_THRESHOLD)
+            failure_mask_check, metrics_check = evaluator.identify_failures(earlystop_specs, threshold=ERROR_THRESHOLD)
             current_failure_rate = failure_mask_check.mean()
-            log_failure_breakdown(metrics_check, prefix="    earlystop/")
+            _logger.info(f"    earlystop@{epoch+1:3d}: failure_rate={current_failure_rate*100:.1f}% "
+                         f"(best={best_failure_rate*100:.1f}%, patience={patience})")
+            if (epoch + 1) % EARLYSTOP_LOG_EVERY == 0 or epoch == EPOCHS_PER_ITER - 1:
+                log_failure_breakdown(metrics_check, prefix="    earlystop/")
             if current_failure_rate < best_failure_rate:
                 best_failure_rate = current_failure_rate
                 patience = 0
                 best_failure_state = {k: v.cpu().clone() for k, v in student.state_dict().items()}
             else:
                 patience += 1
-                if patience >= 3:
-                    _logger.info(f"  Early stop at epoch {epoch+1} (failure rate not improving)")
+                patience_limit = max(1, EARLYSTOP_PATIENCE_EPOCHS // EARLYSTOP_EVAL_EVERY)
+                if patience >= patience_limit:
+                    _logger.info(f"  Early stop at epoch {epoch+1} (failure rate not improving on "
+                                 f"fixed seeded set for {EARLYSTOP_PATIENCE_EPOCHS} epochs "
+                                 f"since best={best_failure_rate*100:.1f}%)")
                     break
 
     # Restore best model by failure rate; fall back to val-loss best if needed
     if best_failure_state is not None:
         student.load_state_dict(best_failure_state)
         student.to(DEVICE)
+        _logger.info(f"  Carry-forward: restored best-failure-rate model "
+                     f"({best_failure_rate*100:.1f}% on seeded set of {EARLYSTOP_EVAL_SIZE})")
     elif best_state is not None:
         student.load_state_dict(best_state)
         student.to(DEVICE)
+        _logger.warning(f"  Carry-forward: no best_failure_state captured this iteration "
+                        f"(early-stop eval never improved past {best_failure_rate*100:.1f}%); "
+                        f"falling back to val-loss best (val={best_val_loss:.4f})")
+    else:
+        _logger.warning(f"  Carry-forward: NO checkpoint captured this iteration "
+                        f"(no best_failure_state AND no best_state); keeping last-epoch student")
 
     best_loss = float(best_val_loss)
 

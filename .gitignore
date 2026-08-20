@@ -19,3 +19,5 @@ dagger_output/
 *ipynb*
 *.sh
 outputs
+auth_token.txt
+*.zip

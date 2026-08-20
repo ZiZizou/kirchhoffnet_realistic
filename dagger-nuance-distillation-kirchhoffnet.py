@@ -551,8 +551,8 @@ WARMUP_EPOCHS   = 5      # epochs over which L_spec/L_phys/L_invalid ramp from 0
 # Replicates the friedman2 train_script.py preset with num_stages and
 # num_hidden tuned so the param count lands in the 5e3-6e3 target range.
 # ---------------------------------------------------------------
-KN_NUM_STAGES       = 3       # ODE circuit stages (3 tunes param count to ~5755 with out_dim=7)
-KN_NUM_HIDDEN       = 23      # hidden nodes per stage (>= max boundary fan-out target)
+KN_NUM_STAGES       = 4       # ODE circuit stages (3 tunes param count to ~5755 with out_dim=7)
+KN_NUM_HIDDEN       = 14      # hidden nodes per stage (>= max boundary fan-out target)
 KN_SMALL_WORLD_K    = 4       # Watts-Strogatz ring-lattice degree
 KN_SMALL_WORLD_P    = 0.2     # Watts-Strogatz rewiring probability
 KN_SMALL_WORLD_SEED = 1       # RNG seed for rewiring
@@ -562,7 +562,7 @@ KN_LEAK_MODE        = "non-programmable"  # fixed leak_constant (config default 
 KN_INTERSTAGE_ACTIVATION = "residual-relu-tanh"  # interstage StageTransfer activation
 KN_FREEZE_READ          = True      # precompute edge currents once from state (frozen OTA read core)
 KN_TEMPORAL_READOUT     = True      # append per-stage output ODE accumulators (temporal-readout readout)
-KN_BOUNDARY_FAN_OUT = '{"0": [2, 12], "1": [7, 17], "2": [22, 5], "3": [10, 15]}'  # 4 inputs -> 8 boundary edges
+KN_BOUNDARY_FAN_OUT = '{"0": [2, 4], "1": [1, 3], "2": [12, 5], "3": [7, 9]}'  # 4 inputs -> 8 boundary edges
 KN_INPUT_RAIL       = 4.0     # clamp normalized input to [-KN_INPUT_RAIL, KN_INPUT_RAIL] (x_max=4.0)
 
 KN_X_MAX            = 4.0     # local knet rail (overrides PHYS["x_max"]=3.0 via build_net_from_config x_max kwarg)
@@ -572,11 +572,11 @@ KN_X_MAX            = 4.0     # local knet rail (overrides PHYS["x_max"]=3.0 via
 # Identity-at-init is preserved: with --vca on, vca_W is zero-init and the
 # 2-sigma gate evaluates to 1.0 at step 0, so the VCA-off baseline behavior is
 # reproduced bit-for-bit at epoch 0 regardless of the chosen flags.
-KN_VCA                   = False  # --vca: enable low-rank input-driven VCA on boundary / temporal-readout edges
-KN_VCA_CORE              = False  # --vca-core: also gate core (hidden) edges (auto-enabled if no boundary / readout families)
+KN_VCA                   = True  # --vca: enable low-rank input-driven VCA on boundary / temporal-readout edges
+KN_VCA_CORE              = True  # --vca-core: also gate core (hidden) edges (auto-enabled if no boundary / readout families)
 KN_VCA_GATE_SHUNT        = False  # --vca-gate-shunt: also gate parallel resistive shunt with the core VCA gate (input-dependent routing)
-KN_VCA_SEPARATE_CORE_BUS = False  # --vca-separate-core-bus: give core family its own vca_W_core projection (ablation)
-KN_VCA_RANK              = None   # projection rank r; None -> config.VCA['rank'] (must be >= VCA['min_rank'])
+KN_VCA_SEPARATE_CORE_BUS = True  # --vca-separate-core-bus: give core family its own vca_W_core projection (ablation)
+KN_VCA_RANK              = 2   # projection rank r; None -> config.VCA['rank'] (must be >= VCA['min_rank'])
 
 # Fallback per-dim log10 spec bounds used when historical data is unavailable.
 # Order: [power, jitter, height, width]. Rebound from df after data load below.

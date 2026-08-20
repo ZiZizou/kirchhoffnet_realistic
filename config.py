@@ -258,7 +258,7 @@ CELL_LIBRARIES = {
     "tanh": {"cells": {}, "cell_order": ["S"], "device": "tanh"},
     "tanh_realistic": {"cells": {}, "cell_order": ["S"], "device": "tanh_realistic", "BIAS_ENABLED": False},
     "tanh_realistic_upgrade": {"cells": {}, "cell_order": ["S"], "device": "tanh_realistic_upgrade", "BIAS_ENABLED": False},
-    "tanh_free": {"cells": {}, "cell_order": ["S"], "device": "tanh_free", "BIAS_ENABLED": False, "PARALLEL_TANH_MULT_ENABLED": False},
+    "tanh_free": {"cells": {}, "cell_order": ["S"], "device": "tanh_free", "BIAS_ENABLED": True, "PARALLEL_TANH_MULT_ENABLED": False},
     "tanh_anti": {"cells": {}, "cell_order": ["S"], "device": "tanh_anti", "THETA_ENABLED": False},
 }
 
@@ -365,7 +365,7 @@ TAU = {
 # 0.0 in every config — nodes are pruned by connectivity only, and the
 # C_eff·Σu proxy would be a constant per stage if node_mask were 1.0.
 LAMBDAS = {
-    "sparsity": 1e-6,
+    "sparsity": 0,
     "rail": 0.1,
     "edge_gate": 0,
     "node_gate": 0.0,       # DEPRECATED (deprecate-node-gates)
@@ -411,13 +411,13 @@ PRUNE = {
 #     used in concert with edge_gate; remove the regularizer from B entirely)
 SCHEDULE_THREE_PHASE = {
     # Fraction of total epochs allocated to each phase.
-    "frac_a": 0.15,            # Phase A: fit (no structure pressure)
-    "frac_b": 0.40,            # Phase B: compress (Strategy 2 gate penalties)
-    "frac_c": 0.45,            # Phase C: retrain after prune
+    "frac_a": 0.3,            # Phase A: fit (no structure pressure)
+    "frac_b": 0.7,            # Phase B: compress (Strategy 2 gate penalties)
+    "frac_c": 0.0,            # Phase C: retrain after prune
     # Tau targets per phase.
     "tau_a": 0.8,              # Fixed tau during fit
     "tau_b_init": 0.8,         # Tau at start of compress
-    "tau_b_final": 0.4,        # Tau at end of compress
+    "tau_b_final": 0.05,        # Tau at end of compress
     "tau_c_init": 0.4,         # Tau at start of retrain
     "tau_c_final": 0.1,        # Tau at end of retrain
     # Lambda warmup within Phase B: ramp from 0 to full over this fraction.
@@ -426,20 +426,20 @@ SCHEDULE_THREE_PHASE = {
     # deprecate-node-gates: node_gate=0, capacitance=0 (both regularizers
     # are no-ops; node pruning is connectivity-only).
     "lambdas_b": {
-        "sparsity": 1e-6,
+        "sparsity": 0,
         "edge_gate": 0,
         "node_gate": 0.0,        # DEPRECATED (deprecate-node-gates)
-        "power": 1e-6,
+        "power": 1e-5,
         "capacitance": 0.0,      # DEPRECATED (deprecate-node-gates)
         "tanh_sat": 0.0,
     },
     # Phase C retrain lambdas: gate penalties off (irrelevant post-prune),
     # tiny sparsity for crisp cell family, rail unchanged.
     "lambdas_c": {
-        "sparsity": 1e-8,
+        "sparsity": 0,
         "edge_gate": 0.0,
         "node_gate": 0.0,        # DEPRECATED (deprecate-node-gates)
-        "power": 0.0,
+        "power": 1e-7,
         "capacitance": 0.0,      # DEPRECATED (deprecate-node-gates)
         "tanh_sat": 0.0,
     },

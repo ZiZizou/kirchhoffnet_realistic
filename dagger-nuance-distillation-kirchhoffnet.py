@@ -184,7 +184,7 @@ def _restore_rng(states):
 
 def _ckpt_baseline_payload(dagger_iter=0, converged=False):
     """Build a baseline checkpoint dict (called after initial build + split)."""
-    return {
+    payload = {
         'format_version': _CKPT_VERSION,
         'dagger_iter': int(dagger_iter),
         'converged': bool(converged),
@@ -201,6 +201,9 @@ def _ckpt_baseline_payload(dagger_iter=0, converged=False):
         'rng': _capture_rng(),
         'saved_at': time.strftime('%Y-%m-%d %H:%M:%S'),
     }
+    if globals().get('COMMON_EVAL_SPECS') is not None:
+        payload['common_eval_specs'] = np.asarray(globals()['COMMON_EVAL_SPECS']).tolist()
+    return payload
 
 
 def _restore_dataset_from_ckpt(ckpt):
@@ -227,6 +230,33 @@ def _restore_histories_from_ckpt(ckpt):
             continue
         for k, v in saved.items():
             target[k] = list(v)
+
+
+def _restore_common_eval_specs_from_ckpt(ckpt):
+    """Restore the shared COMMON_EVAL_SPECS ndarray from a checkpoint, if present.
+
+    If the checkpoint has no ``common_eval_specs`` field (older schema or a
+    pre-existing checkpoint from before this change), leave the module-level
+    ``COMMON_EVAL_SPECS`` as the freshly-built value so the resume still
+    functions; only override when the field is present and well-formed.
+    """
+    if 'COMMON_EVAL_SPECS' not in globals():
+        return
+    saved = ckpt.get('common_eval_specs')
+    if saved is None:
+        return
+    try:
+        restored = np.asarray(saved, dtype=np.float32)
+    except Exception as e:
+        _logger.warning(f"[CKPT] Failed to restore common_eval_specs: {e}; keeping rebuilt set")
+        return
+    if restored.ndim != 2 or restored.shape[1] != 4:
+        _logger.warning(f"[CKPT] Restored common_eval_specs has unexpected shape "
+                        f"{restored.shape}; keeping rebuilt set")
+        return
+    globals()['COMMON_EVAL_SPECS'] = restored
+    _logger.info(f"[CKPT] Restored COMMON_EVAL_SPECS from checkpoint: "
+                 f"shape={restored.shape}")
 
 # Make the local KirchhoffNet codebase importable. This file lives in the
 # repo root, so adding the script directory is sufficient.
@@ -413,11 +443,13 @@ def _log_hyperparameters():
         ("LR_FLOOR", LR_FLOOR),
         ("FAILURE_CAP_RATIO", FAILURE_CAP_RATIO),
         ("CONVERGENCE_THRESHOLD", CONVERGENCE_THRESHOLD),
-        ("EARLYSTOP_EVAL_SIZE", EARLYSTOP_EVAL_SIZE),
         ("EARLYSTOP_EVAL_EVERY", EARLYSTOP_EVAL_EVERY),
         ("EARLYSTOP_LOG_EVERY", EARLYSTOP_LOG_EVERY),
-        ("EARLYSTOP_EVAL_SEED_BASE", EARLYSTOP_EVAL_SEED_BASE),
+        ("EARLYSTOP_SKIP_EPOCHS", EARLYSTOP_SKIP_EPOCHS),
         ("EARLYSTOP_PATIENCE_EPOCHS", EARLYSTOP_PATIENCE_EPOCHS),
+        ("COMMON_EVAL_SIZE", COMMON_EVAL_SIZE),
+        ("COMMON_EVAL_SEED", COMMON_EVAL_SEED),
+        ("MIN_FAILURE_IMPROVEMENT", MIN_FAILURE_IMPROVEMENT),
         ("N_EMPIRICAL_SAMPLES", N_EMPIRICAL_SAMPLES),
         ("N_CANDIDATES_INITIAL", N_CANDIDATES_INITIAL),
         ("WEIGHT_DECAY", WEIGHT_DECAY),
@@ -507,16 +539,28 @@ STRUCT_LR_SCALE       = 4.0      # structural core params: name.endswith('.z_log
 DYN_LR_SCALE          = 1.0      # sensitive dynamical params: raw_leak, raw_drive_g
 FAILURE_CAP_RATIO     = 0.40     # max new failures / existing dataset size per iter
 CONVERGENCE_THRESHOLD = 0.02     # early-stop if failure_rate < 2%
-# Per-epoch early-stop failure-rate tracking (plan dagger-best-checkpoint):
-# a fixed seeded set of EARLYSTOP_EVAL_SIZE specs is sampled once per DAgger iteration
-# and evaluated every EARLYSTOP_EVAL_EVERY epochs, so the best-state selection is
-# apples-to-apples (no sampling noise) and catches within-epoch bests.
-EARLYSTOP_EVAL_SIZE   = 300      # specs per early-stop check (fixed per iteration via seed)
-EARLYSTOP_EVAL_EVERY  = 1        # evaluate failure rate every N epochs (1 = every epoch)
-EARLYSTOP_LOG_EVERY   = 10       # emit verbose earlystop log every N epochs
-EARLYSTOP_EVAL_SEED_BASE = 1234567  # per-iteration seed: base + dagger_iter * 7919
-EARLYSTOP_PATIENCE_EPOCHS = 30  # scaled patience horizon in epochs; preserves ~30-epoch no-improvement
-                                 # budget from prior every-10-epoch check × patience=3 design
+# Best-model selection (plan dagger_knet_best_model_selection_improvement):
+# A SINGLE shared eval set is built once (COMMON_EVAL_SPECS) and used for both
+# per-epoch early-stop tracking AND the per-iteration "Validation failure rate"
+# report. Every iteration and every resume uses the *same* spec set, so the
+# per-iteration failure rates are directly comparable and monotone-improvement
+# can be enforced, not assumed.
+COMMON_EVAL_SIZE      = 2000      # size of the shared eval set
+COMMON_EVAL_SEED      = 24681012  # fixed seed; identical set across iterations + resumes
+EARLYSTOP_EVAL_EVERY  = 1         # evaluate failure rate every N epochs (1 = every epoch)
+EARLYSTOP_LOG_EVERY   = 10        # emit verbose earlystop log every N epochs
+EARLYSTOP_SKIP_EPOCHS = 5         # no best-tracking during the first N epochs of an
+                                  # iteration (prevents warm-started epoch-1 snapshot
+                                  # from winning immediately)
+EARLYSTOP_PATIENCE_EPOCHS = EPOCHS_PER_ITER  # effectively disables in-budget early
+                                             # stopping; loop always runs full budget
+MIN_FAILURE_IMPROVEMENT = 0.01    # absolute (1%) improvement required to accept a
+                                  # new within-iteration best over prev_failure_rate
+
+# Module-level slot for the shared eval set (built lazily below the DAgger
+# hyperparameter block, before the training loop). Declared here so the
+# resume-from-checkpoint helper can overwrite it as soon as ckpt is loaded.
+COMMON_EVAL_SPECS = None
 N_EMPIRICAL_SAMPLES   = 20000    # initial empirical distillation samples (was 5000)
 N_CANDIDATES_INITIAL  = 5000     # candidates per spec for initial dataset build
 WEIGHT_DECAY          = 1e-4     # AdamW weight decay
@@ -2812,6 +2856,7 @@ if ckpt is not None:
         distillation_dataset = DistillationDataset([])
         _restore_dataset_from_ckpt(ckpt)
         _restore_histories_from_ckpt(ckpt)
+        _restore_common_eval_specs_from_ckpt(ckpt)
         _logger.info(
             f"[CKPT] Resumed from {CHECKPOINT_PATH}  "
             f"next_iter={int(ckpt['dagger_iter'])}, "
@@ -3014,6 +3059,26 @@ else:
     _logger.info("[CKPT] Skipping run_diagnostics on resume")
 
 
+# ── Shared COMMON_EVAL_SPECS ─────────────────────────────────────────
+# Single fixed shared eval set used for both per-epoch early-stop tracking
+# AND per-iteration "Validation failure rate" reporting (plan
+# dagger_knet_best_model_selection_improvement). Built fresh on a fresh start;
+# on resume, _restore_common_eval_specs_from_ckpt already overwrote this from
+# the checkpoint if the field was present.
+if COMMON_EVAL_SPECS is None:
+    with Timer("build COMMON_EVAL_SPECS shared eval set"):
+        COMMON_EVAL_SPECS = sample_validation_specs(
+            df,
+            n_samples=COMMON_EVAL_SIZE,
+            boundary_ratio=BOUNDARY_RATIO,
+            seed=COMMON_EVAL_SEED,
+        )
+    _logger.info(f"  COMMON_EVAL_SPECS: shape={COMMON_EVAL_SPECS.shape}, "
+                 f"seed={COMMON_EVAL_SEED}")
+else:
+    _logger.info(f"  COMMON_EVAL_SPECS already set (shape="
+                 f"{COMMON_EVAL_SPECS.shape}); reusing")
+
 # ── Main DAgger loop ─────────────────────────────────────────────────
 _start_iter = int(ckpt['dagger_iter']) if ckpt is not None else 0
 if ckpt is not None and ckpt.get('converged', False):
@@ -3034,23 +3099,35 @@ for dagger_iter in range(_start_iter, DAGGER_ITERATIONS):
 
     # ── 3a. Train student with early stopping on failure rate ─────
     best_val_loss = float('inf')
-    best_failure_rate = 1.0
     patience = 0
     best_state = None
     best_failure_state = None
+    # best_failure_rate is initialized below to prev_failure_rate (iter 1 → 1.0)
+    # so the first within-iteration accept threshold is the carried-forward baseline.
 
-    # Fixed seeded early-stop validation set: same 300 specs every check this
-    # iteration (plan dagger-best-checkpoint) so failure-rate comparisons are
-    # apples-to-apples and within-epoch bests are captured.
-    earlystop_seed = EARLYSTOP_EVAL_SEED_BASE + dagger_iter * 7919
-    earlystop_specs = sample_validation_specs(
-        df,
-        n_samples=EARLYSTOP_EVAL_SIZE,
-        boundary_ratio=BOUNDARY_RATIO,
-        seed=earlystop_seed,
-    )
-    _logger.info(f"  Early-stop eval set: {len(earlystop_specs)} specs (seed={earlystop_seed}, "
-                 f"every={EARLYSTOP_EVAL_EVERY}ep, log_every={EARLYSTOP_LOG_EVERY}ep)")
+    # Snapshot the carried-forward student (last iteration's restored best)
+    # and measure its baseline failure rate on COMMON_EVAL_SPECS. Iteration 1
+    # has no previous iteration → use 1.0 so any reasonable model passes the
+    # MIN_FAILURE_IMPROVEMENT threshold on the first iteration.
+    prev_state = {k: v.cpu().clone() for k, v in student.state_dict().items()}
+    if dagger_iter == 0:
+        prev_failure_rate = 1.0
+        _logger.info(f"  Prev-iter baseline: no prior model (iteration 1) → "
+                     f"prev_failure_rate=100.0%")
+    else:
+        evaluator.student = student
+        _prev_mask, _prev_metrics = evaluator.identify_failures(
+            COMMON_EVAL_SPECS, threshold=ERROR_THRESHOLD
+        )
+        prev_failure_rate = float(_prev_mask.mean())
+        _logger.info(f"  Prev-iter baseline: prev_failure_rate="
+                     f"{prev_failure_rate*100:.2f}% on COMMON_EVAL_SPECS "
+                     f"(n={len(COMMON_EVAL_SPECS)})")
+    best_failure_rate = prev_failure_rate
+
+    _logger.info(f"  Shared eval set (COMMON_EVAL_SPECS): n={len(COMMON_EVAL_SPECS)} "
+                 f"specs (seed={COMMON_EVAL_SEED}, every={EARLYSTOP_EVAL_EVERY}ep, "
+                 f"log_every={EARLYSTOP_LOG_EVERY}ep, skip_first={EARLYSTOP_SKIP_EPOCHS}ep)")
 
     epoch_losses = {'total': [], 'imit': [], 'spec': [], 'phys': [], 'invalid': [], 'manifold': []}
     n_batches = 0
@@ -3114,49 +3191,92 @@ for dagger_iter in range(_start_iter, DAGGER_ITERATIONS):
             best_state = {k: v.cpu().clone() for k, v in student.state_dict().items()}
 
         # Early stopping on failure rate: evaluate every EARLYSTOP_EVAL_EVERY epochs
-        # on the FIXED seeded earlystop_specs set (built once per iteration above).
+        # on the SHARED COMMON_EVAL_SPECS set (built once before the DAgger loop).
+        # - During the first EARLYSTOP_SKIP_EPOCHS epochs, no best-tracking is
+        #   performed so the warm-started epoch-1 snapshot can't win immediately.
+        # - A new best is accepted only when it beats the running best by at
+        #   least MIN_FAILURE_IMPROVEMENT (absolute), enforcing monotone
+        #   improvement across the in-iteration budget.
+        # - EARLYSTOP_PATIENCE_EPOCHS = EPOCHS_PER_ITER (full budget) by design,
+        #   so the inner loop is never cut short.
         if (epoch + 1) % EARLYSTOP_EVAL_EVERY == 0 or epoch == EPOCHS_PER_ITER - 1:
             evaluator.student = student
-            failure_mask_check, metrics_check = evaluator.identify_failures(earlystop_specs, threshold=ERROR_THRESHOLD)
+            failure_mask_check, metrics_check = evaluator.identify_failures(
+                COMMON_EVAL_SPECS, threshold=ERROR_THRESHOLD
+            )
             current_failure_rate = failure_mask_check.mean()
-            _logger.info(f"    earlystop@{epoch+1:3d}: failure_rate={current_failure_rate*100:.1f}% "
-                         f"(best={best_failure_rate*100:.1f}%, patience={patience})")
+            if (epoch + 1) > EARLYSTOP_SKIP_EPOCHS:
+                if current_failure_rate < best_failure_rate - MIN_FAILURE_IMPROVEMENT:
+                    best_failure_rate = current_failure_rate
+                    patience = 0
+                    best_failure_state = {k: v.cpu().clone() for k, v in student.state_dict().items()}
+                    _logger.info(f"    earlystop@{epoch+1:3d}: failure_rate="
+                                 f"{current_failure_rate*100:.2f}% "
+                                 f"(new best, prev={prev_failure_rate*100:.2f}%, "
+                                 f"delta={(prev_failure_rate - current_failure_rate)*100:+.2f}pts)")
+                else:
+                    patience += 1
+                    _logger.info(f"    earlystop@{epoch+1:3d}: failure_rate="
+                                 f"{current_failure_rate*100:.2f}% "
+                                 f"(no accept; best={best_failure_rate*100:.2f}%, "
+                                 f"min_delta={MIN_FAILURE_IMPROVEMENT*100:.1f}%, "
+                                 f"patience={patience})")
+            else:
+                _logger.info(f"    earlystop@{epoch+1:3d}: failure_rate="
+                             f"{current_failure_rate*100:.2f}% "
+                             f"(skipped, epoch {epoch+1} <= "
+                             f"EARLYSTOP_SKIP_EPOCHS={EARLYSTOP_SKIP_EPOCHS})")
             if (epoch + 1) % EARLYSTOP_LOG_EVERY == 0 or epoch == EPOCHS_PER_ITER - 1:
                 log_failure_breakdown(metrics_check, prefix="    earlystop/")
-            if current_failure_rate < best_failure_rate:
-                best_failure_rate = current_failure_rate
-                patience = 0
-                best_failure_state = {k: v.cpu().clone() for k, v in student.state_dict().items()}
-            else:
-                patience += 1
-                patience_limit = max(1, EARLYSTOP_PATIENCE_EPOCHS // EARLYSTOP_EVAL_EVERY)
-                if patience >= patience_limit:
-                    _logger.info(f"  Early stop at epoch {epoch+1} (failure rate not improving on "
-                                 f"fixed seeded set for {EARLYSTOP_PATIENCE_EPOCHS} epochs "
-                                 f"since best={best_failure_rate*100:.1f}%)")
-                    break
 
-    # Restore best model by failure rate; fall back to val-loss best if needed
-    if best_failure_state is not None:
+    # ── Carry-forward model selection with regression guardrail ────────
+    # Priority:
+    #   1. best_failure_state if it beat prev_failure_rate by >= MIN_FAILURE_IMPROVEMENT
+    #      (new within-iteration best is strictly better on COMMON_EVAL_SPECS)
+    #   2. prev_state (carried-forward from last iteration; only fallback for
+    #      "no meaningful improvement" — protects against regression per the plan)
+    #   3. best_state (val-loss best) — legacy fallback for the rare edge case
+    #      where we have a loss-best but neither a failure-state nor a prev_state
+    #   4. last-epoch student (final fallback)
+    iter_outcome = "keep_new"
+    if (best_failure_state is not None
+            and best_failure_rate < prev_failure_rate - MIN_FAILURE_IMPROVEMENT):
         student.load_state_dict(best_failure_state)
         student.to(DEVICE)
         _logger.info(f"  Carry-forward: restored best-failure-rate model "
-                     f"({best_failure_rate*100:.1f}% on seeded set of {EARLYSTOP_EVAL_SIZE})")
+                     f"({best_failure_rate*100:.2f}% on COMMON_EVAL_SPECS, "
+                     f"prev={prev_failure_rate*100:.2f}%, "
+                     f"delta={(prev_failure_rate - best_failure_rate)*100:+.2f}pts)")
+    elif prev_state is not None:
+        student.load_state_dict(prev_state)
+        student.to(DEVICE)
+        iter_outcome = "fallback_prev"
+        _logger.warning(
+            f"  Carry-forward: iteration {dagger_iter+1} no >="
+            f"{MIN_FAILURE_IMPROVEMENT*100:.1f}% improvement "
+            f"(prev={prev_failure_rate*100:.2f}% -> "
+            f"best={best_failure_rate*100:.2f}%); kept carried-forward model"
+        )
     elif best_state is not None:
         student.load_state_dict(best_state)
         student.to(DEVICE)
-        _logger.warning(f"  Carry-forward: no best_failure_state captured this iteration "
-                        f"(early-stop eval never improved past {best_failure_rate*100:.1f}%); "
-                        f"falling back to val-loss best (val={best_val_loss:.4f})")
+        iter_outcome = "fallback_valloss"
+        _logger.warning(f"  Carry-forward: no prev_state and no accepted "
+                        f"best_failure_state; falling back to val-loss best "
+                        f"(val={best_val_loss:.4f})")
     else:
+        iter_outcome = "keep_last"
         _logger.warning(f"  Carry-forward: NO checkpoint captured this iteration "
-                        f"(no best_failure_state AND no best_state); keeping last-epoch student")
+                        f"(no best_failure_state, no prev_state, no best_state); "
+                        f"keeping last-epoch student")
 
     best_loss = float(best_val_loss)
 
-    # ── 3b. Evaluate on validation set (vectorized) ──────────────────
-    val_specs_arr = sample_validation_specs(df, n_samples=VALIDATION_SIZE,
-                                           boundary_ratio=BOUNDARY_RATIO)
+    # ── 3b. Evaluate on the SHARED COMMON_EVAL_SPECS set (vectorized) ─────
+    # Same 2000-spec set used for per-epoch early-stop tracking, so the
+    # per-iteration rate reported here is directly comparable to last
+    # iteration's (monotone-improvement table).
+    val_specs_arr = COMMON_EVAL_SPECS
     evaluator.student = student
     failure_mask, metrics = evaluator.identify_failures(val_specs_arr, threshold=ERROR_THRESHOLD)
     failure_errors = metrics['errors'].max(axis=1)
@@ -3179,6 +3299,14 @@ for dagger_iter in range(_start_iter, DAGGER_ITERATIONS):
     log_saturation_breakdown(metrics, prefix="  val/")
     log_param_bound_feasibility("Rolling dataset", np.array([d['params'] for d in distillation_dataset.data]))
     log_rail_probe(student, val_specs_arr)
+
+    # Per-iteration summary line: monotone-improvement table.
+    iter_delta = (prev_failure_rate - failure_rate) * 100
+    _logger.info(
+        f"  Iter {dagger_iter+1} final={failure_rate*100:.2f}% "
+        f"vs prev={prev_failure_rate*100:.2f}% "
+        f"(delta {iter_delta:+.2f} pts) -> {iter_outcome}"
+    )
 
     # ── 3c. Convergence check ───────────────────────────────────────
     dagger_history['iteration'].append(dagger_iter + 1)

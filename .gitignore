@@ -21,3 +21,5 @@ dagger_output/
 outputs
 auth_token.txt
 *.zip
+dagger_knet_best_model_selection_improvement_plan.md
+test_dagger_best_model_selection.py

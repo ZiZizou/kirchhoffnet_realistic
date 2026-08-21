@@ -41,6 +41,7 @@ import os
 import sys
 import json
 import time
+import math
 import logging
 import subprocess
 import hashlib
@@ -450,6 +451,9 @@ def _log_hyperparameters():
         ("COMMON_EVAL_SIZE", COMMON_EVAL_SIZE),
         ("COMMON_EVAL_SEED", COMMON_EVAL_SEED),
         ("MIN_FAILURE_IMPROVEMENT", MIN_FAILURE_IMPROVEMENT),
+        ("DIVERGENCE_ABORT", DIVERGENCE_ABORT),
+        ("DIVERGENCE_MARGIN", DIVERGENCE_MARGIN),
+        ("DIVERGENCE_CONSEC_EVALS", DIVERGENCE_CONSEC_EVALS),
         ("N_EMPIRICAL_SAMPLES", N_EMPIRICAL_SAMPLES),
         ("N_CANDIDATES_INITIAL", N_CANDIDATES_INITIAL),
         ("WEIGHT_DECAY", WEIGHT_DECAY),
@@ -553,9 +557,18 @@ EARLYSTOP_SKIP_EPOCHS = 5         # no best-tracking during the first N epochs o
                                   # iteration (prevents warm-started epoch-1 snapshot
                                   # from winning immediately)
 EARLYSTOP_PATIENCE_EPOCHS = EPOCHS_PER_ITER  # effectively disables in-budget early
-                                             # stopping; loop always runs full budget
+                                              # stopping; loop always runs full budget
 MIN_FAILURE_IMPROVEMENT = 0.01    # absolute (1%) improvement required to accept a
                                   # new within-iteration best over prev_failure_rate
+# Divergence abort (safety valve for the full-budget policy above): if training
+# catastrophically diverges (failure rate explodes far ABOVE the previous
+# iteration's baseline) for several consecutive evals, the rest of the budget
+# would be wasted — abort the iteration and let the carry-forward guardrail
+# restore the best/previous model. Never fires on normal noise: it requires a
+# large sustained REGRESSION, not merely a failure to improve.
+DIVERGENCE_ABORT          = True  # enable the mid-iteration divergence abort
+DIVERGENCE_MARGIN         = 0.20  # absolute failure-rate INCREASE over prev (20 pts)
+DIVERGENCE_CONSEC_EVALS   = 5     # consecutive above-margin evals before aborting
 
 # Module-level slot for the shared eval set (built lazily below the DAgger
 # hyperparameter block, before the training loop). Declared here so the
@@ -3131,6 +3144,9 @@ for dagger_iter in range(_start_iter, DAGGER_ITERATIONS):
 
     epoch_losses = {'total': [], 'imit': [], 'spec': [], 'phys': [], 'invalid': [], 'manifold': []}
     n_batches = 0
+    n_nonfinite_batches = 0   # batches skipped by the NaN/grad guards this iteration
+    _div_consec = 0           # consecutive divergence-margin evals (see DIVERGENCE_*)
+    diverged_at = None        # epoch at which the iteration was aborted, if any
     for epoch in range(EPOCHS_PER_ITER):
         ramped_criterion.set_epoch(epoch)
         student.train()
@@ -3152,13 +3168,29 @@ for dagger_iter in range(_start_iter, DAGGER_ITERATIONS):
             base_loss_dict = ramped_criterion.base_loss(student, spec_targets, params_batch, logits=logits)
             ramped_loss_dict = ramped_criterion(student, spec_targets, params_batch, logits=logits, loss_dict=base_loss_dict)
             total_loss = ramped_loss_dict['total']
-            if not total_loss.requires_grad:
-                losses['total'] += total_loss.item()
+            if not total_loss.requires_grad or not torch.isfinite(total_loss):
+                # NaN/Inf batch (flagged by the loss's internal guard or a
+                # non-finite ramped total): skip the update entirely so a
+                # poisoned batch can never reach optimizer.step().
+                losses['total'] += float(total_loss)
+                n_nonfinite_batches += 1
             else:
                 total_loss.backward()
-                # clip_grad_norm_ over the wrapper's parameters covers the local KirchhoffNet fabric.
-                torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
-                optimizer.step()
+                # clip_grad_norm_ over the wrapper's parameters covers the local
+                # KirchhoffNet fabric. Its return value is the PRE-clip total
+                # norm: if backward exploded (stiff ODE), the norm is Inf/NaN
+                # and clipping itself maps Inf grads to NaN — stepping here
+                # would write NaN into every weight (permanent 100% failure).
+                grad_norm = float(torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0))
+                if math.isfinite(grad_norm):
+                    optimizer.step()
+                else:
+                    n_nonfinite_batches += 1
+                    optimizer.zero_grad(set_to_none=True)
+                    if n_nonfinite_batches == 1 or n_nonfinite_batches % 50 == 0:
+                        _logger.warning(
+                            f"    [grad-guard] non-finite grad norm at epoch {epoch+1}; "
+                            f"skipped optimizer step ({n_nonfinite_batches} skipped this iteration)")
                 losses['total'] += total_loss.item()
             for k in ('imit', 'spec', 'phys', 'invalid', 'manifold'):
                 losses[k] += ramped_loss_dict[k]
@@ -3221,6 +3253,27 @@ for dagger_iter in range(_start_iter, DAGGER_ITERATIONS):
                                  f"(no accept; best={best_failure_rate*100:.2f}%, "
                                  f"min_delta={MIN_FAILURE_IMPROVEMENT*100:.1f}%, "
                                  f"patience={patience})")
+                # Divergence abort: a large SUSTAINED regression above the
+                # previous iteration's baseline means this iteration's training
+                # is destroying the model (e.g. NaN-poisoned or loss-ramp
+                # collapse). The remaining budget would be wasted — abort and
+                # let the carry-forward guardrail below restore the best/prev
+                # model. Requires DIVERGENCE_CONSEC_EVALS consecutive evals
+                # above prev + DIVERGENCE_MARGIN, so normal noise never fires it.
+                if DIVERGENCE_ABORT and (
+                        current_failure_rate >= prev_failure_rate + DIVERGENCE_MARGIN):
+                    _div_consec += 1
+                    if _div_consec >= DIVERGENCE_CONSEC_EVALS:
+                        diverged_at = epoch + 1
+                        _logger.warning(
+                            f"    [divergence] failure_rate >= "
+                            f"{(prev_failure_rate + DIVERGENCE_MARGIN)*100:.1f}% for "
+                            f"{DIVERGENCE_CONSEC_EVALS} consecutive evals; aborting "
+                            f"iteration {dagger_iter+1} at epoch {epoch+1} "
+                            f"(carry-forward guardrail will restore the best/previous model)")
+                        break
+                else:
+                    _div_consec = 0
             else:
                 _logger.info(f"    earlystop@{epoch+1:3d}: failure_rate="
                              f"{current_failure_rate*100:.2f}% "
@@ -3302,6 +3355,10 @@ for dagger_iter in range(_start_iter, DAGGER_ITERATIONS):
 
     # Per-iteration summary line: monotone-improvement table.
     iter_delta = (prev_failure_rate - failure_rate) * 100
+    if diverged_at is not None:
+        iter_outcome += f" (divergence-abort@ep{diverged_at})"
+    if n_nonfinite_batches > 0:
+        iter_outcome += f" (skipped {n_nonfinite_batches} non-finite batches)"
     _logger.info(
         f"  Iter {dagger_iter+1} final={failure_rate*100:.2f}% "
         f"vs prev={prev_failure_rate*100:.2f}% "
@@ -3370,7 +3427,16 @@ for dagger_iter in range(_start_iter, DAGGER_ITERATIONS):
         for pg in optimizer.param_groups:
             pg['lr'] = new_lr * pg.get('lr_scale', 1.0)
         _lr_per_group = ', '.join('{:.2e}'.format(pg['lr']) for pg in optimizer.param_groups)
-        _logger.info(f"  LR reset to {new_lr:.2e} (per-group: {_lr_per_group})")
+        # Recreate the cosine scheduler so it restarts from the reset LR.
+        # Without this, the continuously-stepped CosineAnnealingLR overrides
+        # the manual reset on its next step() and its phase wraps across
+        # iterations (T_max=EPOCHS_PER_ITER), so some iterations would START
+        # at the full initial LR — instantly destroying the warm-started model.
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=EPOCHS_PER_ITER, eta_min=LR_FLOOR
+        )
+        _logger.info(f"  LR reset to {new_lr:.2e} (per-group: {_lr_per_group}); "
+                     f"cosine scheduler restarted for next iteration")
 
     # ── 3g. Teacher labeling with k-NN empirical fallback ─────────────
     final_specs = np.empty((0, 4), dtype=np.float32)

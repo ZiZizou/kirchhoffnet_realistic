@@ -1,397 +1,82 @@
-"""CTLE Inverse Design: KirchhoffNet Student (DAgger)
+# ---
+# jupyter:
+#   jupytext:
+#     text_representation:
+#       extension: .py
+#       format_name: percent
+#       format_version: '1.3'
+#       jupytext_version: 1.19.5
+#   kernelspec:
+#     display_name: Python 3
+#     language: python
+#     name: python3
+# ---
 
-Standalone training script (originally a jupytext `.py` of a notebook).
-Run directly: ``python dagger-nuance-distillation-kirchhoffnet.py`` after
-editing the path constants below to point at local teacher artifacts and
-data.
+# %% [markdown] papermill={"duration": 0.006957, "end_time": "2026-07-01T22:28:11.248628+00:00", "exception": false, "start_time": "2026-07-01T22:28:11.241671+00:00", "status": "completed"}
+#  # CTLE Inverse Design: Variant A (FP32/FP16 Baseline)
+#
+#
+#
+#  **Goal:** Train a compact 8-layer MLP that learns the inverse design policy from the teacher (RealNVP flow + ZIG critic).
+#
+#
+#
+#  **This variant:** FP32 baseline, no QAT. Same architecture as Variant B for comparison.
+#
+#
+#
+#  **Key design:**
+#
+#  - Bounded log-space outputs (sigmoid + scale per param)
+#
+#  - Regime-aware loss (zero-inflated and ceiling regions handled)
+#
+#  - Adaptive teacher labeling (tiered candidate budget)
+#
+#  - Huber imitation + ZIG forward-consistency + physics loss
 
-Goal: train an ODE-based KirchhoffNet student that learns the inverse
-design policy from the teacher (RealNVP flow + ZIG critic) using the full
-DAgger distillation loop.
-
-This variant uses the LOCAL KirchhoffNet codebase (an ODE-based fabric
-built via ``topology.build_net_from_config``), wrapped to provide the same
-``forward`` / ``predict`` / ``log_lo`` / ``log_hi`` API as the MLP student
-so the DAgger loop, RegimeAwareLoss, and StudentEvaluator work unchanged.
-
-Student architecture (configured via the ``KN_*`` constants below):
-- input scaling: per-dim log10 + min-max -> [-1, +1] (computed from the
-  empirical df with a 5% margin), rail-clamped to [-KN_INPUT_RAIL, +KN_INPUT_RAIL]
-  (= [-4, 4], matching the local x_max=4.0).
-- fabric: 3-stage KirchhoffNetWithIO built with small_world (k=4, p=0.2)
-  hidden topology, 23 hidden nodes per stage, edge_repeats=2, boundary
-  fan-out map tying each input terminal to specific hidden nodes,
-  temporal-readout appending 7 output ODE accumulators per stage.
-- circuit: FreeTanhLibrary edges per stage, non-programmable leak,
-  freeze_read, interstage activation "residual-relu-tanh".
-- output: gain/bias + tanh/relu residual branches of the 7 output-ODE
-  node voltages -> bounded via sigmoid + log_lo/log_hi buffers.
-
-Key design:
-- LocalKirchhoffStudentWrapper provides the MLP-compatible API
-  (forward / predict / log_lo / log_hi / scale_input /
-  get_bounded_output / count_params_by_component).
-- Regime-aware loss preserved: imitation + ZIG forward-consistency +
-  physics + invalid + manifold.
-- Adaptive teacher labeling (tiered candidate budget).
-- Huber imitation + ZIG forward-consistency + physics loss.
-"""
-
+# %% papermill={"duration": 0.014837, "end_time": "2026-07-01T22:28:11.269131+00:00", "exception": false, "start_time": "2026-07-01T22:28:11.254294+00:00", "status": "completed"}
 import os
-import sys
-import json
-import time
-import math
-import logging
-import subprocess
-import hashlib
-from functools import wraps
+# os.chdir('/home/annaik/Documents/train_ctle')
 
+TEACHER_DIR = '/kaggle/input/models/awekill/improved-zig-nf-spline/pytorch/default/1'
+DATA_DIR = '/kaggle/input/datasets/awekill/augmented-cvae-ctle'
+OUTPUT_DIR = '/kaggle/working/'
+
+
+# %% [markdown] papermill={"duration": 0.005545, "end_time": "2026-07-01T22:28:11.279866+00:00", "exception": false, "start_time": "2026-07-01T22:28:11.274321+00:00", "status": "completed"}
+#  ## Phase 1: Setup and Imports
+
+# %% papermill={"duration": 7.953187, "end_time": "2026-07-01T22:28:19.238321+00:00", "exception": false, "start_time": "2026-07-01T22:28:11.285134+00:00", "status": "completed"}
+import sys
+import math
+import json
 import joblib
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributions as dist
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler, Subset
-from sklearn.neighbors import NearestNeighbors
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 import matplotlib.pyplot as plt
 import warnings
+from sklearn.neighbors import NearestNeighbors
 warnings.filterwarnings('ignore')
 
-# Paths to edit for local runs (these default to Kaggle-mount paths).
-TEACHER_DIR = '/home/annaik/Documents/improved-zig-nf-spline-pytorch-default-v2/'
-DATA_DIR = '/home/annaik/Documents/augmented-cvae-ctle/'
-OUTPUT_DIR = '/home/annaik/Documents/dagger_output'
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+np.random.seed(42)
+torch.manual_seed(42)
 
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# ----------------------------------------------------------------------------
-# Checkpoint / resume helpers.
-#
-# Two complementary mechanisms:
-# 1. ``dagger_checkpoint.pt`` — a rolling, atomic checkpoint saved at the
-#    baseline (after initial dataset build) and at the end of every DAgger
-#    iteration. Contains full dataset, student/optimizer/scheduler state,
-#    histories, and RNG state. On startup it's loaded and the run resumes at
-#    ``dagger_iter = dagger_iter + 1`` from the latest checkpoint.
-# 2. ``initial_dataset_<hash>.pkl`` — a joblib cache of the ~20k-sample
-#    initial distillation dataset, keyed by a hash of the labeling-relevant
-#    hyperparams + df fingerprint. Consulted only on a *fresh* start (no
-#    checkpoint) so the most expensive single step is never re-run.
-#
-# A crash mid-iteration loses at most that one iteration (per the
-# iteration-end-only granularity choice); the dataset is only mutated at
-# iteration end, so there is no double-append risk on resume.
-# ----------------------------------------------------------------------------
-CHECKPOINT_PATH = os.path.join(OUTPUT_DIR, 'dagger_checkpoint.pt')
-_CKPT_VERSION = 1
-
-
-def _config_hash():
-    """sha256 over the labeling-relevant hyperparams + df fingerprint.
-
-    Hash inputs include the dataset-length bounds so a stale cache can never
-    be silently reused after the underlying historical CSV changes.
-    """
-    try:
-        df_n = int(len(df))
-    except Exception:
-        df_n = -1
-    try:
-        spec_cols = ['power', 'stage_2_jitter', 'stage_2_eye_max_height', 'stage_2_eye_max_width']
-        if 'df' in globals() and df_n > 0:
-            spec_log = np.log10(np.clip(df[spec_cols].values, 1e-12, None))
-            spec_min = np.round(spec_log.min(axis=0), 6).tolist()
-            spec_max = np.round(spec_log.max(axis=0), 6).tolist()
-        else:
-            spec_min, spec_max = [], []
-    except Exception:
-        spec_min, spec_max = [], []
-    payload = {
-        'N_EMPIRICAL_SAMPLES': N_EMPIRICAL_SAMPLES,
-        'N_CANDIDATES_INITIAL': N_CANDIDATES_INITIAL,
-        'BOUNDARY_RATIO': BOUNDARY_RATIO,
-        'N_CANDIDATES_PER_SPEC': N_CANDIDATES_PER_SPEC,
-        'N_CANDIDATES_BOUNDARY': N_CANDIDATES_BOUNDARY,
-        'np_seed': _NP_SEED,
-        'torch_seed': _TORCH_SEED,
-        'PARAM_COLS': list(PARAM_COLS),
-        'df_n': df_n,
-        'spec_min': spec_min,
-        'spec_max': spec_max,
-        'TEACHER_DIR': TEACHER_DIR,
-    }
-    h = hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode('utf-8')).hexdigest()
-    return h[:16]
-
-
-def _initial_dataset_cache_path():
-    return os.path.join(OUTPUT_DIR, f'initial_dataset_{_config_hash()}.pkl')
-
-
-def load_checkpoint():
-    """Load the latest checkpoint, returning ``None`` if missing or corrupt."""
-    if not os.path.exists(CHECKPOINT_PATH):
-        return None
-    try:
-        return torch.load(CHECKPOINT_PATH, map_location='cpu', weights_only=False)
-    except Exception as e:
-        _logger.warning(f"[CKPT] Failed to load checkpoint at {CHECKPOINT_PATH}: {e}; ignoring")
-        return None
-
-
-def save_checkpoint(ckpt):
-    """Atomically save checkpoint to ``CHECKPOINT_PATH`` (tmp + replace)."""
-    tmp = CHECKPOINT_PATH + '.tmp'
-    torch.save(ckpt, tmp)
-    os.replace(tmp, CHECKPOINT_PATH)
-
-
-def _capture_rng():
-    states = {
-        'np': np.random.get_state(),
-        'torch': torch.random.get_rng_state(),
-    }
-    if torch.cuda.is_available():
-        try:
-            states['torch_cuda'] = torch.cuda.get_rng_state_all()
-        except Exception:
-            states['torch_cuda'] = None
-    else:
-        states['torch_cuda'] = None
-    return states
-
-
-def _restore_rng(states):
-    if states is None:
-        return
-    try:
-        np.random.set_state(states['np'])
-    except Exception as e:
-        _logger.warning(f"[CKPT] Failed to restore numpy RNG state: {e}")
-    try:
-        torch.random.set_rng_state(states['torch'])
-    except Exception as e:
-        _logger.warning(f"[CKPT] Failed to restore torch RNG state: {e}")
-    cuda_states = states.get('torch_cuda')
-    if cuda_states is not None and torch.cuda.is_available():
-        try:
-            torch.cuda.set_rng_state_all(cuda_states)
-        except Exception as e:
-            _logger.warning(f"[CKPT] Failed to restore cuda RNG state: {e}")
-
-
-def _ckpt_baseline_payload(dagger_iter=0, converged=False):
-    """Build a baseline checkpoint dict (called after initial build + split)."""
-    payload = {
-        'format_version': _CKPT_VERSION,
-        'dagger_iter': int(dagger_iter),
-        'converged': bool(converged),
-        'student_state': student.state_dict(),
-        'optimizer_state': optimizer.state_dict(),
-        'scheduler_state': scheduler.state_dict(),
-        'dataset': list(distillation_dataset.data),
-        'train_indices': list(distillation_dataset._train_indices) if distillation_dataset._train_indices is not None else None,
-        'val_indices': list(distillation_dataset._val_indices) if distillation_dataset._val_indices is not None else None,
-        'hard_buffer_start_idx': int(distillation_dataset._hard_buffer_start_idx),
-        'hard_indices': list(distillation_dataset._hard_indices),
-        'dagger_history': {k: list(v) for k, v in dagger_history.items()},
-        'loss_history': {k: list(v) for k, v in loss_history.items()},
-        'rng': _capture_rng(),
-        'saved_at': time.strftime('%Y-%m-%d %H:%M:%S'),
-    }
-    if globals().get('COMMON_EVAL_SPECS') is not None:
-        payload['common_eval_specs'] = np.asarray(globals()['COMMON_EVAL_SPECS']).tolist()
-    return payload
-
-
-def _restore_dataset_from_ckpt(ckpt):
-    """Rebuild the DistillationDataset from a checkpoint and restore indices."""
-    distillation_dataset.data = list(ckpt['dataset'])
-    distillation_dataset._train_indices = list(ckpt['train_indices']) if ckpt['train_indices'] is not None else None
-    distillation_dataset._val_indices = list(ckpt['val_indices']) if ckpt['val_indices'] is not None else None
-    distillation_dataset._hard_buffer_start_idx = int(ckpt['hard_buffer_start_idx'])
-    distillation_dataset._hard_indices = list(ckpt['hard_indices'])
-    distillation_dataset._loader = None
-    distillation_dataset._val_loader = None
-
-
-def _restore_histories_from_ckpt(ckpt):
-    """Restore the dagger_history / loss_history dicts from a checkpoint.
-
-    Only updates keys that are present in the checkpoint payload so a
-    newer schema (extra metric) still gets its empty list from the
-    module-level initializers.
-    """
-    for hist_name, target in (('dagger_history', dagger_history), ('loss_history', loss_history)):
-        saved = ckpt.get(hist_name)
-        if not isinstance(saved, dict):
-            continue
-        for k, v in saved.items():
-            target[k] = list(v)
-
-
-def _restore_common_eval_specs_from_ckpt(ckpt):
-    """Restore the shared COMMON_EVAL_SPECS ndarray from a checkpoint, if present.
-
-    If the checkpoint has no ``common_eval_specs`` field (older schema or a
-    pre-existing checkpoint from before this change), leave the module-level
-    ``COMMON_EVAL_SPECS`` as the freshly-built value so the resume still
-    functions; only override when the field is present and well-formed.
-    """
-    if 'COMMON_EVAL_SPECS' not in globals():
-        return
-    saved = ckpt.get('common_eval_specs')
-    if saved is None:
-        return
-    try:
-        restored = np.asarray(saved, dtype=np.float32)
-    except Exception as e:
-        _logger.warning(f"[CKPT] Failed to restore common_eval_specs: {e}; keeping rebuilt set")
-        return
-    if restored.ndim != 2 or restored.shape[1] != 4:
-        _logger.warning(f"[CKPT] Restored common_eval_specs has unexpected shape "
-                        f"{restored.shape}; keeping rebuilt set")
-        return
-    globals()['COMMON_EVAL_SPECS'] = restored
-    _logger.info(f"[CKPT] Restored COMMON_EVAL_SPECS from checkpoint: "
-                 f"shape={restored.shape}")
-
-# Make the local KirchhoffNet codebase importable. This file lives in the
-# repo root, so adding the script directory is sufficient.
-_LOCAL_KIRCHHOFF_DIR = os.path.dirname(os.path.abspath(__file__))
-if _LOCAL_KIRCHHOFF_DIR not in sys.path:
-    sys.path.insert(0, _LOCAL_KIRCHHOFF_DIR)
-
-from config import SOLVER, VCA
-from cell_library import make_cell_library
-from topology import build_net_from_config
-from kirchhoff_net import format_parameter_breakdown
-
-
-
-_NP_SEED = 42
-_TORCH_SEED = 42
-
-np.random.seed(_NP_SEED)
-torch.manual_seed(_TORCH_SEED)
-
-DEVICE = torch.device('cuda', 0) if torch.cuda.is_available() else torch.device('cpu')
+import logging
+import time
+from functools import wraps
 
 _LOG_FMT = "%(asctime)s [%(levelname)s] %(message)s"
 _DATE_FMT = "%H:%M:%S"
-
-
-class _Tee:
-    """File-like stream that mirrors writes to an original stream and a log
-    file handle, flushing after every write so the log grows continuously
-    for live monitoring (e.g. `tail -f` / `Get-Content -Wait`).
-
-    Cross-platform: the log file is always UTF-8; console writes are
-    encoding-safe (replace on failure) so Windows cp1252 consoles and
-    redirected pipes never raise for non-ASCII chars (e.g. the `─`
-    literals at lines 1322 / 2197-2199 of this script).
-    """
-
-    def __init__(self, stream, log_fh):
-        self._stream = stream
-        self._log_fh = log_fh
-
-    def write(self, message):
-        try:
-            self._stream.write(message)
-        except UnicodeEncodeError:
-            enc = getattr(self._stream, "encoding", "ascii") or "ascii"
-            self._stream.write(
-                message.encode(enc, errors="replace").decode(enc, errors="replace")
-            )
-        try:
-            self._log_fh.write(message)
-            self._log_fh.flush()
-        except (ValueError, OSError):
-            pass
-        try:
-            self._stream.flush()
-        except (ValueError, OSError, AttributeError):
-            pass
-
-    def flush(self):
-        try:
-            self._log_fh.flush()
-        except (ValueError, OSError):
-            pass
-        try:
-            self._stream.flush()
-        except (ValueError, OSError, AttributeError):
-            pass
-
-    def isatty(self):
-        return bool(getattr(self._stream, "isatty", lambda: False)())
-
-    def fileno(self):
-        return self._stream.fileno()
-
-    @property
-    def encoding(self):
-        return getattr(self._stream, "encoding", None)
-
-    class _Buffer:
-        def __init__(self, tee):
-            self._tee = tee
-
-        def write(self, data):
-            if isinstance(data, (bytes, bytearray)):
-                try:
-                    msg = data.decode("utf-8", errors="replace")
-                except Exception:
-                    msg = data.decode("ascii", errors="replace")
-            else:
-                msg = data
-            self._tee.write(msg)
-            return len(data)
-
-        def flush(self):
-            self._tee.flush()
-
-    @property
-    def buffer(self):
-        return self._Buffer(self)
-
-
-_LOG_FILE = os.path.join(OUTPUT_DIR, "dagger_training.log")
-_log_fh = open(_LOG_FILE, "a", encoding="utf-8")
-sys.stdout = _Tee(sys.stdout, _log_fh)
-sys.stderr = _Tee(sys.stderr, _log_fh)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format=_LOG_FMT,
-    datefmt=_DATE_FMT,
-    force=True,
-    stream=sys.stderr,
-)
-_logger = logging.getLogger("ctle_dagger_kirchhoff")
-
-# Run-header banner: marks each run's block in the appended log file.
-try:
-    _git_commit = subprocess.check_output(
-        ["git", "rev-parse", "--short", "HEAD"],
-        stderr=subprocess.DEVNULL,
-    ).decode("utf-8", errors="replace").strip()
-except Exception:
-    _git_commit = None
-
-_logger.info("=" * 80)
-_logger.info(
-    f"=== Run started {time.strftime('%Y-%m-%d %H:%M:%S')} "
-    f"(pid {os.getpid()}, platform={sys.platform}) ==="
-)
-if _git_commit:
-    _logger.info(f"git_commit={_git_commit}")
-_logger.info(f"log_file={_LOG_FILE}")
-_logger.info("=" * 80)
+logging.basicConfig(level=logging.INFO, format=_LOG_FMT, datefmt=_DATE_FMT, force=True)
+_logger = logging.getLogger("ctle_dagger")
 
 class Timer:
     """Context manager for timing code blocks."""
@@ -410,115 +95,10 @@ class Timer:
     def __str__(self):
         return f"{self.elapsed:.1f}s" if self.elapsed is not None else "incomplete"
 
-
-def _log_hyperparameters():
-    """Emit a full per-run hyperparameter dump to the log file.
-
-    Both human-readable ``[CFG] name=value`` lines and one machine-readable
-    ``[CFG_JSON] {...}`` line are written so runs in the appended log file
-    can be eyeballed and programmatically diffed. Captures KN_INPUT_LOG_MIN/MAX
-    at call time (after the df-driven rebind) and the regime-aware loss
-    weights promoted to module-level constants.
-    """
-    _HYPERPARAMS = [
-        # --- Paths / runtime context ---
-        ("TEACHER_DIR", TEACHER_DIR),
-        ("DATA_DIR", DATA_DIR),
-        ("OUTPUT_DIR", OUTPUT_DIR),
-        ("DEVICE", str(DEVICE)),
-        ("dataset_rows", len(globals()["df"])) if "df" in globals() else ("dataset_rows", "n/a"),
-        # --- DAgger / training knobs ---
-        ("DAGGER_ITERATIONS", DAGGER_ITERATIONS),
-        ("EPOCHS_PER_ITER", EPOCHS_PER_ITER),
-        ("BATCH_SIZE", BATCH_SIZE),
-        ("ERROR_THRESHOLD", ERROR_THRESHOLD),
-        ("VALIDATION_SIZE", VALIDATION_SIZE),
-        ("BOUNDARY_RATIO", BOUNDARY_RATIO),
-        ("N_CANDIDATES_PER_SPEC", N_CANDIDATES_PER_SPEC),
-        ("N_CANDIDATES_BOUNDARY", N_CANDIDATES_BOUNDARY),
-        ("VALIDITY_THRESHOLD", VALIDITY_THRESHOLD),
-        ("DEGRADE_REL_THRESHOLD", DEGRADE_REL_THRESHOLD),
-        ("MIN_DEGRADED_DIMS", MIN_DEGRADED_DIMS),
-        ("LR_INITIAL", LR_INITIAL),
-        ("LR_DECAY_AFTER_ITER", LR_DECAY_AFTER_ITER),
-        ("LR_FLOOR", LR_FLOOR),
-        ("FAILURE_CAP_RATIO", FAILURE_CAP_RATIO),
-        ("CONVERGENCE_THRESHOLD", CONVERGENCE_THRESHOLD),
-        ("EARLYSTOP_EVAL_EVERY", EARLYSTOP_EVAL_EVERY),
-        ("EARLYSTOP_LOG_EVERY", EARLYSTOP_LOG_EVERY),
-        ("EARLYSTOP_SKIP_EPOCHS", EARLYSTOP_SKIP_EPOCHS),
-        ("EARLYSTOP_PATIENCE_EPOCHS", EARLYSTOP_PATIENCE_EPOCHS),
-        ("COMMON_EVAL_SIZE", COMMON_EVAL_SIZE),
-        ("COMMON_EVAL_SEED", COMMON_EVAL_SEED),
-        ("MIN_FAILURE_IMPROVEMENT", MIN_FAILURE_IMPROVEMENT),
-        ("DIVERGENCE_ABORT", DIVERGENCE_ABORT),
-        ("DIVERGENCE_MARGIN", DIVERGENCE_MARGIN),
-        ("DIVERGENCE_CONSEC_EVALS", DIVERGENCE_CONSEC_EVALS),
-        ("N_EMPIRICAL_SAMPLES", N_EMPIRICAL_SAMPLES),
-        ("N_CANDIDATES_INITIAL", N_CANDIDATES_INITIAL),
-        ("WEIGHT_DECAY", WEIGHT_DECAY),
-        ("LOSS_WEIGHT_EMPIRIC", LOSS_WEIGHT_EMPIRIC),
-        ("HARD_BUFFER_WEIGHT", HARD_BUFFER_WEIGHT),
-        ("BOUNDARY_ABS_TOLERANCES", BOUNDARY_ABS_TOLERANCES),
-        ("BOUNDARY_ABS_TOLERANCES_RELAXED", BOUNDARY_ABS_TOLERANCES_RELAXED),
-        # --- Regime-aware loss weights ---
-        ("ALPHA_SPEC", ALPHA_SPEC),
-        ("BETA_PHYS", BETA_PHYS),
-        ("GAMMA_MONO", GAMMA_MONO),
-        ("ALPHA_INVALID", ALPHA_INVALID),
-        ("K_MANIFOLD", K_MANIFOLD),
-        ("ALPHA_MANIFOLD", ALPHA_MANIFOLD),
-        ("WARMUP_EPOCHS", WARMUP_EPOCHS),
-        ("PER_TARGET_HURDLE", PER_TARGET_HURDLE),
-        # --- Local KirchhoffNet topology ---
-        ("KN_NUM_STAGES", KN_NUM_STAGES),
-        ("KN_NUM_HIDDEN", KN_NUM_HIDDEN),
-        ("KN_SMALL_WORLD_K", KN_SMALL_WORLD_K),
-        ("KN_SMALL_WORLD_P", KN_SMALL_WORLD_P),
-        ("KN_SMALL_WORLD_SEED", KN_SMALL_WORLD_SEED),
-        ("KN_EDGE_REPEATS", KN_EDGE_REPEATS),
-        ("KN_CELL_LIBRARY", KN_CELL_LIBRARY),
-        ("KN_LEAK_MODE", KN_LEAK_MODE),
-        ("KN_INTERSTAGE_ACTIVATION", KN_INTERSTAGE_ACTIVATION),
-        ("KN_FREEZE_READ", KN_FREEZE_READ),
-        ("KN_TEMPORAL_READOUT", KN_TEMPORAL_READOUT),
-        ("KN_BOUNDARY_FAN_OUT", KN_BOUNDARY_FAN_OUT),
-        ("KN_INPUT_RAIL", KN_INPUT_RAIL),
-        ("KN_X_MAX", KN_X_MAX),
-        ("KN_VCA", KN_VCA),
-        ("KN_VCA_RANK", KN_VCA_RANK if KN_VCA_RANK is not None else int(VCA["rank"])),
-        ("KN_VCA_CORE", KN_VCA_CORE),
-        ("KN_VCA_GATE_SHUNT", KN_VCA_GATE_SHUNT),
-        ("KN_VCA_SEPARATE_CORE_BUS", KN_VCA_SEPARATE_CORE_BUS),
-        ("KN_INPUT_LOG_PAD_FRAC", KN_INPUT_LOG_PAD_FRAC),
-        ("KN_INPUT_LOG_MIN", KN_INPUT_LOG_MIN),
-        ("KN_INPUT_LOG_MAX", KN_INPUT_LOG_MAX),
-        ("LOG_BOUNDS", LOG_BOUNDS),
-    ]
-
-    def _coerce(v):
-        if isinstance(v, np.ndarray):
-            return v.tolist()
-        return v
-
-    _logger.info("-" * 80)
-    _logger.info("[CFG] Run hyperparameters:")
-    _cfg_dict = {}
-    for _name, _val in _HYPERPARAMS:
-        _val_coerced = _coerce(_val)
-        _cfg_dict[_name] = _val_coerced
-        try:
-            _val_repr = json.dumps(_val_coerced, default=str)
-        except (TypeError, ValueError):
-            _val_repr = repr(_val_coerced)
-        _logger.info(f"[CFG] {_name}={_val_repr}")
-    _logger.info("[CFG_JSON] " + json.dumps(_cfg_dict, default=str))
-    _logger.info("-" * 80)
-
-
 _logger.info(f"Using device: {DEVICE}")
 
 
+# %% papermill={"duration": 0.01532, "end_time": "2026-07-01T22:28:19.260518+00:00", "exception": false, "start_time": "2026-07-01T22:28:19.245198+00:00", "status": "completed"}
 """
 ===========================================================
 HYPERPARAMETERS — edit all DAgger / training knobs here
@@ -538,42 +118,23 @@ MIN_DEGRADED_DIMS     = 2        # fail only when 2+ dimensions degrade meaningf
 LR_INITIAL            = 1e-3     # AdamW initial learning rate
 LR_DECAY_AFTER_ITER   = 3        # iteration index (0-based) after which LR *= 0.5
 LR_FLOOR             = 1e-4      # minimum LR during decay (was eta_min in scheduler)
-MAPPER_LR_SCALE       = 1.0      # I/O mapper + OutputAffine readout (base * 1.0)
-STRUCT_LR_SCALE       = 4.0      # structural core params: name.endswith('.z_logits')
-DYN_LR_SCALE          = 1.0      # sensitive dynamical params: raw_leak, raw_drive_g
 FAILURE_CAP_RATIO     = 0.40     # max new failures / existing dataset size per iter
 CONVERGENCE_THRESHOLD = 0.02     # early-stop if failure_rate < 2%
-# Best-model selection (plan dagger_knet_best_model_selection_improvement):
-# A SINGLE shared eval set is built once (COMMON_EVAL_SPECS) and used for both
-# per-epoch early-stop tracking AND the per-iteration "Validation failure rate"
-# report. Every iteration and every resume uses the *same* spec set, so the
-# per-iteration failure rates are directly comparable and monotone-improvement
-# can be enforced, not assumed.
+# Best-model selection (mirrors dagger-nuance-distillation-kirchhoffnet.py for apples-to-apples):
+# A SINGLE shared eval set (COMMON_EVAL_SPECS) is used for both per-epoch early-stop
+# tracking AND per-iteration validation reporting. Every iteration uses the *same* spec
+# set so the per-iteration rates are directly comparable.
 COMMON_EVAL_SIZE      = 2000      # size of the shared eval set
-COMMON_EVAL_SEED      = 24681012  # fixed seed; identical set across iterations + resumes
+COMMON_EVAL_SEED      = 24681012  # fixed seed; identical set across iterations
 EARLYSTOP_EVAL_EVERY  = 1         # evaluate failure rate every N epochs (1 = every epoch)
 EARLYSTOP_LOG_EVERY   = 10        # emit verbose earlystop log every N epochs
-EARLYSTOP_SKIP_EPOCHS = 5         # no best-tracking during the first N epochs of an
-                                  # iteration (prevents warm-started epoch-1 snapshot
-                                  # from winning immediately)
-EARLYSTOP_PATIENCE_EPOCHS = EPOCHS_PER_ITER  # effectively disables in-budget early
-                                              # stopping; loop always runs full budget
-MIN_FAILURE_IMPROVEMENT = 0.01    # absolute (1%) improvement required to accept a
-                                  # new within-iteration best over prev_failure_rate
-# Divergence abort (safety valve for the full-budget policy above): if training
-# catastrophically diverges (failure rate explodes far ABOVE the previous
-# iteration's baseline) for several consecutive evals, the rest of the budget
-# would be wasted — abort the iteration and let the carry-forward guardrail
-# restore the best/previous model. Never fires on normal noise: it requires a
-# large sustained REGRESSION, not merely a failure to improve.
-DIVERGENCE_ABORT          = True  # enable the mid-iteration divergence abort
-DIVERGENCE_MARGIN         = 0.20  # absolute failure-rate INCREASE over prev (20 pts)
-DIVERGENCE_CONSEC_EVALS   = 5     # consecutive above-margin evals before aborting
-
-# Module-level slot for the shared eval set (built lazily below the DAgger
-# hyperparameter block, before the training loop). Declared here so the
-# resume-from-checkpoint helper can overwrite it as soon as ckpt is loaded.
-COMMON_EVAL_SPECS = None
+EARLYSTOP_SKIP_EPOCHS = 5         # no best-tracking during first N epochs (warm-start guard)
+EARLYSTOP_PATIENCE_EPOCHS = EPOCHS_PER_ITER  # full budget; loop never cut short on patience
+MIN_FAILURE_IMPROVEMENT = 0.01    # absolute 1% improvement required to accept new best
+DIVERGENCE_ABORT          = True  # abort iteration early on large sustained regression
+DIVERGENCE_MARGIN         = 0.20  # absolute increase over prev (20 pts)
+DIVERGENCE_CONSEC_EVALS   = 5     # consecutive above-margin evals before abort
+COMMON_EVAL_SPECS = None          # built once before the DAgger loop
 N_EMPIRICAL_SAMPLES   = 20000    # initial empirical distillation samples (was 5000)
 N_CANDIDATES_INITIAL  = 5000     # candidates per spec for initial dataset build
 WEIGHT_DECAY          = 1e-4     # AdamW weight decay
@@ -592,83 +153,19 @@ BOUNDARY_ABS_TOLERANCES_RELAXED = {
     'power':  (0.003, 0.0005),
 }
 
-# ---------------------------------------------------------------
-# Regime-aware loss weights (used by RegimeAwareLoss + RampedRegimeLoss)
-# ---------------------------------------------------------------
-ALPHA_SPEC      = 1.5    # weight on L_spec (target-spec regression)
-BETA_PHYS       = 0.1    # weight on L_phys (power / RC physics priors)
-GAMMA_MONO      = 0.01   # weight on L_mono (monotonicity penalty)
-ALPHA_INVALID   = 1.5    # weight on L_invalid (invalid-zone penalty)
-K_MANIFOLD      = 5      # k-NN neighbor count for manifold regularization
-ALPHA_MANIFOLD  = 0.1    # weight on L_manifold (k-NN empirical pull)
-WARMUP_EPOCHS   = 5      # epochs over which L_spec/L_phys/L_invalid ramp from 0
-
-# ---------------------------------------------------------------
-# Local KirchhoffNet student topology
-# Replicates the friedman2 train_script.py preset with num_stages and
-# num_hidden tuned so the param count lands in the 5e3-6e3 target range.
-# ---------------------------------------------------------------
-KN_NUM_STAGES       = 4       # ODE circuit stages (3 tunes param count to ~5755 with out_dim=7)
-KN_NUM_HIDDEN       = 14      # hidden nodes per stage (>= max boundary fan-out target)
-KN_SMALL_WORLD_K    = 4       # Watts-Strogatz ring-lattice degree
-KN_SMALL_WORLD_P    = 0.2     # Watts-Strogatz rewiring probability
-KN_SMALL_WORLD_SEED = 1       # RNG seed for rewiring
-KN_EDGE_REPEATS     = 2       # parallel edges per unique hidden pair
-KN_CELL_LIBRARY     = "tanh_free"   # FreeTanhLibrary (per-edge tanh OTA)
-KN_LEAK_MODE        = "non-programmable"  # fixed leak_constant (config default 0.0486)
-KN_INTERSTAGE_ACTIVATION = "residual-relu-tanh"  # interstage StageTransfer activation
-KN_FREEZE_READ          = True      # precompute edge currents once from state (frozen OTA read core)
-KN_TEMPORAL_READOUT     = True      # append per-stage output ODE accumulators (temporal-readout readout)
-KN_BOUNDARY_FAN_OUT = '{"0": [2, 4], "1": [1, 3], "2": [12, 5], "3": [7, 9]}'  # 4 inputs -> 8 boundary edges
-KN_INPUT_RAIL       = 4.0     # clamp normalized input to [-KN_INPUT_RAIL, KN_INPUT_RAIL] (x_max=4.0)
-
-KN_X_MAX            = 4.0     # local knet rail (overrides PHYS["x_max"]=3.0 via build_net_from_config x_max kwarg)
-
-# VCA (Voltage-Controlled Amplifier) gating knobs — mirrored from train_script.py
-# argparse flags so the DAgger student matches the canonical train.py surface.
-# Identity-at-init is preserved: with --vca on, vca_W is zero-init and the
-# 2-sigma gate evaluates to 1.0 at step 0, so the VCA-off baseline behavior is
-# reproduced bit-for-bit at epoch 0 regardless of the chosen flags.
-KN_VCA                   = True  # --vca: enable low-rank input-driven VCA on boundary / temporal-readout edges
-KN_VCA_CORE              = True  # --vca-core: also gate core (hidden) edges (auto-enabled if no boundary / readout families)
-KN_VCA_GATE_SHUNT        = False  # --vca-gate-shunt: also gate parallel resistive shunt with the core VCA gate (input-dependent routing)
-KN_VCA_SEPARATE_CORE_BUS = True  # --vca-separate-core-bus: give core family its own vca_W_core projection (ablation)
-KN_VCA_RANK              = 2   # projection rank r; None -> config.VCA['rank'] (must be >= VCA['min_rank'])
-
-# Fallback per-dim log10 spec bounds used when historical data is unavailable.
-# Order: [power, jitter, height, width]. Rebound from df after data load below.
-KN_INPUT_LOG_MIN_DEFAULT = np.array([np.log10(1e-4), np.log10(1.0), np.log10(0.5), np.log10(1.0)], dtype=np.float32)
-KN_INPUT_LOG_MAX_DEFAULT = np.array([np.log10(1e-1), np.log10(1e3), np.log10(2e2), np.log10(5e2)], dtype=np.float32)
-KN_INPUT_LOG_MIN = KN_INPUT_LOG_MIN_DEFAULT
-KN_INPUT_LOG_MAX = KN_INPUT_LOG_MAX_DEFAULT
-KN_INPUT_LOG_PAD_FRAC = 0.05  # widen each bound by this fraction of the dim range
-
-
-LOG_BOUNDS = [-15.0, 8]
-
-# ── BO overrides for CTLE 4×100 proxy (kn_bayes_opt.py) ─────────────────────
-# Allows `python dagger-nuance-distillation-kirchhoffnet.py --dagger-iterations 4
-# --epochs-per-iter 100 ...` to override hyperparams without editing the file.
-# Unknown args are ignored so normal `python script.py` still uses defaults.
+# ── BO overrides for CTLE 4×100 proxy (mlp_bayes_opt.py) ─────────────────────
 try:
     import argparse as _argparse
     _bo_parser = _argparse.ArgumentParser(add_help=False)
     _bo_parser.add_argument('--dagger-iterations', type=int, default=None)
     _bo_parser.add_argument('--epochs-per-iter', type=int, default=None)
     _bo_parser.add_argument('--common-eval-size', type=int, default=None)
-    _bo_parser.add_argument('--common-eval-seed', type=int, default=None)
-    _bo_parser.add_argument('--kn-num-stages', type=int, default=None)
-    _bo_parser.add_argument('--kn-num-hidden', type=int, default=None)
-    _bo_parser.add_argument('--kn-small-world-k', type=int, default=None)
-    _bo_parser.add_argument('--kn-small-world-p', type=float, default=None)
-    _bo_parser.add_argument('--kn-vca-rank', type=int, default=None)
-    _bo_parser.add_argument('--kn-x-max', type=float, default=None)
-    _bo_parser.add_argument('--kn-gm-max', type=float, default=None)
-    _bo_parser.add_argument('--kn-isat-max', type=float, default=None)
-    _bo_parser.add_argument('--t-span', type=float, default=None)
-    _bo_parser.add_argument('--boundary-fan-out', type=str, default=None)
+    _bo_parser.add_argument('--moe-trunk-width', type=int, default=None)
+    _bo_parser.add_argument('--moe-trunk-layers', type=int, default=None)
+    _bo_parser.add_argument('--moe-num-experts', type=int, default=None)
     _bo_parser.add_argument('--lr', type=float, default=None)
     _bo_parser.add_argument('--weight-decay', type=float, default=None)
+    _bo_parser.add_argument('--batch-size', type=int, default=None)
     _bo_parser.add_argument('--output', type=str, default=None)
     _bo_parser.add_argument('--device', type=str, default=None)
     _bo_parser.add_argument('--seed', type=int, default=None)
@@ -677,53 +174,41 @@ try:
         DAGGER_ITERATIONS = _bo_args.dagger_iterations
     if _bo_args.epochs_per_iter is not None:
         EPOCHS_PER_ITER = _bo_args.epochs_per_iter
-        # keep early-stop patience consistent with new budget
         EARLYSTOP_PATIENCE_EPOCHS = EPOCHS_PER_ITER
     if _bo_args.common_eval_size is not None:
         COMMON_EVAL_SIZE = _bo_args.common_eval_size
-    if _bo_args.common_eval_seed is not None:
-        COMMON_EVAL_SEED = _bo_args.common_eval_seed
-    if _bo_args.kn_num_stages is not None:
-        KN_NUM_STAGES = _bo_args.kn_num_stages
-    if _bo_args.kn_num_hidden is not None:
-        KN_NUM_HIDDEN = _bo_args.kn_num_hidden
-    if _bo_args.kn_small_world_k is not None:
-        KN_SMALL_WORLD_K = _bo_args.kn_small_world_k
-    if _bo_args.kn_small_world_p is not None:
-        KN_SMALL_WORLD_P = _bo_args.kn_small_world_p
-    if _bo_args.kn_vca_rank is not None:
-        KN_VCA_RANK = _bo_args.kn_vca_rank
-    if _bo_args.kn_x_max is not None:
-        KN_X_MAX = _bo_args.kn_x_max
-    if _bo_args.boundary_fan_out is not None:
-        KN_BOUNDARY_FAN_OUT = _bo_args.boundary_fan_out
+    if _bo_args.moe_trunk_width is not None:
+        MOE_TRUNK_WIDTH = _bo_args.moe_trunk_width
+    if _bo_args.moe_trunk_layers is not None:
+        MOE_TRUNK_LAYERS = _bo_args.moe_trunk_layers
+    if _bo_args.moe_num_experts is not None:
+        MOE_NUM_EXPERTS = _bo_args.moe_num_experts
     if _bo_args.lr is not None:
         LR_INITIAL = _bo_args.lr
     if _bo_args.weight_decay is not None:
         WEIGHT_DECAY = _bo_args.weight_decay
+    if _bo_args.batch_size is not None:
+        BATCH_SIZE = _bo_args.batch_size
     if _bo_args.output is not None:
         OUTPUT_DIR = _bo_args.output
     if _bo_args.device is not None:
         DEVICE = torch.device(_bo_args.device) if _bo_args.device != 'auto' else DEVICE
     if _bo_args.seed is not None:
-        _NP_SEED = _bo_args.seed
-        _TORCH_SEED = _bo_args.seed
-        np.random.seed(_NP_SEED)
-        torch.manual_seed(_TORCH_SEED)
-    # t-span overrides SOLVER global (used in build_net_from_config via stage_t_span)
-    if _bo_args.t_span is not None:
-        try:
-            SOLVER["t_span"] = float(_bo_args.t_span)
-        except Exception:
-            pass
-    # kn-gm/isat overrides: applied via PARAM_LOG_BOUNDS if provided
-    if _bo_args.kn_gm_max is not None:
-        try:
-            pass  # handled via cell_library defaults; kept for CLI compat
-        except Exception:
-            pass
+        np.random.seed(_bo_args.seed)
+        torch.manual_seed(_bo_args.seed)
 except Exception as _e:
     _logger.warning(f"[BO] override parsing failed: {_e}")
+
+
+# %% papermill={"duration": 0.086574, "end_time": "2026-07-01T22:28:19.352706+00:00", "exception": false, "start_time": "2026-07-01T22:28:19.266132+00:00", "status": "completed"}
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.distributions as dist
+import joblib
+from pathlib import Path
+
+LOG_BOUNDS = [-15.0, 8]
 
 
 # =============================================================================
@@ -1051,6 +536,20 @@ class ActNorm(nn.Module):
             return y, -self.log_scale.sum()
 
 
+class Permute(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        perm = torch.arange(dim - 1, -1, -1)
+        self.register_buffer('perm', perm)
+        self.register_buffer('inv_perm', torch.argsort(perm))
+
+    def forward(self, x, cond=None, reverse=False):
+        if not reverse:
+            return x[:, self.perm], 0.0
+        else:
+            return x[:, self.inv_perm], 0.0
+
+
 class ConditionalSplineFlow(nn.Module):
     """
     Conditional Spline Flow matching trained ctle_conditional_flow.pt.
@@ -1307,6 +806,22 @@ class FlowInference:
 
         return best_phys, best_preds.cpu().numpy(), best_validity.cpu().numpy()
 
+    def _pred_specs_physical_from_scaled(self, pred_specs_scaled):
+        power_scaled = pred_specs_scaled[:, 0]
+        j_scaled = pred_specs_scaled[:, 1]
+        h_scaled = pred_specs_scaled[:, 2]
+        w_scaled = pred_specs_scaled[:, 3]
+        power_raw = 10 ** (power_scaled * self.scaler_y_p.scale_[0] + self.scaler_y_p.mean_[0])
+        j_raw = 10 ** (j_scaled * self._eye_scale_j)
+        h_raw = 10 ** (h_scaled * self._eye_scale_h)
+        w_raw = 10 ** (w_scaled * self._eye_scale_w)
+        if hasattr(power_raw, 'cpu'):
+            power_raw = power_raw.detach().cpu().numpy()
+            j_raw = j_raw.detach().cpu().numpy()
+            h_raw = h_raw.detach().cpu().numpy()
+            w_raw = w_raw.detach().cpu().numpy()
+        return np.stack([power_raw, j_raw, h_raw, w_raw], axis=1)
+
 
 def load_flow_inference(teacher_dir, device=None):
     """Load flow model, scalers, and ZIG wrapper for Q75 architecture."""
@@ -1393,9 +908,26 @@ class FlowTeacherLabeler:
         return params
 
 
-# ----------------------------------------------------------------------------
-# Load teacher artifacts (flow + ZIG).
-# ----------------------------------------------------------------------------
+
+# %% papermill={"duration": 0.01134, "end_time": "2026-07-01T22:28:19.369617+00:00", "exception": false, "start_time": "2026-07-01T22:28:19.358277+00:00", "status": "completed"}
+# Flow model already defined in Cell 4 above
+
+
+# %% [markdown] papermill={"duration": 0.005282, "end_time": "2026-07-01T22:28:19.380147+00:00", "exception": false, "start_time": "2026-07-01T22:28:19.374865+00:00", "status": "completed"}
+#  ## Phase 2: Load Teacher Artifacts
+
+# %% [markdown] papermill={"duration": 0.005216, "end_time": "2026-07-01T22:28:19.390715+00:00", "exception": false, "start_time": "2026-07-01T22:28:19.385499+00:00", "status": "completed"}
+#  ## Phase 3: Define ZIG Forward Model (Teacher Surrogate)
+
+# %% papermill={"duration": 0.010736, "end_time": "2026-07-01T22:28:19.406917+00:00", "exception": false, "start_time": "2026-07-01T22:28:19.396181+00:00", "status": "completed"}
+# ZIG model loaded above
+
+
+
+# %% [markdown] papermill={"duration": 0.005401, "end_time": "2026-07-01T22:28:19.417688+00:00", "exception": false, "start_time": "2026-07-01T22:28:19.412287+00:00", "status": "completed"}
+#  ## Phase 4: Load Scalers
+
+# %% papermill={"duration": 0.047013, "end_time": "2026-07-01T22:28:19.470172+00:00", "exception": false, "start_time": "2026-07-01T22:28:19.423159+00:00", "status": "completed"}
 # Parameter scaler — flow model (used for flow inference only)
 flow_scaler_X = joblib.load(os.path.join(TEACHER_DIR, 'flow_scaler_X.pkl'))
 scaler_X = flow_scaler_X
@@ -1419,7 +951,8 @@ eye_scale_w = float(zig_config['eye_scale_w'])
 eye_scale_j = float(zig_config['eye_scale_j'])
 PER_TARGET_HURDLE = bool(zig_config.get('per_target_hurdle', False))
 
-# ZIG-related code must use ZIG's own scalers, NOT flow's scalers.
+# ZIG-related functions (filter_by_zig_consistency, RegimeAwareLoss, compute_zig_score)
+# must use ZIG's own scalers, NOT flow's scalers.
 # Override globals: ZIG operations now use correct scalers.
 scaler_X = zig_scaler_X
 scaler_y_p = zig_scaler_y_p
@@ -1445,6 +978,8 @@ for name, flow_val, zig_val in [
         _logger.warning(f"  eye_scale_{name} differs between flow_scaler_C and zig_config")
 
 
+
+# %% papermill={"duration": 0.389838, "end_time": "2026-07-01T22:28:19.867008+00:00", "exception": false, "start_time": "2026-07-01T22:28:19.477170+00:00", "status": "completed"}
 # Load the trained HybridHurdleModel as ZIG
 zig_model = HybridHurdleModel(dropout=0.0, per_target=PER_TARGET_HURDLE).to(DEVICE)
 zig_model.load_state_dict(torch.load(os.path.join(TEACHER_DIR, 'hybrid_hurdle_ctle_model.pt'),
@@ -1455,9 +990,23 @@ for p in zig_model.parameters():
 _logger.info("HybridHurdleModel (ZIG) loaded from checkpoint")
 
 
-# ----------------------------------------------------------------------------
-# Output parameterization.
-# ----------------------------------------------------------------------------
+
+# %% [markdown] papermill={"duration": 0.006327, "end_time": "2026-07-01T22:28:19.879549+00:00", "exception": false, "start_time": "2026-07-01T22:28:19.873222+00:00", "status": "completed"}
+#  ## Phase 5: Define Spec Ranges and Output Bounds
+
+# %% papermill={"duration": 0.025777, "end_time": "2026-07-01T22:28:19.911524+00:00", "exception": false, "start_time": "2026-07-01T22:28:19.885747+00:00", "status": "completed"}
+# Spec ranges (from empirical ctle_ml_dataset.csv, 83k rows)
+SPEC_RANGES = {
+    'power': (0.0012, 0.012),
+    'stage_2_eye_max_height': (0.0, 88.4),
+    'stage_2_eye_max_width': (0.0, 98.5),
+    'stage_2_jitter': (1.57, 100.0),
+}
+
+# Input: [power, jitter, height, width]
+# These are the target specs we condition on
+SPEC_INPUT_COLS = ['power', 'stage_2_jitter', 'stage_2_eye_max_height', 'stage_2_eye_max_width']
+
 # Output: [fW, current, ind, Rd, Cs, Rs, VDD]
 PARAM_COLS = ['fW', 'current', 'ind', 'Rd', 'Cs', 'Rs', 'VDD']
 
@@ -1473,273 +1022,259 @@ PARAM_LOG_BOUNDS = {
     'VDD':  (np.log10(0.6),   np.log10(1.2)),     # [−0.22, 0.08]
 }
 
+def params_from_logits(logits, param_log_bounds=PARAM_LOG_BOUNDS):
+    """Convert bounded logits to physical parameter values."""
+    # logits: shape (..., 7), unbounded
+    # Apply sigmoid to get [0, 1]
+    probs = torch.sigmoid(logits)
+    
+    results = {}
+    for i, (name, (log_lo, log_hi)) in enumerate(param_log_bounds.items()):
+        log_val = log_lo + (log_hi - log_lo) * probs[..., i]
+        results[name] = torch.pow(10, log_val)
+    
+    return results
+
+def params_to_log_logits(params_dict, param_log_bounds=PARAM_LOG_BOUNDS):
+    """Convert physical params back to unbounded logits (for loss computation)."""
+    logits = []
+    for name, (log_lo, log_hi) in param_log_bounds.items():
+        log_val = torch.log10(torch.clamp(params_dict[name], min=1e-12))
+        # Invert: prob = (log_val - log_lo) / (log_hi - log_lo)
+        prob = (log_val - log_lo) / (log_hi - log_lo)
+        prob = torch.clamp(prob, 0.0, 1.0)
+        # Inverse sigmoid
+        logits.append(torch.logit(prob.clamp(1e-6, 1-1e-6)))
+    return torch.stack(logits, dim=-1)
+
 _logger.info("Parameter log bounds defined:")
 for k, v in PARAM_LOG_BOUNDS.items():
     _logger.info(f"  {k}: [{v[0]:.2f}, {v[1]:.2f}] -> [10^{v[0]:.1f}, 10^{v[1]:.1f}]")
 
 
+# %% [markdown] papermill={"duration": 0.007104, "end_time": "2026-07-01T22:28:19.926015+00:00", "exception": false, "start_time": "2026-07-01T22:28:19.918911+00:00", "status": "completed"}
+#  ## Phase 6: Define Student MLP Architecture
+
+# %% papermill={"duration": 0.037144, "end_time": "2026-07-01T22:28:19.970293+00:00", "exception": false, "start_time": "2026-07-01T22:28:19.933149+00:00", "status": "completed"}
 # =============================================================================
-# STUDENT MODEL: Local KirchhoffNet wrapper
+# STUDENT MODEL: Regime-Aware Mixture of Experts (MoE)
 # =============================================================================
-# Provides MLP-compatible API (forward / predict / log_lo / log_hi /
-# get_bounded_output / scale_input / count_params_by_component) so the
-# DAgger loop, RegimeAwareLoss, and StudentEvaluator work unchanged.
+# Hyperparameters — edit here to modify MoE architecture sizes
+MOE_TRUNK_WIDTH     = 44   # shared trunk hidden dimension (4 → trunk → trunk → trunk)
+MOE_TRUNK_LAYERS    = 3     # number of trunk layers (excluding input)
+MOE_NUM_EXPERTS     = 3     # number of localized experts (Interior, Boundary, High-Jitter/Power)
+MOE_TRUNK_ACTIVATION = nn.SiLU  # activation function for trunk layers (SiLU or GELU)
+MOE_USE_LAYERNORM   = False # LayerNorm in trunk (keep False — inputs already scaled)
 
-
-def _parse_boundary_fan_out(spec):
-    """Parse boundary fan-out JSON spec into a {input_index: [targets...]} dict.
-
-    Accepts either a JSON string (CLI-style) or an already-parsed dict.
+class RegimeAwareMoE(nn.Module):
     """
-    if isinstance(spec, dict):
-        return {int(k): list(v) for k, v in spec.items()}
-    parsed = json.loads(spec)
-    return {int(k): list(v) for k, v in parsed.items()}
-
-
-class LocalKirchhoffStudentWrapper(nn.Module):
-    """Wrapper around a local KirchhoffNetWithIO that exposes the same
-    `forward` / `predict` / `log_lo` / `log_hi` / `scale_input` API used by
-    the original MLP-based student. The local fabric is built via
-    ``topology.build_net_from_config`` using a small-world hidden topology,
-    boundary fan-out (input terminals wired to specific hidden nodes),
-    temporal-readout (each stage appends ``out_dim`` output-ODE accumulators
-    read out through a learnable ``OutputAffine`` layer), non-programmable
-    leak, freeze-read tanh contributions, and a residual-relu-tanh
-    interstage activation.
-
-    Forward:
-        specs (..., 4) raw physical units [power, jitter, height, width]
-            └─ scale_input(...)                                # log10 + per-dim min-max -> [-1, +1], clamp to [-rail, rail]
-                └─ KirchhoffNetWithIO (boundary-mode)          # input -> 4-dim boundary voltages
-                    └─ 3 ODE stages w/ interstage activation
-                        └─ OutputAffine -> logits (..., 7)
-        bounded via sigmoid + log_lo / log_hi buffers
+    Regime-Aware Mixture of Experts for CTLE inverse design.
+    
+    Input:  [power, jitter, height, width] (4 dims, raw physical units)
+    Output: logits for 7 params -> bounded via sigmoid + scale -> 10^value
+    
+    Architecture:
+        - Shared trunk: 3-layer MLP (width=64), SiLU, no LayerNorm
+        - Gating: input-driven Linear(4→3) + softmax → 3 expert weights
+        - 3 Localized experts: Linear(64→7) each
+        - Output: weighted combination of expert logits → bounded sigmoid output
+    
+    Size target: ~40k–60k total parameters
+    Drop-in replacement for BoundedMLP in RegimeAwareLoss / StudentEvaluator / DAgger loop.
     """
-
-    def __init__(self,
-                 num_stages: int = 3,
-                 num_hidden: int = 23,
-                 small_world_k: int = 4,
-                 small_world_p: float = 0.2,
-                 small_world_seed: int = 1,
-                 edge_repeats: int = 2,
-                 cell_library: str = "tanh_free",
-                 leak_mode: str = "non-programmable",
-                 interstage_activation: str = "residual-relu-tanh",
-                 freeze_read: bool = True,
-                 boundary_fan_out=None,
-                 enable_temporal_readout: bool = True,
-                 num_targets: int = 7,
-                 input_rail: float = KN_INPUT_RAIL,
-                 x_max: float = KN_X_MAX,
-                 param_log_bounds=None,
-                 input_log_min=None,
-                 input_log_max=None,
-                 stage_t_span: float | None = None,
-                 stage_num_steps: int | None = None,
-                 seed: int | None = None,
-                 vca_enabled: bool = False,
-                 vca_rank: int | None = None,
-                 vca_core_enabled: bool = False,
-                 vca_gate_shunt: bool = False,
-                 vca_separate_core_bus: bool = False):
+    def __init__(self, trunk_width=MOE_TRUNK_WIDTH, trunk_layers=MOE_TRUNK_LAYERS,
+                 num_experts=MOE_NUM_EXPERTS, param_log_bounds=PARAM_LOG_BOUNDS,
+                 activation=MOE_TRUNK_ACTIVATION, use_log_features=True):
         super().__init__()
-
-        if param_log_bounds is None:
-            param_log_bounds = PARAM_LOG_BOUNDS
-        if input_log_min is None:
-            input_log_min = KN_INPUT_LOG_MIN
-        if input_log_max is None:
-            input_log_max = KN_INPUT_LOG_MAX
-
-        self.num_stages = int(num_stages)
-        self.num_hidden = int(num_hidden)
-        self.small_world_k = int(small_world_k)
-        self.small_world_p = float(small_world_p)
-        self.small_world_seed = int(small_world_seed)
-        self.edge_repeats = int(edge_repeats)
-        self.cell_library = cell_library
-        self.leak_mode = leak_mode
-        self.interstage_activation = interstage_activation
-        self.freeze_read = bool(freeze_read)
-        self.boundary_fan_out = _parse_boundary_fan_out(boundary_fan_out)
-        self.enable_temporal_readout = bool(enable_temporal_readout)
-        self.num_targets = int(num_targets)
-        self.input_rail = float(input_rail)
-        self.x_max = float(x_max)
+        self.trunk_width = trunk_width
+        self.trunk_layers = trunk_layers
+        self.num_experts = num_experts
         self.param_log_bounds = param_log_bounds
+        self.activation = activation
+        self.use_log_features = use_log_features
 
-        self._seed = int(seed if seed is not None else small_world_seed)
+        input_dim = 4
+        trunk_input_dim = input_dim * 2 if use_log_features else input_dim
+        trunk_dims = [trunk_input_dim] + [trunk_width] * trunk_layers
 
-        # VCA gating (mirrors train_script.py --vca / --vca-core /
-        # --vca-gate-shunt / --vca-separate-core-bus / --vca-rank).
-        # Rank resolution mirrors train_script.py: explicit kwarg >
-        # config.VCA['rank']. Rank is only validated when vca_enabled=True
-        # (matches train_script.py:3393-3398); when vca_enabled=False the
-        # rank is unused and no validation is performed.
-        self.vca_enabled = bool(vca_enabled)
-        self.vca_rank = (
-            int(vca_rank) if vca_rank is not None else int(VCA["rank"])
-        )
-        if self.vca_enabled and self.vca_rank < VCA["min_rank"]:
-            raise ValueError(
-                f"vca_rank must be >= {VCA['min_rank']}, got {self.vca_rank}"
-            )
-        self.vca_core_enabled = bool(vca_core_enabled)
-        self.vca_gate_shunt = bool(vca_gate_shunt)
-        self.vca_separate_core_bus = bool(vca_separate_core_bus)
+        trunk_layers_list = []
+        for i in range(trunk_layers):
+            trunk_layers_list.append(nn.Linear(trunk_dims[i], trunk_dims[i+1]))
+            if MOE_USE_LAYERNORM:
+                trunk_layers_list.append(nn.LayerNorm(trunk_dims[i+1]))
+            trunk_layers_list.append(activation())
+        self.trunk = nn.Sequential(*trunk_layers_list)
 
+        self.gate = nn.Linear(trunk_input_dim, num_experts, bias=False)
+        self.regime_classifier = nn.Linear(trunk_input_dim, num_experts, bias=False)
 
-        self.register_buffer("input_log_min", torch.as_tensor(input_log_min, dtype=torch.float32))
-        self.register_buffer("input_log_max", torch.as_tensor(input_log_max, dtype=torch.float32))
+        self.experts = nn.ModuleList([
+            nn.Linear(trunk_width, 7) for _ in range(num_experts)
+        ])
 
-        # Bounded-output buffers.
-        self.log_lo = nn.Parameter(torch.zeros(num_targets), requires_grad=False)
-        self.log_hi = nn.Parameter(torch.zeros(num_targets), requires_grad=False)
+        self.log_lo = nn.Parameter(torch.zeros(7), requires_grad=False)
+        self.log_hi = nn.Parameter(torch.zeros(7), requires_grad=False)
         for i, (name, (lo, hi)) in enumerate(param_log_bounds.items()):
             self.log_lo.data[i] = lo
             self.log_hi.data[i] = hi
 
-        # Build the local KirchhoffNetWithIO via build_net_from_config.
-        t_span_stage = stage_t_span if stage_t_span is not None else SOLVER["t_span"] / num_stages
-        num_steps_stage = stage_num_steps if stage_num_steps is not None else max(1, int(round(SOLVER["num_steps"] / num_stages)))
-        cfg = {
-            "stages": [
-                {
-                    "num_inputs": 4,
-                    "num_hidden": num_hidden,
-                    "num_proj": 0,
-                    "num_outputs": 0,
-                    "hidden_family": "small_world",
-                    "hidden_kwargs": {
-                        "k": int(small_world_k),
-                        "p": float(small_world_p),
-                        "seed": int(small_world_seed),
-                        "bidirectional": False,
-                    },
-                    "input_pattern": "all_to_all",
-                    "output_pattern": "all_to_all",
-                    "proj_pattern": "all_to_all",
-                    "edge_repeats": int(edge_repeats),
-                    "t_span": float(t_span_stage),
-                    "num_steps": int(num_steps_stage),
-                }
-                for _ in range(num_stages)
-            ],
-            "out_dim": int(num_targets),
-            "write_mode": "sparse_proj",
-            "read_mode": "dense",
-            "use_robust_input": False,
-        }
-        cell_lib_template = make_cell_library(cell_library)
-        self.net = build_net_from_config(
-            cfg,
-            cell_lib=cell_lib_template,
-            leak_mode=leak_mode,
-            freeze_read=freeze_read,
-            interstage_activation=interstage_activation,
-            boundary_fan_out=self.boundary_fan_out,
-            enable_temporal_readout=enable_temporal_readout,
+        self.scaler_p_scale = flow_scaler_C['scaler_y_p'].scale_[0]
+        self.scaler_p_mean = flow_scaler_C['scaler_y_p'].mean_[0]
+        self._eye_scale_j = float(flow_scaler_C['eye_scale_j'])
+        self._eye_scale_h = float(flow_scaler_C['eye_scale_h'])
+        self._eye_scale_w = float(flow_scaler_C['eye_scale_w'])
 
-            x_max=self.x_max,
-            vca_enabled=self.vca_enabled,
-            vca_rank=self.vca_rank,
-            vca_core_enabled=self.vca_core_enabled,
-            vca_gate_shunt=self.vca_gate_shunt,
-            vca_separate_core_bus=self.vca_separate_core_bus,
-        )
-        self._state_dim = num_hidden
-        # local readout size is num_targets; the OutputAffine returns logits.
-        self._output_dim = int(num_targets)
+    def scale_input(self, x):
+        power_log = torch.log10(x[..., 0].clamp(min=1e-12))
+        power_scaled = (power_log - self.scaler_p_mean) / self.scaler_p_scale
+        jitter_scaled = torch.log10(x[..., 1].clamp(min=1e-12)) / self._eye_scale_j
+        height_scaled = torch.log10(x[..., 2].clamp(min=1e-12)) / self._eye_scale_h
+        width_scaled = torch.log10(x[..., 3].clamp(min=1e-12)) / self._eye_scale_w
+        linear_scaled = torch.stack([power_scaled, jitter_scaled, height_scaled, width_scaled], dim=-1)
+        if self.use_log_features:
+            log_scaled = torch.stack([power_log, torch.log10(x[..., 1].clamp(min=1e-12)),
+                                      torch.log10(x[..., 2].clamp(min=1e-12)),
+                                      torch.log10(x[..., 3].clamp(min=1e-12))], dim=-1)
+            return torch.cat([linear_scaled, log_scaled], dim=-1)
+        return linear_scaled
 
-    def scale_input(self, x: torch.Tensor) -> torch.Tensor:
-        """Per-dim log10 + min-max normalization for the 4 raw spec dims -> boundary voltages.
+    def get_regime_label(self, x):
+        h = self.scale_input(x)
+        target_h = x[..., 2]
+        target_w = x[..., 3]
+        target_j = x[..., 1]
+        target_p = x[..., 0]
+        regimes = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
+        regimes[(target_h >= 5) & (target_w >= 5) & (target_j <= 90) & (target_p >= 0.003)] = 0
+        regimes[(target_h < 5) | (target_w < 5)] = 1
+        regimes[(target_j > 90) | (target_p < 0.003)] = 2
+        return regimes
 
-        For each of [power, jitter, height, width]:
-            u_i = 2 * (log10(x_i) - input_log_min[i]) / (input_log_max[i] - input_log_min[i]) - 1
-        so the empirical range maps linearly to [-1, +1] (with a small margin
-        applied to ``input_log_min/max`` at data-load time). Log space preserves
-        relative resolution across the wide multi-decade raw spec ranges.
+    def forward(self, x, return_regime_loss=False):
+        x_s = self.scale_input(x)
+        h = self.trunk(x_s)
+        gate_weights = F.softmax(self.gate(x_s), dim=-1)
+        expert_outputs = torch.stack([expert(h) for expert in self.experts], dim=-1)
+        logits = (expert_outputs * gate_weights.unsqueeze(-2)).sum(dim=-1)
 
-        Result is rail-clamped to [-input_rail, +input_rail] (default 4.0) as a
-        compliance guard so the boundary OTA gates stay well below the rail.
-        """
-        eps = 1e-12
-        lo = self.input_log_min.to(x)
-        hi = self.input_log_max.to(x)
-        log_x = torch.log10(x.clamp(min=eps))
-        span = (hi - lo).clamp(min=1e-8)
-        u = 2.0 * (log_x - lo) / span - 1.0
-        return u.clamp(min=-self.input_rail, max=self.input_rail)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass through KirchhoffNetWithIO. Returns unbounded 7 logits.
-
-        Compatible with the MLP student API consumed by RegimeAwareLoss.
-        """
-        u = self.scale_input(x)
-        logits, _trajs = self.net(u, store_trajectory=False, solver="heun")
+        if return_regime_loss:
+            regime_labels = self.get_regime_label(x)
+            regime_logits = self.regime_classifier(x_s)
+            regime_loss = F.cross_entropy(regime_logits, regime_labels)
+            return logits, regime_loss
         return logits
 
-    def predict(self, x: torch.Tensor) -> dict:
-        """Returns dict of physical params (10**bounded_log) for the 7 targets."""
+    def predict(self, x):
         logits = self.forward(x)
         probs = torch.sigmoid(logits)
         results = {}
         for i, name in enumerate(self.param_log_bounds.keys()):
             log_val = self.log_lo[i] + (self.log_hi[i] - self.log_lo[i]) * probs[..., i]
-            results[name] = torch.pow(10.0, log_val)
+            results[name] = torch.pow(10, log_val)
         return results
 
-    def get_bounded_output(self, x: torch.Tensor):
-        """Returns (logits, bounded_log (...,7), physical_params (dict))."""
+    def get_bounded_output(self, x):
         logits = self.forward(x)
         probs = torch.sigmoid(logits)
         bounded_log = self.log_lo.unsqueeze(0) + (self.log_hi.unsqueeze(0) - self.log_lo.unsqueeze(0)) * probs
-        physical = {name: torch.pow(10.0, bounded_log[:, i])
-                    for i, name in enumerate(self.param_log_bounds.keys())}
+        physical = {name: torch.pow(10, bounded_log[:, i]) for i, name in enumerate(self.param_log_bounds.keys())}
         return logits, bounded_log, physical
 
     def extra_repr(self):
-        return (f"num_stages={self.num_stages}, num_hidden={self.num_hidden}, "
-                f"cell_library={self.cell_library}, leak_mode={self.leak_mode}, "
-                f"freeze_read={self.freeze_read}, "
-                f"interstage_activation={self.interstage_activation}, "
-                f"temporal_readout={self.enable_temporal_readout}, "
-                f"vca_enabled={self.vca_enabled}, vca_rank={self.vca_rank}, "
-                f"vca_core={self.vca_core_enabled}, "
-                f"vca_gate_shunt={self.vca_gate_shunt}, "
-                f"vca_separate_core_bus={self.vca_separate_core_bus}, "
-                f"out_dim={self._output_dim}")
+        return (f"trunk_width={self.trunk_width}, trunk_layers={self.trunk_layers}, "
+                f"num_experts={self.num_experts}")
 
-    def count_params_by_component(self):
-        """Return ``{encoder, circuit, projector, total}`` param counts.
 
-        Maps the local knet's :meth:`parameter_breakdown` groups onto the
-        ``encoder / circuit / projector / total`` schema the DAgger
-        diagnostics expect.
+class BoundedMLP(nn.Module):
+    """Compact MLP with bounded log-space outputs for CTLE inverse design.
+    
+    Input: [power, jitter, height, width] (4 dims)
+    Output: logits for 7 params -> bounded via sigmoid + scale -> 10^value
+    """
+    def __init__(self, hidden_dim=128, num_layers=4, 
+                 input_dim=4, output_dim=7,
+                 param_log_bounds=PARAM_LOG_BOUNDS,
+                 use_per_output_heads=False):
+        super().__init__()
+        self.param_log_bounds = param_log_bounds
+        self.use_per_output_heads = use_per_output_heads
+        
+        layers = []
+        dims = [input_dim] + [hidden_dim] * num_layers
+        for i in range(num_layers):
+            layers.extend([
+                nn.Linear(dims[i], dims[i+1]),
+                nn.GELU(),
+                nn.LayerNorm(dims[i+1]),
+            ])
+        self.backbone = nn.Sequential(*layers)
+        
+        if use_per_output_heads:
+            self.heads = nn.ModuleList([nn.Linear(hidden_dim, 1) for _ in range(output_dim)])
+        else:
+            self.head = nn.Linear(hidden_dim, output_dim)
+        
+        self.log_lo = nn.Parameter(torch.zeros(output_dim), requires_grad=False)
+        self.log_hi = nn.Parameter(torch.zeros(output_dim), requires_grad=False)
+        
+        for i, (name, (lo, hi)) in enumerate(param_log_bounds.items()):
+            self.log_lo.data[i] = lo
+            self.log_hi.data[i] = hi
+        
+        self.scaler_p_scale = flow_scaler_C['scaler_y_p'].scale_[0]
+        self.scaler_p_mean = flow_scaler_C['scaler_y_p'].mean_[0]
+        self._eye_scale_j = float(flow_scaler_C['eye_scale_j'])
+        self._eye_scale_h = float(flow_scaler_C['eye_scale_h'])
+        self._eye_scale_w = float(flow_scaler_C['eye_scale_w'])
+    
+    def scale_input(self, x):
         """
-        bd = self.net.parameter_breakdown()
-        groups = bd.get("groups", {})
-        total = bd.get("total", 0)
-        per_stage = bd.get("per_stage", {})
-        encoder = int(groups.get("input_mapper", 0))
-        projector = int(groups.get("output_mapper", 0)) + int(groups.get("skip_linear", 0))
-        drive = int(groups.get("drive_mappers", 0))
-        circuit = int(total) - encoder - projector - drive
-        return {
-            "encoder": encoder,
-            "circuit": circuit,
-            "projector": projector,
-            "total": int(total),
-        }
+        Scale input specs [power, jitter, height, width] using Q75 condition scaling.
+        - power: StandardScaler on log10(power)
+        - jitter/height/width: Q75 (log10(raw) / eye_scale)
+        """
+        power_log = torch.log10(x[..., 0].clamp(min=1e-12))
+        power_scaled = (power_log - self.scaler_p_mean) / self.scaler_p_scale
+        jitter_scaled = torch.log10(x[..., 1].clamp(min=1e-12)) / self._eye_scale_j
+        height_scaled = torch.log10(x[..., 2].clamp(min=1e-12)) / self._eye_scale_h
+        width_scaled = torch.log10(x[..., 3].clamp(min=1e-12)) / self._eye_scale_w
+        return torch.stack([power_scaled, jitter_scaled, height_scaled, width_scaled], dim=-1)
+
+    def forward(self, x):
+        """Forward pass. Returns unbounded logits."""
+        x = self.scale_input(x)
+        h = self.backbone(x)
+        if self.use_per_output_heads:
+            logits = torch.cat([head(h) for head in self.heads], dim=-1)
+        else:
+            logits = self.head(h)
+        return logits
+    
+    def predict(self, x):
+        """Forward pass with bounded output. Returns physical param dict."""
+        logits = self.forward(x)
+        probs = torch.sigmoid(logits)
+        results = {}
+        for i, name in enumerate(self.param_log_bounds.keys()):
+            log_val = self.log_lo[i] + (self.log_hi[i] - self.log_lo[i]) * probs[..., i]
+            results[name] = torch.pow(10, log_val)
+        return results
+
+    def get_bounded_output(self, x):
+        """Returns (logits, bounded_log_values, physical_params)."""
+        logits = self.forward(x)
+        probs = torch.sigmoid(logits)
+        bounded_log = self.log_lo.unsqueeze(0) + (self.log_hi.unsqueeze(0) - self.log_lo.unsqueeze(0)) * probs
+        physical = {name: torch.pow(10, bounded_log[:, i]) for i, name in enumerate(self.param_log_bounds.keys())}
+        return logits, bounded_log, physical
 
 
-# ----------------------------------------------------------------------------
-# Load historical data to get spec distributions.
-# ----------------------------------------------------------------------------
-history_dir = DATA_DIR
+# %% papermill={"duration": 0.390682, "end_time": "2026-07-01T22:28:20.367544+00:00", "exception": false, "start_time": "2026-07-01T22:28:19.976862+00:00", "status": "completed"}
+# Load historical data to get spec distributions
+# import zipfile
+
+CSV_PATHS = []
+history_dir = '/kaggle/input/datasets/awekill/augmented-cvae-ctle'
 
 csv_files = [
     'dataset_log_part_1_may3.csv', 'dataset_log_part_1_may4.csv',
@@ -1752,6 +1287,8 @@ csv_files = [
     'dataset_log_march12.csv','dataset_log_may_18.csv'
 ]
 
+# # Try loading from the backup zip
+# backup_zip = os.path.join(history_dir, 'history_csvs_backup.zip')
 dfs = []
 for fname in csv_files:
     fpath = os.path.join(history_dir, fname)
@@ -1767,6 +1304,7 @@ _logger.info(f"Total rows: {len(combined)}")
 _logger.info(f"Columns: {list(combined.columns)[:10]}...")
 
 
+# %% papermill={"duration": 0.046427, "end_time": "2026-07-01T22:28:20.421150+00:00", "exception": false, "start_time": "2026-07-01T22:28:20.374723+00:00", "status": "completed"}
 # Map column names from history CSV to our naming
 COL_MAPPING = {
     'eye_maxHeight_norm Vout_2 56G': 'stage_2_eye_max_height',
@@ -1795,34 +1333,62 @@ for col in ['power', 'stage_2_eye_max_height', 'stage_2_eye_max_width', 'stage_2
     _logger.info(f"{col}: n={len(nz)}, min={nz.min():.4f}, max={nz.max():.4f}, median={nz.median():.4f}")
 
 
-# Rebind KN_INPUT_LOG_MIN/MAX from the empirical spec distributions so
-# log10 + min-max -> [-1, 1] covers the full data range with small margin.
-if len(df) > 0:
-    _spec_log = np.log10(np.clip(
-        df[['power', 'stage_2_jitter', 'stage_2_eye_max_height', 'stage_2_eye_max_width']].values,
-        1e-12, None,
-    ))
-    _lo = _spec_log.min(axis=0)
-    _hi = _spec_log.max(axis=0)
-    _pad = KN_INPUT_LOG_PAD_FRAC * np.maximum(_hi - _lo, 1e-8)
-    KN_INPUT_LOG_MIN = (_lo - _pad).astype(np.float32)
-    KN_INPUT_LOG_MAX = (_hi + _pad).astype(np.float32)
-    for _i, _name in enumerate(['power', 'jitter', 'height', 'width']):
-        _logger.info(
-            f"KN input log bound [{_name}]: "
-            f"[{10 ** KN_INPUT_LOG_MIN[_i]:.4e}, {10 ** KN_INPUT_LOG_MAX[_i]:.4e}] "
-            f"(log10 [{KN_INPUT_LOG_MIN[_i]:.3f}, {KN_INPUT_LOG_MAX[_i]:.3f}])"
-        )
+# %% [markdown] papermill={"duration": 0.0067, "end_time": "2026-07-01T22:28:20.434866+00:00", "exception": false, "start_time": "2026-07-01T22:28:20.428166+00:00", "status": "completed"}
+#  ## Phase 8: Implement Teacher Inference (Canonical Labeling)
+
+# %% papermill={"duration": 0.014828, "end_time": "2026-07-01T22:28:20.456337+00:00", "exception": false, "start_time": "2026-07-01T22:28:20.441509+00:00", "status": "completed"}
+def compute_zig_score(params_log, zig_model, scaler_X, target_specs,
+                         eye_scale_h, eye_scale_w, eye_scale_j, scaler_y_p):
+    """
+    Compute ZIG-based score for a candidate parameter set using Q75 scaler structure.
+
+    HybridHurdleModel outputs:
+      pred_h_soft, pred_w_soft, pred_j_soft: already in physical units (p_valid * expm1(log1p_pred))
+      mu_power: StandardScaler on log10(power) — needs StandardScaler inverse
+
+    Returns dict with predicted physical specs and validity score.
+    """
+    x_scaled = scaler_X.transform(params_log)
+    x_tensor = torch.from_numpy(x_scaled.astype(np.float32)).to(DEVICE)
+
+    with torch.no_grad():
+        out = zig_model(x_tensor)
+
+    # pred_h_soft/pred_w_soft/pred_j_soft are already in physical units (expm1 applied in model)
+    pred_h = out['pred_h_soft'].cpu().numpy()
+    pred_w = out['pred_w_soft'].cpu().numpy()
+    pred_j = out['pred_j_soft'].cpu().numpy()
+
+    # Power: StandardScaler inverse on log10 scale
+    power_scaled = out['mu_power'].cpu().numpy() * scaler_y_p.scale_[0] + scaler_y_p.mean_[0]
+    pred_p = 10 ** power_scaled
+
+    # Validity: product of per-metric validity probabilities
+    validity = out['p_valid'].cpu().numpy()
+
+    return {
+        'pred_height': pred_h,
+        'pred_width': pred_w,
+        'pred_jitter': pred_j,
+        'pred_power': pred_p,
+        'validity': validity,
+    }
 
 
-# ----------------------------------------------------------------------------
-# Build distillation dataset with adaptive labeling.
+
+# %% [markdown] papermill={"duration": 0.006865, "end_time": "2026-07-01T22:28:20.470365+00:00", "exception": false, "start_time": "2026-07-01T22:28:20.463500+00:00", "status": "completed"}
+#  ## Phase 9: Build Distillation Dataset with Adaptive Labeling
+
+# %% papermill={"duration": 0.02605, "end_time": "2026-07-01T22:28:20.503196+00:00", "exception": false, "start_time": "2026-07-01T22:28:20.477146+00:00", "status": "completed"}
+# Phase 9: Build Distillation Dataset with Flow-Generated Canonical Labels
+#
+# TWO-PHASE TRAINING:
+#   Phase 1 (primary):   Train on flow-generated canonical labels via FlowTeacherLabeler
+#   Phase 2 (fine-tune): Fine-tune on empirical data with tunable weight λ_fine
 #
 # The flow generates diverse candidates for each target spec, ZIG ranks them,
-# and the best (canonical) candidate becomes the distillation label. Target
-# specs are sampled from the empirical distribution to preserve spec-space
-# coverage.
-# ----------------------------------------------------------------------------
+# and the best (canonical) candidate becomes the distillation label.
+# Target specs are still sampled from empirical distribution (preserves spec-space coverage).
 
 def sample_target_specs(df, n_samples, boundary_ratio=0.3):
     """Sample target specs with priority on boundary cases.
@@ -1860,6 +1426,76 @@ def sample_target_specs(df, n_samples, boundary_ratio=0.3):
         })
     
     return targets
+
+def is_boundary_case(specs):
+    """Identify if a target spec is a boundary case needing Cadence validation."""
+    if specs['height'] < 5 or specs['width'] < 5:
+        return True
+    if specs['jitter'] > 90:
+        return True
+    if specs['power'] > 0.011:
+        return True
+    return False
+
+def create_blended_distillation_dataset(df, teacher_labeler=None, n_samples=5000, n_candidates=5000,
+                                        boundary_ratio=0.3, tolerance=0.05):
+    """
+    Creates a dataset where labels are either:
+    - empirical (real) parameters if a noisy spec matches an existing design within `tolerance`,
+    - otherwise flow-generated canonical parameters.
+
+    tolerance: relative tolerance (e.g., 0.05 = 5%) in each spec dimension.
+    """
+
+    if teacher_labeler is None:
+        teacher_labeler = FlowTeacherLabeler(TEACHER_DIR, DEVICE)
+    
+    # 1. Sample target specs (clean) from empirical distribution
+    targets = sample_target_specs(df, n_samples, boundary_ratio)
+    
+    # 2. Build nearest-neighbor index on empirical specs (log10 transformed for relative distances)
+    emp_specs = df[['power', 'stage_2_jitter', 'stage_2_eye_max_height', 
+                    'stage_2_eye_max_width']].values.copy()
+    # Convert to log space so that relative differences become absolute differences
+    emp_specs_log = np.log10(emp_specs + 1e-12)
+    nn = NearestNeighbors(n_neighbors=1, metric='chebyshev')
+    nn.fit(emp_specs_log)
+    
+    # 3. For each target, apply noise and decide label source
+    data_list = []
+    for i, t in enumerate(targets):
+        # Generate noisy specs (same as in original create_flow_distillation_dataset)
+        noisy_power = t['power'] * np.random.uniform(0.95, 1.05)
+        noisy_height = t['height'] * np.random.uniform(0.9, 1.1) if t['height'] > 1 else np.random.uniform(0, 2)
+        noisy_width = t['width'] * np.random.uniform(0.9, 1.1) if t['width'] > 1 else np.random.uniform(0, 2)
+        noisy_jitter = np.clip(t['jitter'] * np.random.uniform(0.95, 1.05), 1.57, 100)
+        noisy_specs = np.array([noisy_power, noisy_jitter, noisy_height, noisy_width])
+        
+        # Convert noisy specs to log10 space and query nearest empirical point
+        noisy_specs_log = np.log10(noisy_specs + 1e-12)
+        distances, indices = nn.kneighbors(noisy_specs_log.reshape(1, -1))
+        # Chebyshev distance in log space = max relative difference in original space
+        if distances[0, 0] < tolerance:
+            # Close match → use empirical parameters (physical values)
+            row = df.iloc[indices[0, 0]]
+            params = row[PARAM_COLS].values
+        else:
+            # No close match → use flow teacher
+            params = teacher_labeler.label_single(noisy_specs, n_candidates=n_candidates,
+                                                  valid_threshold=0.9, top_k=1)
+            params = params[0]  # label_single with top_k=1 returns (1,7)
+        
+        data_list.append({
+            'power': noisy_specs[0],
+            'height': noisy_specs[2],
+            'width': noisy_specs[3],
+            'jitter': noisy_specs[1],
+            'params': params,
+        })
+    
+    _logger.info(f"Blended distillation dataset: {len(data_list)} samples "
+                 f"(empirical matches used where distance < {tolerance})")
+    return data_list
 
 def create_flow_distillation_dataset(df, n_samples=10000, n_candidates=5000,
                                     boundary_ratio=0.3, teacher_labeler=None):
@@ -1912,9 +1548,11 @@ def create_flow_distillation_dataset(df, n_samples=10000, n_candidates=5000,
     return data_list
 
 
-# ----------------------------------------------------------------------------
-# Regime-aware loss function.
-# ----------------------------------------------------------------------------
+
+# %% [markdown] papermill={"duration": 0.006736, "end_time": "2026-07-01T22:28:20.516495+00:00", "exception": false, "start_time": "2026-07-01T22:28:20.509759+00:00", "status": "completed"}
+#  ## Phase 10: Regime-Aware Loss Function
+
+# %% papermill={"duration": 0.034162, "end_time": "2026-07-01T22:28:20.558452+00:00", "exception": false, "start_time": "2026-07-01T22:28:20.524290+00:00", "status": "completed"}
 def huber_loss(pred, target, delta=1.0):
     """Huber loss - robust to outliers."""
     diff = torch.abs(pred - target)
@@ -2098,9 +1736,36 @@ class RegimeAwareLoss(nn.Module):
 _logger.info("Regime-aware loss defined (Q75 + HybridHurdleModel)")
 
 
-# ----------------------------------------------------------------------------
-# Dataset and DataLoader.
-# ----------------------------------------------------------------------------
+
+# %% [markdown] papermill={"duration": 0.007029, "end_time": "2026-07-01T22:28:20.572530+00:00", "exception": false, "start_time": "2026-07-01T22:28:20.565501+00:00", "status": "completed"}
+#  ## Phase 11: Dataset and DataLoader
+
+# %% papermill={"duration": 0.054051, "end_time": "2026-07-01T22:28:20.633411+00:00", "exception": false, "start_time": "2026-07-01T22:28:20.579360+00:00", "status": "completed"}
+def check_label_quality(teacher_labeler, specs, zig, scaler_X, threshold=0.10):
+    params = teacher_labeler.label_batch(specs, n_candidates=3000, top_k=1).squeeze(1)
+    params_log = np.log10(np.clip(params, 1e-12, None))
+    x_scaled = scaler_X.transform(params_log)
+    x_t = torch.from_numpy(x_scaled.astype(np.float32)).to(DEVICE)
+    with torch.no_grad():
+        out = zig(x_t)
+
+    pred_power = 10**(out['mu_power'].cpu().numpy() * scaler_y_p.scale_ + scaler_y_p.mean_)
+    pred_h = out['pred_h_soft'].cpu().numpy()   # already physical
+    pred_w = out['pred_w_soft'].cpu().numpy()
+    pred_j = out['pred_j_soft'].cpu().numpy()
+
+    target_p = specs[:, 0]; target_j = specs[:, 1]
+    target_h = specs[:, 2]; target_w = specs[:, 3]
+
+    err_p = np.abs(pred_power - target_p) / np.maximum(target_p, 1e-6)
+    err_h = np.abs(pred_h - target_h) / np.maximum(target_h, 1e-6)
+    err_w = np.abs(pred_w - target_w) / np.maximum(target_w, 1e-6)
+    err_j = np.abs(pred_j - target_j) / np.maximum(target_j, 1e-6)
+    max_err = np.maximum.reduce([err_p, err_h, err_w, err_j])
+    fail = max_err > threshold
+    return fail.mean(), max_err, params
+
+
 class DistillationDataset(Dataset):
     """Rolling distillation dataset that grows via DAgger iterations.
 
@@ -2294,19 +1959,134 @@ class StudentEvaluator:
                    'degraded_dims': metric_dict['degraded_dims'],
                    'failure_mask': failure_mask,
                    'invalid_mask': invalid_mask,
-                   'p_valid': p_valid.detach().cpu().numpy(),
-                   'probs': probs.detach().cpu().numpy(),
-                   'logits': logits.detach().cpu().numpy()}
+                   'p_valid': p_valid.detach().cpu().numpy()}
         return failure_mask, metrics
+
+    def identify_failures_relaxed(self, val_specs, threshold=1.0):
+        """Compatibility wrapper for the adaptive validity-first metric."""
+        self.student.eval()
+
+        with torch.no_grad():
+            specs_t = torch.from_numpy(val_specs).float().to(self.device)
+            logits = self.student(specs_t)
+            probs = torch.sigmoid(logits)
+            log_lo = self.student.log_lo.unsqueeze(0)
+            log_hi = self.student.log_hi.unsqueeze(0)
+            bounded_log = log_lo + (log_hi - log_lo) * probs
+
+            x_mean_t = torch.from_numpy(self._scaler_X_mean).to(self.device)
+            x_scale_t = torch.from_numpy(self._scaler_X_scale).to(self.device)
+            x_scaled = (bounded_log - x_mean_t) / (x_scale_t + 1e-8)
+            x_scaled = torch.clamp(x_scaled, -10.0, 10.0)
+
+            out = self.zig(x_scaled)
+
+            pred_h = out['pred_h_soft'].clamp(min=1e-12, max=1e12)
+            pred_w = out['pred_w_soft'].clamp(min=1e-12, max=1e12)
+            pred_j = out['pred_j_soft'].clamp(min=1e-12, max=1e12)
+            power_scaled = out['mu_power'] * self._scaler_y_p_scale + self._scaler_y_p_mean
+            pred_p = torch.clamp(10.0 ** power_scaled, 1e-12, 1e12)
+            if 'p_valid' in out:
+                p_valid = out['p_valid'].clamp(1e-6, 1.0 - 1e-6)
+            else:
+                p_valid = (out['p_valid_h'] * out['p_valid_w'] * out['p_valid_j']).clamp(1e-6, 1.0 - 1e-6)
+
+            pred_specs = np.stack([
+                pred_p.detach().cpu().numpy(),
+                pred_j.detach().cpu().numpy(),
+                pred_h.detach().cpu().numpy(),
+                pred_w.detach().cpu().numpy(),
+            ], axis=1)
+            metric_dict = compute_forward_errors_relaxed(pred_specs, val_specs)
+            all_errors = np.stack([
+                metric_dict['err_p'],
+                metric_dict['err_j'],
+                metric_dict['err_h'],
+                metric_dict['err_w'],
+            ], axis=1)
+            nan_mask = np.isnan(all_errors).any(axis=1) | np.isnan(pred_specs).any(axis=1)
+            invalid_mask = p_valid.detach().cpu().numpy() < VALIDITY_THRESHOLD
+            failure_mask = nan_mask | invalid_mask | metric_dict['failure_mask']
+            all_errors = np.where(nan_mask[:, np.newaxis], np.inf, all_errors)
+
+            target_p = specs_t[:, 0]
+            target_j = specs_t[:, 1]
+            target_h = specs_t[:, 2]
+            target_w = specs_t[:, 3]
+            is_boundary = ((target_h < BOUNDARY_ABS_TOLERANCES['height'][0]) |
+                           (target_w < BOUNDARY_ABS_TOLERANCES['width'][0]) |
+                           (target_j > BOUNDARY_ABS_TOLERANCES['jitter'][0]) |
+                           (target_p < BOUNDARY_ABS_TOLERANCES['power'][0])).cpu().numpy()
+            boundary_failure = failure_mask & is_boundary
+            interior_failure = failure_mask & ~is_boundary
+
+        metrics = {'errors': all_errors, 'mean_errors': all_errors.mean(axis=1),
+                   'boundary_failure': boundary_failure, 'interior_failure': interior_failure,
+                   'is_boundary': is_boundary,
+                   'pred_specs': pred_specs,
+                   'target_specs': val_specs.copy(),
+                   'dim_fail_rates': (all_errors >= DEGRADE_REL_THRESHOLD).mean(axis=0),
+                   'degraded_dims': metric_dict['degraded_dims'],
+                   'failure_mask': failure_mask,
+                   'invalid_mask': invalid_mask,
+                   'p_valid': p_valid.detach().cpu().numpy()}
+        return failure_mask, metrics
+
+class TeacherLabeler:
+    """
+    Wrapper around FlowTeacherLabeler that adds ZIG validity filtering.
+    Accepts a FlowTeacherLabeler instance and uses it to generate labels
+    for failed specs, filtering by HybridHurdleModel validity.
+    """
+    def __init__(self, teacher_labeler, zig_model, scaler_X, device):
+        self.teacher_labeler = teacher_labeler
+        self.zig = zig_model
+        self.scaler_X = scaler_X
+        self.device = device
+
+    def compute_validity(self, params_log):
+        """Compute ZIG validity for params in log10 space using HybridHurdleModel."""
+        x_scaled = self.scaler_X.transform(params_log)
+        x_t = torch.from_numpy(x_scaled.astype(np.float32)).to(self.device)
+        with torch.no_grad():
+            out = self.zig(x_t)
+        if 'p_valid' in out:
+            validity = out['p_valid'].cpu().numpy()
+        else:
+            validity = (out['p_valid_h'] * out['p_valid_w'] * out['p_valid_j']).cpu().numpy()
+        return validity
+
+    def generate_labels(self, failed_specs, sample_budget=3000, validity_threshold=0.9):
+        """
+        Query FlowTeacherLabeler for canonical params and filter by ZIG validity.
+        Returns (specs_list, params_list).
+        """
+        failed_array = np.array(failed_specs)
+        raw_params = self.teacher_labeler.label_batch(
+            failed_array, n_candidates=sample_budget,
+            valid_threshold=0.9, top_k=1, verbose=True
+        ).squeeze(1)  # (N, 1, 7) -> (N, 7)
+        params_log = np.log10(np.clip(raw_params, 1e-12, None))
+        validities = self.compute_validity(params_log)
+
+        keep_mask = validities >= validity_threshold
+        kept_params = raw_params[keep_mask]
+        kept_specs = failed_array[keep_mask]
+
+        _logger.info(f"  TeacherLabeler: {keep_mask.sum()}/{len(failed_specs)} passed "
+                    f"ZIG validity >= {validity_threshold}")
+
+        result_specs = [spec for spec in kept_specs]
+        result_params = [params for params in kept_params]
+        return result_specs, result_params
 
 
 def sample_validation_specs(df, n_samples=2000, boundary_ratio=0.5, seed=None):
     """Sample validation specs with heavy boundary emphasis for DAgger evaluation.
 
-    If ``seed`` is not None, every random draw (boundary/interior row selection and
-    final shuffle) is deterministic, so repeating the call with the same seed yields
-    the exact same spec set. ``seed=None`` preserves the historical unseeded behavior
-    used by the per-iteration final validation.
+    If ``seed`` is not None, every random draw is deterministic so repeating the
+    call with the same seed yields the exact same spec set. ``seed=None``
+    preserves the historical unseeded behavior.
     """
     n_boundary = int(n_samples * boundary_ratio)
     n_interior = n_samples - n_boundary
@@ -2336,10 +2116,71 @@ def sample_validation_specs(df, n_samples=2000, boundary_ratio=0.5, seed=None):
     return sampled[['power', 'stage_2_jitter', 'stage_2_eye_max_height', 'stage_2_eye_max_width']].values.astype(np.float32)
 
 
+def create_empirical_distillation_dataset(df, n_samples=10000, boundary_ratio=0.3):
+    """Create empirical fine-tune dataset (Phase 2 fine-tuning). Returns a list of dicts."""
+    targets = sample_target_specs(df, n_samples, boundary_ratio)
+    data_list = []
+    for t in targets:
+        noisy_specs = {
+            'power': t['power'] * np.random.uniform(0.95, 1.05),
+            'height': t['height'] * np.random.uniform(0.9, 1.1) if t['height'] > 1 else np.random.uniform(0, 2),
+            'width': t['width'] * np.random.uniform(0.9, 1.1) if t['width'] > 1 else np.random.uniform(0, 2),
+            'jitter': np.clip(t['jitter'] * np.random.uniform(0.95, 1.05), 1.57, 100),
+        }
+        noisy_params = t['params'] * np.random.uniform(0.98, 1.02)
+        phys_lo = np.array([10**v[0] for v in PARAM_LOG_BOUNDS.values()])
+        phys_hi = np.array([10**v[1] for v in PARAM_LOG_BOUNDS.values()])
+        noisy_params = np.clip(noisy_params, phys_lo, phys_hi)
+        data_list.append({
+            'power': noisy_specs['power'],
+            'height': noisy_specs['height'],
+            'width': noisy_specs['width'],
+            'jitter': noisy_specs['jitter'],
+            'params': noisy_params,
+        })
+    return data_list
+
+
 # =====================================================================
 # DAGGER DISTILLATION EXECUTION
 # =====================================================================
 
+
+# %% papermill={"duration": 0.019891, "end_time": "2026-07-01T22:28:20.660162+00:00", "exception": false, "start_time": "2026-07-01T22:28:20.640271+00:00", "status": "completed"}
+# =====================================================================
+def train_epoch(student, train_loader, optimizer, criterion, device, loss_weight=1.0):
+    student.train()
+    total_loss = 0
+    losses = {'total': 0, 'imit': 0, 'spec': 0, 'phys': 0, 'invalid': 0}
+    
+    for specs, params_target in train_loader:
+        specs = specs.to(device)
+        params_target = params_target.to(device)
+        
+        optimizer.zero_grad()
+        
+        spec_targets = {
+            'power': specs[:, 0],
+            'height': specs[:, 2],
+            'width': specs[:, 3],
+            'jitter': specs[:, 1],
+        }
+        
+        loss_dict = criterion(student, spec_targets, params_target)
+        
+        # Apply loss weight (for empirical fine-tune phase)
+        weighted_loss = loss_dict['total'] * loss_weight
+        weighted_loss.backward()
+        torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
+        optimizer.step()
+        
+        total_loss += loss_dict['total'].item()
+        losses['total'] += loss_dict['total'].item()
+        for k in ('imit', 'spec', 'phys', 'invalid'):
+            losses[k] += loss_dict[k]
+    
+    n = len(train_loader)
+    return {k: float(v/n) for k, v in losses.items()}
 
 def eval_epoch(student, val_loader, criterion, device):
     student.eval()
@@ -2370,6 +2211,7 @@ def eval_epoch(student, val_loader, criterion, device):
 _logger.info("Training functions defined (two-phase)")
 
 
+# %% papermill={"duration": 2441.971062, "end_time": "2026-07-01T23:09:02.638092+00:00", "exception": false, "start_time": "2026-07-01T22:28:20.667030+00:00", "status": "completed"}
 def filter_by_zig_consistency(specs_arr, params_arr, zig_model, scaler_X, scaler_y_p, threshold=ERROR_THRESHOLD, device=DEVICE):
     """Keep only (spec, param) pairs that are valid and pass adaptive degradation checks."""
     params_log = np.log10(np.clip(params_arr, 1e-12, None))
@@ -2587,191 +2429,6 @@ def log_label_quality_summary(name, specs_arr, params_arr, zig_model, scaler_X, 
     )
 
 
-def log_param_bound_feasibility(name, params_arr, log_lo=None, log_hi=None,
-                                param_cols=PARAM_COLS, edge_eps=0.02):
-    """Log per-param buckets of where teacher labels sit within [log_lo, log_hi].
-
-    For each output param i, computes ``frac = (log10(p) - log_lo[i]) / (log_hi[i] - log_lo[i])``
-    (clipped to 1e-12 for log10) and reports the fraction of labels in five buckets:
-
-      * ``below``  — frac < 0           (label cannot be represented)
-      * ``at_lo``  — frac in [0, edge_eps]
-      * ``mid``    — frac in (edge_eps, 1 - edge_eps)
-      * ``at_hi``  — frac in [1 - edge_eps, 1]
-      * ``above``  — frac > 1           (label cannot be represented)
-
-    Any non-zero ``below`` or ``above`` bucket is a strong signal that the
-    output ``log_lo/log_hi`` bounds are too tight for the task.
-    """
-    if params_arr is None or len(params_arr) == 0:
-        _logger.info(f"[BOUNDS] {name}: no samples")
-        return
-    try:
-        if log_lo is None or log_hi is None:
-            lo_arr = np.array([PARAM_LOG_BOUNDS[k][0] for k in param_cols], dtype=np.float64)
-            hi_arr = np.array([PARAM_LOG_BOUNDS[k][1] for k in param_cols], dtype=np.float64)
-        else:
-            lo_arr = np.asarray(log_lo, dtype=np.float64).flatten()
-            hi_arr = np.asarray(log_hi, dtype=np.float64).flatten()
-        if len(lo_arr) != len(param_cols) or len(hi_arr) != len(param_cols):
-            raise ValueError(f"log_lo/log_hi length {len(lo_arr)}/{len(hi_arr)} != #param_cols {len(param_cols)}")
-        params = np.asarray(params_arr, dtype=np.float64)
-        if params.ndim != 2 or params.shape[1] != len(param_cols):
-            raise ValueError(f"params_arr shape {params.shape} does not match #param_cols {len(param_cols)}")
-        safe = np.clip(params, 1e-12, None)
-        log_p = np.log10(safe)
-        span = (hi_arr - lo_arr)
-        if np.any(span <= 0):
-            raise ValueError("non-positive log span in PARAM_LOG_BOUNDS")
-        frac = (log_p - lo_arr) / span
-        frac = np.nan_to_num(frac, nan=0.5, posinf=1.0, neginf=0.0)
-        below = (frac < 0).mean(axis=0) * 100
-        at_lo = ((frac >= 0) & (frac <= edge_eps)).mean(axis=0) * 100
-        mid = ((frac > edge_eps) & (frac < 1 - edge_eps)).mean(axis=0) * 100
-        at_hi = ((frac >= 1 - edge_eps) & (frac <= 1)).mean(axis=0) * 100
-        above = (frac > 1).mean(axis=0) * 100
-        _logger.info(
-            f"[BOUNDS] {name} feasibility (frac in [log_lo, log_hi], edges={edge_eps:.2f}):"
-        )
-        for i, pname in enumerate(param_cols):
-            _logger.info(
-                f"  {pname:>8}: below={below[i]:4.1f}%  at_lo={at_lo[i]:4.1f}%  "
-                f"mid={mid[i]:5.1f}%  at_hi={at_hi[i]:4.1f}%  above={above[i]:4.1f}%"
-            )
-    except Exception as e:
-        _logger.warning(f"[BOUNDS] Failed to compute feasibility for {name}: {e}")
-
-
-def log_saturation_breakdown(metrics, prefix="  val/", param_cols=PARAM_COLS, edge_eps=0.02):
-    """Log how close the student's sigmoid outputs are to the log_lo/log_hi edges.
-
-    Reads ``metrics['probs']`` (sigmoid outputs) and ``metrics['logits']``
-    (pre-sigmoid) — both added to the metrics dict by ``identify_failures``.
-    Reports per-param sigmoid mean/median, fraction pinned near 0 / 1, and
-    ``max |logit|`` as a proxy for how hard the readout is being driven.
-    """
-    try:
-        probs = metrics.get('probs') if metrics else None
-        logits = metrics.get('logits') if metrics else None
-        if probs is None:
-            _logger.info(f"{prefix}saturation: (no probs in metrics — skipping)")
-            return
-        probs = np.asarray(probs, dtype=np.float64)
-        if probs.ndim != 2 or probs.shape[1] != len(param_cols):
-            _logger.info(f"{prefix}saturation: unexpected probs shape {probs.shape} — skipping")
-            return
-        probs = np.nan_to_num(probs, nan=0.5)
-        if logits is not None:
-            logits = np.asarray(logits, dtype=np.float64)
-            logits = np.nan_to_num(logits, nan=0.0)
-            max_abs = np.abs(logits).max(axis=0)
-        else:
-            max_abs = np.full(len(param_cols), float('nan'))
-        mean = probs.mean(axis=0)
-        med = np.median(probs, axis=0)
-        sat_lo = (probs <= edge_eps).mean(axis=0) * 100
-        sat_hi = (probs >= 1 - edge_eps).mean(axis=0) * 100
-        _logger.info(f"{prefix}saturation (sigmoid -> 0=log_lo, 1=log_hi, edges={edge_eps:.2f}):")
-        for i, pname in enumerate(param_cols):
-            _logger.info(
-                f"  {pname:>8}: mean={mean[i]:.3f}  med={med[i]:.3f}  "
-                f"sat_lo={sat_lo[i]:4.1f}%  sat_hi={sat_hi[i]:4.1f}%  max|logit|={max_abs[i]:.2f}"
-            )
-    except Exception as e:
-        _logger.warning(f"{prefix}saturation logging failed: {e}")
-
-
-def log_rail_probe(student, specs_arr, n=256, x_max=None, device=DEVICE):
-    """Forward a subsample with trajectory storage; log node-voltage magnitude vs x_max.
-
-    Per ODE stage, reports ``max|x|/x_max`` and the fraction of node-timepoints
-    with ``|x| > 0.9*x_max`` (i.e., the tanh cells saturating against the local
-    rail). A high rail fraction means the circuit dynamics are clamped and the
-    effective expressivity is bounded by ``x_max``.
-    """
-    if x_max is None:
-        x_max = KN_X_MAX
-    if student is None or specs_arr is None or len(specs_arr) == 0:
-        _logger.info(f"[RAIL] no specs — skipping (x_max={x_max})")
-        return
-    # Output ODE accumulators are the last ``output_ode_count`` entries of each
-    # stage's ODE state vector (differential_stage.py:334). The readout is the
-    # accumulator value at the final timepoint (t_span); if it is still changing
-    # there, the effective output is a mid-transient integral (unsettled readout).
-    out_dim = int(getattr(student.net, "output_ode_count", 0))
-    try:
-        subsample = specs_arr[: min(n, len(specs_arr))]
-        specs_t = torch.from_numpy(subsample.astype(np.float32)).to(device)
-        was_training = student.training
-        student.eval()
-        with torch.no_grad():
-            u = student.scale_input(specs_t)
-            _, trajs = student.net(u, store_trajectory=True, solver="heun")
-        if was_training:
-            student.train()
-        if not trajs:
-            _logger.info(f"[RAIL] no per-stage trajectories returned (x_max={x_max})")
-            return
-        _logger.info(f"[RAIL] node-voltage saturation vs x_max={x_max} (n={len(subsample)}):")
-        for s, traj in enumerate(trajs):
-            if traj is None:
-                _logger.info(f"  stage {s}: (no trajectory)")
-                continue
-            v = traj.detach().abs()
-            v_flat = torch.nan_to_num(v.reshape(-1), nan=0.0)
-            max_v = v_flat.max().item()
-            max_ratio = max_v / x_max if x_max > 0 else float('inf')
-            frac = (v_flat > 0.9 * x_max).float().mean().item() * 100
-            _logger.info(
-                f"  stage {s}: max|x|/x_max={max_ratio:.2f}  "
-                f"frac(|x|>0.9*x_max)={frac:4.1f}%"
-            )
-            _log_readout_settling(traj, out_dim=out_dim, s=s)
-    except Exception as e:
-        _logger.warning(f"[RAIL] probe failed: {e}")
-
-
-def _log_readout_settling(traj, out_dim, s, first_frac=0.25, last_frac=0.25):
-    """Report whether the output ODE accumulator readout is still in flight.
-
-    Estimates the accumulator time-derivative over the early window vs the
-    final window of each stage's trajectory. ``vel_last/vel_first`` near 1
-    means the accumulator is still integrating (readout is a mid-transient
-    value); a small ratio means it has settled before ``t_span``. Uses only the
-    last ``output_ode_count`` columns, which are the accumulator nodes.
-    """
-    if out_dim <= 0:
-        return
-    try:
-        a = traj[..., -out_dim:, :].float()  # (B, out_dim, T)
-        if a.dim() == 2:
-            a = a.unsqueeze(0)
-        B, Oc, T = a.shape
-        if T < 4 or Oc < 1:
-            _logger.info("  readout: too few time steps to measure settling")
-            return
-        abs_a = torch.nan_to_num(a.detach().abs(), nan=0.0)
-        mean_acc = abs_a.mean().item()
-        max_acc = abs_a.max().item()
-        # finite-difference derivative magnitudes
-        d = torch.diff(a, dim=2).abs()  # (B, Oc, T-1)
-        i_first = max(1, int(first_frac * (T - 1)))
-        i_last = max(1, int(last_frac * (T - 1)))
-        vel_first = d[..., :i_first].mean().item()
-        vel_last = d[..., -i_last:].mean().item()
-        ratio = (vel_last / (vel_first + 1e-12)) if vel_first > 0 else float('inf')
-        state = "SETTLED" if ratio < 0.5 else ("RISING" if ratio > 1.0 else "MIXED")
-        # fraction of (sample,accumulator) entries still moving in the last window
-        any_move = (d[..., -i_last:].abs() > 1e-6).float().mean().item() * 100
-        _logger.info(
-            f"    readout: mean|acc|={mean_acc:.4f}  max={max_acc:.4f}  "
-            f"vel_first={vel_first:.2e}  vel_last={vel_last:.2e}  "
-            f"ratio={ratio:.2f} [{state}]  %moving_last={any_move:.1f}"
-        )
-    except Exception as e:
-        _logger.warning(f"  [readout] settling probe failed on stage {s}: {e}")
-
-
 # =====================================================================
 #  DAgger DISTILLATION LOOP
 # =====================================================================
@@ -2806,232 +2463,53 @@ evaluator = StudentEvaluator(
     scaler_y_p=scaler_y_p, device=DEVICE
 )
 
-# Instantiate student (Local KirchhoffNet wrapper)
-# Topology hyperparameters are at the top of the notebook
-# (KN_NUM_STAGES, KN_NUM_HIDDEN, KN_SMALL_WORLD_K/P/SEED, KN_EDGE_REPEATS,
-#  KN_CELL_LIBRARY, KN_LEAK_MODE, KN_INTERSTAGE_ACTIVATION,
-#  KN_BOUNDARY_FAN_OUT, KN_INPUT_RAIL).
-student = LocalKirchhoffStudentWrapper(
-    num_stages=KN_NUM_STAGES,
-    num_hidden=KN_NUM_HIDDEN,
-    small_world_k=KN_SMALL_WORLD_K,
-    small_world_p=KN_SMALL_WORLD_P,
-    small_world_seed=KN_SMALL_WORLD_SEED,
-    edge_repeats=KN_EDGE_REPEATS,
-    cell_library=KN_CELL_LIBRARY,
-    leak_mode=KN_LEAK_MODE,
-    interstage_activation=KN_INTERSTAGE_ACTIVATION,
-    freeze_read=KN_FREEZE_READ,
-    boundary_fan_out=KN_BOUNDARY_FAN_OUT,
-    enable_temporal_readout=KN_TEMPORAL_READOUT,
-    num_targets=7,
-    input_rail=KN_INPUT_RAIL,
-    x_max=KN_X_MAX,
+# Instantiate student (Regime-Aware MoE — drop-in replacement for BoundedMLP)
+# Architecture hyperparameters are at the top of the MoE section above.
+# To switch back to BoundedMLP, replace RegimeAwareMoE(...) with:
+#   BoundedMLP(hidden_dim=128, num_layers=8, input_dim=4, output_dim=7,
+#              param_log_bounds=PARAM_LOG_BOUNDS, use_per_output_heads=True)
+student = RegimeAwareMoE(
+    trunk_width=MOE_TRUNK_WIDTH,
+    trunk_layers=MOE_TRUNK_LAYERS,
+    num_experts=MOE_NUM_EXPERTS,
     param_log_bounds=PARAM_LOG_BOUNDS,
-    seed=KN_SMALL_WORLD_SEED,
-    vca_enabled=KN_VCA,
-    vca_rank=KN_VCA_RANK,
-    vca_core_enabled=KN_VCA_CORE,
-    vca_gate_shunt=KN_VCA_GATE_SHUNT,
-    vca_separate_core_bus=KN_VCA_SEPARATE_CORE_BUS,
+    activation=MOE_TRUNK_ACTIVATION,
 ).to(DEVICE)
+_logger.info(f"Student model: {sum(p.numel() for p in student.parameters()):,} params  "
+             f"(trunk_width={MOE_TRUNK_WIDTH}, trunk_layers={MOE_TRUNK_LAYERS}, experts={MOE_NUM_EXPERTS})")
 
-_logger.info(
-    f"Student VCA config: enabled={KN_VCA}, rank="
-    f"{int(KN_VCA_RANK) if KN_VCA_RANK is not None else int(VCA['rank'])}, "
-    f"core={KN_VCA_CORE}, gate_shunt={KN_VCA_GATE_SHUNT}, "
-    f"separate_core_bus={KN_VCA_SEPARATE_CORE_BUS} "
-    f"(mirrors train_script.py --vca/--vca-core/--vca-gate-shunt/"
-    f"--vca-separate-core-bus)"
-)
-
-# No `student.prepare(...)` step needed — local KirchhoffNetWithIO
-# builds its src/dst indices eagerly inside build_net_from_config.
-
-_param_counts = student.count_params_by_component()
-_logger.info(
-    f"Student (Local KirchhoffNet): "
-    f"encoder={_param_counts['encoder']}, "
-    f"circuit={_param_counts['circuit']}, "
-    f"projector={_param_counts['projector']}, "
-    f"total={_param_counts['total']:,} params  "
-    f"(num_stages={KN_NUM_STAGES}, num_hidden={KN_NUM_HIDDEN}, "
-    f"small_world_k={KN_SMALL_WORLD_K}, small_world_p={KN_SMALL_WORLD_P}, "
-    f"edge_repeats={KN_EDGE_REPEATS}, cell_library={KN_CELL_LIBRARY}, "
-    f"leak_mode={KN_LEAK_MODE}, interstage_activation={KN_INTERSTAGE_ACTIVATION}, "
-    f"freeze_read={KN_FREEZE_READ}, temporal_readout={KN_TEMPORAL_READOUT}, input_rail={KN_INPUT_RAIL}, "
-    f"x_max={KN_X_MAX})"
-)
-_n_trainable = sum(p.numel() for p in student.parameters() if p.requires_grad)
-_logger.info(f"Student trainable params: {_n_trainable:,}")
-_bd = student.net.parameter_breakdown()
-_logger.info(f"Student param breakdown:\n{format_parameter_breakdown(_bd)}")
-
-# Optimizer and scheduler (defined once, reused across iterations).
-# Wrapper's parameters() exposes the entire local KirchhoffNetWithIO
-# (fabric stages, transfers, InputMapper, OutputAffine). Per-group LR scales
-#   - mapper: InputMapper + OutputAffine (output_mapper)
-#   - struct: name.endswith('.z_logits') (per-stage edge-gate logits)
-#             + .vca_W / .vca_W_core / .vca_v_{boundary,readout,core}
-#             (VCA routing-structure params, train.py:1102-1108)
-#   - dyn:    name.endswith('.raw_leak') or '.raw_drive_g'
-#   - other:  everything else (stages/transfers/vref/etc.)
-# The 'lr_scale' key is stored in each group dict so the per-iteration LR
-# reset at dagger:3004-3010 can multiply the base LR by the group's scale.
-def _make_dagger_optimizer(student, lr, weight_decay):
-    _mapper, _struct, _dyn, _other = [], [], [], []
-    for _name, _p in student.named_parameters():
-        if not _p.requires_grad:
-            continue
-        if "input_mapper" in _name or "output_mapper" in _name:
-            _mapper.append(_p)
-        elif _name.endswith(".z_logits"):
-            _struct.append(_p)
-        elif (
-            _name.endswith(".vca_W")
-            or _name.endswith(".vca_W_core")
-            or _name.endswith(".vca_v_boundary")
-            or _name.endswith(".vca_v_readout")
-            or _name.endswith(".vca_v_core")
-        ):
-            # VCA routing-structure params (shared input projection +
-            # per-edge tap embeddings for each gated family). Mirrors
-            # train.py make_optimizer classification (train.py:1102-1108):
-            # routed to the structural LR group (4x base by convention)
-            # so the gate signal learns alongside z_logits.
-            _struct.append(_p)
-        elif _name.endswith(".raw_leak") or _name.endswith(".raw_drive_g"):
-            _dyn.append(_p)
-        else:
-            _other.append(_p)
-    groups = []
-    if _other:
-        groups.append({"params": _other, "lr": lr, "lr_scale": 1.0})
-    if _mapper:
-        groups.append({"params": _mapper, "lr": lr * MAPPER_LR_SCALE, "lr_scale": MAPPER_LR_SCALE})
-    if _struct:
-        groups.append({"params": _struct, "lr": lr * STRUCT_LR_SCALE, "lr_scale": STRUCT_LR_SCALE})
-    if _dyn:
-        groups.append({"params": _dyn, "lr": lr * DYN_LR_SCALE, "lr_scale": DYN_LR_SCALE})
-    _logger.info(f"[OPT] Param groups: other={sum(p.numel() for p in _other)} "
-                 f"({len(_other)} tensors, lr={lr:.2e}); "
-                 f"mapper={sum(p.numel() for p in _mapper)} "
-                 f"({len(_mapper)} tensors, lr={lr*MAPPER_LR_SCALE:.2e}); "
-                 f"struct={sum(p.numel() for p in _struct)} "
-                 f"({len(_struct)} tensors, lr={lr*STRUCT_LR_SCALE:.2e}); "
-                 f"dyn={sum(p.numel() for p in _dyn)} "
-                 f"({len(_dyn)} tensors, lr={lr*DYN_LR_SCALE:.2e})")
-    return torch.optim.AdamW(groups, lr=lr, weight_decay=weight_decay)
-
-
-optimizer = _make_dagger_optimizer(student, LR_INITIAL, WEIGHT_DECAY)
+# Optimizer and scheduler (defined once, reused across iterations)
+optimizer = torch.optim.AdamW(student.parameters(), lr=LR_INITIAL, weight_decay=WEIGHT_DECAY)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
     optimizer, T_max=EPOCHS_PER_ITER, eta_min=LR_FLOOR
 )
 
-# Load any existing checkpoint BEFORE the initial-build guard so we can either
-# resume from it (skipping the expensive initial labeling and re-splitting)
-# or fall through to the fresh-start path. The entire resume restore —
-# model/optimizer/scheduler state, RNG, dataset, and histories — is wrapped
-# in one try/except so any legacy/incompatible field gracefully degrades to
-# a fresh start instead of crashing.
-ckpt = load_checkpoint()
-distillation_dataset = None
-if ckpt is not None:
-    try:
-        student.load_state_dict(ckpt['student_state'])
-        student.to(DEVICE)
-        optimizer.load_state_dict(ckpt['optimizer_state'])
-        scheduler.load_state_dict(ckpt['scheduler_state'])
-        if 'rng' in ckpt:
-            _restore_rng(ckpt['rng'])
-        distillation_dataset = DistillationDataset([])
-        _restore_dataset_from_ckpt(ckpt)
-        _restore_histories_from_ckpt(ckpt)
-        _restore_common_eval_specs_from_ckpt(ckpt)
-        _logger.info(
-            f"[CKPT] Resumed from {CHECKPOINT_PATH}  "
-            f"next_iter={int(ckpt['dagger_iter'])}, "
-            f"dataset_size={len(ckpt.get('dataset', []))}, "
-            f"format_version={ckpt.get('format_version')}"
-        )
-        _logger.info(f"[CKPT] Restored DistillationDataset from checkpoint: "
-                     f"{len(distillation_dataset)} samples, "
-                     f"train={len(distillation_dataset._train_indices)}, "
-                     f"val={len(distillation_dataset._val_indices)}, "
-                     f"hard_buffer_start_idx={distillation_dataset._hard_buffer_start_idx}")
-    except Exception as e:
-        _logger.warning(f"[CKPT] Failed to restore from checkpoint: {e}; "
-                        f"starting fresh and overwriting checkpoint")
-        ckpt = None
-        distillation_dataset = None
-
 # ── Initial dataset ──────────────────────────────────────────────────
-if ckpt is not None:
-    pass  # already restored above
-else:
-    # Fresh-start path: consult the initial-dataset cache (config-hashed),
-    # else run the (expensive) teacher labeling and write the cache. The cache
-    # load is guarded because a corrupt or partial file (from an interrupted
-    # prior write) must not crash the script; the dump is atomic so a kill
-    # mid-write leaves the prior valid file untouched.
-    _cache_path = _initial_dataset_cache_path()
-    initial_data = None
-    if os.path.exists(_cache_path):
-        try:
-            with Timer("load initial distillation dataset from cache"):
-                initial_data = joblib.load(_cache_path)
-            _logger.info(f"[CKPT] Initial dataset loaded from cache: {_cache_path} "
-                         f"({len(initial_data)} samples, hash={os.path.basename(_cache_path)})")
-        except Exception as e:
-            _logger.warning(f"[CKPT] Failed to load initial-dataset cache ({_cache_path}): "
-                            f"{e}; rebuilding from scratch")
-            initial_data = None
-    if initial_data is None:
-        with Timer("build initial flow distillation dataset"):
-            initial_data = create_flow_distillation_dataset(
-                df,
-                n_samples=N_EMPIRICAL_SAMPLES,
-                n_candidates=N_CANDIDATES_INITIAL,
-                boundary_ratio=BOUNDARY_RATIO,
-                teacher_labeler=teacher_labeler,
-            )
-        try:
-            _cache_tmp = _cache_path + '.tmp'
-            joblib.dump(initial_data, _cache_tmp)
-            os.replace(_cache_tmp, _cache_path)
-            _logger.info(f"[CKPT] Initial dataset cached at {_cache_path} "
-                         f"(hash={os.path.basename(_cache_path)})")
-        except Exception as e:
-            _logger.warning(f"[CKPT] Failed to write initial dataset cache: {e}")
-    _logger.info(f"Initial dataset (flow teacher labels): {len(initial_data)} samples")
-    distillation_dataset = DistillationDataset(initial_data)
-    all_specs = np.array([[d['power'], d['jitter'], d['height'], d['width']] for d in distillation_dataset.data])
-    all_params = np.array([d['params'] for d in distillation_dataset.data])
-    with Timer("ZIG forward-consistency check on initial dataset"):
-        keep_strict = filter_by_zig_consistency(all_specs, all_params, zig_model, scaler_X, scaler_y_p, threshold=ERROR_THRESHOLD, device=DEVICE)
-        keep_relaxed = filter_by_zig_consistency_relaxed(all_specs, all_params, zig_model, scaler_X, scaler_y_p, device=DEVICE)
-    _logger.info(f"Initial dataset: {len(distillation_dataset)} samples")
-    _logger.info(f"Initial dataset forward-consistency (strict): {keep_strict.mean()*100:.1f}%  ({keep_strict.sum()}/{len(keep_strict)})")
-    _logger.info(f"Initial dataset forward-consistency (relaxed): {keep_relaxed.mean()*100:.1f}%  ({keep_relaxed.sum()}/{len(keep_relaxed)})")
-    log_label_quality_summary("Initial dataset labels", all_specs, all_params, zig_model, scaler_X, scaler_y_p, device=DEVICE)
-    log_param_bound_feasibility("Initial dataset", all_params)
+with Timer("build initial flow distillation dataset"):
+    initial_data = create_flow_distillation_dataset(
+        df,
+        n_samples=N_EMPIRICAL_SAMPLES,
+        n_candidates=N_CANDIDATES_INITIAL,
+        boundary_ratio=BOUNDARY_RATIO,
+        teacher_labeler=teacher_labeler,
+    )
+_logger.info(f"Initial dataset (flow teacher labels): {len(initial_data)} samples")
+distillation_dataset = DistillationDataset(initial_data)
+all_specs = np.array([[d['power'], d['jitter'], d['height'], d['width']] for d in distillation_dataset.data])
+all_params = np.array([d['params'] for d in distillation_dataset.data])
+with Timer("ZIG forward-consistency check on initial dataset"):
+    keep_strict = filter_by_zig_consistency(all_specs, all_params, zig_model, scaler_X, scaler_y_p, threshold=ERROR_THRESHOLD, device=DEVICE)
+    keep_relaxed = filter_by_zig_consistency_relaxed(all_specs, all_params, zig_model, scaler_X, scaler_y_p, device=DEVICE)
+_logger.info(f"Initial dataset: {len(distillation_dataset)} samples")
+_logger.info(f"Initial dataset forward-consistency (strict): {keep_strict.mean()*100:.1f}%  ({keep_strict.sum()}/{len(keep_strict)})")
+_logger.info(f"Initial dataset forward-consistency (relaxed): {keep_relaxed.mean()*100:.1f}%  ({keep_relaxed.sum()}/{len(keep_relaxed)})")
+log_label_quality_summary("Initial dataset labels", all_specs, all_params, zig_model, scaler_X, scaler_y_p, device=DEVICE)
 
-    # Carve out 10% validation split (never augmented by DAgger)
-    train_subset, val_subset = distillation_dataset.split_train_val(val_frac=0.1)
-
-    # Baseline checkpoint: anchors the run at dagger_iter=0 so a crash during
-    # the first iteration's training or teacher labeling can resume cleanly.
-    try:
-        save_checkpoint(_ckpt_baseline_payload(dagger_iter=0))
-        _logger.info(f"[CKPT] Baseline checkpoint saved to {CHECKPOINT_PATH}")
-    except Exception as e:
-        _logger.warning(f"[CKPT] Failed to write baseline checkpoint: {e}")
-
+# Carve out 10% validation split (never augmented by DAgger)
+train_subset, val_subset = distillation_dataset.split_train_val(val_frac=0.1)
 train_loader = distillation_dataset.get_loader(batch_size=BATCH_SIZE, shuffle=True, hard_weight=10.0)
 val_loader = distillation_dataset.get_val_loader(batch_size=BATCH_SIZE)
-_logger.info(f"Train: {len(distillation_dataset._train_indices)}, "
-             f"Val: {len(distillation_dataset._val_indices)}")
+_logger.info(f"Train: {len(train_subset)}, Val: {len(val_subset)}")
 
 # ── Warmup wrapper for ZIG-dependent losses ─────────────────────────
 class RampedRegimeLoss(nn.Module):
@@ -3077,18 +2555,15 @@ criterion = RegimeAwareLoss(
     eye_scale_w=eye_scale_w,
     eye_scale_j=eye_scale_j,
     scaler_y_p=scaler_y_p,
-    alpha_spec=ALPHA_SPEC,
-    beta_phys=BETA_PHYS,
-    gamma_mono=GAMMA_MONO,
-    alpha_invalid=ALPHA_INVALID,
+    alpha_spec=1.5,
+    beta_phys=0.1,
+    gamma_mono=0.01,
+    alpha_invalid=1.5,
     empirical_df=df,
-    k_manifold=K_MANIFOLD,
-    alpha_manifold=ALPHA_MANIFOLD,
+    k_manifold=5,
+    alpha_manifold=0.1,
 )
-ramped_criterion = RampedRegimeLoss(criterion, warmup_epochs=WARMUP_EPOCHS)
-
-# Dump the full hyperparameter set to the log file at the start of each run.
-_log_hyperparameters()
+ramped_criterion = RampedRegimeLoss(criterion, warmup_epochs=5)
 
 # =====================================================================
 # DIAGNOSTIC SCRIPT — run before training to identify the bottleneck
@@ -3143,20 +2618,14 @@ def run_diagnostics(teacher_labeler, df, zig_model, scaler_X, scaler_y_p, device
         'zig_real_acc': keep_real.mean(),
     }
 
-# Run diagnostics (skip on resume: already logged in the prior run, and the
-# teacher-labeling call inside is expensive — we don't want to re-pay it).
-if ckpt is None:
-    run_diagnostics(teacher_labeler, df, zig_model, scaler_X, scaler_y_p, DEVICE, n=200)
-else:
-    _logger.info("[CKPT] Skipping run_diagnostics on resume")
-
+# Run diagnostics
+diag_results = run_diagnostics(teacher_labeler, df, zig_model, scaler_X, scaler_y_p, DEVICE, n=200)
 
 # ── Shared COMMON_EVAL_SPECS ─────────────────────────────────────────
 # Single fixed shared eval set used for both per-epoch early-stop tracking
-# AND per-iteration "Validation failure rate" reporting (plan
-# dagger_knet_best_model_selection_improvement). Built fresh on a fresh start;
-# on resume, _restore_common_eval_specs_from_ckpt already overwrote this from
-# the checkpoint if the field was present.
+# AND per-iteration validation reporting (mirrors dagger-nuance-distillation-
+# kirchhoffnet.py). Every iteration uses the *same* spec set so the
+# per-iteration failure rates are directly comparable.
 if COMMON_EVAL_SPECS is None:
     with Timer("build COMMON_EVAL_SPECS shared eval set"):
         COMMON_EVAL_SPECS = sample_validation_specs(
@@ -3171,16 +2640,9 @@ else:
     _logger.info(f"  COMMON_EVAL_SPECS already set (shape="
                  f"{COMMON_EVAL_SPECS.shape}); reusing")
 
+
 # ── Main DAgger loop ─────────────────────────────────────────────────
-_start_iter = int(ckpt['dagger_iter']) if ckpt is not None else 0
-if ckpt is not None and ckpt.get('converged', False):
-    _logger.info(f"[CKPT] Resumed checkpoint has converged=True; skipping training loop "
-                 f"and regenerating final artifacts")
-    _start_iter = DAGGER_ITERATIONS
-if _start_iter >= DAGGER_ITERATIONS:
-    _logger.info(f"[CKPT] Resumed dagger_iter={_start_iter} >= DAGGER_ITERATIONS="
-                 f"{DAGGER_ITERATIONS}; skipping training loop")
-for dagger_iter in range(_start_iter, DAGGER_ITERATIONS):
+for dagger_iter in range(DAGGER_ITERATIONS):
     _logger.info(f"{'='*60}")
     _logger.info(f"  DAgger Iteration {dagger_iter + 1}/{DAGGER_ITERATIONS}")
     _logger.info(f"{'='*60}")
@@ -3194,17 +2656,12 @@ for dagger_iter in range(_start_iter, DAGGER_ITERATIONS):
     patience = 0
     best_state = None
     best_failure_state = None
-    # best_failure_rate is initialized below to prev_failure_rate (iter 1 → 1.0)
-    # so the first within-iteration accept threshold is the carried-forward baseline.
-
-    # Snapshot the carried-forward student (last iteration's restored best)
-    # and measure its baseline failure rate on COMMON_EVAL_SPECS. Iteration 1
-    # has no previous iteration → use 1.0 so any reasonable model passes the
-    # MIN_FAILURE_IMPROVEMENT threshold on the first iteration.
+    # Snapshot the carried-forward student and measure its baseline on the
+    # shared COMMON_EVAL_SPECS set (iter 1 has no prior model -> 100%).
     prev_state = {k: v.cpu().clone() for k, v in student.state_dict().items()}
     if dagger_iter == 0:
         prev_failure_rate = 1.0
-        _logger.info(f"  Prev-iter baseline: no prior model (iteration 1) → "
+        _logger.info(f"  Prev-iter baseline: no prior model (iteration 1) -> "
                      f"prev_failure_rate=100.0%")
     else:
         evaluator.student = student
@@ -3221,15 +2678,15 @@ for dagger_iter in range(_start_iter, DAGGER_ITERATIONS):
                  f"specs (seed={COMMON_EVAL_SEED}, every={EARLYSTOP_EVAL_EVERY}ep, "
                  f"log_every={EARLYSTOP_LOG_EVERY}ep, skip_first={EARLYSTOP_SKIP_EPOCHS}ep)")
 
-    epoch_losses = {'total': [], 'imit': [], 'spec': [], 'phys': [], 'invalid': [], 'manifold': []}
+    epoch_losses = {'total': [], 'imit': [], 'spec': [], 'phys': [], 'invalid': [], 'manifold': [], 'regime': []}
     n_batches = 0
-    n_nonfinite_batches = 0   # batches skipped by the NaN/grad guards this iteration
-    _div_consec = 0           # consecutive divergence-margin evals (see DIVERGENCE_*)
-    diverged_at = None        # epoch at which the iteration was aborted, if any
+    n_nonfinite_batches = 0
+    _div_consec = 0
+    diverged_at = None
     for epoch in range(EPOCHS_PER_ITER):
         ramped_criterion.set_epoch(epoch)
         student.train()
-        losses = {'total': 0, 'imit': 0, 'spec': 0, 'phys': 0, 'invalid': 0, 'manifold': 0}
+        losses = {'total': 0, 'imit': 0, 'spec': 0, 'phys': 0, 'invalid': 0, 'manifold': 0, 'regime': 0}
         for specs_batch, params_batch in train_loader:
             specs_batch = specs_batch.to(DEVICE)
             params_batch = params_batch.to(DEVICE)
@@ -3242,24 +2699,15 @@ for dagger_iter in range(_start_iter, DAGGER_ITERATIONS):
             }
 
             optimizer.zero_grad()
-            # LocalKirchhoffStudentWrapper returns just logits (no regime branch).
-            logits = student(specs_batch)
+            logits, regime_loss = student(specs_batch, return_regime_loss=True)
             base_loss_dict = ramped_criterion.base_loss(student, spec_targets, params_batch, logits=logits)
             ramped_loss_dict = ramped_criterion(student, spec_targets, params_batch, logits=logits, loss_dict=base_loss_dict)
-            total_loss = ramped_loss_dict['total']
+            total_loss = ramped_loss_dict['total'] + 0.1 * regime_loss
             if not total_loss.requires_grad or not torch.isfinite(total_loss):
-                # NaN/Inf batch (flagged by the loss's internal guard or a
-                # non-finite ramped total): skip the update entirely so a
-                # poisoned batch can never reach optimizer.step().
                 losses['total'] += float(total_loss)
                 n_nonfinite_batches += 1
             else:
                 total_loss.backward()
-                # clip_grad_norm_ over the wrapper's parameters covers the local
-                # KirchhoffNet fabric. Its return value is the PRE-clip total
-                # norm: if backward exploded (stiff ODE), the norm is Inf/NaN
-                # and clipping itself maps Inf grads to NaN — stepping here
-                # would write NaN into every weight (permanent 100% failure).
                 grad_norm = float(torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0))
                 if math.isfinite(grad_norm):
                     optimizer.step()
@@ -3273,6 +2721,7 @@ for dagger_iter in range(_start_iter, DAGGER_ITERATIONS):
                 losses['total'] += total_loss.item()
             for k in ('imit', 'spec', 'phys', 'invalid', 'manifold'):
                 losses[k] += ramped_loss_dict[k]
+            losses['regime'] += regime_loss.item()
 
         n = len(train_loader)
         avg_loss = losses['total'] / n
@@ -3281,6 +2730,7 @@ for dagger_iter in range(_start_iter, DAGGER_ITERATIONS):
         avg_phys = losses['phys'] / n
         avg_invalid = losses['invalid'] / n
         avg_manifold = losses['manifold'] / n
+        avg_regime = losses['regime'] / n
 
         for k in epoch_losses:
             epoch_losses[k] += [losses[k] / n]
@@ -3292,7 +2742,7 @@ for dagger_iter in range(_start_iter, DAGGER_ITERATIONS):
 
         if (epoch + 1) % 10 == 0 or epoch == 0:
             _logger.info(f"  Epoch {epoch+1:3d}/{EPOCHS_PER_ITER}  "
-                         f"train={avg_loss:.4f}(imit={avg_imit:.3f},spec={avg_spec:.3f},phys={avg_phys:.3f},invalid={avg_invalid:.3f},manifold={avg_manifold:.3f})  "
+                         f"train={avg_loss:.4f}(imit={avg_imit:.3f},spec={avg_spec:.3f},phys={avg_phys:.3f},invalid={avg_invalid:.3f},manifold={avg_manifold:.3f},regime={avg_regime:.3f})  "
                          f"val={val_losses['total']:.4f}(imit={val_losses['imit']:.3f},spec={val_losses['spec']:.3f},phys={val_losses['phys']:.3f},invalid={val_losses['invalid']:.3f},manifold={val_losses['manifold']:.3f})  "
                          f"lr={optimizer.param_groups[0]['lr']:.2e}")
 
@@ -3301,15 +2751,10 @@ for dagger_iter in range(_start_iter, DAGGER_ITERATIONS):
             best_val_loss = val_losses['total']
             best_state = {k: v.cpu().clone() for k, v in student.state_dict().items()}
 
-        # Early stopping on failure rate: evaluate every EARLYSTOP_EVAL_EVERY epochs
-        # on the SHARED COMMON_EVAL_SPECS set (built once before the DAgger loop).
-        # - During the first EARLYSTOP_SKIP_EPOCHS epochs, no best-tracking is
-        #   performed so the warm-started epoch-1 snapshot can't win immediately.
-        # - A new best is accepted only when it beats the running best by at
-        #   least MIN_FAILURE_IMPROVEMENT (absolute), enforcing monotone
-        #   improvement across the in-iteration budget.
-        # - EARLYSTOP_PATIENCE_EPOCHS = EPOCHS_PER_ITER (full budget) by design,
-        #   so the inner loop is never cut short.
+        # Early stopping on failure rate: evaluate on the SHARED COMMON_EVAL_SPECS set.
+        # - First EARLYSTOP_SKIP_EPOCHS epochs: no best-tracking (warm-start guard).
+        # - New best only when it beats running best by >= MIN_FAILURE_IMPROVEMENT.
+        # - Patience never triggers a break (EARLYSTOP_PATIENCE_EPOCHS = EPOCHS_PER_ITER).
         if (epoch + 1) % EARLYSTOP_EVAL_EVERY == 0 or epoch == EPOCHS_PER_ITER - 1:
             evaluator.student = student
             failure_mask_check, metrics_check = evaluator.identify_failures(
@@ -3332,13 +2777,6 @@ for dagger_iter in range(_start_iter, DAGGER_ITERATIONS):
                                  f"(no accept; best={best_failure_rate*100:.2f}%, "
                                  f"min_delta={MIN_FAILURE_IMPROVEMENT*100:.1f}%, "
                                  f"patience={patience})")
-                # Divergence abort: a large SUSTAINED regression above the
-                # previous iteration's baseline means this iteration's training
-                # is destroying the model (e.g. NaN-poisoned or loss-ramp
-                # collapse). The remaining budget would be wasted — abort and
-                # let the carry-forward guardrail below restore the best/prev
-                # model. Requires DIVERGENCE_CONSEC_EVALS consecutive evals
-                # above prev + DIVERGENCE_MARGIN, so normal noise never fires it.
                 if DIVERGENCE_ABORT and (
                         current_failure_rate >= prev_failure_rate + DIVERGENCE_MARGIN):
                     _div_consec += 1
@@ -3362,14 +2800,6 @@ for dagger_iter in range(_start_iter, DAGGER_ITERATIONS):
                 log_failure_breakdown(metrics_check, prefix="    earlystop/")
 
     # ── Carry-forward model selection with regression guardrail ────────
-    # Priority:
-    #   1. best_failure_state if it beat prev_failure_rate by >= MIN_FAILURE_IMPROVEMENT
-    #      (new within-iteration best is strictly better on COMMON_EVAL_SPECS)
-    #   2. prev_state (carried-forward from last iteration; only fallback for
-    #      "no meaningful improvement" — protects against regression per the plan)
-    #   3. best_state (val-loss best) — legacy fallback for the rare edge case
-    #      where we have a loss-best but neither a failure-state nor a prev_state
-    #   4. last-epoch student (final fallback)
     iter_outcome = "keep_new"
     if (best_failure_state is not None
             and best_failure_rate < prev_failure_rate - MIN_FAILURE_IMPROVEMENT):
@@ -3404,10 +2834,7 @@ for dagger_iter in range(_start_iter, DAGGER_ITERATIONS):
 
     best_loss = float(best_val_loss)
 
-    # ── 3b. Evaluate on the SHARED COMMON_EVAL_SPECS set (vectorized) ─────
-    # Same 2000-spec set used for per-epoch early-stop tracking, so the
-    # per-iteration rate reported here is directly comparable to last
-    # iteration's (monotone-improvement table).
+    # ── 3b. Evaluate on validation set (vectorized) — shared COMMON_EVAL_SPECS
     val_specs_arr = COMMON_EVAL_SPECS
     evaluator.student = student
     failure_mask, metrics = evaluator.identify_failures(val_specs_arr, threshold=ERROR_THRESHOLD)
@@ -3428,11 +2855,8 @@ for dagger_iter in range(_start_iter, DAGGER_ITERATIONS):
     _logger.info(f"  boundary: {boundary_failure_rate*100:.1f}%  "
                 f"interior: {interior_failure_rate*100:.1f}%")
     log_failure_breakdown(metrics, prefix="  val/")
-    log_saturation_breakdown(metrics, prefix="  val/")
-    log_param_bound_feasibility("Rolling dataset", np.array([d['params'] for d in distillation_dataset.data]))
-    log_rail_probe(student, val_specs_arr)
 
-    # Per-iteration summary line: monotone-improvement table.
+    # Per-iteration summary line (mirrors kirchhoffnet for apples-to-apples).
     iter_delta = (prev_failure_rate - failure_rate) * 100
     if diverged_at is not None:
         iter_outcome += f" (divergence-abort@ep{diverged_at})"
@@ -3476,140 +2900,114 @@ for dagger_iter in range(_start_iter, DAGGER_ITERATIONS):
     _logger.info(f"  Iter {dagger_iter+1} loss summary: train_total={avg_train_total:.3f}(imit={avg_train_imit:.3f},spec={avg_train_spec:.3f},phys={avg_train_phys:.3f},invalid={avg_train_invalid:.3f},manifold={avg_train_manifold:.3f})  "
                  f"val_total={val_losses['total']:.3f}(imit={val_losses['imit']:.3f},spec={val_losses['spec']:.3f},phys={val_losses['phys']:.3f},invalid={val_losses['invalid']:.3f},manifold={val_losses['manifold']:.3f})")
 
-    # Use flags instead of break/continue so the iteration-end checkpoint
-    # below always runs (regardless of path through the body).
-    converged = False
-    skip_labeling = False
-
     if failure_rate < CONVERGENCE_THRESHOLD:
         _logger.info(f"CONVERGENCE MET (failure_rate={failure_rate*100:.2f}% < "
                      f"{CONVERGENCE_THRESHOLD*100}%)")
-        converged = True
+        break
 
     # ── 3d. Skip teacher labeling if no failures ────────────────────
-    if not converged and len(failed_specs_arr) == 0:
+    if len(failed_specs_arr) == 0:
         _logger.info("No failures detected — skipping teacher labeling.")
-        skip_labeling = True
+        continue
 
     # ── 3e. Data imbalance check ────────────────────────────────────
-    if not converged and not skip_labeling:
-        cap = int(len(distillation_dataset) * FAILURE_CAP_RATIO)
-        if len(failed_specs_arr) > cap:
-            top_k_idx = np.argsort(failure_errors[failure_mask])[-cap:]
-            failed_specs_arr = failed_specs_arr[top_k_idx]
-            _logger.info(f"  Capped failures to top {cap} highest-error cases")
+    cap = int(len(distillation_dataset) * FAILURE_CAP_RATIO)
+    if len(failed_specs_arr) > cap:
+        top_k_idx = np.argsort(failure_errors[failure_mask])[-cap:]
+        failed_specs_arr = failed_specs_arr[top_k_idx]
+        _logger.info(f"  Capped failures to top {cap} highest-error cases")
 
     # ── 3f. Reset optimizer LR and apply decay (floor at 1e-4) ─────
-    if not converged and not skip_labeling:
-        new_lr = LR_INITIAL * (0.5 ** max(0, dagger_iter - LR_DECAY_AFTER_ITER))
-        new_lr = max(new_lr, 1e-4)
-        for pg in optimizer.param_groups:
-            pg['lr'] = new_lr * pg.get('lr_scale', 1.0)
-        _lr_per_group = ', '.join('{:.2e}'.format(pg['lr']) for pg in optimizer.param_groups)
-        # Recreate the cosine scheduler so it restarts from the reset LR.
-        # Without this, the continuously-stepped CosineAnnealingLR overrides
-        # the manual reset on its next step() and its phase wraps across
-        # iterations (T_max=EPOCHS_PER_ITER), so some iterations would START
-        # at the full initial LR — instantly destroying the warm-started model.
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=EPOCHS_PER_ITER, eta_min=LR_FLOOR
-        )
-        _logger.info(f"  LR reset to {new_lr:.2e} (per-group: {_lr_per_group}); "
-                     f"cosine scheduler restarted for next iteration")
+    new_lr = LR_INITIAL * (0.5 ** max(0, dagger_iter - LR_DECAY_AFTER_ITER))
+    new_lr = max(new_lr, 1e-4)
+    for pg in optimizer.param_groups:
+        pg['lr'] = new_lr
+    # Recreate cosine scheduler so it restarts from the reset LR (otherwise the
+    # continuously-stepped scheduler overrides the manual reset on next step
+    # and its phase wraps across iterations).
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=EPOCHS_PER_ITER, eta_min=LR_FLOOR
+    )
+    _logger.info(f"  LR reset to {new_lr:.2e}; cosine scheduler restarted for next iteration")
 
     # ── 3g. Teacher labeling with k-NN empirical fallback ─────────────
-    final_specs = np.empty((0, 4), dtype=np.float32)
-    final_labels = np.empty((0, 7), dtype=np.float32)
-    if not converged and not skip_labeling:
-        _logger.info(f"  Querying teacher for {len(failed_specs_arr)} failed specs ...")
+    _logger.info(f"  Querying teacher for {len(failed_specs_arr)} failed specs ...")
 
-        # Separate boundary and interior specs for tiered teacher budget
-        boundary_mask = np.array([is_boundary_spec(s) for s in failed_specs_arr])
-        boundary_specs = failed_specs_arr[boundary_mask]
-        interior_specs = failed_specs_arr[~boundary_mask]
+    # Separate boundary and interior specs for tiered teacher budget
+    boundary_mask = np.array([is_boundary_spec(s) for s in failed_specs_arr])
+    boundary_specs = failed_specs_arr[boundary_mask]
+    interior_specs = failed_specs_arr[~boundary_mask]
 
-        new_labels = np.zeros((len(failed_specs_arr), 7))  # (N, 7) params
-        label_source = np.zeros(len(failed_specs_arr), dtype=int)  # 0=unlabeled, 1=flow, 2=knn
+    new_labels = np.zeros((len(failed_specs_arr), 7))  # (N, 7) params
+    label_source = np.zeros(len(failed_specs_arr), dtype=int)  # 0=unlabeled, 1=flow, 2=knn
 
-        # Interior specs: standard flow labeling
-        if len(interior_specs) > 0:
-            _logger.info(f"  Interior specs ({len(interior_specs)}): using flow teacher")
-            new_labels_int = teacher_labeler.label_batch(
-                interior_specs,
-                n_candidates=N_CANDIDATES_PER_SPEC,
-                valid_threshold=0.9,
-                top_k=1,
-                verbose=False,
-            )
-            keep_int = filter_by_zig_validity(
-                new_labels_int.squeeze(), zig_model, scaler_X, threshold=0.5, device=DEVICE
-            )
-            idx_int = np.where(~boundary_mask)[0]
-            if keep_int.sum() > 0:
-                new_labels[idx_int[keep_int]] = new_labels_int[keep_int]
-                label_source[idx_int[keep_int]] = 1
+    # Interior specs: standard flow labeling
+    if len(interior_specs) > 0:
+        _logger.info(f"  Interior specs ({len(interior_specs)}): using flow teacher")
+        new_labels_int = teacher_labeler.label_batch(
+            interior_specs,
+            n_candidates=N_CANDIDATES_PER_SPEC,
+            valid_threshold=0.9,
+            top_k=1,
+            verbose=False,
+        )
+        keep_int = filter_by_zig_validity(
+            new_labels_int.squeeze(), zig_model, scaler_X, threshold=0.5, device=DEVICE
+        )
+        idx_int = np.where(~boundary_mask)[0]
+        if keep_int.sum() > 0:
+            new_labels[idx_int[keep_int]] = new_labels_int[keep_int]
+            label_source[idx_int[keep_int]] = 1
 
-        # Boundary specs: high-budget flow + empirical k-NN fallback
-        if len(boundary_specs) > 0:
-            _logger.info(f"  Boundary specs ({len(boundary_specs)}): high-budget flow + k-NN fallback")
-            new_labels_bnd = teacher_labeler.label_batch(
-                boundary_specs,
-                n_candidates=10000,
-                valid_threshold=0.5,
-                top_k=1,
-                verbose=False,
-            )
-            keep_bnd = filter_by_zig_validity(
-                new_labels_bnd.squeeze(), zig_model, scaler_X, threshold=0.5, device=DEVICE
-            )
-            idx_bnd = np.where(boundary_mask)[0]
-            if keep_bnd.sum() > 0:
-                new_labels[idx_bnd[keep_bnd]] = new_labels_bnd[keep_bnd]
-                label_source[idx_bnd[keep_bnd]] = 1
+    # Boundary specs: high-budget flow + empirical k-NN fallback
+    if len(boundary_specs) > 0:
+        _logger.info(f"  Boundary specs ({len(boundary_specs)}): high-budget flow + k-NN fallback")
+        new_labels_bnd = teacher_labeler.label_batch(
+            boundary_specs,
+            n_candidates=10000,
+            valid_threshold=0.5,
+            top_k=1,
+            verbose=False,
+        )
+        keep_bnd = filter_by_zig_validity(
+            new_labels_bnd.squeeze(), zig_model, scaler_X, threshold=0.5, device=DEVICE
+        )
+        idx_bnd = np.where(boundary_mask)[0]
+        if keep_bnd.sum() > 0:
+            new_labels[idx_bnd[keep_bnd]] = new_labels_bnd[keep_bnd]
+            label_source[idx_bnd[keep_bnd]] = 1
 
-            still_failed_bnd = idx_bnd[~keep_bnd] if keep_bnd.sum() > 0 else idx_bnd
-            if len(still_failed_bnd) > 0:
-                _logger.info(f"  k-NN fallback for {len(still_failed_bnd)} boundary specs where flow failed")
-                for i, fi in enumerate(still_failed_bnd):
-                    spec = failed_specs_arr[fi]
-                    fallback_params = empirical_fallback_label(spec, df, k=3)
-                    new_labels[fi] = fallback_params
-                    label_source[fi] = 2
-                _logger.info(f"  k-NN fallback: {(label_source[still_failed_bnd] == 2).sum()}/{len(still_failed_bnd)} labeled")
+        still_failed_bnd = idx_bnd[~keep_bnd] if keep_bnd.sum() > 0 else idx_bnd
+        if len(still_failed_bnd) > 0:
+            _logger.info(f"  k-NN fallback for {len(still_failed_bnd)} boundary specs where flow failed")
+            for i, fi in enumerate(still_failed_bnd):
+                spec = failed_specs_arr[fi]
+                fallback_params = empirical_fallback_label(spec, df, k=3)
+                new_labels[fi] = fallback_params
+                label_source[fi] = 2
+            _logger.info(f"  k-NN fallback: {(label_source[still_failed_bnd] == 2).sum()}/{len(still_failed_bnd)} labeled")
 
-        _logger.info(f"  Teacher labels: flow={int((label_source==1).sum())}, "
-                     f"k-NN={int((label_source==2).sum())}, total={int((label_source>0).sum())}/{len(label_source)}")
+    _logger.info(f"  Teacher labels: flow={int((label_source==1).sum())}, "
+                 f"k-NN={int((label_source==2).sum())}, total={int((label_source>0).sum())}/{len(label_source)}")
 
-        final_keep_mask = label_source > 0
-        final_specs = failed_specs_arr[final_keep_mask]
-        final_labels = new_labels[final_keep_mask]
+    final_keep_mask = label_source > 0
+    final_specs = failed_specs_arr[final_keep_mask]
+    final_labels = new_labels[final_keep_mask]
 
     # ── 3h. Dataset aggregation ──────────────────────────────────────
     if len(final_specs) > 0:
         log_label_quality_summary("  DAgger labels", final_specs, final_labels, zig_model, scaler_X, scaler_y_p, device=DEVICE)
-        log_param_bound_feasibility("DAgger labels", final_labels)
         distillation_dataset.append_samples(final_specs, final_labels)
         _logger.info(f"  Added {len(final_labels)} labeled failures.  Dataset now: "
                      f"{len(distillation_dataset)}")
-
-    # ── 3i. Iteration-end checkpoint ─────────────────────────────────
-    # Save unconditionally at the end of every iteration (normal path,
-    # no-failure skip, and convergence). Next resume starts at dagger_iter+1.
-    try:
-        save_checkpoint(_ckpt_baseline_payload(dagger_iter=dagger_iter + 1, converged=converged))
-        _logger.info(f"[CKPT] Iteration {dagger_iter+1} checkpoint saved "
-                     f"(next_iter={dagger_iter+1}, dataset={len(distillation_dataset)})")
-    except Exception as e:
-        _logger.warning(f"[CKPT] Failed to write iteration-end checkpoint: {e}")
-
-    if converged:
-        break
 
 _logger.info("DAgger training complete")
 
 _logger.info("DAgger training complete - no Phase 2 fine-tuning (pure manifold-constrained distillation)")
 
 
+
+# %% papermill={"duration": 0.068704, "end_time": "2026-07-01T23:09:02.784150+00:00", "exception": false, "start_time": "2026-07-01T23:09:02.715446+00:00", "status": "completed"}
 def evaluate_student(student, df_eval, device, eye_scale_h, eye_scale_w, eye_scale_j,
                      scaler_y_p, scaler_X, zig_model):
     """Run final evaluation on a held-out set of specs."""
@@ -3634,13 +3032,13 @@ def evaluate_student(student, df_eval, device, eye_scale_h, eye_scale_w, eye_sca
                  f"jitter: {metrics['errors'][:,1].mean():.4f}, "
                  f"height: {metrics['errors'][:,2].mean():.4f}, "
                  f"width: {metrics['errors'][:,3].mean():.4f}")
-    log_saturation_breakdown(metrics, prefix="  test/")
     return metrics
 
 
-# ----------------------------------------------------------------------------
-# Final DAgger plots, evaluation, and artifact save.
-# ----------------------------------------------------------------------------
+
+# %% papermill={"duration": 0.962692, "end_time": "2026-07-01T23:09:03.802976+00:00", "exception": false, "start_time": "2026-07-01T23:09:02.840284+00:00", "status": "completed"}
+# %%
+# DAgger loop has completed; plot failure-rate trajectory
 fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 
 axes[0].plot(dagger_history['iteration'], dagger_history['failure_rate'], 'r-o', label='overall')
@@ -3682,13 +3080,38 @@ eval_results = evaluate_student(
 )
 
 # =====================================================================
-# Save model
+# Save model and export ONNX
 # =====================================================================
+#os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-MODEL_NAME = 'dagger_student_kirchhoff'
+MODEL_NAME = 'dagger_student_moe'
 torch.save(student.state_dict(), os.path.join(OUTPUT_DIR, f'{MODEL_NAME}.pt'))
 joblib.dump(scaler_X, os.path.join(OUTPUT_DIR, 'scaler_X.pkl'))
 joblib.dump(flow_scaler_C, os.path.join(OUTPUT_DIR, 'flow_scaler_C.pkl'))
+#import json as _json
+#with open(os.path.join(OUTPUT_DIR, 'param_log_bounds.json'), 'w') as _f:
+#    _json.dump({k: list(v) for k, v in PARAM_LOG_BOUNDS.items()}, _f, indent=2)
+#with open(os.path.join(OUTPUT_DIR, 'dagger_history.json'), 'w') as _f:
+#    _json.dump(dagger_history, _f, indent=2)
+#with open(os.path.join(OUTPUT_DIR, 'loss_history.json'), 'w') as _f:
+#    _json.dump(loss_history, _f, indent=2)
+#print(f"DAgger student model saved to {OUTPUT_DIR}")
+#
+#import subprocess
+#subprocess.run(["pip", "install", "-U", "onnxscript", "-q"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+#import torch.onnx
+#dummy_input = torch.zeros(1, 4).to(DEVICE)
+#onnx_path = os.path.join(OUTPUT_DIR, f'{MODEL_NAME}.onnx')
+#torch.onnx.export(
+#    student,
+#    dummy_input,
+#    onnx_path,
+#    input_names=['specs'],
+#    output_names=['logits'],
+#    dynamic_axes={'specs': {0: 'batch'}, 'logits': {0: 'batch'}},
+#    opset_version=13,
+#)
+#print(f"ONNX exported to {onnx_path}")
 
 # =====================================================================
 # Save test set predictions to CSV
@@ -3736,7 +3159,7 @@ print(f"Outputs saved to: {OUTPUT_DIR}")
 
 
 # ============================================================
-# Demo: Student Predictions (KirchhoffNet) for Specific Target Specs
+# Demo: Student Predictions (Bounded MLP) for Specific Target Specs
 # ============================================================
 # Input: [power, jitter, height, width] — raw physical units
 # Output: [fW, current, ind, Rd, Cs, Rs, VDD] — raw physical units
@@ -3769,11 +3192,12 @@ with torch.no_grad():
               " ".join(f"{v:>12.4e}" for v in pred_values))
 print(f"{'='*80}")
 
-print("\nInput scaling (LocalKirchhoffStudentWrapper.scale_input):")
-print(f"  per dim: log10(raw) -> min-max -> 2*(log - lo)/(hi - lo) - 1, clamp to [-{KN_INPUT_RAIL}, {KN_INPUT_RAIL}]")
-for _i, _name in enumerate(['power', 'jitter', 'height', 'width']):
-    print(f"  {_name:<7}: log10 range [{KN_INPUT_LOG_MIN[_i]:.3f}, {KN_INPUT_LOG_MAX[_i]:.3f}] "
-          f"-> raw [{10 ** KN_INPUT_LOG_MIN[_i]:.4e}, {10 ** KN_INPUT_LOG_MAX[_i]:.4e}]")
+print("\nInput scaling (BoundedMLP.scale_input):")
+print(f"  power  : log10(raw) -> StandardScaler -> (log10 - mean) / scale")
+print(f"  jitter : log10(raw) -> Q75           -> log10 / eye_scale_j")
+print(f"  height : log10(raw) -> Q75           -> log10 / eye_scale_h")
+print(f"  width  : log10(raw) -> Q75           -> log10 / eye_scale_w")
 print(f"\nOutput (bounded log-space -> physical): 10^(log_lo + (log_hi - log_lo)*sigmoid)")
 for name, (lo, hi) in PARAM_LOG_BOUNDS.items():
     print(f"  {name:>8}: [{10**lo:.4e}, {10**hi:.4e}]")
+

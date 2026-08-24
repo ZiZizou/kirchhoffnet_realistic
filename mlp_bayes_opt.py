@@ -44,8 +44,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 import os
+import re
 import subprocess
 import sys
 import time
@@ -55,6 +57,30 @@ from typing import Any
 import optuna
 import torch
 from optuna.samplers import TPESampler
+
+
+def _recover_unfinished_trials(study: optuna.Study) -> tuple[list[dict[str, Any]], set[int]]:
+    """Mark abandoned RUNNING trials as FAIL and re-queue their params.
+
+    Mirrors kn_bayes_opt.py:510 for AllianceCan Slurm preemptions. A trial
+    stays RUNNING in SQLite if the allocation is killed; study.optimize will
+    otherwise never retry it.
+    """
+    running = [t for t in study.trials if t.state == optuna.trial.TrialState.RUNNING]
+    if not running:
+        return [], set()
+    retry_params: list[dict[str, Any]] = []
+    recovered_seed_indices: set[int] = set()
+    for trial in running:
+        params = dict(trial.params)
+        retry_params.append(params)
+        try:
+            study._storage.set_trial_state_values(  # type: ignore[attr-defined]
+                trial._trial_id, optuna.trial.TrialState.FAIL, None
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Could not mark abandoned trial {trial.number} as FAIL") from exc
+    return retry_params, recovered_seed_indices
 
 
 DATASETS: dict[str, dict[str, Any]] = {
@@ -87,6 +113,13 @@ DATASETS: dict[str, dict[str, Any]] = {
         "in_dim": 2,
         "out_dim": 1,
         "default_budget": 1842,
+    },
+    "ctle": {
+        # 4-dim specs -> 7 params, MoE variant (RegimeAwareMoE) via DAgger
+        "script": "generative-distillation-improved-dagger-nuance-mlp.py",
+        "in_dim": 4,
+        "out_dim": 7,
+        "default_budget": 6000,
     },
 }
 
@@ -336,6 +369,11 @@ def main() -> None:
     if args.resume and (run_dir / (study_name + ".db")).exists():
         study = optuna.load_study(study_name=study_name, storage=storage,
                                   sampler=sampler)
+        retry_params, _ = _recover_unfinished_trials(study)
+        if retry_params:
+            print(f"[mlp_bayes_opt] recovered {len(retry_params)} unfinished trial(s); they will be retried")
+            for params in retry_params:
+                study.enqueue_trial(params)
     else:
         study = optuna.create_study(study_name=study_name, storage=storage,
                                     sampler=sampler, direction="minimize")
@@ -355,6 +393,78 @@ def main() -> None:
     print(f"[mlp_bayes_opt] script={script_path}")
 
     def objective(trial: optuna.Trial) -> float:
+        # ── CTLE fast DAgger proxy (4×100, Test 1000) ───────────────────
+        if args.dataset == "ctle":
+            # Use current defaults as trial 0 seed; otherwise sample MoE + DAgger knobs.
+            is_seed = trial.number == 0 and not args.resume
+            if is_seed:
+                trunk_width = 44
+                trunk_layers = 3
+                num_experts = 3
+                lr = 1e-3
+                weight_decay = 1e-4
+                batch_size = 256
+            else:
+                trunk_width = trial.suggest_int("moe_trunk_width", 32, 64)
+                trunk_layers = trial.suggest_int("moe_trunk_layers", 2, 3)
+                num_experts = trial.suggest_int("moe_num_experts", 2, 4)
+                lr = trial.suggest_float("lr", args.lr_min, args.lr_max, log=True)
+                weight_decay = trial.suggest_float("weight_decay", args.wd_min, args.wd_max, log=True)
+                batch_size = trial.suggest_categorical("batch_size", [256, 512, 1024])
+            trial_dir = run_dir / f"trial_{trial.number:04d}"
+            trial_dir.mkdir(parents=True, exist_ok=True)
+            log_path = trial_dir / "log.txt"
+            # 4×100 proxy: 4 DAgger iterations × 100 epochs, common-eval 1000 for speed
+            cmd = [
+                python_exe, str(script_path),
+                "--dagger-iterations", "4",
+                "--epochs-per-iter", "100",
+                "--common-eval-size", "1000",
+                "--moe-trunk-width", str(trunk_width),
+                "--moe-trunk-layers", str(trunk_layers),
+                "--moe-num-experts", str(num_experts),
+                "--lr", f"{lr:.6e}",
+                "--weight-decay", f"{weight_decay:.6e}",
+                "--batch-size", str(batch_size),
+                "--output", str(trial_dir),
+                "--device", device,
+                "--seed", str(args.seed),
+            ]
+            t0 = time.time()
+            sub_env = os.environ.copy()
+            sub_env.setdefault("PYTHONIOENCODING", "utf-8")
+            sub_env.setdefault("PYTHONUTF8", "1")
+            gpu_idx = -1
+            if device == "cuda" and n_gpus >= 1:
+                gpu_idx = trial.number % n_gpus
+                sub_env["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
+            with open(log_path, "w", encoding="utf-8") as logf:
+                logf.write(f"$ {' '.join(cmd)}\n")
+                logf.flush()
+                proc = subprocess.run(cmd, stdout=logf, stderr=subprocess.STDOUT, text=True, cwd=str(repo_dir), creationflags=creationflags, env=sub_env)
+            if proc.returncode != 0:
+                return float("inf")
+            text = log_path.read_text(encoding="utf-8", errors="ignore")
+            m = re.search(r"Test failure rate:\s*([\d\.]+)%", text)
+            if not m:
+                return float("inf")
+            test_rate = float(m.group(1)) / 100.0
+            # Parse actual param count for --param-budget penalty (mlp dagger logs "Student model: X params")
+            pm = re.search(r"Student model:\s*([0-9,]+)\s*params", text)
+            if pm is None:
+                pm = re.search(r"trainable params:\s*([0-9,]+)", text, re.I)
+            param_count = int(pm.group(1).replace(",", "")) if pm else None
+            trial.set_user_attr("test_failure_rate", test_rate)
+            trial.set_user_attr("moe_trunk_width", trunk_width)
+            trial.set_user_attr("moe_num_experts", num_experts)
+            if param_count is not None:
+                trial.set_user_attr("param_count", param_count)
+            # Obey --param-budget via same penalized objective as kn_bayes/mlp non-CTLE
+            penalized = _penalized_objective(test_rate, param_count or 0, param_budget, args.param_penalty)
+            trial.set_user_attr("raw_test_rate", test_rate)
+            trial.set_user_attr("penalized", penalized)
+            return penalized
+
         num_layers = trial.suggest_int("num_layers", 2, args.n_layers_max)
         hidden_dim = derive_hidden_dim(num_layers=num_layers,
                                        budget=param_budget,

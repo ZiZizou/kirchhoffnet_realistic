@@ -112,6 +112,12 @@ DATASETS: dict[str, dict[str, Any]] = {
         "num_hidden_range": (8, 24),
         "max_fanout_count": 2,
     },
+    "ctle": {
+        "in_dim": 4,
+        "out_dim": 7,
+        "num_hidden_range": (10, 20),
+        "max_fanout_count": 2,
+    },
 }
 
 BATCH_SIZE_CHOICES = [512, 1024, 2048, 4096]
@@ -164,6 +170,22 @@ START_POINTS: dict[str, dict[str, Any]] = {
         "sparsity_lambda": 0.0, "entropy_lambda": 1e-6,
         "device_l2_lambda": 0.0, "freeze_boundary": 0,
         "freeze_temporal_read": 0,
+    },
+    "ctle": {
+        # Seed is the current default dagger config (4 stages, 14 hidden, rank 2, t-span ~4.0 via SOLVER)
+        # plus the Friedman2 winner t-span 7.12 as prior for BO to explore.
+        "boundary_fan_out": {
+            "0": [2, 4], "1": [1, 3], "2": [12, 5], "3": [7, 9],
+        },
+        "num_hidden": 14, "small_world_k": 4, "small_world_p": 0.2,
+        "num_stages": 4, "fanout_count": 2,
+        "t_span": 4.0, "num_steps": 40,
+        "lr": 1e-3, "weight_decay": 1e-4, "batch_size": 256,
+        "x_max": 4.0, "gm_max": 10.0, "isat_max": 10.0,
+        "sparsity_lambda": 0.0, "entropy_lambda": 1e-6,
+        "device_l2_lambda": 0.0, "freeze_boundary": 0,
+        "freeze_temporal_read": 0,
+        "vca_rank": 2,
     },
 }
 
@@ -387,6 +409,67 @@ def _build_command(
     if problem.startswith("friedman"):
         cmd += ["--target-noise-std", "1.0"]
     return cmd
+
+
+def _build_dagger_command(
+    *,
+    python: str,
+    script: str,
+    dagger_iterations: int,
+    epochs_per_iter: int,
+    common_eval_size: int,
+    kn_num_stages: int,
+    kn_num_hidden: int,
+    kn_small_world_k: int,
+    kn_small_world_p: float,
+    kn_vca_rank: int,
+    kn_x_max: float,
+    lr: float,
+    weight_decay: float,
+    batch_size: int,
+    output: Path,
+    device: str,
+    boundary_fan_out: dict | None = None,
+    t_span: float | None = None,
+    seed: int = 0,
+) -> list[str]:
+    if boundary_fan_out is None:
+        # CTLE in_dim=4
+        boundary_fan_out = build_boundary_fan_out(
+            in_dim=4, fanout_count=2, num_hidden=kn_num_hidden
+        )
+    cmd = [
+        python,
+        script,
+        "--dagger-iterations", str(dagger_iterations),
+        "--epochs-per-iter", str(epochs_per_iter),
+        "--common-eval-size", str(common_eval_size),
+        "--kn-num-stages", str(kn_num_stages),
+        "--kn-num-hidden", str(kn_num_hidden),
+        "--kn-small-world-k", str(kn_small_world_k),
+        "--kn-small-world-p", f"{kn_small_world_p:.6f}",
+        "--kn-vca-rank", str(kn_vca_rank),
+        "--kn-x-max", f"{kn_x_max:.6f}",
+        "--boundary-fan-out", json.dumps(boundary_fan_out),
+        "--lr", f"{lr:.6e}",
+        "--weight-decay", f"{weight_decay:.6e}",
+        "--batch-size", str(batch_size),
+        "--output", str(output),
+        "--device", device,
+        "--seed", str(seed),
+    ]
+    if t_span is not None:
+        cmd += ["--t-span", f"{t_span:.6f}"]
+    return cmd
+
+
+def _parse_dagger_test_failure(log_text: str) -> float | None:
+    """Extract Test failure rate: X% from dagger log. Returns fraction 0-1."""
+    # Prefer last occurrence (final test)
+    matches = re.findall(r"Test failure rate:\s*([\d\.]+)%", log_text)
+    if not matches:
+        return None
+    return float(matches[-1]) / 100.0
 
 
 def _plot_history(study: optuna.Study, path: Path, *, title: str,
@@ -724,6 +807,107 @@ def main() -> None:
             trial.user_attrs.get("seed_trial") is True
             or trial.user_attrs.get("recovered_seed_trial") is True
         )
+
+        # ── CTLE fast DAgger proxy (4×100, Test 1000 objective) ──────────
+        if args.dataset == "ctle":
+            # Use defaults as seed-trial, otherwise sample 4×100 proxy space.
+            if is_seed_trial:
+                sp = START_POINTS["ctle"]
+                fanout_count = sp["fanout_count"]
+                num_hidden = sp["num_hidden"]
+                small_world_k = sp["small_world_k"]
+                small_world_p = sp["small_world_p"]
+                num_stages = sp["num_stages"]
+                t_span = sp["t_span"]
+                vca_rank = sp.get("vca_rank", 2)
+                lr = sp["lr"]
+                weight_decay = sp["weight_decay"]
+                batch_size = sp["batch_size"]
+                x_max = sp["x_max"]
+                seed_boundary_map = sp["boundary_fan_out"]
+            else:
+                fanout_count = trial.suggest_categorical("fanout_count", FANOUT_COUNT_CHOICES)
+                min_hidden_for_fanout = in_dim * fanout_count
+                nh_low = max(num_hidden_min, min_hidden_for_fanout)
+                if nh_low > num_hidden_max:
+                    raise optuna.TrialPruned(f"fanout_count={fanout_count} requires num_hidden >= {min_hidden_for_fanout}, but max={num_hidden_max}")
+                num_hidden = trial.suggest_int("num_hidden", nh_low, num_hidden_max)
+                small_world_k = trial.suggest_categorical("small_world_k", SMALL_WORLD_K_CHOICES)
+                if small_world_k >= num_hidden:
+                    raise optuna.TrialPruned(f"small_world_k={small_world_k} must be < num_hidden={num_hidden}")
+                small_world_p = SMALL_WORLD_P_FIXED
+                num_stages = trial.suggest_int("num_stages", 1, args.num_stages_max)
+                t_span = trial.suggest_float("t_span", args.t_span_min, args.t_span_max)
+                vca_rank = trial.suggest_int("vca_rank", args.vca_rank_min, args.vca_rank_max)
+                lr = trial.suggest_float("lr", args.lr_min, args.lr_max, log=True)
+                weight_decay = trial.suggest_float("weight_decay", args.wd_min, args.wd_max, log=True)
+                batch_size = trial.suggest_categorical("batch_size", BATCH_SIZE_CHOICES)
+                x_max = trial.suggest_float("x_max", args.x_max_min, args.x_max_max)
+                seed_boundary_map = None
+
+            dagger_iterations = 4
+            epochs_per_iter = 100
+            common_eval_size = 1000
+            # CTLE uses fixed 4-dim spec, so build_boundary_fan_out needs in_dim=4
+            trial_dir = run_dir / f"trial_{trial.number:04d}"
+            log_path = run_dir / f"trial_{trial.number:04d}.log.txt"
+            dagger_script = str((Path(__file__).parent / "dagger-nuance-distillation-kirchhoffnet.py").resolve())
+            cmd = _build_dagger_command(
+                python=python_exe, script=dagger_script,
+                dagger_iterations=dagger_iterations, epochs_per_iter=epochs_per_iter,
+                common_eval_size=common_eval_size,
+                kn_num_stages=num_stages, kn_num_hidden=num_hidden,
+                kn_small_world_k=small_world_k, kn_small_world_p=small_world_p,
+                kn_vca_rank=vca_rank, kn_x_max=x_max,
+                lr=lr, weight_decay=weight_decay, batch_size=batch_size,
+                output=trial_dir, device=device,
+                boundary_fan_out=seed_boundary_map, t_span=t_span, seed=args.seed,
+            )
+            # seed-trial attrs
+            if is_seed_trial:
+                trial.set_user_attr("seed_trial", True)
+                trial.set_user_attr("start_point", json.dumps(START_POINTS["ctle"]))
+            else:
+                trial.set_user_attr("seed_trial", False)
+            # GPU pinning
+            n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+            sub_env = os.environ.copy()
+            sub_env["PYTHONIOENCODING"] = "utf-8"
+            if device == "cuda" and n_gpus >= 1:
+                gpu_idx = trial.number % n_gpus
+                sub_env["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
+            # Run dagger (4×100)
+            trial_dir.mkdir(parents=True, exist_ok=True)
+            _logger.info(f"[ctle] trial {trial.number}: {' '.join(cmd)}")
+            with open(log_path, "w", encoding="utf-8") as logf:
+                logf.write(f"$ {' '.join(cmd)}\n")
+                logf.flush()
+                proc = subprocess.run(cmd, stdout=logf, stderr=subprocess.STDOUT, text=True, cwd=str(Path(__file__).parent), env=sub_env)
+            if proc.returncode != 0:
+                _logger.warning(f"[ctle] trial {trial.number} subprocess failed (code {proc.returncode})")
+                return float("inf")
+            log_text = log_path.read_text(encoding="utf-8", errors="ignore") if log_path.exists() else ""
+            test_rate = _parse_dagger_test_failure(log_text)
+            if test_rate is None:
+                _logger.warning(f"[ctle] trial {trial.number} could not parse Test failure rate")
+                return float("inf")
+            # Parse param count for penalty (optional)
+            param_count = _parse_trainable_param_count(log_text)
+            trial.set_user_attr("test_failure_rate", test_rate)
+            trial.set_user_attr("param_count", param_count if param_count is not None else 0)
+            # Penalized objective (same as kn_bayes for friedman)
+            base_metric = test_rate  # minimize Test 1000
+            if param_count is not None and args.param_budget is not None:
+                # over-budget -> large penalty as in original
+                param_limit = args.param_budget * (1 + args.param_tolerance)
+                if param_count > param_limit:
+                    ratio = param_count / max(1, param_limit)
+                    return float(args.invalid_param_objective) * (ratio ** 2)
+            penalized = _penalized_objective(base_metric, param_count or 0, args.param_budget or 10000, args.param_penalty)
+            trial.set_user_attr("raw_test_rate", base_metric)
+            trial.set_user_attr("penalized", penalized)
+            _logger.info(f"[ctle] trial {trial.number} Test {test_rate*100:.2f}% penalized {penalized*100:.2f}%")
+            return penalized
 
         fanout_count = trial.suggest_categorical("fanout_count",
                                                   FANOUT_COUNT_CHOICES)

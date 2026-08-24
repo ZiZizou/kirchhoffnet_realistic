@@ -39,9 +39,9 @@
 import os
 # os.chdir('/home/annaik/Documents/train_ctle')
 
-TEACHER_DIR = '/kaggle/input/models/awekill/improved-zig-nf-spline/pytorch/default/1'
-DATA_DIR = '/kaggle/input/datasets/awekill/augmented-cvae-ctle'
-OUTPUT_DIR = '/kaggle/working/'
+TEACHER_DIR = '/home/annaik/Documents/improved-zig-nf-spline-pytorch-default-v2/'
+DATA_DIR = '/home/annaik/Documents/augmented-cvae-ctle/'
+OUTPUT_DIR = '/home/annaik/Documents/dagger_output_bo_mlp'
 
 
 # %% [markdown] papermill={"duration": 0.005545, "end_time": "2026-07-01T22:28:11.279866+00:00", "exception": false, "start_time": "2026-07-01T22:28:11.274321+00:00", "status": "completed"}

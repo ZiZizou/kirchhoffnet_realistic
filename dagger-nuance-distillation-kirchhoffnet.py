@@ -671,6 +671,8 @@ try:
     _bo_parser.add_argument('--weight-decay', type=float, default=None)
     _bo_parser.add_argument('--output', type=str, default=None)
     _bo_parser.add_argument('--device', type=str, default=None)
+    _bo_parser.add_argument('--data-dir', type=str, default=None)
+    _bo_parser.add_argument('--teacher-dir', type=str, default=None)
     _bo_parser.add_argument('--seed', type=int, default=None)
     _bo_args, _ = _bo_parser.parse_known_args()
     if _bo_args.dagger_iterations is not None:
@@ -705,6 +707,10 @@ try:
         OUTPUT_DIR = _bo_args.output
     if _bo_args.device is not None:
         DEVICE = torch.device(_bo_args.device) if _bo_args.device != 'auto' else DEVICE
+    if _bo_args.data_dir is not None:
+        DATA_DIR = _bo_args.data_dir
+    if _bo_args.teacher_dir is not None:
+        TEACHER_DIR = _bo_args.teacher_dir
     if _bo_args.seed is not None:
         _NP_SEED = _bo_args.seed
         _TORCH_SEED = _bo_args.seed

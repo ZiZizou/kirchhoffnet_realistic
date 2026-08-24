@@ -41,7 +41,12 @@ import os
 
 TEACHER_DIR = '/home/annaik/Documents/improved-zig-nf-spline-pytorch-default-v2/'
 DATA_DIR = '/home/annaik/Documents/augmented-cvae-ctle/'
-OUTPUT_DIR = '/home/annaik/Documents/dagger_output_bo_mlp'
+OUTPUT_DIR = '/home/annaik/Documents/dagger_output'
+# BO wiring: keep Kaggle fallback for local smoke tests
+if not os.path.isdir(DATA_DIR):
+    _kaggle_fallback = '/kaggle/input/datasets/awekill/augmented-cvae-ctle'
+    if os.path.isdir(_kaggle_fallback):
+        DATA_DIR = _kaggle_fallback
 
 
 # %% [markdown] papermill={"duration": 0.005545, "end_time": "2026-07-01T22:28:11.279866+00:00", "exception": false, "start_time": "2026-07-01T22:28:11.274321+00:00", "status": "completed"}
@@ -168,6 +173,8 @@ try:
     _bo_parser.add_argument('--batch-size', type=int, default=None)
     _bo_parser.add_argument('--output', type=str, default=None)
     _bo_parser.add_argument('--device', type=str, default=None)
+    _bo_parser.add_argument('--data-dir', type=str, default=None)
+    _bo_parser.add_argument('--teacher-dir', type=str, default=None)
     _bo_parser.add_argument('--seed', type=int, default=None)
     _bo_args, _ = _bo_parser.parse_known_args()
     if _bo_args.dagger_iterations is not None:
@@ -193,6 +200,10 @@ try:
         OUTPUT_DIR = _bo_args.output
     if _bo_args.device is not None:
         DEVICE = torch.device(_bo_args.device) if _bo_args.device != 'auto' else DEVICE
+    if _bo_args.data_dir is not None:
+        DATA_DIR = _bo_args.data_dir
+    if _bo_args.teacher_dir is not None:
+        TEACHER_DIR = _bo_args.teacher_dir
     if _bo_args.seed is not None:
         np.random.seed(_bo_args.seed)
         torch.manual_seed(_bo_args.seed)
@@ -1065,6 +1076,20 @@ MOE_TRUNK_LAYERS    = 3     # number of trunk layers (excluding input)
 MOE_NUM_EXPERTS     = 3     # number of localized experts (Interior, Boundary, High-Jitter/Power)
 MOE_TRUNK_ACTIVATION = nn.SiLU  # activation function for trunk layers (SiLU or GELU)
 MOE_USE_LAYERNORM   = False # LayerNorm in trunk (keep False — inputs already scaled)
+# Re-apply BO MoE overrides that were parsed before this block was defined
+# (the initial BO block at ~161 runs before these defaults exist, so it cannot
+# override them; re-apply here so --moe-trunk-width etc. from mlp_bayes_opt.py
+# actually take effect for the RegimeAwareMoE instantiation at 2482).
+try:
+    if '_bo_args' in globals() and _bo_args is not None:
+        if getattr(_bo_args, 'moe_trunk_width', None) is not None:
+            MOE_TRUNK_WIDTH = _bo_args.moe_trunk_width
+        if getattr(_bo_args, 'moe_trunk_layers', None) is not None:
+            MOE_TRUNK_LAYERS = _bo_args.moe_trunk_layers
+        if getattr(_bo_args, 'moe_num_experts', None) is not None:
+            MOE_NUM_EXPERTS = _bo_args.moe_num_experts
+except Exception as _e:
+    _logger.warning(f"[BO] MoE override re-apply failed: {_e}")
 
 class RegimeAwareMoE(nn.Module):
     """
@@ -1274,7 +1299,7 @@ class BoundedMLP(nn.Module):
 # import zipfile
 
 CSV_PATHS = []
-history_dir = '/kaggle/input/datasets/awekill/augmented-cvae-ctle'
+history_dir = DATA_DIR
 
 csv_files = [
     'dataset_log_part_1_may3.csv', 'dataset_log_part_1_may4.csv',

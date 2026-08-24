@@ -78,6 +78,9 @@ from typing import Any
 
 import optuna
 import torch
+import logging
+
+_logger = logging.getLogger("kn_bayes_opt")
 from optuna.samplers import TPESampler
 
 
@@ -878,18 +881,18 @@ def main() -> None:
                 sub_env["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
             # Run dagger (4×100)
             trial_dir.mkdir(parents=True, exist_ok=True)
-            _logger.info(f"[ctle] trial {trial.number}: {' '.join(cmd)}")
+            print(f"[ctle] trial {trial.number}: {' '.join(cmd)}", flush=True)
             with open(log_path, "w", encoding="utf-8") as logf:
                 logf.write(f"$ {' '.join(cmd)}\n")
                 logf.flush()
                 proc = subprocess.run(cmd, stdout=logf, stderr=subprocess.STDOUT, text=True, cwd=str(Path(__file__).parent), env=sub_env)
             if proc.returncode != 0:
-                _logger.warning(f"[ctle] trial {trial.number} subprocess failed (code {proc.returncode})")
+                print(f"[ctle] trial {trial.number} subprocess failed (code {proc.returncode})", flush=True)
                 return float("inf")
             log_text = log_path.read_text(encoding="utf-8", errors="ignore") if log_path.exists() else ""
             test_rate = _parse_dagger_test_failure(log_text)
             if test_rate is None:
-                _logger.warning(f"[ctle] trial {trial.number} could not parse Test failure rate")
+                print(f"[ctle] trial {trial.number} could not parse Test failure rate", flush=True)
                 return float("inf")
             # Parse param count for penalty (optional)
             param_count = _parse_trainable_param_count(log_text)
@@ -906,7 +909,7 @@ def main() -> None:
             penalized = _penalized_objective(base_metric, param_count or 0, args.param_budget or 10000, args.param_penalty)
             trial.set_user_attr("raw_test_rate", base_metric)
             trial.set_user_attr("penalized", penalized)
-            _logger.info(f"[ctle] trial {trial.number} Test {test_rate*100:.2f}% penalized {penalized*100:.2f}%")
+            print(f"[ctle] trial {trial.number} Test {test_rate*100:.2f}% penalized {penalized*100:.2f}%", flush=True)
             return penalized
 
         fanout_count = trial.suggest_categorical("fanout_count",

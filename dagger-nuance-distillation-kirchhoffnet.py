@@ -674,7 +674,12 @@ try:
     _bo_parser.add_argument('--data-dir', type=str, default=None)
     _bo_parser.add_argument('--teacher-dir', type=str, default=None)
     _bo_parser.add_argument('--seed', type=int, default=None)
+    _bo_parser.add_argument('--count-params-only', action='store_true', default=False,
+                            help='Build the student, print trainable param count, and exit '
+                                 'before data/teacher loading (for kn_bayes_opt preflight).')
     _bo_args, _ = _bo_parser.parse_known_args()
+    # stash for later early-exit check (after LocalKirchhoffStudentWrapper is defined)
+    _COUNT_PARAMS_ONLY = bool(getattr(_bo_args, 'count_params_only', False))
     if _bo_args.dagger_iterations is not None:
         DAGGER_ITERATIONS = _bo_args.dagger_iterations
     if _bo_args.epochs_per_iter is not None:
@@ -1741,6 +1746,50 @@ class LocalKirchhoffStudentWrapper(nn.Module):
             "total": int(total),
         }
 
+
+# ── count-params-only fast path (before heavy data loading) ────────────
+# If invoked via kn_bayes_opt preflight, build a lightweight student and exit
+# immediately without loading CSVs / teacher models. This mirrors
+# train_script.py --count-params-only.
+if globals().get('_COUNT_PARAMS_ONLY', False) or '--count-params-only' in sys.argv:
+    try:
+        _pf_student = LocalKirchhoffStudentWrapper(
+            num_stages=KN_NUM_STAGES,
+            num_hidden=KN_NUM_HIDDEN,
+            small_world_k=KN_SMALL_WORLD_K,
+            small_world_p=KN_SMALL_WORLD_P,
+            small_world_seed=KN_SMALL_WORLD_SEED,
+            edge_repeats=KN_EDGE_REPEATS,
+            cell_library=KN_CELL_LIBRARY,
+            leak_mode=KN_LEAK_MODE,
+            interstage_activation=KN_INTERSTAGE_ACTIVATION,
+            freeze_read=KN_FREEZE_READ,
+            boundary_fan_out=KN_BOUNDARY_FAN_OUT,
+            enable_temporal_readout=KN_TEMPORAL_READOUT,
+            num_targets=7,
+            input_rail=KN_INPUT_RAIL,
+            x_max=KN_X_MAX,
+            param_log_bounds=PARAM_LOG_BOUNDS,
+            seed=KN_SMALL_WORLD_SEED,
+            vca_enabled=KN_VCA,
+            vca_rank=KN_VCA_RANK,
+            vca_core_enabled=KN_VCA_CORE,
+            vca_gate_shunt=KN_VCA_GATE_SHUNT,
+            vca_separate_core_bus=KN_VCA_SEPARATE_CORE_BUS,
+        )
+        _pf_n = sum(p.numel() for p in _pf_student.parameters() if p.requires_grad)
+        print(f"trainable params: {_pf_n:,}")
+        try:
+            print(f"param breakdown:\n{format_parameter_breakdown(_pf_student.net.parameter_breakdown())}")
+        except Exception:
+            pass
+        sys.exit(0)
+    except SystemExit:
+        raise
+    except Exception as _e:
+        print(f"[dagger] --count-params-only failed: {_e}", file=sys.stderr)
+        import traceback; traceback.print_exc()
+        sys.exit(1)
 
 # ----------------------------------------------------------------------------
 # Load historical data to get spec distributions.
@@ -2870,8 +2919,18 @@ _logger.info(
 )
 _n_trainable = sum(p.numel() for p in student.parameters() if p.requires_grad)
 _logger.info(f"Student trainable params: {_n_trainable:,}")
+# train_script.py-compatible line for kn_bayes_opt._parse_trainable_param_count
+print(f"trainable params: {_n_trainable:,}")
 _bd = student.net.parameter_breakdown()
 _logger.info(f"Student param breakdown:\n{format_parameter_breakdown(_bd)}")
+# ── count-params-only preflight (kn_bayes_opt.py CTLE gate) ─────────────
+# Exit before any data/teacher loading so the Optuna sampler can reject
+# over-budget configs without paying the 4×100 training cost. The flag is
+# parsed early above; this check runs right after the student is built so
+# the printed trainable count matches the log line above.
+if globals().get('_COUNT_PARAMS_ONLY', False) or '--count-params-only' in sys.argv:
+    print(f"[dagger] --count-params-only: trainable params={_n_trainable:,} — exiting before training")
+    sys.exit(0)
 
 # Optimizer and scheduler (defined once, reused across iterations).
 # Wrapper's parameters() exposes the entire local KirchhoffNetWithIO

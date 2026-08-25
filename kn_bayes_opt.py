@@ -90,36 +90,42 @@ DATASETS: dict[str, dict[str, Any]] = {
         "out_dim": 1,
         "num_hidden_range": (16, 32),
         "max_fanout_count": 2,
+        "default_budget": 8000,
     },
     "smooth2d": {
         "in_dim": 2,
         "out_dim": 1,
         "num_hidden_range": (8, 24),
         "max_fanout_count": 2,
+        "default_budget": 7000,
     },
     "friedman1": {
         "in_dim": 10,
         "out_dim": 1,
         "num_hidden_range": (20, 32),
         "max_fanout_count": 2,
+        "default_budget": 7000,
     },
     "friedman2": {
         "in_dim": 4,
         "out_dim": 1,
         "num_hidden_range": (8, 32),
         "max_fanout_count": 2,
+        "default_budget": 7000,
     },
     "friedman3": {
         "in_dim": 4,
         "out_dim": 1,
         "num_hidden_range": (8, 24),
         "max_fanout_count": 2,
+        "default_budget": 7000,
     },
     "ctle": {
         "in_dim": 4,
         "out_dim": 7,
         "num_hidden_range": (10, 20),
         "max_fanout_count": 2,
+        "default_budget": 6000,
     },
 }
 
@@ -590,9 +596,12 @@ def main() -> None:
                         help="Dimensionless multiplier for the parameter-count "
                              "penalty (default: 0.25; 0 disables it).")
     parser.add_argument("--param-budget", type=int, default=None,
-                        help="Optional hard maximum on trainable parameters. "
-                             "Trials exceeding it receive a finite graded "
-                             "objective before training.")
+                        help="Hard maximum on trainable parameters. "
+                              "Defaults to per-dataset budget (housing 8000, "
+                              "friedman1/2/3 7000, smooth2d 7000, ctle 6000); "
+                              "trials exceeding budget*(1+tolerance) are "
+                              "rejected via an upfront --count-params-only "
+                              "preflight without training.")
     parser.add_argument("--param-tolerance", type=float, default=0.10,
                         help="Allowed fractional overage above param-budget "
                              "before rejection (default: 0.10 = 10%%).")
@@ -600,9 +609,9 @@ def main() -> None:
                         help="Base objective for over-budget models. Their "
                              "finite penalty is this value times the squared "
                              "parameter-count/budget ratio (default: 1e6).")
-    parser.add_argument("--param-reference", type=int, default=10000,
+    parser.add_argument("--param-reference", type=int, default=None,
                         help="Parameter count corresponding to normalized size "
-                             "1.0 for the penalty (default: 10000).")
+                             "1.0 for the penalty (default: param-budget or 10000).")
     parser.add_argument("--num-hidden-min", type=int, default=None,
                         help="Override min num_hidden (default: "
                              "max(default_min_from_DATASETS, "
@@ -680,6 +689,8 @@ def main() -> None:
 
     if args.param_budget is not None and args.param_budget < 1:
         raise ValueError("--param-budget must be >= 1")
+    if args.param_reference is not None and args.param_reference < 1:
+        raise ValueError("--param-reference must be >= 1")
     if args.param_tolerance < 0.0:
         raise ValueError("--param-tolerance must be >= 0")
     if args.vca_rank_min < 1 or args.vca_rank_min > args.vca_rank_max:
@@ -800,10 +811,27 @@ def main() -> None:
     print(f"[kn_bayes_opt] run_dir={run_dir}")
     print(f"[kn_bayes_opt] script={script_path}")
     print(f"[kn_bayes_opt] study_resumed={study_was_resumed}")
-    param_reference = (args.param_budget if args.param_budget is not None
-                       else args.param_reference)
-    param_limit = (args.param_budget * (1.0 + args.param_tolerance)
-                   if args.param_budget is not None else None)
+    # Resolve effective param budget: CLI override > per-dataset default.
+    # This makes the upfront --count-params-only gate active for every
+    # dataset including housing (previously housing had no default budget).
+    param_budget: int | None = (
+        args.param_budget if args.param_budget is not None
+        else cfg.get("default_budget")
+    )
+    # param_reference: explicit CLI > resolved budget > 10000 fallback.
+    if args.param_reference is not None:
+        param_reference = args.param_reference
+    elif param_budget is not None:
+        param_reference = param_budget
+    else:
+        param_reference = 10000
+    param_limit: float | None = (
+        param_budget * (1.0 + args.param_tolerance)
+        if param_budget is not None else None
+    )
+    print(f"[kn_bayes_opt] param_budget={param_budget} "
+          f"param_limit={param_limit} param_reference={param_reference} "
+          f"param_tolerance={args.param_tolerance}")
 
     def objective(trial: optuna.Trial) -> float:
         is_seed_trial = (
@@ -899,14 +927,17 @@ def main() -> None:
             trial.set_user_attr("test_failure_rate", test_rate)
             trial.set_user_attr("param_count", param_count if param_count is not None else 0)
             # Penalized objective (same as kn_bayes for friedman)
+            # Upfront gate for CTLE: use --count-params-only would require
+            # dagger preflight; for now we gate after the run (CTLE runs are
+            # 4x100 fast proxy). Also enforce hard gate before penalty.
             base_metric = test_rate  # minimize Test 1000
-            if param_count is not None and args.param_budget is not None:
-                # over-budget -> large penalty as in original
-                param_limit = args.param_budget * (1 + args.param_tolerance)
-                if param_count > param_limit:
+            if param_count is not None and param_budget is not None:
+                # over-budget -> finite graded penalty, no extra training waste
+                # for subsequent trials (TPE learns to avoid large configs)
+                if param_limit is not None and param_count > param_limit:
                     ratio = param_count / max(1, param_limit)
                     return float(args.invalid_param_objective) * (ratio ** 2)
-            penalized = _penalized_objective(base_metric, param_count or 0, args.param_budget or 10000, args.param_penalty)
+            penalized = _penalized_objective(base_metric, param_count or 0, param_reference, args.param_penalty)
             trial.set_user_attr("raw_test_rate", base_metric)
             trial.set_user_attr("penalized", penalized)
             print(f"[ctle] trial {trial.number} Test {test_rate*100:.2f}% penalized {penalized*100:.2f}%", flush=True)
@@ -1027,16 +1058,19 @@ def main() -> None:
             trial.set_user_attr("preflight_returncode", preflight.returncode)
             return float("inf")
         trial.set_user_attr("preflight_params", preflight_params)
+        # Upfront gate: reject over-budget configs before training.
+        # Uses --count-params-only preflight so housing and all other
+        # datasets are checked identically; no training time is wasted.
         if (param_limit is not None and preflight_params > param_limit):
             invalid_objective = _over_budget_objective(
                 preflight_params, int(param_limit),
                 args.invalid_param_objective)
             trial.set_user_attr("param_budget_exceeded", True)
-            trial.set_user_attr("param_budget", args.param_budget)
+            trial.set_user_attr("param_budget", param_budget)
             trial.set_user_attr("param_limit", param_limit)
             trial.set_user_attr("actual_params", preflight_params)
             trial.set_user_attr("normalized_param_count",
-                                preflight_params / args.param_budget)
+                                preflight_params / max(1, param_budget))
             trial.set_user_attr("invalid_param_objective", invalid_objective)
             print(f"[kn_bayes_opt] trial {trial.number:04d} rejected before "
                   f"training: params={preflight_params} > "
@@ -1084,11 +1118,11 @@ def main() -> None:
                 actual_params, int(param_limit),
                 args.invalid_param_objective)
             trial.set_user_attr("param_budget_exceeded", True)
-            trial.set_user_attr("param_budget", args.param_budget)
+            trial.set_user_attr("param_budget", param_budget)
             trial.set_user_attr("param_limit", param_limit)
             trial.set_user_attr("actual_params", actual_params)
             trial.set_user_attr("normalized_param_count",
-                                actual_params / args.param_budget)
+                                actual_params / max(1, param_budget))
             trial.set_user_attr("invalid_param_objective", invalid_objective)
             print(f"[kn_bayes_opt] trial {trial.number:04d} rejected after "
                   f"training: params={actual_params} > "
@@ -1151,11 +1185,11 @@ def main() -> None:
         f.write(f"epochs: {args.epochs}\n")
         f.write(f"objective: {args.objective}\n")
         f.write(f"param_penalty: {args.param_penalty}\n")
-        f.write(f"param_budget: {args.param_budget}\n")
+        f.write(f"param_budget: {param_budget}\n")
         f.write(f"param_tolerance: {args.param_tolerance}\n")
         f.write(f"param_limit: {param_limit}\n")
         f.write(f"invalid_param_objective: {args.invalid_param_objective}\n")
-        f.write(f"param_reference: {args.param_reference}\n")
+        f.write(f"param_reference: {param_reference}\n")
         f.write(f"seed: {args.seed}\n")
         f.write(f"n_trials: {args.n_trials}\n")
         f.write(f"n_workers: {n_workers}\n")

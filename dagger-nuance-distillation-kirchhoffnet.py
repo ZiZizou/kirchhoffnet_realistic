@@ -65,6 +65,11 @@ TEACHER_DIR = '/home/annaik/Documents/improved-zig-nf-spline-pytorch-default-v2/
 DATA_DIR = '/home/annaik/Documents/augmented-cvae-ctle/'
 OUTPUT_DIR = '/home/annaik/Documents/dagger_output'
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+# Keep the original base output dir for shared caches (initial dataset).
+# ``OUTPUT_DIR`` is overridden per-trial via ``--output`` in BO, but the
+# initial dataset cache should remain global so BO trials reuse the expensive
+# teacher-labeled 20k sample set.
+_BASE_OUTPUT_DIR = OUTPUT_DIR
 
 
 # ----------------------------------------------------------------------------
@@ -87,6 +92,18 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # ----------------------------------------------------------------------------
 CHECKPOINT_PATH = os.path.join(OUTPUT_DIR, 'dagger_checkpoint.pt')
 _CKPT_VERSION = 1
+
+
+def _get_checkpoint_path() -> str:
+    """Return the checkpoint path for the current ``OUTPUT_DIR``.
+
+    ``OUTPUT_DIR`` can be overridden via ``--output`` (kn_bayes_opt CTLE
+    proxy). ``CHECKPOINT_PATH`` is bound at import, so after an override the
+    stale global would point at the shared ``dagger_output/`` directory and
+    concurrent BO trials would race on the same file (size-mismatch on
+    topology change). This helper always reflects the current ``OUTPUT_DIR``.
+    """
+    return os.path.join(OUTPUT_DIR, 'dagger_checkpoint.pt')
 
 
 def _config_hash():
@@ -128,25 +145,31 @@ def _config_hash():
 
 
 def _initial_dataset_cache_path():
-    return os.path.join(OUTPUT_DIR, f'initial_dataset_{_config_hash()}.pkl')
+    # Keep the initial dataset cache global (in _BASE_OUTPUT_DIR) so BO's
+    # sequential trials reuse the same 20k teacher-labeled set. Using the
+    # per-trial OUTPUT_DIR would force a costly rebuild per trial.
+    base = globals().get("_BASE_OUTPUT_DIR", OUTPUT_DIR)
+    return os.path.join(base, f'initial_dataset_{_config_hash()}.pkl')
 
 
 def load_checkpoint():
     """Load the latest checkpoint, returning ``None`` if missing or corrupt."""
-    if not os.path.exists(CHECKPOINT_PATH):
+    ckpt_path = _get_checkpoint_path()
+    if not os.path.exists(ckpt_path):
         return None
     try:
-        return torch.load(CHECKPOINT_PATH, map_location='cpu', weights_only=False)
+        return torch.load(ckpt_path, map_location='cpu', weights_only=False)
     except Exception as e:
-        _logger.warning(f"[CKPT] Failed to load checkpoint at {CHECKPOINT_PATH}: {e}; ignoring")
+        _logger.warning(f"[CKPT] Failed to load checkpoint at {ckpt_path}: {e}; ignoring")
         return None
 
 
 def save_checkpoint(ckpt):
-    """Atomically save checkpoint to ``CHECKPOINT_PATH`` (tmp + replace)."""
-    tmp = CHECKPOINT_PATH + '.tmp'
+    """Atomically save checkpoint to the per-``OUTPUT_DIR`` checkpoint path (tmp + replace)."""
+    ckpt_path = _get_checkpoint_path()
+    tmp = ckpt_path + '.tmp'
     torch.save(ckpt, tmp)
-    os.replace(tmp, CHECKPOINT_PATH)
+    os.replace(tmp, ckpt_path)
 
 
 def _capture_rng():
@@ -710,6 +733,31 @@ try:
         WEIGHT_DECAY = _bo_args.weight_decay
     if _bo_args.output is not None:
         OUTPUT_DIR = _bo_args.output
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        # Keep the legacy global in sync for any external importers, but
+        # checkpoint helpers now use _get_checkpoint_path() so concurrent BO
+        # trials no longer race on the shared dagger_output/ file.
+        CHECKPOINT_PATH = _get_checkpoint_path()
+        # Best-effort: re-target the Tee log file to the per-trial output
+        # dir as well so dagger_training.log is side-by-side with the
+        # checkpoint. Failures are non-fatal (global log still works).
+        try:
+            _new_log_file = os.path.join(OUTPUT_DIR, "dagger_training.log")
+            if _new_log_file != globals().get("_LOG_FILE"):
+                _new_fh = open(_new_log_file, "a", encoding="utf-8")
+                # Swap the file handle underlying the Tee streams.
+                _old_fh = globals().get("_log_fh")
+                if _old_fh is not None:
+                    try:
+                        _old_fh.flush()
+                    except Exception:
+                        pass
+                sys.stdout._log_fh = _new_fh  # type: ignore[attr-defined]
+                sys.stderr._log_fh = _new_fh  # type: ignore[attr-defined]
+                globals()["_LOG_FILE"] = _new_log_file
+                globals()["_log_fh"] = _new_fh
+        except Exception as _e:
+            _logger.warning(f"[BO] failed to re-target log file to {OUTPUT_DIR}: {_e}")
     if _bo_args.device is not None:
         DEVICE = torch.device(_bo_args.device) if _bo_args.device != 'auto' else DEVICE
     if _bo_args.data_dir is not None:
@@ -3015,7 +3063,7 @@ if ckpt is not None:
         _restore_histories_from_ckpt(ckpt)
         _restore_common_eval_specs_from_ckpt(ckpt)
         _logger.info(
-            f"[CKPT] Resumed from {CHECKPOINT_PATH}  "
+            f"[CKPT] Resumed from {_get_checkpoint_path()}  "
             f"next_iter={int(ckpt['dagger_iter'])}, "
             f"dataset_size={len(ckpt.get('dataset', []))}, "
             f"format_version={ckpt.get('format_version')}"
@@ -3089,7 +3137,7 @@ else:
     # the first iteration's training or teacher labeling can resume cleanly.
     try:
         save_checkpoint(_ckpt_baseline_payload(dagger_iter=0))
-        _logger.info(f"[CKPT] Baseline checkpoint saved to {CHECKPOINT_PATH}")
+        _logger.info(f"[CKPT] Baseline checkpoint saved to {_get_checkpoint_path()}")
     except Exception as e:
         _logger.warning(f"[CKPT] Failed to write baseline checkpoint: {e}")
 

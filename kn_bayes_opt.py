@@ -436,6 +436,9 @@ def _build_dagger_command(
     lr: float,
     weight_decay: float,
     batch_size: int,
+    fanout_count: int,
+    earlystop_eval_every: int,
+    initial_dataset_cache_dir: Path | None,
     output: Path,
     device: str,
     boundary_fan_out: dict | None = None,
@@ -445,7 +448,7 @@ def _build_dagger_command(
     if boundary_fan_out is None:
         # CTLE in_dim=4
         boundary_fan_out = build_boundary_fan_out(
-            in_dim=4, fanout_count=2, num_hidden=kn_num_hidden
+            in_dim=4, fanout_count=fanout_count, num_hidden=kn_num_hidden
         )
     cmd = [
         python,
@@ -463,12 +466,15 @@ def _build_dagger_command(
         "--lr", f"{lr:.6e}",
         "--weight-decay", f"{weight_decay:.6e}",
         "--batch-size", str(batch_size),
+        "--earlystop-eval-every", str(earlystop_eval_every),
         "--output", str(output),
         "--device", device,
         "--seed", str(seed),
     ]
     if t_span is not None:
         cmd += ["--t-span", f"{t_span:.6f}"]
+    if initial_dataset_cache_dir is not None:
+        cmd += ["--initial-dataset-cache-dir", str(initial_dataset_cache_dir)]
     return cmd
 
 
@@ -683,8 +689,20 @@ def main() -> None:
                              "studies are resumed automatically.")
     parser.add_argument("--no-seed-trial", action="store_true",
                         help="Skip enqueueing the START_POINTS seed trial "
-                             "(trial 0 explores the search space from a "
-                             "random TPE sample instead).")
+                        "(trial 0 explores the search space from a "
+                        "random TPE sample instead).")
+    parser.add_argument("--ctle-dagger-iterations", type=int, default=4,
+                        help="CTLE DAgger iterations per BO trial (default: 4).")
+    parser.add_argument("--ctle-epochs-per-iter", type=int, default=100,
+                        help="CTLE epochs per DAgger iteration (default: 100).")
+    parser.add_argument("--ctle-common-eval-size", type=int, default=1000,
+                        help="CTLE common evaluation specs per BO trial (default: 1000).")
+    parser.add_argument("--ctle-earlystop-eval-every", type=int, default=5,
+                        help="Evaluate CTLE common failure rate every N epochs "
+                             "(default: 5; final epoch is always evaluated).")
+    parser.add_argument("--ctle-initial-dataset-cache-dir", type=Path, default=None,
+                        help="Shared cache for CTLE initial teacher labels. Defaults to "
+                             "<output>/ctle_initial_dataset_cache.")
     args = parser.parse_args()
 
     if args.param_budget is not None and args.param_budget < 1:
@@ -697,6 +715,11 @@ def main() -> None:
         raise ValueError("Invalid VCA rank range")
     if args.invalid_param_objective <= 0.0:
         raise ValueError("--invalid-param-objective must be > 0")
+    if (args.ctle_dagger_iterations < 1 or args.ctle_epochs_per_iter < 1
+            or args.ctle_common_eval_size < 1 or args.ctle_earlystop_eval_every < 1):
+        raise ValueError("CTLE iteration, epoch, evaluation-size, and evaluation-frequency values must be >= 1")
+    if args.dataset == "ctle" and args.num_stages_max < 2:
+        raise ValueError("CTLE prior search requires --num-stages-max >= 2")
 
     cfg = DATASETS[args.dataset]
     in_dim: int = cfg["in_dim"]
@@ -746,7 +769,8 @@ def main() -> None:
         n_workers = max(1, args.n_workers)
 
     db_path = run_dir / (study_name + ".db")
-    sampler = TPESampler(seed=args.seed)
+    # KNet's topology, solver, and optimizer parameters interact strongly.
+    sampler = TPESampler(seed=args.seed, multivariate=True, group=True)
     study_was_resumed = db_path.exists()
     if study_was_resumed:
         study = optuna.load_study(study_name=study_name, storage=storage,
@@ -832,6 +856,15 @@ def main() -> None:
     print(f"[kn_bayes_opt] param_budget={param_budget} "
           f"param_limit={param_limit} param_reference={param_reference} "
           f"param_tolerance={args.param_tolerance}")
+    ctle_cache_dir: Path | None = None
+    if args.dataset == "ctle":
+        ctle_cache_dir = (args.ctle_initial_dataset_cache_dir
+                          or (out_dir / "ctle_initial_dataset_cache")).resolve()
+        ctle_cache_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[kn_bayes_opt] CTLE proxy={args.ctle_dagger_iterations}x"
+              f"{args.ctle_epochs_per_iter}, eval={args.ctle_common_eval_size} "
+              f"every {args.ctle_earlystop_eval_every} epochs, "
+              f"initial_cache={ctle_cache_dir}")
 
     def objective(trial: optuna.Trial) -> float:
         is_seed_trial = (
@@ -857,28 +890,31 @@ def main() -> None:
                 x_max = sp["x_max"]
                 seed_boundary_map = sp["boundary_fan_out"]
             else:
-                fanout_count = trial.suggest_categorical("fanout_count", FANOUT_COUNT_CHOICES)
-                min_hidden_for_fanout = in_dim * fanout_count
-                nh_low = max(num_hidden_min, min_hidden_for_fanout)
-                if nh_low > num_hidden_max:
-                    raise optuna.TrialPruned(f"fanout_count={fanout_count} requires num_hidden >= {min_hidden_for_fanout}, but max={num_hidden_max}")
+                # CTLE's known useful prior is two distinct boundary targets
+                # per input, so do not spend a DAgger trial on fanout=1.
+                fanout_count = 2
+                nh_low = max(num_hidden_min, in_dim * fanout_count)
                 num_hidden = trial.suggest_int("num_hidden", nh_low, num_hidden_max)
                 small_world_k = trial.suggest_categorical("small_world_k", SMALL_WORLD_K_CHOICES)
                 if small_world_k >= num_hidden:
                     raise optuna.TrialPruned(f"small_world_k={small_world_k} must be < num_hidden={num_hidden}")
                 small_world_p = SMALL_WORLD_P_FIXED
-                num_stages = trial.suggest_int("num_stages", 1, args.num_stages_max)
-                t_span = trial.suggest_float("t_span", args.t_span_min, args.t_span_max)
-                vca_rank = trial.suggest_int("vca_rank", args.vca_rank_min, args.vca_rank_max)
+                # CTLE-specific parameter names preserve compatibility when a
+                # pre-existing broad CTLE study is resumed from SQLite.
+                num_stages = trial.suggest_int("ctle_num_stages", 2, min(5, args.num_stages_max))
+                t_span = trial.suggest_float("ctle_t_span", max(3.0, args.t_span_min), min(7.0, args.t_span_max))
+                # Rank 2 is a demonstrated prior; nearby values retain a
+                # capacity ablation without wasting trials on ranks 1 and 5-8.
+                vca_rank = trial.suggest_categorical("ctle_vca_rank", [2, 3, 4])
                 lr = trial.suggest_float("lr", args.lr_min, args.lr_max, log=True)
                 weight_decay = trial.suggest_float("weight_decay", args.wd_min, args.wd_max, log=True)
                 batch_size = trial.suggest_categorical("batch_size", BATCH_SIZE_CHOICES)
-                x_max = trial.suggest_float("x_max", args.x_max_min, args.x_max_max)
+                x_max = START_POINTS["ctle"]["x_max"]
                 seed_boundary_map = None
 
-            dagger_iterations = 4
-            epochs_per_iter = 100
-            common_eval_size = 1000
+            dagger_iterations = args.ctle_dagger_iterations
+            epochs_per_iter = args.ctle_epochs_per_iter
+            common_eval_size = args.ctle_common_eval_size
             # CTLE uses fixed 4-dim spec, so build_boundary_fan_out needs in_dim=4
             trial_dir = run_dir / f"trial_{trial.number:04d}"
             log_path = run_dir / f"trial_{trial.number:04d}.log.txt"
@@ -891,6 +927,9 @@ def main() -> None:
                 kn_small_world_k=small_world_k, kn_small_world_p=small_world_p,
                 kn_vca_rank=vca_rank, kn_x_max=x_max,
                 lr=lr, weight_decay=weight_decay, batch_size=batch_size,
+                fanout_count=fanout_count,
+                earlystop_eval_every=args.ctle_earlystop_eval_every,
+                initial_dataset_cache_dir=ctle_cache_dir,
                 output=trial_dir, device=device,
                 boundary_fan_out=seed_boundary_map, t_span=t_span, seed=args.seed,
             )
@@ -907,7 +946,26 @@ def main() -> None:
             if device == "cuda" and n_gpus >= 1:
                 gpu_idx = trial.number % n_gpus
                 sub_env["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
-            # Run dagger (4×100)
+            # A DAgger trial can take hours. Reject architectures materially
+            # above the shared parameter budget before teacher/data work.
+            preflight_cmd = cmd.copy()
+            preflight_output = trial_dir / "_preflight"
+            preflight_cmd[preflight_cmd.index("--output") + 1] = str(preflight_output)
+            preflight_cmd += ["--count-params-only"]
+            preflight = subprocess.run(
+                preflight_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, cwd=str(Path(__file__).parent), env=sub_env,
+            )
+            preflight_params = _parse_trainable_param_count(preflight.stdout)
+            if preflight.returncode != 0 or preflight_params is None:
+                trial.set_user_attr("preflight_failed", True)
+                return float("inf")
+            trial.set_user_attr("preflight_params", preflight_params)
+            if param_limit is not None and preflight_params > param_limit:
+                trial.set_user_attr("actual_params", preflight_params)
+                return _over_budget_objective(
+                    preflight_params, int(param_limit), args.invalid_param_objective)
+            # Run DAgger.
             trial_dir.mkdir(parents=True, exist_ok=True)
             print(f"[ctle] trial {trial.number}: {' '.join(cmd)}", flush=True)
             with open(log_path, "w", encoding="utf-8") as logf:

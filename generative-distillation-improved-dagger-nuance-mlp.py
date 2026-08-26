@@ -165,6 +165,7 @@ try:
     _bo_parser.add_argument('--dagger-iterations', type=int, default=None)
     _bo_parser.add_argument('--epochs-per-iter', type=int, default=None)
     _bo_parser.add_argument('--common-eval-size', type=int, default=None)
+    _bo_parser.add_argument('--earlystop-eval-every', type=int, default=None)
     _bo_parser.add_argument('--moe-trunk-width', type=int, default=None)
     _bo_parser.add_argument('--moe-trunk-layers', type=int, default=None)
     _bo_parser.add_argument('--moe-num-experts', type=int, default=None)
@@ -184,6 +185,10 @@ try:
         EARLYSTOP_PATIENCE_EPOCHS = EPOCHS_PER_ITER
     if _bo_args.common_eval_size is not None:
         COMMON_EVAL_SIZE = _bo_args.common_eval_size
+    if _bo_args.earlystop_eval_every is not None:
+        if _bo_args.earlystop_eval_every < 1:
+            raise ValueError('--earlystop-eval-every must be >= 1')
+        EARLYSTOP_EVAL_EVERY = _bo_args.earlystop_eval_every
     if _bo_args.moe_trunk_width is not None:
         MOE_TRUNK_WIDTH = _bo_args.moe_trunk_width
     if _bo_args.moe_trunk_layers is not None:
@@ -3225,4 +3230,3 @@ print(f"  width  : log10(raw) -> Q75           -> log10 / eye_scale_w")
 print(f"\nOutput (bounded log-space -> physical): 10^(log_lo + (log_hi - log_lo)*sigmoid)")
 for name, (lo, hi) in PARAM_LOG_BOUNDS.items():
     print(f"  {name:>8}: [{10**lo:.4e}, {10**hi:.4e}]")
-

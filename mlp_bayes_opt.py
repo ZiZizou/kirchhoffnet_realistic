@@ -144,6 +144,36 @@ def _penalized_objective(metric: float, actual_params: int,
     return metric * (1.0 + strength * normalized_params)
 
 
+def _over_budget_objective(actual_params: int, budget: int, base: float) -> float:
+    """Finite graded objective used by KNet for soft-budget violations."""
+    ratio = actual_params / max(1, budget)
+    return base * ratio * ratio
+
+
+def moe_param_count(trunk_width: int, trunk_layers: int, num_experts: int) -> int:
+    """Exact trainable parameter count of CTLE's RegimeAwareMoE student.
+
+    The student uses 8 log/raw input features, ``trunk_layers`` affine trunk
+    layers, two bias-free 8-to-expert routing heads, and one width-to-7 affine
+    head per expert.  Non-trainable output-bound tensors are intentionally not
+    included, matching ``sum(p.numel() for p in student.parameters())``.
+    """
+    if trunk_width < 1 or trunk_layers < 1 or num_experts < 1:
+        raise ValueError("MoE dimensions must be positive")
+    trunk = 9 * trunk_width + (trunk_layers - 1) * (trunk_width ** 2 + trunk_width)
+    routes = 16 * num_experts
+    experts = num_experts * (7 * trunk_width + 7)
+    return trunk + routes + experts
+
+
+def max_moe_width(*, trunk_layers: int, num_experts: int, param_limit: int,
+                  lower: int, upper: int) -> int:
+    """Largest permitted CTLE MoE width under the shared soft parameter cap."""
+    valid = [w for w in range(lower, upper + 1)
+             if moe_param_count(w, trunk_layers, num_experts) <= param_limit]
+    return max(valid, default=-1)
+
+
 def _param_count(h: int, num_layers: int, in_dim: int, out_dim: int) -> int:
     """Closed-form MLP parameter count.
 
@@ -313,6 +343,12 @@ def main() -> None:
                              "penalty (default: 0.25; 0 disables it). The BO "
                              "objective is metric * (1 + penalty * params / "
                              "param-budget).")
+    parser.add_argument("--param-tolerance", type=float, default=0.10,
+                        help="Allowed fractional overage above --param-budget "
+                             "before a CTLE trial is rejected (default: 0.10).")
+    parser.add_argument("--invalid-param-objective", type=float, default=1e6,
+                        help="Base finite objective for CTLE architectures above "
+                             "the soft parameter cap (default: 1e6).")
     parser.add_argument("--loss", choices=["huber", "mse"], default="huber",
                         help="Training loss (default: huber, matches KNet).")
     parser.add_argument("--validate-every", type=int, default=5)
@@ -323,8 +359,25 @@ def main() -> None:
                              "<dataset>_budget<P>_e<E>.")
     parser.add_argument("--resume", action="store_true",
                         help="Resume an existing study from <run_dir>/"
-                             "<study_name>.db")
+                        "<study_name>.db")
+    parser.add_argument("--ctle-dagger-iterations", type=int, default=4,
+                        help="CTLE DAgger iterations per BO trial (default: 4).")
+    parser.add_argument("--ctle-epochs-per-iter", type=int, default=100,
+                        help="CTLE epochs per DAgger iteration (default: 100).")
+    parser.add_argument("--ctle-common-eval-size", type=int, default=1000,
+                        help="CTLE common evaluation specs per BO trial (default: 1000).")
+    parser.add_argument("--ctle-earlystop-eval-every", type=int, default=5,
+                        help="Evaluate CTLE common failure rate every N epochs "
+                             "(default: 5; final epoch is always evaluated).")
     args = parser.parse_args()
+
+    if args.param_tolerance < 0.0:
+        raise ValueError("--param-tolerance must be >= 0")
+    if args.invalid_param_objective <= 0.0:
+        raise ValueError("--invalid-param-objective must be > 0")
+    if (args.ctle_dagger_iterations < 1 or args.ctle_epochs_per_iter < 1
+            or args.ctle_common_eval_size < 1 or args.ctle_earlystop_eval_every < 1):
+        raise ValueError("CTLE iteration, epoch, evaluation-size, and evaluation-frequency values must be >= 1")
 
     cfg = DATASETS[args.dataset]
     in_dim: int = cfg["in_dim"]
@@ -365,7 +418,7 @@ def main() -> None:
 
     patience = args.epochs  # full fixed-budget run, no early stopping
 
-    sampler = TPESampler(seed=args.seed)
+    sampler = TPESampler(seed=args.seed, multivariate=True, group=True)
     if args.resume and (run_dir / (study_name + ".db")).exists():
         study = optuna.load_study(study_name=study_name, storage=storage,
                                   sampler=sampler)
@@ -377,6 +430,32 @@ def main() -> None:
     else:
         study = optuna.create_study(study_name=study_name, storage=storage,
                                     sampler=sampler, direction="minimize")
+
+    # Mirror KNet's queued CTLE baseline, including when --resume is used.
+    # This gives both optimizers one deterministic, budget-valid prior.
+    if args.dataset == "ctle":
+        seed_complete = any(
+            t.user_attrs.get("seed_trial") is True
+            and t.state == optuna.trial.TrialState.COMPLETE
+            for t in study.trials
+        )
+        seed_waiting = any(
+            t.state == optuna.trial.TrialState.WAITING
+            and t.user_attrs.get("seed_trial") is True
+            for t in study.trials
+        )
+        if not seed_complete and not seed_waiting:
+            study.enqueue_trial(
+                {
+                    "moe_trunk_width": 44,
+                    "moe_trunk_layers": 3,
+                    "moe_num_experts": 3,
+                    "lr": 1e-3,
+                    "weight_decay": 1e-4,
+                    "batch_size": 256,
+                },
+                user_attrs={"seed_trial": True},
+            )
 
     repo_dir = Path(__file__).resolve().parent
     script_path = repo_dir / script
@@ -391,12 +470,17 @@ def main() -> None:
           f"n_gpus={n_gpus} study_name={study_name} storage={storage}")
     print(f"[mlp_bayes_opt] run_dir={run_dir}")
     print(f"[mlp_bayes_opt] script={script_path}")
+    if args.dataset == "ctle":
+        print(f"[mlp_bayes_opt] CTLE proxy={args.ctle_dagger_iterations}x"
+              f"{args.ctle_epochs_per_iter}, eval={args.ctle_common_eval_size} "
+              f"every {args.ctle_earlystop_eval_every} epochs, "
+              f"param_limit={param_budget * (1.0 + args.param_tolerance):.0f}")
 
     def objective(trial: optuna.Trial) -> float:
         # ── CTLE fast DAgger proxy (4×100, Test 1000) ───────────────────
         if args.dataset == "ctle":
             # Use current defaults as trial 0 seed; otherwise sample MoE + DAgger knobs.
-            is_seed = trial.number == 0 and not args.resume
+            is_seed = trial.user_attrs.get("seed_trial") is True
             if is_seed:
                 trunk_width = 44
                 trunk_layers = 3
@@ -405,21 +489,38 @@ def main() -> None:
                 weight_decay = 1e-4
                 batch_size = 256
             else:
-                trunk_width = trial.suggest_int("moe_trunk_width", 32, 64)
                 trunk_layers = trial.suggest_int("moe_trunk_layers", 2, 3)
                 num_experts = trial.suggest_int("moe_num_experts", 2, 4)
+                soft_limit = int(param_budget * (1.0 + args.param_tolerance))
+                width_max = max_moe_width(
+                    trunk_layers=trunk_layers, num_experts=num_experts,
+                    param_limit=soft_limit, lower=32, upper=64,
+                )
+                if width_max < 32:
+                    raise optuna.TrialPruned(
+                        f"No MoE width in [32, 64] fits soft cap {soft_limit}")
+                # A fixed-distribution fraction avoids Optuna's prohibition on
+                # changing ``suggest_int`` bounds across conditional trials.
+                width_fraction = trial.suggest_float("moe_width_fraction", 0.0, 1.0)
+                trunk_width = 32 + round(width_fraction * (width_max - 32))
                 lr = trial.suggest_float("lr", args.lr_min, args.lr_max, log=True)
                 weight_decay = trial.suggest_float("weight_decay", args.wd_min, args.wd_max, log=True)
                 batch_size = trial.suggest_categorical("batch_size", [256, 512, 1024])
             trial_dir = run_dir / f"trial_{trial.number:04d}"
             trial_dir.mkdir(parents=True, exist_ok=True)
             log_path = trial_dir / "log.txt"
+            expected_params = moe_param_count(trunk_width, trunk_layers, num_experts)
+            soft_limit = int(param_budget * (1.0 + args.param_tolerance))
+            if expected_params > soft_limit:
+                return _over_budget_objective(
+                    expected_params, soft_limit, args.invalid_param_objective)
             # 4×100 proxy: 4 DAgger iterations × 100 epochs, common-eval 1000 for speed
             cmd = [
                 python_exe, str(script_path),
-                "--dagger-iterations", "4",
-                "--epochs-per-iter", "100",
-                "--common-eval-size", "1000",
+                "--dagger-iterations", str(args.ctle_dagger_iterations),
+                "--epochs-per-iter", str(args.ctle_epochs_per_iter),
+                "--common-eval-size", str(args.ctle_common_eval_size),
+                "--earlystop-eval-every", str(args.ctle_earlystop_eval_every),
                 "--moe-trunk-width", str(trunk_width),
                 "--moe-trunk-layers", str(trunk_layers),
                 "--moe-num-experts", str(num_experts),
@@ -459,6 +560,9 @@ def main() -> None:
             trial.set_user_attr("moe_num_experts", num_experts)
             if param_count is not None:
                 trial.set_user_attr("param_count", param_count)
+                if param_count > soft_limit:
+                    return _over_budget_objective(
+                        param_count, soft_limit, args.invalid_param_objective)
             # Obey --param-budget via same penalized objective as kn_bayes/mlp non-CTLE
             penalized = _penalized_objective(test_rate, param_count or 0, param_budget, args.param_penalty)
             trial.set_user_attr("raw_test_rate", test_rate)

@@ -128,7 +128,8 @@ def _config_hash():
 
 
 def _initial_dataset_cache_path():
-    return os.path.join(OUTPUT_DIR, f'initial_dataset_{_config_hash()}.pkl')
+    cache_dir = INITIAL_DATASET_CACHE_DIR or OUTPUT_DIR
+    return os.path.join(cache_dir, f'initial_dataset_{_config_hash()}.pkl')
 
 
 def load_checkpoint():
@@ -527,6 +528,7 @@ HYPERPARAMETERS — edit all DAgger / training knobs here
 DAGGER_ITERATIONS     = 10        # max DAgger loop iterations
 EPOCHS_PER_ITER       = 200       # student training epochs per iteration
 BATCH_SIZE            = 256      # DataLoader batch size
+INITIAL_DATASET_CACHE_DIR = None  # optional shared cache for repeated BO trials
 ERROR_THRESHOLD       = 0.10     # 10% relative error per spec dimension → failure
 VALIDATION_SIZE       = 2000     # validation specs sampled per evaluation
 BOUNDARY_RATIO        = 0.50     # fraction of val specs from boundary regions
@@ -657,6 +659,9 @@ try:
     _bo_parser.add_argument('--epochs-per-iter', type=int, default=None)
     _bo_parser.add_argument('--common-eval-size', type=int, default=None)
     _bo_parser.add_argument('--common-eval-seed', type=int, default=None)
+    _bo_parser.add_argument('--earlystop-eval-every', type=int, default=None)
+    _bo_parser.add_argument('--batch-size', type=int, default=None)
+    _bo_parser.add_argument('--initial-dataset-cache-dir', type=str, default=None)
     _bo_parser.add_argument('--kn-num-stages', type=int, default=None)
     _bo_parser.add_argument('--kn-num-hidden', type=int, default=None)
     _bo_parser.add_argument('--kn-small-world-k', type=int, default=None)
@@ -685,6 +690,17 @@ try:
         COMMON_EVAL_SIZE = _bo_args.common_eval_size
     if _bo_args.common_eval_seed is not None:
         COMMON_EVAL_SEED = _bo_args.common_eval_seed
+    if _bo_args.earlystop_eval_every is not None:
+        if _bo_args.earlystop_eval_every < 1:
+            raise ValueError('--earlystop-eval-every must be >= 1')
+        EARLYSTOP_EVAL_EVERY = _bo_args.earlystop_eval_every
+    if _bo_args.batch_size is not None:
+        if _bo_args.batch_size < 1:
+            raise ValueError('--batch-size must be >= 1')
+        BATCH_SIZE = _bo_args.batch_size
+    if _bo_args.initial_dataset_cache_dir is not None:
+        INITIAL_DATASET_CACHE_DIR = _bo_args.initial_dataset_cache_dir
+        os.makedirs(INITIAL_DATASET_CACHE_DIR, exist_ok=True)
     if _bo_args.kn_num_stages is not None:
         KN_NUM_STAGES = _bo_args.kn_num_stages
     if _bo_args.kn_num_hidden is not None:

@@ -332,7 +332,7 @@ def _parse_final_metrics(path: Path) -> dict[str, float]:
 
 def _parse_trainable_param_count(text: str) -> int | None:
     """Extract train_script.py's pre-training trainable-parameter count."""
-    match = re.search(r"trainable params:\s*([0-9][0-9,]*)", text)
+    match = re.search(r"trainable params:\s*([0-9][0-9,]*)", text, re.IGNORECASE)
     if match is None:
         return None
     return int(match.group(1).replace(",", ""))
@@ -967,9 +967,57 @@ def main() -> None:
                     preflight_params, int(param_limit), args.invalid_param_objective)
             # Run DAgger.
             trial_dir.mkdir(parents=True, exist_ok=True)
+            if False:  # Preflight was already performed above.
+                preflight_cmd = cmd.copy()
+                try:
+                    out_idx = preflight_cmd.index("--output") + 1
+                    preflight_output = str(trial_dir / "_preflight")
+                    preflight_cmd[out_idx] = preflight_output
+                except ValueError:
+                    pass
+                preflight_cmd += ["--count-params-only"]
+                print(f"[ctle] trial {trial.number} preflight: {' '.join(preflight_cmd)}", flush=True)
+                with open(log_path, "w", encoding="utf-8") as logf:
+                    logf.write(f"$ {' '.join(preflight_cmd)}\n")
+                    logf.flush()
+                    preflight = subprocess.run(
+                        preflight_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        text=True, cwd=str(Path(__file__).parent),
+                        env=sub_env, creationflags=creationflags,
+                    )
+                    logf.write(preflight.stdout)
+                    logf.flush()
+                preflight_params = _parse_trainable_param_count(preflight.stdout)
+                if preflight.returncode != 0 or preflight_params is None:
+                    trial.set_user_attr("subprocess_failed", True)
+                    trial.set_user_attr("preflight_failed", True)
+                    trial.set_user_attr("preflight_returncode", preflight.returncode)
+                    trial.set_user_attr("preflight_params", preflight_params if preflight_params is not None else -1)
+                    print(f"[ctle] trial {trial.number} preflight failed (code {preflight.returncode})", flush=True)
+                    return float("inf")
+                trial.set_user_attr("preflight_params", preflight_params)
+                if preflight_params > param_limit:
+                    invalid_objective = _over_budget_objective(
+                        preflight_params, int(param_limit), args.invalid_param_objective
+                    )
+                    trial.set_user_attr("param_budget_exceeded", True)
+                    trial.set_user_attr("param_budget", param_budget)
+                    trial.set_user_attr("param_limit", param_limit)
+                    trial.set_user_attr("actual_params", preflight_params)
+                    trial.set_user_attr("normalized_param_count", preflight_params / max(1, param_budget))
+                    trial.set_user_attr("invalid_param_objective", invalid_objective)
+                    trial.set_user_attr("param_count", preflight_params)
+                    print(f"[kn_bayes_opt] trial {trial.number:04d} rejected before training: params={preflight_params} > param_limit={param_limit:.0f}; objective={invalid_objective:.6g}")
+                    return invalid_objective
+            else:
+                # no budget configured — ensure log file exists for training append
+                with open(log_path, "w", encoding="utf-8") as logf:
+                    logf.write("[ctle] no param_limit configured; skipping preflight\n")
+            # Run dagger (4×100) — only reached if preflight passed
             print(f"[ctle] trial {trial.number}: {' '.join(cmd)}", flush=True)
-            with open(log_path, "w", encoding="utf-8") as logf:
+            with open(log_path, "a", encoding="utf-8") as logf:
                 logf.write(f"$ {' '.join(cmd)}\n")
+                logf.write("[preflight completed; launching training]\n")
                 logf.flush()
                 proc = subprocess.run(cmd, stdout=logf, stderr=subprocess.STDOUT, text=True, cwd=str(Path(__file__).parent), env=sub_env)
             if proc.returncode != 0:
@@ -980,24 +1028,35 @@ def main() -> None:
             if test_rate is None:
                 print(f"[ctle] trial {trial.number} could not parse Test failure rate", flush=True)
                 return float("inf")
-            # Parse param count for penalty (optional)
+            # Parse param count for penalty — parser failure must not be rewarded
             param_count = _parse_trainable_param_count(log_text)
+            if param_count is None:
+                print(f"[ctle] trial {trial.number} could not parse trainable params", flush=True)
+                trial.set_user_attr("test_failure_rate", test_rate)
+                trial.set_user_attr("param_count", -1)
+                trial.set_user_attr("preflight_failed", True)
+                return float("inf")
             trial.set_user_attr("test_failure_rate", test_rate)
-            trial.set_user_attr("param_count", param_count if param_count is not None else 0)
-            # Penalized objective (same as kn_bayes for friedman)
-            # Upfront gate for CTLE: use --count-params-only would require
-            # dagger preflight; for now we gate after the run (CTLE runs are
-            # 4x100 fast proxy). Also enforce hard gate before penalty.
+            trial.set_user_attr("param_count", param_count)
             base_metric = test_rate  # minimize Test 1000
-            if param_count is not None and param_budget is not None:
-                # over-budget -> finite graded penalty, no extra training waste
-                # for subsequent trials (TPE learns to avoid large configs)
-                if param_limit is not None and param_count > param_limit:
-                    ratio = param_count / max(1, param_limit)
-                    return float(args.invalid_param_objective) * (ratio ** 2)
-            penalized = _penalized_objective(base_metric, param_count or 0, param_reference, args.param_penalty)
+            # Hard gate after training (defensive: catches drift vs preflight)
+            if param_limit is not None and param_count > param_limit:
+                invalid_objective = _over_budget_objective(
+                    param_count, int(param_limit), args.invalid_param_objective
+                )
+                trial.set_user_attr("param_budget_exceeded", True)
+                trial.set_user_attr("param_budget", param_budget)
+                trial.set_user_attr("param_limit", param_limit)
+                trial.set_user_attr("actual_params", param_count)
+                trial.set_user_attr("normalized_param_count", param_count / max(1, param_budget))
+                trial.set_user_attr("invalid_param_objective", invalid_objective)
+                print(f"[kn_bayes_opt] trial {trial.number:04d} rejected after training: params={param_count} > param_limit={param_limit:.0f}; objective={invalid_objective:.6g}")
+                return invalid_objective
+            penalized = _penalized_objective(base_metric, param_count, param_reference, args.param_penalty)
             trial.set_user_attr("raw_test_rate", base_metric)
             trial.set_user_attr("penalized", penalized)
+            trial.set_user_attr("actual_params", param_count)
+            trial.set_user_attr("normalized_param_count", param_count / max(1, param_reference))
             print(f"[ctle] trial {trial.number} Test {test_rate*100:.2f}% penalized {penalized*100:.2f}%", flush=True)
             return penalized
 

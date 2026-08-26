@@ -952,6 +952,8 @@ def main() -> None:
             preflight_output = trial_dir / "_preflight"
             preflight_cmd[preflight_cmd.index("--output") + 1] = str(preflight_output)
             preflight_cmd += ["--count-params-only"]
+            print(f"[ctle] trial {trial.number} preflight: {' '.join(preflight_cmd)}",
+                  flush=True)
             preflight = subprocess.run(
                 preflight_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, cwd=str(Path(__file__).parent), env=sub_env,
@@ -984,10 +986,9 @@ def main() -> None:
             param_count = _parse_trainable_param_count(log_text)
             trial.set_user_attr("test_failure_rate", test_rate)
             trial.set_user_attr("param_count", param_count if param_count is not None else 0)
-            # Penalized objective (same as kn_bayes for friedman)
-            # Upfront gate for CTLE: use --count-params-only would require
-            # dagger preflight; for now we gate after the run (CTLE runs are
-            # 4x100 fast proxy). Also enforce hard gate before penalty.
+            # Penalized objective (same as KNet's non-CTLE path). The
+            # architecture was already preflighted before DAgger started;
+            # this post-run check remains a defensive consistency guard.
             base_metric = test_rate  # minimize Test 1000
             if param_count is not None and param_budget is not None:
                 # over-budget -> finite graded penalty, no extra training waste

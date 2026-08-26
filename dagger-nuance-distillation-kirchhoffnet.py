@@ -662,6 +662,8 @@ try:
     _bo_parser.add_argument('--earlystop-eval-every', type=int, default=None)
     _bo_parser.add_argument('--batch-size', type=int, default=None)
     _bo_parser.add_argument('--initial-dataset-cache-dir', type=str, default=None)
+    _bo_parser.add_argument('--count-params-only', action='store_true',
+                            help='Construct the student, print trainable parameter count, and exit.')
     _bo_parser.add_argument('--kn-num-stages', type=int, default=None)
     _bo_parser.add_argument('--kn-num-hidden', type=int, default=None)
     _bo_parser.add_argument('--kn-small-world-k', type=int, default=None)
@@ -2888,6 +2890,13 @@ _n_trainable = sum(p.numel() for p in student.parameters() if p.requires_grad)
 _logger.info(f"Student trainable params: {_n_trainable:,}")
 _bd = student.net.parameter_breakdown()
 _logger.info(f"Student param breakdown:\n{format_parameter_breakdown(_bd)}")
+
+# BO's parameter preflight must stop before teacher setup, initial-label
+# generation, or any DAgger iteration. ``print`` provides a stable contract
+# for kn_bayes_opt.py's subprocess parser.
+if getattr(_bo_args, 'count_params_only', False):
+    print(f"trainable params: {_n_trainable:,}", flush=True)
+    raise SystemExit(0)
 
 # Optimizer and scheduler (defined once, reused across iterations).
 # Wrapper's parameters() exposes the entire local KirchhoffNetWithIO

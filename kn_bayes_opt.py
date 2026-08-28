@@ -46,6 +46,12 @@ of the original training script is preserved. Optuna ``n_jobs`` concurrently
 spawns up to ``n_workers`` trial subprocesses; trials are pinned round-robin
 to individual GPUs via ``CUDA_VISIBLE_DEVICES`` when CUDA is available.
 
+For CTLE, the default is multi-fidelity successive halving.  A trial first
+runs a short DAgger prefix (one iteration by default), reports its shared
+validation failure rate to Optuna, and is pruned unless it is competitive with
+the other trials at that fidelity.  Promoted trials resume their own DAgger
+checkpoint and continue to the next rung, so completed work is never repeated.
+
 Dataset-in / -out dimensions and per-dataset ``num_hidden`` range are
 hardcoded in ``DATASETS``. Default ranges favor the existing small_world
 configurations used in recent friedman2 grid runs.
@@ -82,6 +88,7 @@ import logging
 
 _logger = logging.getLogger("kn_bayes_opt")
 from optuna.samplers import TPESampler
+from optuna.pruners import NopPruner, SuccessiveHalvingPruner
 
 
 DATASETS: dict[str, dict[str, Any]] = {
@@ -487,6 +494,40 @@ def _parse_dagger_test_failure(log_text: str) -> float | None:
     return float(matches[-1]) / 100.0
 
 
+def _parse_dagger_validation_failure(log_text: str) -> float | None:
+    """Extract the latest shared-COMMON_EVAL validation failure rate.
+
+    DAgger reports this once per completed DAgger iteration after restoring
+    that iteration's best checkpoint.  It is therefore the right cheap,
+    boundary-stratified metric for deciding whether a partial trial warrants
+    more DAgger iterations.  The final test metric remains the legacy BO
+    objective for backwards compatibility.
+    """
+    matches = re.findall(r"Validation failure rate:\s*([\d\.]+)%", log_text)
+    if not matches:
+        return None
+    return float(matches[-1]) / 100.0
+
+
+def _ctle_fidelity_rungs(spec: str, full_iterations: int) -> list[int]:
+    """Parse CTLE successive-halving rungs and guarantee a final full rung."""
+    try:
+        rungs = sorted({int(token.strip()) for token in spec.split(",") if token.strip()})
+    except ValueError as exc:
+        raise ValueError(
+            "--ctle-fidelity-rungs must be comma-separated positive integers "
+            "such as '1,2,4'"
+        ) from exc
+    if any(rung < 1 for rung in rungs):
+        raise ValueError("--ctle-fidelity-rungs values must be >= 1")
+    if any(rung > full_iterations for rung in rungs):
+        raise ValueError(
+            "--ctle-fidelity-rungs cannot exceed --ctle-dagger-iterations"
+        )
+    rungs.append(full_iterations)
+    return sorted(set(rungs))
+
+
 def _plot_history(study: optuna.Study, path: Path, *, title: str,
                   objective: str) -> None:
     try:
@@ -700,6 +741,20 @@ def main() -> None:
     parser.add_argument("--ctle-earlystop-eval-every", type=int, default=5,
                         help="Evaluate CTLE common failure rate every N epochs "
                              "(default: 5; final epoch is always evaluated).")
+    parser.add_argument("--ctle-multifidelity",
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help="Use successive-halving DAgger prefixes for CTLE "
+                             "(default: enabled). Promoted trials resume their "
+                             "own checkpoints; use --no-ctle-multifidelity for "
+                             "the legacy fixed-fidelity behavior.")
+    parser.add_argument("--ctle-fidelity-rungs", default="1,2",
+                        help="Completed DAgger iterations at which CTLE trials "
+                             "can be pruned, comma-separated. The full "
+                             "--ctle-dagger-iterations budget is always appended "
+                             "(default: 1,2; a 4-iteration trial uses 1,2,4).")
+    parser.add_argument("--ctle-halving-reduction-factor", type=int, default=2,
+                        help="Successive-halving reduction factor for CTLE "
+                             "multi-fidelity pruning (default: 2).")
     parser.add_argument("--ctle-initial-dataset-cache-dir", type=Path, default=None,
                         help="Shared cache for CTLE initial teacher labels. Defaults to "
                              "<output>/ctle_initial_dataset_cache.")
@@ -718,8 +773,15 @@ def main() -> None:
     if (args.ctle_dagger_iterations < 1 or args.ctle_epochs_per_iter < 1
             or args.ctle_common_eval_size < 1 or args.ctle_earlystop_eval_every < 1):
         raise ValueError("CTLE iteration, epoch, evaluation-size, and evaluation-frequency values must be >= 1")
+    if args.ctle_halving_reduction_factor < 2:
+        raise ValueError("--ctle-halving-reduction-factor must be >= 2")
     if args.dataset == "ctle" and args.num_stages_max < 2:
         raise ValueError("CTLE prior search requires --num-stages-max >= 2")
+    ctle_rungs = (
+        _ctle_fidelity_rungs(args.ctle_fidelity_rungs, args.ctle_dagger_iterations)
+        if args.dataset == "ctle" and args.ctle_multifidelity
+        else [args.ctle_dagger_iterations]
+    )
 
     cfg = DATASETS[args.dataset]
     in_dim: int = cfg["in_dim"]
@@ -771,10 +833,18 @@ def main() -> None:
     db_path = run_dir / (study_name + ".db")
     # KNet's topology, solver, and optimizer parameters interact strongly.
     sampler = TPESampler(seed=args.seed, multivariate=True, group=True)
+    pruner = (
+        SuccessiveHalvingPruner(
+            min_resource=ctle_rungs[0],
+            reduction_factor=args.ctle_halving_reduction_factor,
+        )
+        if args.dataset == "ctle" and args.ctle_multifidelity
+        else NopPruner()
+    )
     study_was_resumed = db_path.exists()
     if study_was_resumed:
         study = optuna.load_study(study_name=study_name, storage=storage,
-                                  sampler=sampler)
+                                  sampler=sampler, pruner=pruner)
         retry_params, recovered_seed_indices = _recover_unfinished_trials(
             study, args.dataset
         )
@@ -785,7 +855,8 @@ def main() -> None:
             recovered_seed_indices = set()
     else:
         study = optuna.create_study(study_name=study_name, storage=storage,
-                                    sampler=sampler, direction="minimize")
+                                    sampler=sampler, pruner=pruner,
+                                    direction="minimize")
         retry_params = []
         recovered_seed_indices = set()
 
@@ -865,6 +936,13 @@ def main() -> None:
               f"{args.ctle_epochs_per_iter}, eval={args.ctle_common_eval_size} "
               f"every {args.ctle_earlystop_eval_every} epochs, "
               f"initial_cache={ctle_cache_dir}")
+        if args.ctle_multifidelity:
+            print(f"[kn_bayes_opt] CTLE multi-fidelity rungs={ctle_rungs} "
+                  f"successive-halving reduction="
+                  f"{args.ctle_halving_reduction_factor}")
+        else:
+            print("[kn_bayes_opt] CTLE multi-fidelity disabled; every trial "
+                  "uses the full DAgger budget")
 
     def objective(trial: optuna.Trial) -> float:
         is_seed_trial = (
@@ -967,16 +1045,62 @@ def main() -> None:
                 trial.set_user_attr("actual_params", preflight_params)
                 return _over_budget_objective(
                     preflight_params, int(param_limit), args.invalid_param_objective)
-            # Run DAgger.
+            # Run DAgger in resumable fidelity rungs.  The student script
+            # writes an iteration-end checkpoint in trial_dir.  Reissuing the
+            # command with a larger --dagger-iterations value restores that
+            # checkpoint and runs only the missing iterations.
             trial_dir.mkdir(parents=True, exist_ok=True)
-            print(f"[ctle] trial {trial.number}: {' '.join(cmd)}", flush=True)
-            with open(log_path, "w", encoding="utf-8") as logf:
-                logf.write(f"$ {' '.join(cmd)}\n")
-                logf.flush()
-                proc = subprocess.run(cmd, stdout=logf, stderr=subprocess.STDOUT, text=True, cwd=str(Path(__file__).parent), env=sub_env)
-            if proc.returncode != 0:
-                print(f"[ctle] trial {trial.number} subprocess failed (code {proc.returncode})", flush=True)
-                return float("inf")
+            trial.set_user_attr("ctle_fidelity_rungs", json.dumps(ctle_rungs))
+            validation_rate: float | None = None
+            for rung_index, rung_iterations in enumerate(ctle_rungs):
+                rung_cmd = cmd.copy()
+                rung_cmd[rung_cmd.index("--dagger-iterations") + 1] = str(rung_iterations)
+                mode = "w" if rung_index == 0 else "a"
+                print(f"[ctle] trial {trial.number} rung {rung_iterations}/"
+                      f"{dagger_iterations}: {' '.join(rung_cmd)}", flush=True)
+                with open(log_path, mode, encoding="utf-8") as logf:
+                    logf.write(f"\n# CTLE fidelity rung {rung_iterations}/"
+                               f"{dagger_iterations}\n$ {' '.join(rung_cmd)}\n")
+                    logf.flush()
+                    proc = subprocess.run(
+                        rung_cmd, stdout=logf, stderr=subprocess.STDOUT,
+                        text=True, cwd=str(Path(__file__).parent), env=sub_env,
+                    )
+                if proc.returncode != 0:
+                    print(f"[ctle] trial {trial.number} rung {rung_iterations} "
+                          f"subprocess failed (code {proc.returncode})", flush=True)
+                    return float("inf")
+
+                log_text = (log_path.read_text(encoding="utf-8", errors="ignore")
+                            if log_path.exists() else "")
+                validation_rate = _parse_dagger_validation_failure(log_text)
+                if validation_rate is None:
+                    print(f"[ctle] trial {trial.number} rung {rung_iterations} "
+                          "could not parse Validation failure rate", flush=True)
+                    return float("inf")
+                trial.set_user_attr(
+                    f"validation_failure_rate_iter_{rung_iterations}",
+                    validation_rate,
+                )
+                trial.report(validation_rate, step=rung_iterations)
+                print(f"[ctle] trial {trial.number} rung {rung_iterations}/"
+                      f"{dagger_iterations} validation "
+                      f"{validation_rate * 100:.2f}%", flush=True)
+
+                # Do not prune the final rung: it has already completed and
+                # its test metric is needed for the legacy final objective.
+                if rung_iterations < dagger_iterations and trial.should_prune():
+                    trial.set_user_attr("pruned_at_dagger_iteration", rung_iterations)
+                    trial.set_user_attr("pruned_validation_failure_rate", validation_rate)
+                    print(f"[ctle] trial {trial.number} pruned after DAgger "
+                          f"iteration {rung_iterations}: validation "
+                          f"{validation_rate * 100:.2f}% is not competitive",
+                          flush=True)
+                    raise optuna.TrialPruned(
+                        f"validation={validation_rate:.6f} at DAgger iteration "
+                        f"{rung_iterations}"
+                    )
+
             log_text = log_path.read_text(encoding="utf-8", errors="ignore") if log_path.exists() else ""
             test_rate = _parse_dagger_test_failure(log_text)
             if test_rate is None:
@@ -985,6 +1109,7 @@ def main() -> None:
             # Parse param count for penalty (optional)
             param_count = _parse_trainable_param_count(log_text)
             trial.set_user_attr("test_failure_rate", test_rate)
+            trial.set_user_attr("validation_failure_rate", validation_rate)
             trial.set_user_attr("param_count", param_count if param_count is not None else 0)
             # Penalized objective (same as KNet's non-CTLE path). The
             # architecture was already preflighted before DAgger started;

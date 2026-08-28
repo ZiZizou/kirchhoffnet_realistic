@@ -722,7 +722,13 @@ try:
     if _bo_args.weight_decay is not None:
         WEIGHT_DECAY = _bo_args.weight_decay
     if _bo_args.output is not None:
+        # OUTPUT_DIR is overridden after the module-level checkpoint path was
+        # initialized.  Keep the checkpoint colocated with the requested run
+        # so repeated invocations can resume one trial's DAgger prefix without
+        # ever restoring another trial's state.
         OUTPUT_DIR = _bo_args.output
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        CHECKPOINT_PATH = os.path.join(OUTPUT_DIR, 'dagger_checkpoint.pt')
     if _bo_args.device is not None:
         DEVICE = torch.device(_bo_args.device) if _bo_args.device != 'auto' else DEVICE
     if _bo_args.data_dir is not None:

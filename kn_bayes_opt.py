@@ -204,6 +204,10 @@ START_POINTS: dict[str, dict[str, Any]] = {
         "device_l2_lambda": 0.0, "freeze_boundary": 0,
         "freeze_temporal_read": 0,
         "vca_rank": 3,
+        # Shared KNet fabric + VCA-gated complete-candidate banks.  These are
+        # readout/gate dimensions only; they never create a second KNet.
+        "moe_num_experts": 3,
+        "moe_gate_rank": 2,
     },
 }
 
@@ -441,6 +445,9 @@ def _build_dagger_command(
     kn_small_world_k: int,
     kn_small_world_p: float,
     kn_vca_rank: int,
+    kn_moe_num_experts: int,
+    kn_moe_gate_rank: int,
+    kn_moe_top_k: int,
     kn_x_max: float,
     lr: float,
     weight_decay: float,
@@ -470,6 +477,9 @@ def _build_dagger_command(
         "--kn-small-world-k", str(kn_small_world_k),
         "--kn-small-world-p", f"{kn_small_world_p:.6f}",
         "--kn-vca-rank", str(kn_vca_rank),
+        "--kn-moe-num-experts", str(kn_moe_num_experts),
+        "--kn-moe-gate-rank", str(kn_moe_gate_rank),
+        "--kn-moe-top-k", str(kn_moe_top_k),
         "--kn-x-max", f"{kn_x_max:.6f}",
         "--boundary-fan-out", json.dumps(boundary_fan_out),
         "--lr", f"{lr:.6e}",
@@ -760,6 +770,10 @@ def main() -> None:
     parser.add_argument("--ctle-initial-dataset-cache-dir", type=Path, default=None,
                         help="Shared cache for CTLE initial teacher labels. Defaults to "
                              "<output>/ctle_initial_dataset_cache.")
+    parser.add_argument("--ctle-moe-top-k", type=int, choices=[1, 2], default=1,
+                        help="Hard-WTA CTLE inference candidates retained for the "
+                             "ZIG feasibility selector (default: 1; 2 never averages "
+                             "parameter vectors).")
     args = parser.parse_args()
 
     if args.param_budget is not None and args.param_budget < 1:
@@ -964,6 +978,8 @@ def main() -> None:
                 num_stages = sp["num_stages"]
                 t_span = sp["t_span"]
                 vca_rank = sp.get("vca_rank", 2)
+                moe_num_experts = sp.get("moe_num_experts", 3)
+                moe_gate_rank = sp.get("moe_gate_rank", 2)
                 lr = sp["lr"]
                 weight_decay = sp["weight_decay"]
                 batch_size = sp["batch_size"]
@@ -986,6 +1002,11 @@ def main() -> None:
                 # Rank 2 is a demonstrated prior; nearby values retain a
                 # capacity ablation without wasting trials on ranks 1 and 5-8.
                 vca_rank = trial.suggest_categorical("ctle_vca_rank", [2, 3, 4])
+                # Each expert emits a complete candidate.  Keep M small so
+                # the hardware remains one shared dynamical fabric plus a
+                # compact VCA/current-mode readout, not replicated KNets.
+                moe_num_experts = trial.suggest_categorical("ctle_moe_num_experts", [2, 3])
+                moe_gate_rank = trial.suggest_categorical("ctle_moe_gate_rank", [1, 2, 3])
                 lr = trial.suggest_float("lr", args.lr_min, args.lr_max, log=True)
                 weight_decay = trial.suggest_float("weight_decay", args.wd_min, args.wd_max, log=True)
                 batch_size = trial.suggest_categorical("batch_size", BATCH_SIZE_CHOICES)
@@ -1006,6 +1027,9 @@ def main() -> None:
                 kn_num_stages=num_stages, kn_num_hidden=num_hidden,
                 kn_small_world_k=small_world_k, kn_small_world_p=small_world_p,
                 kn_vca_rank=vca_rank, kn_x_max=x_max,
+                kn_moe_num_experts=moe_num_experts,
+                kn_moe_gate_rank=moe_gate_rank,
+                kn_moe_top_k=args.ctle_moe_top_k,
                 lr=lr, weight_decay=weight_decay, batch_size=batch_size,
                 fanout_count=fanout_count,
                 earlystop_eval_every=args.ctle_earlystop_eval_every,

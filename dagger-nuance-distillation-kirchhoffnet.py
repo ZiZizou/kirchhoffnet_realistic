@@ -24,8 +24,11 @@ Student architecture (configured via the ``KN_*`` constants below):
   temporal-readout appending 7 output ODE accumulators per stage.
 - circuit: FreeTanhLibrary edges per stage, non-programmable leak,
   freeze_read, interstage activation "residual-relu-tanh".
-- output: gain/bias + tanh/relu residual branches of the 7 output-ODE
-  node voltages -> bounded via sigmoid + log_lo/log_hi buffers.
+- output: a shared-state, VCA-gated mixture of bounded CTLE readout banks.
+  The KNet fabric is instantiated once; its final hidden and temporal-output
+  voltages drive a small low-rank VCA gate bus and M complete 7-parameter
+  expert readouts.  Deployment selects one bank (never an average of
+  physical parameter vectors).
 
 Key design:
 - LocalKirchhoffStudentWrapper provides the MLP-compatible API
@@ -637,6 +640,22 @@ KN_VCA_GATE_SHUNT        = False  # --vca-gate-shunt: also gate parallel resisti
 KN_VCA_SEPARATE_CORE_BUS = True  # --vca-separate-core-bus: give core family its own vca_W_core projection (ablation)
 KN_VCA_RANK              = 2   # projection rank r; None -> config.VCA['rank'] (must be >= VCA['min_rank'])
 
+# Shared-fabric CTLE inverse-mode readout.  This is deliberately *not* a
+# second KNet: all expert/gate signals are buffered readouts of the one ODE
+# fabric above.  The gate bus is a rank-r VCA current projection followed by
+# a differential-pair soft winner-take-all (softmax in training, hard WTA at
+# inference).  Expert heads produce whole log-parameter candidates so we
+# never average incompatible physical CTLE solutions.
+KN_MOE_NUM_EXPERTS        = 3   # M in {2, 3}
+KN_MOE_GATE_RANK          = 2   # low-rank VCA bus rank
+KN_MOE_TEMP_START         = 0.90
+KN_MOE_TEMP_END           = 0.20
+KN_MOE_TEMP_ANNEAL_EPOCHS = 160
+KN_MOE_LOAD_BALANCE       = 0.05
+KN_MOE_DIVERSITY          = 0.05
+KN_MOE_DIVERSITY_MARGIN   = 0.15  # normalized bounded-log distance
+KN_MOE_TOP_K              = 1     # 2 lets StudentEvaluator rerank top-2 with ZIG
+
 # Fallback per-dim log10 spec bounds used when historical data is unavailable.
 # Order: [power, jitter, height, width]. Rebound from df after data load below.
 KN_INPUT_LOG_MIN_DEFAULT = np.array([np.log10(1e-4), np.log10(1.0), np.log10(0.5), np.log10(1.0)], dtype=np.float32)
@@ -669,6 +688,9 @@ try:
     _bo_parser.add_argument('--kn-small-world-k', type=int, default=None)
     _bo_parser.add_argument('--kn-small-world-p', type=float, default=None)
     _bo_parser.add_argument('--kn-vca-rank', type=int, default=None)
+    _bo_parser.add_argument('--kn-moe-num-experts', type=int, default=None)
+    _bo_parser.add_argument('--kn-moe-gate-rank', type=int, default=None)
+    _bo_parser.add_argument('--kn-moe-top-k', type=int, default=None)
     _bo_parser.add_argument('--kn-x-max', type=float, default=None)
     _bo_parser.add_argument('--kn-gm-max', type=float, default=None)
     _bo_parser.add_argument('--kn-isat-max', type=float, default=None)
@@ -713,6 +735,12 @@ try:
         KN_SMALL_WORLD_P = _bo_args.kn_small_world_p
     if _bo_args.kn_vca_rank is not None:
         KN_VCA_RANK = _bo_args.kn_vca_rank
+    if _bo_args.kn_moe_num_experts is not None:
+        KN_MOE_NUM_EXPERTS = _bo_args.kn_moe_num_experts
+    if _bo_args.kn_moe_gate_rank is not None:
+        KN_MOE_GATE_RANK = _bo_args.kn_moe_gate_rank
+    if _bo_args.kn_moe_top_k is not None:
+        KN_MOE_TOP_K = _bo_args.kn_moe_top_k
     if _bo_args.kn_x_max is not None:
         KN_X_MAX = _bo_args.kn_x_max
     if _bo_args.boundary_fan_out is not None:
@@ -1573,7 +1601,16 @@ class LocalKirchhoffStudentWrapper(nn.Module):
                  vca_rank: int | None = None,
                  vca_core_enabled: bool = False,
                  vca_gate_shunt: bool = False,
-                 vca_separate_core_bus: bool = False):
+                 vca_separate_core_bus: bool = False,
+                 moe_num_experts: int = KN_MOE_NUM_EXPERTS,
+                 moe_gate_rank: int = KN_MOE_GATE_RANK,
+                 moe_temp_start: float = KN_MOE_TEMP_START,
+                 moe_temp_end: float = KN_MOE_TEMP_END,
+                 moe_temp_anneal_epochs: int = KN_MOE_TEMP_ANNEAL_EPOCHS,
+                 moe_load_balance: float = KN_MOE_LOAD_BALANCE,
+                 moe_diversity: float = KN_MOE_DIVERSITY,
+                 moe_diversity_margin: float = KN_MOE_DIVERSITY_MARGIN,
+                 moe_top_k: int = KN_MOE_TOP_K):
         super().__init__()
 
         if param_log_bounds is None:
@@ -1619,6 +1656,21 @@ class LocalKirchhoffStudentWrapper(nn.Module):
         self.vca_core_enabled = bool(vca_core_enabled)
         self.vca_gate_shunt = bool(vca_gate_shunt)
         self.vca_separate_core_bus = bool(vca_separate_core_bus)
+        self.moe_num_experts = int(moe_num_experts)
+        self.moe_gate_rank = int(moe_gate_rank)
+        self.moe_temp_start = float(moe_temp_start)
+        self.moe_temp_end = float(moe_temp_end)
+        self.moe_temp_anneal_epochs = int(moe_temp_anneal_epochs)
+        self.moe_load_balance = float(moe_load_balance)
+        self.moe_diversity = float(moe_diversity)
+        self.moe_diversity_margin = float(moe_diversity_margin)
+        self.inference_top_k = int(moe_top_k)
+        if self.moe_num_experts not in (2, 3):
+            raise ValueError(f"moe_num_experts must be 2 or 3, got {self.moe_num_experts}")
+        if self.moe_gate_rank < 1:
+            raise ValueError(f"moe_gate_rank must be >= 1, got {self.moe_gate_rank}")
+        if not 1 <= self.inference_top_k <= self.moe_num_experts:
+            raise ValueError("moe_top_k must be in [1, moe_num_experts]")
 
 
         self.register_buffer("input_log_min", torch.as_tensor(input_log_min, dtype=torch.float32))
@@ -1679,9 +1731,28 @@ class LocalKirchhoffStudentWrapper(nn.Module):
             vca_gate_shunt=self.vca_gate_shunt,
             vca_separate_core_bus=self.vca_separate_core_bus,
         )
-        self._state_dim = num_hidden
-        # local readout size is num_targets; the OutputAffine returns logits.
+        # The old single OutputAffine readout is intentionally removed.  The
+        # temporal ODE nodes remain in the fabric and, together with the final
+        # hidden state, form a physically readable shared voltage vector.
+        self.net.output_mapper = nn.Identity()
+        self._state_dim = int(self.net.hid_count + self.net.proj_count + self.net.output_ode_count)
         self._output_dim = int(num_targets)
+        self.expert_readouts = nn.ModuleList([
+            nn.Linear(self._state_dim, self._output_dim)
+            for _ in range(self.moe_num_experts)
+        ])
+        # Low-rank VCA gate bus.  A is the programmable conductance matrix
+        # from buffered state voltages to r current rails; B steers those rails
+        # into M differential-pair score currents.  Signed B entries represent
+        # the two branches of a differential current mirror, not a digital
+        # gating network.
+        self.gate_vca_A = nn.Parameter(torch.empty(self.moe_gate_rank, self._state_dim))
+        self.gate_vca_B = nn.Parameter(torch.empty(self.moe_num_experts, self.moe_gate_rank))
+        self.gate_vca_bias = nn.Parameter(torch.zeros(self.moe_num_experts))
+        nn.init.xavier_uniform_(self.gate_vca_A, gain=0.25)
+        nn.init.xavier_uniform_(self.gate_vca_B, gain=0.25)
+        self._routing_epoch = 0
+        self._last_moe: dict[str, torch.Tensor] | None = None
 
     def scale_input(self, x: torch.Tensor) -> torch.Tensor:
         """Per-dim log10 + min-max normalization for the 4 raw spec dims -> boundary voltages.
@@ -1703,14 +1774,93 @@ class LocalKirchhoffStudentWrapper(nn.Module):
         u = 2.0 * (log_x - lo) / span - 1.0
         return u.clamp(min=-self.input_rail, max=self.input_rail)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass through KirchhoffNetWithIO. Returns unbounded 7 logits.
+    def set_routing_epoch(self, epoch: int) -> None:
+        """Set the global training epoch used to anneal Gumbel routing."""
+        self._routing_epoch = max(0, int(epoch))
 
-        Compatible with the MLP student API consumed by RegimeAwareLoss.
+    def _routing_temperature(self) -> float:
+        frac = min(1.0, self._routing_epoch / max(1, self.moe_temp_anneal_epochs))
+        return self.moe_temp_start + frac * (self.moe_temp_end - self.moe_temp_start)
+
+    def _shared_state_and_scores(self, x: torch.Tensor):
+        """Return final shared voltages, VCA score currents, and all candidates.
+
+        For normalized buffered state voltage ``v``, the gate-bus equation is
+        ``i_r = tanh(v / Vrail) A^T`` and ``i_m = i_r B_m^T + b_m``.  A/B are
+        trained conductances and are fixed/programmed after training.  The
+        differential-pair WTA normalizes ``i_m`` to expert probabilities.
         """
         u = self.scale_input(x)
-        logits, _trajs = self.net(u, store_trajectory=False, solver="heun")
+        _unused, _trajs, state = self.net(
+            u, store_trajectory=False, solver="heun", return_final_state=True
+        )
+        # Saturating source followers keep the gate bus within a credible rail.
+        v_buf = torch.tanh(state / max(self.x_max, 1e-6))
+        rank_currents = F.linear(v_buf, self.gate_vca_A)
+        score_currents = F.linear(rank_currents, self.gate_vca_B, self.gate_vca_bias)
+        candidates = torch.stack([head(state) for head in self.expert_readouts], dim=1)
+        return state, score_currents, candidates
+
+    def candidate_logits(self, x: torch.Tensor, top_k: int | None = None):
+        """Return deterministic WTA score currents and the highest-score banks.
+
+        This is the deployment interface for optional top-2 ZIG reranking;
+        no physical parameter vectors are averaged.
+        """
+        _state, scores, candidates = self._shared_state_and_scores(x)
+        k = min(int(top_k or self.inference_top_k), self.moe_num_experts)
+        top_scores, top_idx = scores.topk(k, dim=-1)
+        top_candidates = candidates.gather(
+            1, top_idx.unsqueeze(-1).expand(-1, -1, self._output_dim)
+        )
+        return top_candidates, top_scores, top_idx
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Hard-route one full CTLE candidate from the shared KNet fabric.
+
+        During training the forward path is hard Gumbel-softmax with a
+        straight-through gradient; evaluation is deterministic argmax/WTA.
+        """
+        _state, scores, candidates = self._shared_state_and_scores(x)
+        temperature = self._routing_temperature()
+        soft_weights = F.softmax(scores / max(temperature, 1e-6), dim=-1)
+        if self.training:
+            route = F.gumbel_softmax(scores, tau=max(temperature, 1e-6), hard=True, dim=-1)
+        else:
+            route = F.one_hot(scores.argmax(dim=-1), self.moe_num_experts).to(candidates.dtype)
+        logits = (candidates * route.unsqueeze(-1)).sum(dim=1)
+        self._last_moe = {
+            "soft_weights": soft_weights,
+            "candidates": candidates,
+            "scores": scores,
+            "temperature": scores.new_tensor(temperature),
+        }
         return logits
+
+    def moe_auxiliary_losses(self):
+        """Load-balance and candidate-separation losses from the latest pass."""
+        zero = self.log_lo.new_zeros(())
+        if self._last_moe is None:
+            return {"balance": zero, "diversity": zero}
+        weights = self._last_moe["soft_weights"]
+        candidates = self._last_moe["candidates"]
+        # Equal average traffic avoids a permanently unused VCA/expert bank.
+        mean_load = weights.mean(dim=0)
+        balance = self.moe_num_experts * (mean_load - 1.0 / self.moe_num_experts).square().sum()
+        # Compare in normalized bounded-log space, where one unit corresponds
+        # to the complete programmable CTLE range for that parameter.
+        normalized = torch.sigmoid(candidates)
+        pair_distances = []
+        for i in range(self.moe_num_experts):
+            for j in range(i + 1, self.moe_num_experts):
+                pair_distances.append((normalized[:, i] - normalized[:, j]).square().mean(dim=-1).sqrt())
+        diversity = torch.stack([
+            F.relu(self.moe_diversity_margin - d).mean() for d in pair_distances
+        ]).mean()
+        return {
+            "balance": balance * self.moe_load_balance,
+            "diversity": diversity * self.moe_diversity,
+        }
 
     def predict(self, x: torch.Tensor) -> dict:
         """Returns dict of physical params (10**bounded_log) for the 7 targets."""
@@ -1741,6 +1891,8 @@ class LocalKirchhoffStudentWrapper(nn.Module):
                 f"vca_core={self.vca_core_enabled}, "
                 f"vca_gate_shunt={self.vca_gate_shunt}, "
                 f"vca_separate_core_bus={self.vca_separate_core_bus}, "
+                f"moe_experts={self.moe_num_experts}, moe_gate_rank={self.moe_gate_rank}, "
+                f"moe_top_k={self.inference_top_k}, "
                 f"out_dim={self._output_dim}")
 
     def count_params_by_component(self):
@@ -1755,14 +1907,21 @@ class LocalKirchhoffStudentWrapper(nn.Module):
         total = bd.get("total", 0)
         per_stage = bd.get("per_stage", {})
         encoder = int(groups.get("input_mapper", 0))
-        projector = int(groups.get("output_mapper", 0)) + int(groups.get("skip_linear", 0))
+        # Expert affine banks replace the original single OutputAffine.  The
+        # low-rank VCA gate is counted with the analog circuit fabric because
+        # it is programmable conductance/current-mode routing, not an MLP.
+        projector = (sum(p.numel() for p in self.expert_readouts.parameters())
+                     + int(groups.get("skip_linear", 0)))
+        gate_bus = (self.gate_vca_A.numel() + self.gate_vca_B.numel()
+                    + self.gate_vca_bias.numel())
         drive = int(groups.get("drive_mappers", 0))
-        circuit = int(total) - encoder - projector - drive
+        circuit = int(total) - encoder - int(groups.get("output_mapper", 0)) - drive + gate_bus
         return {
             "encoder": encoder,
             "circuit": circuit,
             "projector": projector,
-            "total": int(total),
+            "gate_bus": gate_bus,
+            "total": encoder + circuit + projector + drive,
         }
 
 
@@ -1968,6 +2127,7 @@ class RegimeAwareLoss(nn.Module):
         safe_scale = np.maximum(scaler_X.scale_, 1e-6).astype(np.float32)
         self._scaler_X_scale = safe_scale
         self._scaler_X_mean = scaler_X.mean_.astype(np.float32)
+
         self._scaler_y_p_scale = float(scaler_y_p.scale_[0])
         self._scaler_y_p_mean = float(scaler_y_p.mean_[0])
         self._eye_scale_h = float(eye_scale_h)
@@ -2092,7 +2252,16 @@ class RegimeAwareLoss(nn.Module):
 
         # Invalid design penalty
         L_invalid = invalidity_score.mean()
-        L_total = L_imit + self.alpha_spec * L_spec + L_phys + self.alpha_invalid * L_invalid + L_manifold
+        # The selected expert receives the inverse-design objective.  These
+        # auxiliary terms make the shared-state VCA router use every bank and
+        # keep banks separated in bounded CTLE space, preventing collapse to
+        # one indistinguishable inverse mode.
+        moe_aux = student.moe_auxiliary_losses() if hasattr(student, 'moe_auxiliary_losses') else {}
+        L_gate_balance = moe_aux.get('balance', torch.zeros((), device=bounded_log.device))
+        L_expert_diversity = moe_aux.get('diversity', torch.zeros((), device=bounded_log.device))
+        L_total = (L_imit + self.alpha_spec * L_spec + L_phys
+                   + self.alpha_invalid * L_invalid + L_manifold
+                   + L_gate_balance + L_expert_diversity)
 
         if torch.isnan(L_total) or torch.isinf(L_total):
             return {
@@ -2102,6 +2271,8 @@ class RegimeAwareLoss(nn.Module):
                 'L_phys_t': L_phys.detach().clone(),
                 'L_invalid_t': L_invalid.detach().clone(),
                 'L_manifold_t': L_manifold.detach().clone() if isinstance(L_manifold, torch.Tensor) else torch.tensor(0.0),
+                'L_gate_balance_t': L_gate_balance.detach().clone(),
+                'L_expert_diversity_t': L_expert_diversity.detach().clone(),
                 'imit': 0.0,
                 'spec': 0.0,
                 'phys': 0.0,
@@ -2117,6 +2288,8 @@ class RegimeAwareLoss(nn.Module):
             'L_phys_t': L_phys,
             'L_invalid_t': L_invalid,
             'L_manifold_t': L_manifold if isinstance(L_manifold, torch.Tensor) else torch.tensor(0.0, device=L_total.device),
+            'L_gate_balance_t': L_gate_balance,
+            'L_expert_diversity_t': L_expert_diversity,
             'imit': L_imit.item(),
             'spec': L_spec.item(),
             'phys': L_phys.item(),
@@ -2257,13 +2430,59 @@ class StudentEvaluator:
         self._scaler_X_scale = safe_scale
         self._scaler_X_mean = scaler_X.mean_.astype(np.float32)
 
+    def _select_topk_with_zig(self, specs_t: torch.Tensor) -> torch.Tensor:
+        """Choose a feasible bank from the VCA-WTA top-k candidates.
+
+        This is intentionally evaluator-side: the deployed fabric still emits
+        discrete candidate banks, while the existing forward-validity model
+        chooses among at most two of them when that option is enabled.
+        """
+        top_k = int(getattr(self.student, 'inference_top_k', 1))
+        if top_k <= 1 or not hasattr(self.student, 'candidate_logits'):
+            return self.student(specs_t)
+        candidates, _scores, _indices = self.student.candidate_logits(specs_t, top_k=top_k)
+        batch, k, n_params = candidates.shape
+        log_lo = self.student.log_lo.view(1, 1, -1)
+        log_hi = self.student.log_hi.view(1, 1, -1)
+        bounded = log_lo + (log_hi - log_lo) * torch.sigmoid(candidates)
+        flat = bounded.reshape(batch * k, n_params)
+        x_mean_t = torch.from_numpy(self._scaler_X_mean).to(flat)
+        x_scale_t = torch.from_numpy(self._scaler_X_scale).to(flat)
+        out = self.zig(torch.clamp((flat - x_mean_t) / (x_scale_t + 1e-8), -10.0, 10.0))
+        pred_h = out['pred_h_soft'].reshape(batch, k)
+        pred_w = out['pred_w_soft'].reshape(batch, k)
+        pred_j = out['pred_j_soft'].reshape(batch, k)
+        pred_p = torch.pow(10.0, out['mu_power'] * self._scaler_y_p_scale + self._scaler_y_p_mean).reshape(batch, k)
+        if 'p_valid' in out:
+            p_valid = out['p_valid'].reshape(batch, k)
+        else:
+            p_valid = (out['p_valid_h'] * out['p_valid_w'] * out['p_valid_j']).reshape(batch, k)
+        # Same target-aware forward metrics as evaluation, plus a strong
+        # validity preference.  This is a selector over candidates, never a
+        # weighted average of their physical values.
+        target_p, target_j = specs_t[:, 0:1], specs_t[:, 1:2]
+        target_h, target_w = specs_t[:, 2:3], specs_t[:, 3:4]
+        err_h = torch.where(target_h < BOUNDARY_ABS_TOLERANCES['height'][0],
+                            (pred_h - target_h).abs() / BOUNDARY_ABS_TOLERANCES['height'][1],
+                            (pred_h - target_h).abs() / target_h.clamp(min=1e-6))
+        err_w = torch.where(target_w < BOUNDARY_ABS_TOLERANCES['width'][0],
+                            (pred_w - target_w).abs() / BOUNDARY_ABS_TOLERANCES['width'][1],
+                            (pred_w - target_w).abs() / target_w.clamp(min=1e-6))
+        err_j = (pred_j - target_j).abs() / target_j.clamp(min=1e-6)
+        err_p = torch.where(target_p < BOUNDARY_ABS_TOLERANCES['power'][0],
+                            (pred_p - target_p).abs() / BOUNDARY_ABS_TOLERANCES['power'][1],
+                            (pred_p - target_p).abs() / target_p.clamp(min=1e-6))
+        feasibility_cost = err_h + err_w + err_j + err_p + 4.0 * (1.0 - p_valid)
+        chosen = feasibility_cost.argmin(dim=1)
+        return candidates[torch.arange(batch, device=specs_t.device), chosen]
+
     def identify_failures(self, val_specs, threshold=0.10):
         """Return failure mask and per-spec metrics using validity-first adaptive degradation."""
         self.student.eval()
 
         with torch.no_grad():
             specs_t = torch.from_numpy(val_specs).float().to(self.device)
-            logits = self.student(specs_t)
+            logits = self._select_topk_with_zig(specs_t)
             probs = torch.sigmoid(logits)
             log_lo = self.student.log_lo.unsqueeze(0)
             log_hi = self.student.log_hi.unsqueeze(0)
@@ -2864,6 +3083,15 @@ student = LocalKirchhoffStudentWrapper(
     vca_core_enabled=KN_VCA_CORE,
     vca_gate_shunt=KN_VCA_GATE_SHUNT,
     vca_separate_core_bus=KN_VCA_SEPARATE_CORE_BUS,
+    moe_num_experts=KN_MOE_NUM_EXPERTS,
+    moe_gate_rank=KN_MOE_GATE_RANK,
+    moe_temp_start=KN_MOE_TEMP_START,
+    moe_temp_end=KN_MOE_TEMP_END,
+    moe_temp_anneal_epochs=KN_MOE_TEMP_ANNEAL_EPOCHS,
+    moe_load_balance=KN_MOE_LOAD_BALANCE,
+    moe_diversity=KN_MOE_DIVERSITY,
+    moe_diversity_margin=KN_MOE_DIVERSITY_MARGIN,
+    moe_top_k=KN_MOE_TOP_K,
 ).to(DEVICE)
 
 _logger.info(
@@ -2873,6 +3101,13 @@ _logger.info(
     f"separate_core_bus={KN_VCA_SEPARATE_CORE_BUS} "
     f"(mirrors train_script.py --vca/--vca-core/--vca-gate-shunt/"
     f"--vca-separate-core-bus)"
+)
+_logger.info(
+    "Student MoE readout: one shared KNet fabric; M=%d complete 7-parameter "
+    "banks; VCA gate bus rank=%d; Gumbel %.2f->%.2f over %d epochs; "
+    "hard-WTA inference top_k=%d",
+    KN_MOE_NUM_EXPERTS, KN_MOE_GATE_RANK, KN_MOE_TEMP_START,
+    KN_MOE_TEMP_END, KN_MOE_TEMP_ANNEAL_EPOCHS, KN_MOE_TOP_K,
 )
 
 # No `student.prepare(...)` step needed — local KirchhoffNetWithIO
@@ -2892,6 +3127,9 @@ _logger.info(
     f"freeze_read={KN_FREEZE_READ}, temporal_readout={KN_TEMPORAL_READOUT}, input_rail={KN_INPUT_RAIL}, "
     f"x_max={KN_X_MAX})"
 )
+_logger.info("Student MoE parameter split: gate_bus=%s, expert_readouts=%s",
+             f"{_param_counts.get('gate_bus', 0):,}",
+             f"{_param_counts['projector']:,}")
 _n_trainable = sum(p.numel() for p in student.parameters() if p.requires_grad)
 _logger.info(f"Student trainable params: {_n_trainable:,}")
 _bd = student.net.parameter_breakdown()
@@ -2920,7 +3158,8 @@ def _make_dagger_optimizer(student, lr, weight_decay):
     for _name, _p in student.named_parameters():
         if not _p.requires_grad:
             continue
-        if "input_mapper" in _name or "output_mapper" in _name:
+        if ("input_mapper" in _name or "output_mapper" in _name
+                or "expert_readouts" in _name):
             _mapper.append(_p)
         elif _name.endswith(".z_logits"):
             _struct.append(_p)
@@ -2930,6 +3169,7 @@ def _make_dagger_optimizer(student, lr, weight_decay):
             or _name.endswith(".vca_v_boundary")
             or _name.endswith(".vca_v_readout")
             or _name.endswith(".vca_v_core")
+            or _name.startswith("gate_vca_")
         ):
             # VCA routing-structure params (shared input projection +
             # per-edge tap embeddings for each gated family). Mirrors
@@ -3090,7 +3330,13 @@ class RampedRegimeLoss(nn.Module):
         L_phys = loss_dict['L_phys_t'] * r
         L_invalid = loss_dict['L_invalid_t'] * r
         L_manifold = loss_dict.get('L_manifold_t', torch.tensor(0.0, device=L_imit.device))
-        L_total = L_imit + r * (loss_dict['total'] - L_imit)
+        # Router losses stay active during the ZIG warmup: without them a
+        # straight-through hard router can collapse before the forward loss is
+        # enabled.  Only surrogate/physics terms are ramped.
+        L_gate_balance = loss_dict.get('L_gate_balance_t', torch.zeros((), device=L_imit.device))
+        L_expert_diversity = loss_dict.get('L_expert_diversity_t', torch.zeros((), device=L_imit.device))
+        L_router = L_gate_balance + L_expert_diversity
+        L_total = L_imit + L_router + r * (loss_dict['total'] - L_imit - L_router)
         return {
             'total': L_total,
             'L_imit_t': L_imit,
@@ -3098,6 +3344,8 @@ class RampedRegimeLoss(nn.Module):
             'L_phys_t': L_phys,
             'L_invalid_t': L_invalid,
             'L_manifold_t': L_manifold,
+            'L_gate_balance_t': L_gate_balance,
+            'L_expert_diversity_t': L_expert_diversity,
             'imit': loss_dict['imit'],
             'spec': L_spec.item(),
             'phys': L_phys.item(),
@@ -3265,6 +3513,7 @@ for dagger_iter in range(_start_iter, DAGGER_ITERATIONS):
     diverged_at = None        # epoch at which the iteration was aborted, if any
     for epoch in range(EPOCHS_PER_ITER):
         ramped_criterion.set_epoch(epoch)
+        student.set_routing_epoch(dagger_iter * EPOCHS_PER_ITER + epoch)
         student.train()
         losses = {'total': 0, 'imit': 0, 'spec': 0, 'phys': 0, 'invalid': 0, 'manifold': 0}
         for specs_batch, params_batch in train_loader:

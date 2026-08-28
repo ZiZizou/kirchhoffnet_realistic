@@ -188,20 +188,22 @@ START_POINTS: dict[str, dict[str, Any]] = {
         "freeze_temporal_read": 0,
     },
     "ctle": {
-        # Seed is the current default dagger config (4 stages, 14 hidden, rank 2, t-span ~4.0 via SOLVER)
-        # plus the Friedman2 winner t-span 7.12 as prior for BO to explore.
+        # Best observed CTLE KNet run at the original 4 x 100 DAgger budget
+        # (trial_0015): sparse two-stage fabric, rank 3, long integration
+        # span, and nearly unregularized AdamW.  This is enqueued as run 0 so
+        # every new CTLE study starts from the strongest known KNet point.
         "boundary_fan_out": {
-            "0": [2, 4], "1": [1, 3], "2": [12, 5], "3": [7, 9],
+            "0": [0, 4], "1": [1, 5], "2": [2, 6], "3": [3, 7],
         },
-        "num_hidden": 14, "small_world_k": 4, "small_world_p": 0.2,
-        "num_stages": 4, "fanout_count": 2,
-        "t_span": 4.0, "num_steps": 40,
-        "lr": 1e-3, "weight_decay": 1e-4, "batch_size": 256,
+        "num_hidden": 11, "small_world_k": 2, "small_world_p": 0.2,
+        "num_stages": 2, "fanout_count": 2,
+        "t_span": 6.729228, "num_steps": 67,
+        "lr": 7.044922e-3, "weight_decay": 1.532273e-6, "batch_size": 1024,
         "x_max": 4.0, "gm_max": 10.0, "isat_max": 10.0,
         "sparsity_lambda": 0.0, "entropy_lambda": 1e-6,
         "device_l2_lambda": 0.0, "freeze_boundary": 0,
         "freeze_temporal_read": 0,
-        "vca_rank": 2,
+        "vca_rank": 3,
     },
 }
 

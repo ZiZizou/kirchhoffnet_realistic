@@ -286,11 +286,18 @@ class FreeTanhLibrary(nn.Module):
 
         self._bias_enabled = bool(bias_enabled)
         self._parallel_tanh_mult_enabled = bool(parallel_tanh_mult_enabled)
-        self.a_raw = nn.Parameter(torch.randn(num_edges))
-        self.b_raw = nn.Parameter(torch.randn(num_edges))
-        self.s_raw = nn.Parameter(torch.randn(num_edges))
-        self.gm_raw = nn.Parameter(torch.full((num_edges,), -2.3))
-        self.isat_raw = nn.Parameter(torch.full((num_edges,), -2.3))
+        # Initialize a_raw, b_raw near 0 so softplus gives small values (~0.7)
+        # instead of randn() which can cause huge A,B and gradient explosion.
+        self.a_raw = nn.Parameter(torch.zeros(num_edges))
+        self.b_raw = nn.Parameter(torch.zeros(num_edges))
+        # Initialize s_raw to small random values so sign() gives ±1, not 0.
+        # STE allows gradients to flow; forward needs non-zero sign for tanh path.
+        self.s_raw = nn.Parameter(torch.randn(num_edges) * 0.1)
+        # Initialize gm_raw, isat_raw more negative so initial gm, isat are near
+        # minimum (0.01) to avoid initial gradient explosion in evolving core.
+        # -5.0 -> sigmoid(-5) ≈ 0.0067 -> gm ≈ 0.01 + 9.99*0.0067 ≈ 0.077
+        self.gm_raw = nn.Parameter(torch.full((num_edges,), -5.0))
+        self.isat_raw = nn.Parameter(torch.full((num_edges,), -5.0))
         if self._bias_enabled:
             self.theta_raw = nn.Parameter(torch.zeros(num_edges))
         # Experimental parallel tanh-multiplier cell:

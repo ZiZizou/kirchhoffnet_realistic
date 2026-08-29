@@ -1238,6 +1238,7 @@ def run_fabric_condition(
     val_every: int = 5,
     val_u_test: torch.Tensor | None = None,
     val_y_test: torch.Tensor | None = None,
+    cell_library: str = "tanh",
 ) -> dict[str, Any]:
     """Train one fabric condition and return its results.
 
@@ -1264,6 +1265,11 @@ def run_fabric_condition(
         val_u_test: Optional pre-generated validation input (re-used across
             epochs). If None, generated from the standard test seed.
         val_y_test: Optional pre-generated validation target.
+        cell_library: Name of the cell library to use for this fabric
+            condition. One of ``config.CELL_LIBRARIES`` keys (e.g. ``tanh``,
+            ``tanh_free``, ``tanh_realistic``, ``tanh_realistic_upgrade``,
+            ``tanh_anti``, ``relu``). Defaults to ``tanh`` for backward
+            compatibility.
 
     Returns dict with:
         - "nrmse": test NRMSE on the washed test set
@@ -1298,7 +1304,7 @@ def run_fabric_condition(
         num_steps_per_sample=num_steps,
     )
 
-    cell_lib = make_cell_library("tanh")
+    cell_lib = make_cell_library(cell_library)
     torch.manual_seed(seed)
     net = build_net_from_config(
         cfg=preset,
@@ -1401,6 +1407,7 @@ def run_fabric_condition(
         "freeze_read": freeze_read,
         "t_span": t_span,
         "num_steps": num_steps,
+        "cell_library": cell_library,
     }
     if ridge_result:
         out["ridge_nrmse"] = ridge_result["ridge_nrmse"]
@@ -1481,6 +1488,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-every", type=int, default=5,
                         help="Evaluate test-set NRMSE/R^2 every N epochs (default 5). "
                              "Set to 0 to disable.")
+    parser.add_argument("--cell-library", type=str, default="tanh",
+                        choices=["tanh", "tanh_free", "tanh_realistic",
+                                 "tanh_realistic_upgrade", "tanh_anti", "relu"],
+                        help="Cell library for fabric conditions (default 'tanh'). "
+                             "'tanh_free' uses FreeTanhLibrary; 'tanh_realistic' uses "
+                             "RealisticTanhLibrary; etc. See config.CELL_LIBRARIES.")
     return parser.parse_args()
 
 
@@ -1537,7 +1550,7 @@ def main() -> int:
             cond_name = "fabric_fr_off" if not freeze_read else "fabric_fr_on"
             fr_str = "OFF (evolving core)" if not freeze_read else "ON (frozen core)"
             print(f"  [{idx}/{len(fabric_jobs)}] {cond_name}  seed={seed}  "
-                  f"freeze_read={fr_str}")
+                  f"freeze_read={fr_str}  cell_library={args.cell_library}")
             res = run_fabric_condition(
                 args.order, seed, freeze_read=freeze_read,
                 epochs=args.epochs,
@@ -1552,6 +1565,7 @@ def main() -> int:
                 num_steps=args.num_steps,
                 compile_sequence=args.compile,
                 val_every=args.val_every,
+                cell_library=args.cell_library,
             )
             result_row = {
                 "seed": seed,
@@ -1585,7 +1599,7 @@ def main() -> int:
         f"NARMA-{args.order} -- {len(seeds)} seeds -- final results",
         "=" * 60,
     ]
-    csv_lines = ["condition,seed,nrmse,r2,mc_total,trained_params,total_params,hidden_dim"]
+    csv_lines = ["condition,seed,nrmse,r2,mc_total,trained_params,total_params,hidden_dim,cell_library"]
     for cond in sorted(by_cond):
         runs = by_cond[cond]
         nrmse_vals = [r["nrmse"] for r in runs]
@@ -1628,7 +1642,8 @@ def main() -> int:
             csv_lines.append(
                 f"{cond},{r['seed']},{r['nrmse']:.6f},{r['r2']:.6f},"
                 f"{mc if mc != '' else ''},{tp if tp != '' else ''},"
-                f"{tt if tt != '' else ''},{hd if hd != '' else ''}"
+                f"{tt if tt != '' else ''},{hd if hd != '' else ''},"
+                f"{r.get('cell_library', '')}"
             )
 
     summary_text = "\n".join(summary_lines) + "\n"

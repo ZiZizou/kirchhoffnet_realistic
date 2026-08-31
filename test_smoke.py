@@ -6663,6 +6663,8 @@ def test_free_tanh_construction():
     check("FT-1: s_raw init has no zero signs", bool((lib.s_raw != 0).all()))
     check("FT-1: gm_raw init=-5.0", torch.allclose(lib.gm_raw, torch.full((10,), -5.0)))
     check("FT-1: isat_raw init=-5.0", torch.allclose(lib.isat_raw, torch.full((10,), -5.0)))
+    check("FT-1: g_resistive_raw init=-5.0",
+          torch.allclose(lib.g_resistive_raw, torch.full((10,), -5.0)))
 
     check("FT-1: gm_min from config", lib.gm_min == TANH_REALISTIC_GM_MIN, f"got {lib.gm_min}")
     check("FT-1: gm_max from config", lib.gm_max == TANH_REALISTIC_GM_MAX, f"got {lib.gm_max}")

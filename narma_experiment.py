@@ -126,20 +126,29 @@ from topology import build_net_from_config, build_net_from_preset
 # Data: NARMA-N generator
 # ---------------------------------------------------------------------------
 
+NARMA_INPUT_MAX = {10: 0.5, 20: 0.2}
+
+
 def narma(n_samples: int, order: int = 10, seed: int = 0,
-          u_max: float = 0.5) -> tuple[torch.Tensor, torch.Tensor]:
+          u_max: float | None = None) -> tuple[torch.Tensor, torch.Tensor]:
     """Generate a NARMA-N sequence.
 
     Args:
         n_samples: Number of output samples to return.
         order: NARMA order (10 or 20).
         seed: RNG seed for reproducibility.
-        u_max: Upper bound of the uniform input range ``u(n) in [0, u_max]``.
+        u_max: Upper bound of the uniform input range. Defaults to 0.5 for
+            NARMA-10 and 0.2 for NARMA-20; the latter prevents the canonical
+            recursion from overflowing on long sequences.
 
     Returns:
         ``(u, y)`` each of shape ``(n_samples,)`` — input drive and target.
         The first ``order`` samples are washout and should be discarded.
     """
+    if order not in NARMA_INPUT_MAX:
+        raise ValueError(f"order must be one of {sorted(NARMA_INPUT_MAX)}, got {order}")
+    if u_max is None:
+        u_max = NARMA_INPUT_MAX[order]
     g = torch.Generator().manual_seed(seed)
     u = torch.rand(n_samples + order + 1, generator=g) * u_max
     y = torch.zeros(n_samples + order + 1)
@@ -467,6 +476,9 @@ def memory_capacity(states: torch.Tensor, targets: torch.Tensor,
     The total memory capacity is ``MC = sum_k R^2_k`` (sum over k = 1..20).
     This is the standard reservoir MC measure from Jaeger (2001).
     """
+    if not torch.isfinite(states).all() or not torch.isfinite(targets).all():
+        return [float("nan")] * max_delay, float("nan")
+
     T = states.shape[0]
     r2_list = []
     for k in range(1, max_delay + 1):
@@ -798,6 +810,16 @@ def train_fabric(
                 # y_chunk is (B, K) -> transpose to (K, B) for direct comparison.
                 loss = F.mse_loss(y_pred, y_chunk.t())
 
+                if not torch.isfinite(all_states).all():
+                    raise FloatingPointError(
+                        f"Non-finite fabric state at epoch={epoch}, chunk_start={cs}. "
+                        "Check ODE stability and cell-current initialization."
+                    )
+                if not torch.isfinite(y_pred).all() or not torch.isfinite(loss):
+                    raise FloatingPointError(
+                        f"Non-finite fabric prediction/loss at epoch={epoch}, chunk_start={cs}."
+                    )
+
                 # Hidden voltage RMS over the chunk's last sample (matches
                 # the original "RMS at chunk boundary" semantic).
                 hidden_acc_sq = 0.0
@@ -814,6 +836,13 @@ def train_fabric(
             # Backward
             scaler.scale(loss).backward()
             scaler.unscale_(optim)
+            if any(
+                p.grad is not None and not torch.isfinite(p.grad).all()
+                for p in net.parameters()
+            ):
+                raise FloatingPointError(
+                    f"Non-finite fabric gradient at epoch={epoch}, chunk_start={cs}."
+                )
             torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=grad_clip)
 
             # Capture per-param-group gradient norms (every epoch).
@@ -1330,7 +1359,9 @@ def run_fabric_condition(
         u_diag, y_diag = narma(
             n_streams * train_samples_per_stream, order=order, seed=seed,
         )
-        u_diag = scale_input_to_rails(u_diag, bipolar=bipolar)
+        u_diag = scale_input_to_rails(
+            u_diag, bipolar=bipolar, u_max=NARMA_INPUT_MAX[order],
+        )
         print("  [ridge diagnostic] running untrained fabric on train stream...")
         ridge_result = ridge_readout_diagnostic(
             net, u_diag, y_diag, washout=200, ridge_l2=1e-2, device=device,
@@ -1356,8 +1387,9 @@ def run_fabric_condition(
     u_test, y_test = narma(1000, order=order, seed=seed + 10000)
 
     # Scale input to fabric rails (bipolar recommended).
-    u_train = scale_input_to_rails(u_train, bipolar=bipolar)
-    u_test = scale_input_to_rails(u_test, bipolar=bipolar)
+    input_u_max = NARMA_INPUT_MAX[order]
+    u_train = scale_input_to_rails(u_train, bipolar=bipolar, u_max=input_u_max)
+    u_test = scale_input_to_rails(u_test, bipolar=bipolar, u_max=input_u_max)
 
     res = train_fabric(
         net, u_train, y_train,

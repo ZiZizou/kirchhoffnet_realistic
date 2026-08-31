@@ -247,7 +247,7 @@ class FreeTanhLibrary(nn.Module):
       - ``isat_raw``→ Isat = clamp_min(isat_min + (isat_max - isat_min) * sigmoid(isat_raw), 1e-6).
       - ``theta_raw``→ theta; only present when ``bias_enabled=True`` (init=0).
       - ``g_resistive_raw``→ G = softplus(g_resistive_raw), positive shunt
-        conductance (init=0 → G ≈ 0.69).
+        conductance (init=-5 → G ≈ 0.0067).
 
     Boundary defaults come from ``config.TANH_REALISTIC_*``.
     Compliance gating applied after tanh.
@@ -306,8 +306,10 @@ class FreeTanhLibrary(nn.Module):
             self.gm_x_raw = nn.Parameter(torch.full((num_edges,), -2.3))
             self.gm_y_raw = nn.Parameter(torch.full((num_edges,), -2.3))
             self.isat_parallel_raw = nn.Parameter(torch.full((num_edges,), -2.3))
-        # Resistive shunt: g_raw=0 → G = softplus(0) ≈ 0.6931.
-        self.g_resistive_raw = nn.Parameter(torch.zeros(num_edges))
+        # This branch is always active, including when ``freeze_read`` is
+        # enabled.  Start it in the same low-current regime as the OTA path:
+        # softplus(-5) ≈ 0.0067, rather than a stiff 0.693 per-edge shunt.
+        self.g_resistive_raw = nn.Parameter(torch.full((num_edges,), -5.0))
 
         self._beta_softness = float(PHYS["beta_softness"])
 

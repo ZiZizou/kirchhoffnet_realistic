@@ -245,6 +245,7 @@ class KirchhoffNetWithIO(nn.Module):
         enable_vca: bool = False,
         vca_rank: int | None = None,
         vca_in_dim: int | None = None,
+        vca_bias: bool | None = None,
     ) -> None:
         super().__init__()
         if hid_count < 0 or proj_count < 0:
@@ -366,6 +367,9 @@ class KirchhoffNetWithIO(nn.Module):
         self.enable_vca = bool(enable_vca)
         self.vca_rank = int(vca_rank) if vca_rank is not None else 0
         self.vca_in_dim = int(vca_in_dim) if vca_in_dim is not None else 0
+        # Stored for topology/API compatibility; per-edge VCA biases are
+        # owned and applied by DifferentialStage instances.
+        self.vca_bias = vca_bias
         if self.enable_boundary and self.boundary_fan_out is not None:
             stage_widths = [s.num_nodes for s in core.stages]
             if len(set(stage_widths)) != 1:

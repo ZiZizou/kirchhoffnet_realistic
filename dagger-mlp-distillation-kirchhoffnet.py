@@ -106,6 +106,7 @@ def _config_hash():
     except Exception:
         spec_min, spec_max = [], []
     payload = {
+        'data_dir': os.path.abspath(DATA_DIR),
         'N_EMPIRICAL_SAMPLES': N_EMPIRICAL_SAMPLES,
         'BOUNDARY_RATIO': BOUNDARY_RATIO,
         'np_seed': _NP_SEED,
@@ -608,6 +609,17 @@ INITIAL_DATASET_CACHE_DIR = INITIAL_DATASET_CACHE_DIR_DEFAULT
 # ---------------------------------------------------------------------------
 try:
     import argparse as _argparse
+
+    def _parse_bool_arg(value):
+        if isinstance(value, bool):
+            return value
+        normalized = str(value).strip().lower()
+        if normalized in {'1', 'true', 'yes', 'y', 'on'}:
+            return True
+        if normalized in {'0', 'false', 'no', 'n', 'off'}:
+            return False
+        raise _argparse.ArgumentTypeError(f"expected a boolean, got {value!r}")
+
     _bo_parser = _argparse.ArgumentParser(add_help=False)
     _bo_parser.add_argument('--dagger-iterations', type=int, default=None)
     _bo_parser.add_argument('--epochs-per-iter', type=int, default=None)
@@ -634,12 +646,15 @@ try:
     _bo_parser.add_argument('--output', type=str, default=None)
     _bo_parser.add_argument('--device', type=str, default=None)
     _bo_parser.add_argument('--data-dir', type=str, default=None)
+    _bo_parser.add_argument('--dataset-dir', dest='data_dir', type=str, default=None,
+                            help='Directory containing the historical dataset CSV files (alias for --data-dir).')
     _bo_parser.add_argument('--mlp-teacher-ckpt', type=str, default=None)
     _bo_parser.add_argument('--mlp-teacher-width', type=int, default=None)
     _bo_parser.add_argument('--mlp-teacher-layers', type=int, default=None)
     _bo_parser.add_argument('--mlp-teacher-activation', type=str, default=None,
                             choices=['silu', 'gelu'])
-    _bo_parser.add_argument('--mlp-teacher-use-layernorm', action='store_true', default=False)
+    _bo_parser.add_argument('--mlp-teacher-use-layernorm', nargs='?', const=True,
+                            default=False, type=_parse_bool_arg)
     _bo_parser.add_argument('--mlp-teacher-input-preprocessing', type=str, default=None,
                             choices=['knet', 'q75'])
     _bo_parser.add_argument('--mlp-teacher-batch-size', type=int, default=None)
@@ -1033,6 +1048,14 @@ if not _COUNT_PARAMS_ONLY:
             continue
         df = pd.read_csv(fpath)
         dfs.append(df)
+
+    if not dfs:
+        raise FileNotFoundError(
+            f"No dataset CSV files were found in {history_dir!r}. "
+            "Pass --dataset-dir /kaggle/input/datasets/awekill/augmented-cvae-ctle "
+            "(or --data-dir with the same value). Expected files: "
+            + ", ".join(DATASET_CSV_FILES)
+        )
 
     combined = pd.concat(dfs, ignore_index=True) if dfs else df
     _logger.info(f"Total rows: {len(combined)}")

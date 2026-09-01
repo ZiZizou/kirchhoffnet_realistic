@@ -890,8 +890,41 @@ class FlowTeacherLabeler:
 # ---------------------------------------------------------------------------
 # Teacher: PlainMLP (single-head MLP control)
 # ---------------------------------------------------------------------------
+def _plain_mlp_arch_from_state(state):
+    """Infer the structural PlainMLP options from a state dict.
+
+    This is intentionally based on tensor shapes/key positions rather than on
+    ``teacher_config.json``.  Older runs either did not write that file or
+    wrote metadata that no longer matched the checkpoint.
+    """
+    linear_weights = sorted(
+        (int(k.split('.')[1]), v) for k, v in state.items()
+        if k.startswith('trunk.') and k.endswith('.weight') and getattr(v, 'ndim', 0) == 2
+    )
+    if not linear_weights:
+        raise ValueError("PlainMLP checkpoint has no trunk Linear weights")
+    trunk_layers = len(linear_weights)
+    trunk_width = int(linear_weights[0][1].shape[0])
+    input_dim = int(linear_weights[0][1].shape[1])
+    if input_dim not in (4, 8):
+        raise ValueError(f"Unsupported PlainMLP input dimension in checkpoint: {input_dim}")
+    use_log_features = input_dim == 8
+
+    # With the current Sequential layout, LayerNorm parameters are 1-D
+    # weights at the indices immediately following each Linear layer.
+    linear_indices = {idx for idx, _ in linear_weights}
+    norm_indices = {
+        int(k.split('.')[1]) for k, v in state.items()
+        if k.startswith('trunk.') and k.endswith('.weight')
+        and getattr(v, 'ndim', 0) == 1
+    }
+    use_layernorm = any((idx + 1) in norm_indices for idx in linear_indices)
+    return trunk_width, trunk_layers, use_layernorm, use_log_features
+
+
 def load_plain_mlp_teacher(ckpt_path, device=None, *, trunk_width=48, trunk_layers=3,
-                             activation=None, use_layernorm=False, input_preprocessing="knet"):
+                             activation=None, use_layernorm=False, input_preprocessing="knet",
+                             use_log_features=None):
     """Load a frozen PlainMLP teacher from a ``dagger_student_plain.pt`` checkpoint.
 
     If ``outputs/<dir>/teacher_config.json`` exists alongside the .pt, its values
@@ -919,12 +952,29 @@ def load_plain_mlp_teacher(ckpt_path, device=None, *, trunk_width=48, trunk_laye
             act_name = str(cfg.get("activation", "silu")).lower()
             use_layernorm = bool(cfg.get("use_layernorm", use_layernorm))
             input_preprocessing = str(cfg.get("input_preprocessing", input_preprocessing))
+            if use_log_features is None and "use_log_features" in cfg:
+                use_log_features = bool(cfg["use_log_features"])
             activation = {"silu": nn.SiLU, "gelu": nn.GELU}.get(act_name, nn.SiLU)
             _logger.info(f"[MLP-TEACHER] loaded teacher_config.json: W={trunk_width} L={trunk_layers} "
                          f"act={act_name} LN={use_layernorm} prep={input_preprocessing}")
         except Exception as e:
             _logger.warning(f"[MLP-TEACHER] Failed to read teacher_config.json ({cfg_path}): "
                             f"{e}; using CLI defaults")
+    state = torch.load(ckpt_path, map_location=device)
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
+    inferred = _plain_mlp_arch_from_state(state)
+    inferred_width, inferred_layers, inferred_ln, inferred_log = inferred
+    requested = (int(trunk_width), int(trunk_layers), bool(use_layernorm),
+                 (input_preprocessing == "q75") if use_log_features is None else bool(use_log_features))
+    actual = (inferred_width, inferred_layers, inferred_ln, inferred_log)
+    if requested != actual:
+        _logger.warning(
+            "[MLP-TEACHER] CLI/config architecture %s does not match checkpoint %s; "
+            "using checkpoint architecture",
+            requested, actual,
+        )
+    trunk_width, trunk_layers, use_layernorm, use_log_features = actual
     if activation is None:
         activation = nn.SiLU
     teacher = PlainMLP(
@@ -932,9 +982,8 @@ def load_plain_mlp_teacher(ckpt_path, device=None, *, trunk_width=48, trunk_laye
         trunk_layers=trunk_layers,
         activation=activation,
         use_layernorm=use_layernorm,
-        use_log_features=(input_preprocessing == "q75"),
+        use_log_features=use_log_features,
     )
-    state = torch.load(ckpt_path, map_location=device)
     teacher.load_state_dict(state)
     teacher = teacher.to(device)
     teacher.eval()

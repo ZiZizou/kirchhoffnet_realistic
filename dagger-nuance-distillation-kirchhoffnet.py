@@ -636,6 +636,7 @@ KN_X_MAX            = 4.0     # local knet rail (overrides PHYS["x_max"]=3.0 via
 # reproduced bit-for-bit at epoch 0 regardless of the chosen flags.
 KN_VCA                   = True  # --vca: enable low-rank input-driven VCA on boundary / temporal-readout edges
 KN_VCA_CORE              = True  # --vca-core: also gate core (hidden) edges (auto-enabled if no boundary / readout families)
+KN_VCA_BIAS              = bool(VCA.get("bias", False))  # --vca-bias: affine per-edge offsets
 KN_VCA_GATE_SHUNT        = False  # --vca-gate-shunt: also gate parallel resistive shunt with the core VCA gate (input-dependent routing)
 KN_VCA_SEPARATE_CORE_BUS = True  # --vca-separate-core-bus: give core family its own vca_W_core projection (ablation)
 KN_VCA_RANK              = 2   # projection rank r; None -> config.VCA['rank'] (must be >= VCA['min_rank'])
@@ -688,6 +689,8 @@ try:
     _bo_parser.add_argument('--kn-small-world-k', type=int, default=None)
     _bo_parser.add_argument('--kn-small-world-p', type=float, default=None)
     _bo_parser.add_argument('--kn-vca-rank', type=int, default=None)
+    _bo_parser.add_argument('--vca-bias', action='store_true', default=False,
+                            help='Enable affine per-edge VCA biases.')
     _bo_parser.add_argument('--kn-moe-num-experts', type=int, default=None)
     _bo_parser.add_argument('--kn-moe-gate-rank', type=int, default=None)
     _bo_parser.add_argument('--kn-moe-top-k', type=int, default=None)
@@ -735,6 +738,8 @@ try:
         KN_SMALL_WORLD_P = _bo_args.kn_small_world_p
     if _bo_args.kn_vca_rank is not None:
         KN_VCA_RANK = _bo_args.kn_vca_rank
+    if _bo_args.vca_bias:
+        KN_VCA_BIAS = True
     if _bo_args.kn_moe_num_experts is not None:
         KN_MOE_NUM_EXPERTS = _bo_args.kn_moe_num_experts
     if _bo_args.kn_moe_gate_rank is not None:
@@ -1602,6 +1607,7 @@ class LocalKirchhoffStudentWrapper(nn.Module):
                  vca_core_enabled: bool = False,
                  vca_gate_shunt: bool = False,
                  vca_separate_core_bus: bool = False,
+                 vca_bias: bool = False,
                  moe_num_experts: int = KN_MOE_NUM_EXPERTS,
                  moe_gate_rank: int = KN_MOE_GATE_RANK,
                  moe_temp_start: float = KN_MOE_TEMP_START,
@@ -1656,6 +1662,7 @@ class LocalKirchhoffStudentWrapper(nn.Module):
         self.vca_core_enabled = bool(vca_core_enabled)
         self.vca_gate_shunt = bool(vca_gate_shunt)
         self.vca_separate_core_bus = bool(vca_separate_core_bus)
+        self.vca_bias = bool(vca_bias)
         self.moe_num_experts = int(moe_num_experts)
         self.moe_gate_rank = int(moe_gate_rank)
         self.moe_temp_start = float(moe_temp_start)
@@ -1732,6 +1739,7 @@ class LocalKirchhoffStudentWrapper(nn.Module):
             vca_core_enabled=self.vca_core_enabled,
             vca_gate_shunt=self.vca_gate_shunt,
             vca_separate_core_bus=self.vca_separate_core_bus,
+            vca_bias=self.vca_bias,
         )
         # The old single OutputAffine readout is intentionally removed.  The
         # temporal ODE nodes remain in the fabric and, together with the final
@@ -3094,6 +3102,7 @@ student = LocalKirchhoffStudentWrapper(
     vca_core_enabled=KN_VCA_CORE,
     vca_gate_shunt=KN_VCA_GATE_SHUNT,
     vca_separate_core_bus=KN_VCA_SEPARATE_CORE_BUS,
+    vca_bias=KN_VCA_BIAS,
     moe_num_experts=KN_MOE_NUM_EXPERTS,
     moe_gate_rank=KN_MOE_GATE_RANK,
     moe_temp_start=KN_MOE_TEMP_START,
@@ -3108,7 +3117,7 @@ student = LocalKirchhoffStudentWrapper(
 _logger.info(
     f"Student VCA config: enabled={KN_VCA}, rank="
     f"{int(KN_VCA_RANK) if KN_VCA_RANK is not None else int(VCA['rank'])}, "
-    f"core={KN_VCA_CORE}, gate_shunt={KN_VCA_GATE_SHUNT}, "
+    f"core={KN_VCA_CORE}, bias={KN_VCA_BIAS}, gate_shunt={KN_VCA_GATE_SHUNT}, "
     f"separate_core_bus={KN_VCA_SEPARATE_CORE_BUS} "
     f"(mirrors train_script.py --vca/--vca-core/--vca-gate-shunt/"
     f"--vca-separate-core-bus)"

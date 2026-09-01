@@ -170,6 +170,7 @@ output_ode_src: list[int] | None = None,
         vca_core_enabled: bool = False,
         vca_gate_shunt: bool = False,
         vca_separate_core_bus: bool = False,
+        vca_bias: bool | None = None,
     ) -> None:
         super().__init__()
         self.num_nodes = int(num_nodes)
@@ -184,6 +185,7 @@ output_ode_src: list[int] | None = None,
         self.vca_enabled = bool(vca_enabled)
         self.vca_rank = int(vca_rank) if vca_enabled else int(vca_rank)
         self._vca_in_dim = int(vca_in_dim)
+        self.vca_bias_enabled = bool(VCA.get("bias", False) if vca_bias is None else vca_bias)
         if self.vca_enabled and self.vca_rank < VCA["min_rank"]:
             raise ValueError(
                 f"vca_rank must be >= {VCA['min_rank']}, got {self.vca_rank}"
@@ -473,24 +475,30 @@ output_ode_src: list[int] | None = None,
                 )
             else:
                 self.vca_v_boundary = None
+            self.vca_b_boundary = nn.Parameter(torch.zeros(n_b)) if (n_b > 0 and self.vca_bias_enabled) else None
             if n_r > 0:
                 self.vca_v_readout = nn.Parameter(
                     torch.empty(n_r, self.vca_rank).normal_(std=init_scale)
                 )
             else:
                 self.vca_v_readout = None
+            self.vca_b_readout = nn.Parameter(torch.zeros(n_r)) if (n_r > 0 and self.vca_bias_enabled) else None
             if self._vca_core_enabled:
                 self.vca_v_core = nn.Parameter(
                     torch.empty(n_c, self.vca_rank).normal_(std=init_scale)
                 )
             else:
                 self.vca_v_core = None
+            self.vca_b_core = nn.Parameter(torch.zeros(n_c)) if (self._vca_core_enabled and self.vca_bias_enabled) else None
         else:
             self.vca_W = None
             self.vca_W_core = None
             self.vca_v_boundary = None
             self.vca_v_readout = None
             self.vca_v_core = None
+            self.vca_b_boundary = None
+            self.vca_b_readout = None
+            self.vca_b_core = None
             self._vca_core_enabled = False
             self.vca_gate_shunt = False
             self.vca_separate_core_bus = False
@@ -689,6 +697,7 @@ output_ode_src: list[int] | None = None,
         self,
         u: torch.Tensor,
         v_e: torch.Tensor,
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Low-rank VCA gate for one edge set.
 
@@ -710,6 +719,8 @@ output_ode_src: list[int] | None = None,
         """
         u_proj = u @ self.vca_W              # [batch, rank]
         vca_logits = u_proj @ v_e.T          # [batch, E]
+        if bias is not None:
+            vca_logits = vca_logits + bias
         return 2.0 * torch.sigmoid(vca_logits)
 
     def _compute_core_gate(self, u: torch.Tensor) -> torch.Tensor:
@@ -726,6 +737,8 @@ output_ode_src: list[int] | None = None,
         W = self.vca_W_core if self.vca_separate_core_bus else self.vca_W
         u_proj = u @ W                       # [batch, rank]
         vca_logits = u_proj @ self.vca_v_core.T  # [batch, E_core]
+        if self.vca_b_core is not None:
+            vca_logits = vca_logits + self.vca_b_core
         return 2.0 * torch.sigmoid(vca_logits)
 
     def _compute_frozen_boundary(self, u: torch.Tensor, x0: torch.Tensor) -> torch.Tensor | None:
@@ -761,7 +774,7 @@ output_ode_src: list[int] | None = None,
         b_mask = torch.sigmoid(self.boundary_z_logits)  # [Eb]
         i_edge = i_edge * b_mask.unsqueeze(0)
         if self.vca_enabled and self.vca_v_boundary is not None:
-            i_edge = i_edge * self._compute_vca_gate(u, self.vca_v_boundary)
+            i_edge = i_edge * self._compute_vca_gate(u, self.vca_v_boundary, self.vca_b_boundary)
         acc_b = torch.zeros_like(x0, dtype=torch.float32)
         acc_b.index_add_(1, self.boundary_dst, i_edge.float())
         return acc_b.to(dtype=x0.dtype)
@@ -799,7 +812,7 @@ output_ode_src: list[int] | None = None,
         o_mask = torch.sigmoid(self.output_ode_z_logits)  # [Eo]
         i_edge = i_edge * o_mask.unsqueeze(0)
         if self.vca_enabled and self.vca_v_readout is not None and u is not None:
-            i_edge = i_edge * self._compute_vca_gate(u, self.vca_v_readout)
+            i_edge = i_edge * self._compute_vca_gate(u, self.vca_v_readout, self.vca_b_readout)
         acc_o = torch.zeros_like(x0, dtype=torch.float32)
         acc_o.index_add_(1, self.output_ode_dst, i_edge.float())
         return acc_o.to(dtype=x0.dtype)
@@ -944,7 +957,7 @@ output_ode_src: list[int] | None = None,
                 i_boundary = i_boundary * boundary_mask.unsqueeze(0)   # [B, Eb]
                 if self.vca_enabled and self.vca_v_boundary is not None:
                     i_boundary = i_boundary * self._compute_vca_gate(
-                        u, self.vca_v_boundary,
+                        u, self.vca_v_boundary, self.vca_b_boundary,
                     )  # [B, Eb]
                 i_boundary_f32 = i_boundary.float()
                 # Clone when freeze_read is active so we don't mutate the shared
@@ -971,7 +984,7 @@ output_ode_src: list[int] | None = None,
                     i_res_b = i_res_b * boundary_mask.unsqueeze(0)
                     if self.vca_enabled and self.vca_v_boundary is not None:
                         i_res_b = i_res_b * self._compute_vca_gate(
-                            u, self.vca_v_boundary,
+                            u, self.vca_v_boundary, self.vca_b_boundary,
                         )  # [B, Eb]
                     acc_b_res = torch.zeros_like(x, dtype=torch.float32)
                     acc_b_res.index_add_(1, self.boundary_dst, i_res_b.float())
@@ -1017,7 +1030,7 @@ output_ode_src: list[int] | None = None,
                 i_out = i_out * out_mask.unsqueeze(0)  # [B, Eo]
                 if self.vca_enabled and self.vca_v_readout is not None and u is not None:
                     i_out = i_out * self._compute_vca_gate(
-                        u, self.vca_v_readout,
+                        u, self.vca_v_readout, self.vca_b_readout,
                     )  # [B, Eo]
                 i_out_f32 = i_out.float()
                 if i_edge_const is not None:
@@ -1042,7 +1055,7 @@ output_ode_src: list[int] | None = None,
                     i_res_o = i_res_o * out_mask.unsqueeze(0)
                     if self.vca_enabled and self.vca_v_readout is not None and u is not None:
                         i_res_o = i_res_o * self._compute_vca_gate(
-                            u, self.vca_v_readout,
+                            u, self.vca_v_readout, self.vca_b_readout,
                         )  # [B, Eo]
                     acc_out_res = torch.zeros_like(x, dtype=torch.float32)
                     acc_out_res.index_add_(1, self.output_ode_dst, i_res_o.float())
@@ -1728,6 +1741,11 @@ output_ode_src: list[int] | None = None,
             vca_embed_n += int(self.vca_v_readout.numel())
         if getattr(self, "vca_v_core", None) is not None:
             vca_embed_n += int(self.vca_v_core.numel())
+        vca_bias_n = sum(
+            int(getattr(self, name).numel())
+            for name in ("vca_b_boundary", "vca_b_readout", "vca_b_core")
+            if getattr(self, name, None) is not None
+        )
         return {
             "raw_leak": raw_leak_n,
             "z_logits": int(self.z_logits.numel()),
@@ -1742,6 +1760,7 @@ output_ode_src: list[int] | None = None,
             "output_ode_device_param": out_dev,
             "vca_proj": vca_proj_n,
             "vca_embed": vca_embed_n,
+            "vca_bias": vca_bias_n,
             "total": (
                 raw_leak_n
                 + int(self.z_logits.numel())
@@ -1755,5 +1774,6 @@ output_ode_src: list[int] | None = None,
                 + out_dev
                 + vca_proj_n
                 + vca_embed_n
+                + vca_bias_n
             ),
         }

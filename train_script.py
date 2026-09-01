@@ -2666,7 +2666,7 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
         dest="vca",
         help="Enable low-rank input-driven VCA (Voltage-Controlled Amplifier) "
              "gating on boundary and temporal-readout edges. Each gated "
-             "edge's tail current is modulated by vca_e = sigma(u^T W v_e), "
+             "edge's tail current is modulated by vca_e = 2*sigmoid(u^T W v_e), "
              "where W (in_dim x rank) is a shared input projection and v_e "
              "(rank) is a per-edge embedding. Physically: rank global control "
              "buses broadcast from the input terminals, each unfrozen edge "
@@ -2683,6 +2683,10 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "with per-edge scalar gain; larger r gives the optimizer more "
              "axes to express input-edge alignment. Must be >= "
              f"{VCA['min_rank']}.")
+    parser.add_argument(
+        "--vca-bias", action="store_true", default=None, dest="vca_bias",
+        help="Enable learned per-edge affine VCA offsets: gate_e = 2*sigmoid("
+             "b_e + (u@W)@v_e). Omitted by default for backward compatibility.")
     parser.add_argument(
         "--vca-core", action="store_true", default=False,
         dest="vca_core",
@@ -3577,6 +3581,7 @@ def main():
         enable_temporal_readout=args.enable_temporal_readout,
         vca_enabled=args.vca,
         vca_rank=args.vca_rank,
+        vca_bias=args.vca_bias,
         vca_core_enabled=args.vca_core,
         vca_gate_shunt=args.vca_gate_shunt,
         vca_separate_core_bus=args.vca_separate_core_bus,

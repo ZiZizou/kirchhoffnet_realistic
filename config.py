@@ -560,7 +560,7 @@ DEGREE_BUDGET = {
 # Low-rank input-driven VCA (Voltage-Controlled Amplifier) gating.
 # Applied to boundary, temporal-readout, and (with --vca-core) core
 # edges. VCA gate per edge is
-#   gate_e = 2 * sigma( (u^T W) v_e )
+#   gate_e = 2 * sigma( b_e + (u^T W) v_e )
 # where ``W`` (in_dim x rank) is a shared input projection and ``v_e``
 # (rank) is a per-edge embedding. Physically: ``rank`` global control
 # buses broadcast from the input terminals, each gated edge taps into
@@ -576,7 +576,8 @@ DEGREE_BUDGET = {
 # The 2-sigma gain range (vs 1-sigma) lets the network amplify AND
 # attenuate edge currents symmetrically.
 #
-# Default rank=2 keeps the parameter cost small. Compatible with
+# Default rank=2 keeps the parameter cost small. Biases are opt-in via
+# ``--vca-bias`` (or ``VCA['bias'] = True``). Compatible with
 # --freeze-read because ``u`` is constant per sample across all Heun/DEQ
 # sub-iterations, so the VCA gate is computed once per sample at stage
 # entry and either folded into the frozen KCL contribution (freeze_read
@@ -585,6 +586,7 @@ VCA = {
     "rank": 2,                # projection rank r; must be >= VCA['min_rank']
     "scale_init": 0.01,       # std for v_e init (W is init to all-zero)
     "min_rank": 1,
+    "bias": False,             # enable learned per-edge affine VCA offsets
 }
 
 # Initialization biases

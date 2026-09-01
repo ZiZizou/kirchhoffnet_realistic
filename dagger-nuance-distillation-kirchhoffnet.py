@@ -1675,6 +1675,8 @@ class LocalKirchhoffStudentWrapper(nn.Module):
 
         self.register_buffer("input_log_min", torch.as_tensor(input_log_min, dtype=torch.float32))
         self.register_buffer("input_log_max", torch.as_tensor(input_log_max, dtype=torch.float32))
+        self._clip_elements = 0
+        self._input_elements = 0
 
         # Bounded-output buffers.
         self.log_lo = nn.Parameter(torch.zeros(num_targets), requires_grad=False)
@@ -1772,7 +1774,16 @@ class LocalKirchhoffStudentWrapper(nn.Module):
         log_x = torch.log10(x.clamp(min=eps))
         span = (hi - lo).clamp(min=1e-8)
         u = 2.0 * (log_x - lo) / span - 1.0
+        with torch.no_grad():
+            self._clip_elements += int((u.abs() >= self.input_rail).sum().item())
+            self._input_elements += int(u.numel())
         return u.clamp(min=-self.input_rail, max=self.input_rail)
+
+    def clipping_stats(self):
+        clipped = self._clip_elements
+        total = self._input_elements
+        return {'clipped_elements': clipped, 'input_elements': total,
+                'clip_fraction': clipped / max(1, total)}
 
     def set_routing_epoch(self, epoch: int) -> None:
         """Set the global training epoch used to anneal Gumbel routing."""
@@ -3966,6 +3977,10 @@ eval_results = evaluate_student(
     eye_scale_h, eye_scale_w, eye_scale_j,
     scaler_y_p, scaler_X, zig_model
 )
+_clip_stats = student.clipping_stats()
+_logger.info("KNet input clipping: %d/%d elements (%.4f%%) hit [-%.1f, %.1f] during run",
+             _clip_stats['clipped_elements'], _clip_stats['input_elements'],
+             100.0 * _clip_stats['clip_fraction'], student.input_rail, student.input_rail)
 
 # =====================================================================
 # Save model

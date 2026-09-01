@@ -69,6 +69,9 @@ def parse_args():
     parser.add_argument("--no-plain-log-features", dest="plain_use_log_features",
                         action="store_false",
                         help="Disable the 4-dim raw-log feature concatenation.")
+    parser.add_argument("--input-preprocessing", choices=["knet", "q75"], default="knet",
+                        help="Input representation: knet=4 log/min-max features clipped to [-4,4]; "
+                             "q75=legacy Q75 features plus optional raw-log features.")
     parser.add_argument("--param-budget", type=int, default=None,
                         help="If set, auto-derive plain trunk width via derive_plain_width "
                              "so plain_param_count(W,L) <= param-budget. Overrides --plain-trunk-width.")
@@ -97,7 +100,7 @@ def build_student(args) -> PlainMLP:
         trunk_layers=trunk_layers,
         activation=activation,
         use_layernorm=args.plain_use_layernorm,
-        use_log_features=args.plain_use_log_features,
+        use_log_features=(args.plain_use_log_features and args.input_preprocessing == "q75"),
     )
     return student
 

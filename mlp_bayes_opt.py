@@ -150,27 +150,28 @@ def _over_budget_objective(actual_params: int, budget: int, base: float) -> floa
     return base * ratio * ratio
 
 
-def moe_param_count(trunk_width: int, trunk_layers: int, num_experts: int) -> int:
+def moe_param_count(trunk_width: int, trunk_layers: int, num_experts: int,
+                    input_dim: int = 4) -> int:
     """Exact trainable parameter count of CTLE's RegimeAwareMoE student.
 
-    The student uses 8 log/raw input features, ``trunk_layers`` affine trunk
+    The student uses the controlled 4-feature KNet input by default, ``trunk_layers`` affine trunk
     layers, two bias-free 8-to-expert routing heads, and one width-to-7 affine
     head per expert.  Non-trainable output-bound tensors are intentionally not
     included, matching ``sum(p.numel() for p in student.parameters())``.
     """
     if trunk_width < 1 or trunk_layers < 1 or num_experts < 1:
         raise ValueError("MoE dimensions must be positive")
-    trunk = 9 * trunk_width + (trunk_layers - 1) * (trunk_width ** 2 + trunk_width)
-    routes = 16 * num_experts
+    trunk = (input_dim + 1) * trunk_width + (trunk_layers - 1) * (trunk_width ** 2 + trunk_width)
+    routes = 2 * input_dim * num_experts
     experts = num_experts * (7 * trunk_width + 7)
     return trunk + routes + experts
 
 
 def max_moe_width(*, trunk_layers: int, num_experts: int, param_limit: int,
-                  lower: int, upper: int) -> int:
+                  lower: int, upper: int, input_dim: int = 4) -> int:
     """Largest permitted CTLE MoE width under the shared soft parameter cap."""
     valid = [w for w in range(lower, upper + 1)
-             if moe_param_count(w, trunk_layers, num_experts) <= param_limit]
+             if moe_param_count(w, trunk_layers, num_experts, input_dim) <= param_limit]
     return max(valid, default=-1)
 
 
@@ -351,6 +352,8 @@ def main() -> None:
                              "the soft parameter cap (default: 1e6).")
     parser.add_argument("--loss", choices=["huber", "mse"], default="huber",
                         help="Training loss (default: huber, matches KNet).")
+    parser.add_argument("--input-preprocessing", choices=["knet", "q75"], default="knet",
+                        help="CTLE input representation forwarded to MLP trials (default: knet).")
     parser.add_argument("--validate-every", type=int, default=5)
     parser.add_argument("--output", type=Path,
                         default=Path("./outputs/mlp_bayes_opt"))
@@ -495,6 +498,7 @@ def main() -> None:
                 width_max = max_moe_width(
                     trunk_layers=trunk_layers, num_experts=num_experts,
                     param_limit=soft_limit, lower=32, upper=64,
+                    input_dim=4 if args.input_preprocessing == "knet" else 8,
                 )
                 if width_max < 32:
                     raise optuna.TrialPruned(
@@ -509,7 +513,10 @@ def main() -> None:
             trial_dir = run_dir / f"trial_{trial.number:04d}"
             trial_dir.mkdir(parents=True, exist_ok=True)
             log_path = trial_dir / "log.txt"
-            expected_params = moe_param_count(trunk_width, trunk_layers, num_experts)
+            expected_params = moe_param_count(
+                trunk_width, trunk_layers, num_experts,
+                4 if args.input_preprocessing == "knet" else 8,
+            )
             soft_limit = int(param_budget * (1.0 + args.param_tolerance))
             if expected_params > soft_limit:
                 return _over_budget_objective(
@@ -530,6 +537,7 @@ def main() -> None:
                 "--output", str(trial_dir),
                 "--device", device,
                 "--seed", str(args.seed),
+                "--input-preprocessing", args.input_preprocessing,
             ]
             t0 = time.time()
             sub_env = os.environ.copy()

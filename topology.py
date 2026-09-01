@@ -1324,6 +1324,7 @@ def topology_to_stage(
     vca_core_enabled: bool = False,
     vca_gate_shunt: bool = False,
     vca_separate_core_bus: bool = False,
+    vca_bias: bool | None = None,
 ) -> tuple[DifferentialStage, list[int], dict[int, int]]:
     """Convert a SparseTopology into a DifferentialStage.
 
@@ -1342,7 +1343,8 @@ def topology_to_stage(
         vca_enabled: When ``True``, the stage builds per-edge VCA
             (Voltage-Controlled Amplifier) embeddings for boundary and
             temporal-readout edges plus a shared input projection matrix.
-            The gate per gated edge is ``sigma(u^T W v_e)``. Requires at
+            The gate per gated edge is ``2*sigmoid(b_e + (u^T W) v_e)`` when
+            bias is enabled (otherwise ``2*sigmoid((u^T W) v_e)``). Requires at
             least one of ``boundary_src`` or ``output_ode_src`` to be
             non-empty (else raises ``ValueError``).
         vca_rank: Projection rank ``r`` for the low-rank VCA. Default 2.
@@ -1566,6 +1568,7 @@ def topology_to_stage(
         vca_core_enabled=vca_core_enabled,
         vca_gate_shunt=vca_gate_shunt,
         vca_separate_core_bus=vca_separate_core_bus,
+        vca_bias=vca_bias,
     )
     return stage, active_nodes, id_map
 
@@ -1602,6 +1605,7 @@ def build_net_from_preset(
     vca_core_enabled: bool = False,
     vca_gate_shunt: bool = False,
     vca_separate_core_bus: bool = False,
+    vca_bias: bool | None = None,
     x_max: float | None = None,
     c_eff: float | None = None,
 ):
@@ -1726,6 +1730,7 @@ def build_net_from_preset(
         vca_core_enabled=vca_core_enabled,
         vca_gate_shunt=vca_gate_shunt,
         vca_separate_core_bus=vca_separate_core_bus,
+        vca_bias=vca_bias,
         x_max=x_max,
         c_eff=c_eff,
     )
@@ -1753,6 +1758,7 @@ def build_net_from_config(
     vca_core_enabled: bool = False,
     vca_gate_shunt: bool = False,
     vca_separate_core_bus: bool = False,
+    vca_bias: bool | None = None,
     x_max: float | None = None,
     c_eff: float | None = None,
 ):
@@ -1781,7 +1787,8 @@ def build_net_from_config(
     (Voltage-Controlled Amplifier) gating on boundary and temporal-readout
     edges. ``vca_rank`` (default ``cfg['vca_rank']`` then
     ``config.VCA['rank']``) controls the projection rank ``r``. The VCA
-    gate per gated edge is ``sigma(u^T W v_e)`` where ``W`` (in_dim x rank)
+    gate per gated edge is ``2*sigmoid(b_e + (u^T W) v_e)`` when enabled,
+    where ``W`` (in_dim x rank)
     is a shared input projection and ``v_e`` (rank) is a per-edge
     embedding. Requires at least one of ``boundary_fan_out`` or
     ``enable_temporal_readout``; VCA only modulates unfrozen edges that
@@ -1833,6 +1840,7 @@ def build_net_from_config(
         )
     # VCA rank resolution: explicit kwarg > cfg > config default.
     vca_enabled_effective = bool(vca_enabled or cfg.get("vca_enabled", False))
+    vca_bias_effective = bool(cfg.get("vca_bias", VCA.get("bias", False))) if vca_bias is None else bool(vca_bias)
     if vca_enabled_effective:
         vca_rank_effective = int(
             vca_rank if vca_rank is not None
@@ -2175,6 +2183,7 @@ def build_net_from_config(
             vca_core_enabled=vca_core_enabled,
             vca_gate_shunt=vca_gate_shunt,
             vca_separate_core_bus=vca_separate_core_bus,
+            vca_bias=vca_bias_effective,
             x_max=x_max,
             c_eff=c_eff,
         )
@@ -2388,6 +2397,7 @@ def build_net_from_config(
         enable_vca=vca_enabled_effective,
         vca_rank=vca_rank_effective,
         vca_in_dim=in_dim,
+        vca_bias=vca_bias_effective,
     )
 
     # Hard topology check: write_idx → read_idx must be >1 hop on the core

@@ -177,6 +177,7 @@ try:
     _bo_parser.add_argument('--data-dir', type=str, default=None)
     _bo_parser.add_argument('--teacher-dir', type=str, default=None)
     _bo_parser.add_argument('--seed', type=int, default=None)
+    _bo_parser.add_argument('--input-preprocessing', choices=['knet', 'q75'], default=None)
     _bo_args, _ = _bo_parser.parse_known_args()
     if _bo_args.dagger_iterations is not None:
         DAGGER_ITERATIONS = _bo_args.dagger_iterations
@@ -1081,6 +1082,10 @@ MOE_TRUNK_LAYERS    = 3     # number of trunk layers (excluding input)
 MOE_NUM_EXPERTS     = 3     # number of localized experts (Interior, Boundary, High-Jitter/Power)
 MOE_TRUNK_ACTIVATION = nn.SiLU  # activation function for trunk layers (SiLU or GELU)
 MOE_USE_LAYERNORM   = False # LayerNorm in trunk (keep False — inputs already scaled)
+# Shared input representation. KNet mode is the controlled four-feature default.
+INPUT_PREPROCESSING = getattr(_bo_args, 'input_preprocessing', None) or 'knet'
+KN_INPUT_LOG_MIN = np.zeros(4, dtype=np.float32)
+KN_INPUT_LOG_MAX = np.ones(4, dtype=np.float32)
 # Re-apply BO MoE overrides that were parsed before this block was defined
 # (the initial BO block at ~161 runs before these defaults exist, so it cannot
 # override them; re-apply here so --moe-trunk-width etc. from mlp_bayes_opt.py
@@ -1124,7 +1129,7 @@ class RegimeAwareMoE(nn.Module):
         self.use_log_features = use_log_features
 
         input_dim = 4
-        trunk_input_dim = input_dim * 2 if use_log_features else input_dim
+        trunk_input_dim = input_dim if INPUT_PREPROCESSING == 'knet' else (input_dim * 2 if use_log_features else input_dim)
         trunk_dims = [trunk_input_dim] + [trunk_width] * trunk_layers
 
         trunk_layers_list = []
@@ -1156,6 +1161,13 @@ class RegimeAwareMoE(nn.Module):
 
     def scale_input(self, x):
         power_log = torch.log10(x[..., 0].clamp(min=1e-12))
+        if INPUT_PREPROCESSING == 'knet':
+            logs = torch.stack([power_log, torch.log10(x[..., 1].clamp(min=1e-12)),
+                                torch.log10(x[..., 2].clamp(min=1e-12)),
+                                torch.log10(x[..., 3].clamp(min=1e-12))], dim=-1)
+            lo = torch.as_tensor(KN_INPUT_LOG_MIN, dtype=x.dtype, device=x.device)
+            hi = torch.as_tensor(KN_INPUT_LOG_MAX, dtype=x.dtype, device=x.device)
+            return (2.0 * (logs - lo) / (hi - lo).clamp(min=1e-8) - 1.0).clamp(-4.0, 4.0)
         power_scaled = (power_log - self.scaler_p_mean) / self.scaler_p_scale
         jitter_scaled = torch.log10(x[..., 1].clamp(min=1e-12)) / self._eye_scale_j
         height_scaled = torch.log10(x[..., 2].clamp(min=1e-12)) / self._eye_scale_h
@@ -1230,7 +1242,7 @@ class BoundedMLP(nn.Module):
         self.use_per_output_heads = use_per_output_heads
         
         layers = []
-        dims = [input_dim] + [hidden_dim] * num_layers
+        dims = [4 if INPUT_PREPROCESSING == 'knet' else input_dim] + [hidden_dim] * num_layers
         for i in range(num_layers):
             layers.extend([
                 nn.Linear(dims[i], dims[i+1]),
@@ -1264,6 +1276,13 @@ class BoundedMLP(nn.Module):
         - jitter/height/width: Q75 (log10(raw) / eye_scale)
         """
         power_log = torch.log10(x[..., 0].clamp(min=1e-12))
+        if INPUT_PREPROCESSING == 'knet':
+            logs = torch.stack([power_log, torch.log10(x[..., 1].clamp(min=1e-12)),
+                                torch.log10(x[..., 2].clamp(min=1e-12)),
+                                torch.log10(x[..., 3].clamp(min=1e-12))], dim=-1)
+            lo = torch.as_tensor(KN_INPUT_LOG_MIN, dtype=x.dtype, device=x.device)
+            hi = torch.as_tensor(KN_INPUT_LOG_MAX, dtype=x.dtype, device=x.device)
+            return (2.0 * (logs - lo) / (hi - lo).clamp(min=1e-8) - 1.0).clamp(-4.0, 4.0)
         power_scaled = (power_log - self.scaler_p_mean) / self.scaler_p_scale
         jitter_scaled = torch.log10(x[..., 1].clamp(min=1e-12)) / self._eye_scale_j
         height_scaled = torch.log10(x[..., 2].clamp(min=1e-12)) / self._eye_scale_h
@@ -1356,6 +1375,18 @@ df = combined[required_cols].copy()
 mask = (df['stage_2_jitter'] > 0) & (df['power'] > 0) & (df['stage_2_eye_max_height'] > 0) & (df['stage_2_eye_max_width']>0) & ~df.isna().any(axis=1)
 df = df[mask].reset_index(drop=True)
 _logger.info(f"Filtered rows: {len(df)}")
+
+if len(df) > 0:
+    _spec_logs = np.log10(np.clip(
+        df[['power', 'stage_2_jitter', 'stage_2_eye_max_height', 'stage_2_eye_max_width']].values,
+        1e-12, None))
+    _spec_lo = _spec_logs.min(axis=0)
+    _spec_hi = _spec_logs.max(axis=0)
+    _spec_pad = 0.05 * np.maximum(_spec_hi - _spec_lo, 1e-8)
+    KN_INPUT_LOG_MIN = (_spec_lo - _spec_pad).astype(np.float32)
+    KN_INPUT_LOG_MAX = (_spec_hi + _spec_pad).astype(np.float32)
+    _logger.info(f"Input preprocessing: {INPUT_PREPROCESSING}; KNet log bounds="
+                 f"{KN_INPUT_LOG_MIN.tolist()}..{KN_INPUT_LOG_MAX.tolist()}")
 
 # Show spec distributions
 for col in ['power', 'stage_2_eye_max_height', 'stage_2_eye_max_width', 'stage_2_jitter']:

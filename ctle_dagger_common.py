@@ -966,14 +966,24 @@ class RegimeAwareMoE(nn.Module):
         self._eye_scale_j = float(eye_scale_j) if eye_scale_j is not None else None
         self._eye_scale_h = float(eye_scale_h) if eye_scale_h is not None else None
         self._eye_scale_w = float(eye_scale_w) if eye_scale_w is not None else None
+        self.input_preprocessing = 'q75'
+        self.input_log_min = None
+        self.input_log_max = None
 
     def attach_scaler(self, scaler_p_scale, scaler_p_mean,
-                      eye_scale_j, eye_scale_h, eye_scale_w):
+                      eye_scale_j, eye_scale_h, eye_scale_w,
+                      input_preprocessing='q75', input_log_min=None,
+                      input_log_max=None):
         self.scaler_p_scale = float(scaler_p_scale)
         self.scaler_p_mean = float(scaler_p_mean)
         self._eye_scale_j = float(eye_scale_j)
         self._eye_scale_h = float(eye_scale_h)
         self._eye_scale_w = float(eye_scale_w)
+        self.input_preprocessing = str(input_preprocessing)
+        self.input_log_min = None if input_log_min is None else np.asarray(input_log_min, dtype=np.float32)
+        self.input_log_max = None if input_log_max is None else np.asarray(input_log_max, dtype=np.float32)
+        if self.input_preprocessing == 'knet' and (self.input_log_min is None or self.input_log_max is None):
+            raise ValueError("KNet preprocessing requires input_log_min/input_log_max")
 
     def _require_scaler(self):
         if (self.scaler_p_scale is None or self.scaler_p_mean is None
@@ -985,6 +995,13 @@ class RegimeAwareMoE(nn.Module):
     def scale_input(self, x):
         self._require_scaler()
         power_log = torch.log10(x[..., 0].clamp(min=1e-12))
+        if self.input_preprocessing == 'knet':
+            lo = torch.as_tensor(self.input_log_min, dtype=x.dtype, device=x.device)
+            hi = torch.as_tensor(self.input_log_max, dtype=x.dtype, device=x.device)
+            logs = torch.stack([power_log, torch.log10(x[..., 1].clamp(min=1e-12)),
+                                torch.log10(x[..., 2].clamp(min=1e-12)),
+                                torch.log10(x[..., 3].clamp(min=1e-12))], dim=-1)
+            return (2.0 * (logs - lo) / (hi - lo).clamp(min=1e-8) - 1.0).clamp(-4.0, 4.0)
         power_scaled = (power_log - self.scaler_p_mean) / self.scaler_p_scale
         jitter_scaled = torch.log10(x[..., 1].clamp(min=1e-12)) / self._eye_scale_j
         height_scaled = torch.log10(x[..., 2].clamp(min=1e-12)) / self._eye_scale_h
@@ -1128,15 +1145,25 @@ class PlainMLP(nn.Module):
         self._eye_scale_j = float(eye_scale_j) if eye_scale_j is not None else None
         self._eye_scale_h = float(eye_scale_h) if eye_scale_h is not None else None
         self._eye_scale_w = float(eye_scale_w) if eye_scale_w is not None else None
+        self.input_preprocessing = 'q75'
+        self.input_log_min = None
+        self.input_log_max = None
 
     def attach_scaler(self, scaler_p_scale, scaler_p_mean,
-                      eye_scale_j, eye_scale_h, eye_scale_w):
+                      eye_scale_j, eye_scale_h, eye_scale_w,
+                      input_preprocessing='q75', input_log_min=None,
+                      input_log_max=None):
         """Inject Q75 + StandardScaler constants required by :meth:`scale_input`."""
         self.scaler_p_scale = float(scaler_p_scale)
         self.scaler_p_mean = float(scaler_p_mean)
         self._eye_scale_j = float(eye_scale_j)
         self._eye_scale_h = float(eye_scale_h)
         self._eye_scale_w = float(eye_scale_w)
+        self.input_preprocessing = str(input_preprocessing)
+        self.input_log_min = None if input_log_min is None else np.asarray(input_log_min, dtype=np.float32)
+        self.input_log_max = None if input_log_max is None else np.asarray(input_log_max, dtype=np.float32)
+        if self.input_preprocessing == 'knet' and (self.input_log_min is None or self.input_log_max is None):
+            raise ValueError("KNet preprocessing requires input_log_min/input_log_max")
 
     def _require_scaler(self):
         if (self.scaler_p_scale is None or self.scaler_p_mean is None
@@ -1148,6 +1175,13 @@ class PlainMLP(nn.Module):
     def scale_input(self, x):
         self._require_scaler()
         power_log = torch.log10(x[..., 0].clamp(min=1e-12))
+        if self.input_preprocessing == 'knet':
+            lo = torch.as_tensor(self.input_log_min, dtype=x.dtype, device=x.device)
+            hi = torch.as_tensor(self.input_log_max, dtype=x.dtype, device=x.device)
+            logs = torch.stack([power_log, torch.log10(x[..., 1].clamp(min=1e-12)),
+                                torch.log10(x[..., 2].clamp(min=1e-12)),
+                                torch.log10(x[..., 3].clamp(min=1e-12))], dim=-1)
+            return (2.0 * (logs - lo) / (hi - lo).clamp(min=1e-8) - 1.0).clamp(-4.0, 4.0)
         power_scaled = (power_log - self.scaler_p_mean) / self.scaler_p_scale
         jitter_scaled = torch.log10(x[..., 1].clamp(min=1e-12)) / self._eye_scale_j
         height_scaled = torch.log10(x[..., 2].clamp(min=1e-12)) / self._eye_scale_h
@@ -2154,6 +2188,13 @@ def setup(args) -> dict:
                 & ~df.isna().any(axis=1))
         df = df[mask].reset_index(drop=True)
     _logger.info(f"Filtered rows: {len(df)}")
+    spec_logs = np.log10(np.clip(df[['power', 'stage_2_jitter',
+                                     'stage_2_eye_max_height', 'stage_2_eye_max_width']].values,
+                                  1e-12, None))
+    input_log_min = (spec_logs.min(axis=0) - 0.05 * np.maximum(spec_logs.max(axis=0) - spec_logs.min(axis=0), 1e-8)).astype(np.float32)
+    input_log_max = (spec_logs.max(axis=0) + 0.05 * np.maximum(spec_logs.max(axis=0) - spec_logs.min(axis=0), 1e-8)).astype(np.float32)
+    input_preprocessing = getattr(args, 'input_preprocessing', 'knet')
+    _logger.info(f"Input preprocessing: {input_preprocessing} ({'4 features, min-max, clip [-4,4]' if input_preprocessing == 'knet' else 'legacy Q75 + optional raw-log features'})")
     for col in ['power', 'stage_2_eye_max_height', 'stage_2_eye_max_width', 'stage_2_jitter']:
         nz = df[df[col] > 0][col]
         _logger.info(f"{col}: n={len(nz)}, min={nz.min():.4f}, max={nz.max():.4f}, median={nz.median():.4f}")
@@ -2176,6 +2217,9 @@ def setup(args) -> dict:
         'per_target_hurdle': per_target_hurdle,
         'df': df,
         'teacher_labeler': teacher_labeler,
+        'input_preprocessing': input_preprocessing,
+        'input_log_min': input_log_min,
+        'input_log_max': input_log_max,
     }
     for k, v in HPARAMS_DEFAULTS.items():
         ctx[k] = v
@@ -2262,6 +2306,9 @@ def run_dagger_training(student, ctx, *, regime_loss_fn=None, regime_loss_weight
             eye_scale_j=eye_scale_j,
             eye_scale_h=eye_scale_h,
             eye_scale_w=eye_scale_w,
+            input_preprocessing=ctx.get('input_preprocessing', 'q75'),
+            input_log_min=ctx.get('input_log_min'),
+            input_log_max=ctx.get('input_log_max'),
         )
     student = student.to(DEVICE)
 

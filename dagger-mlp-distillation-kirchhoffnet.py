@@ -1411,7 +1411,7 @@ def _make_dagger_optimizer(student, lr, weight_decay):
     for _name, _p in student.named_parameters():
         if not _p.requires_grad:
             continue
-        if "input_mapper" in _name or "output_mapper" in _name:
+        if "input_mapper" in _name or "output_mapper" in _name or "post_readout_transfer" in _name:
             _mapper.append(_p)
         elif _name.endswith(".z_logits"):
             _struct.append(_p)
@@ -1459,7 +1459,11 @@ ckpt = load_checkpoint()
 distillation_dataset = None
 if ckpt is not None:
     try:
-        student.load_state_dict(ckpt['student_state'])
+        # strict=False so checkpoints produced before post_readout_transfer
+        # (pre-2026-09-01 KNet, without the 28-param residual-relu-tanh
+        # post-readout stage) still load — missing keys keep their
+        # identity-at-init defaults (w1=1, w2=w3=vth=0).
+        student.load_state_dict(ckpt['student_state'], strict=False)
         student.to(DEVICE)
         optimizer.load_state_dict(ckpt['optimizer_state'])
         scheduler.load_state_dict(ckpt['scheduler_state'])

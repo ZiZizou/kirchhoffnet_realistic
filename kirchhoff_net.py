@@ -359,6 +359,19 @@ class KirchhoffNetWithIO(nn.Module):
             None if boundary_fan_out is None
             else {int(k): [int(v) for v in tgts] for k, tgts in boundary_fan_out.items()}
         )
+        # Post-readout residual-relu-tanh transfer (always-on, dataset-agnostic).
+        # Placed after OutputMapper/OutputAffine so the settled temporal
+        # accumulator readout gets one final learned nonlinearity before the
+        # bounded-output sigmoid. Identity at init (w1=1, w2=w3=vth=0) so
+        # epoch-0 behaviour is bit-identical to the pre-transfer baseline.
+        # Hard-wired in KirchhoffNetWithIO so every future preset / problem
+        # inherits it regardless of config/CLI.
+        _out_dim_post = int(self.output_mapper.out_dim) if hasattr(self.output_mapper, "out_dim") else int(self.read_dim)
+        self.post_readout_transfer = StageTransfer(
+            in_nodes=_out_dim_post,
+            out_nodes=_out_dim_post,
+            activation="residual-relu-tanh",
+        )
         # VCA (low-rank input-driven attention gating) lives on unfrozen
         # edges. Stored at the IO level so the forward pass knows to pass
         # ``u`` to every stage (boundary / temporal-readout edge currents
@@ -513,6 +526,7 @@ class KirchhoffNetWithIO(nn.Module):
                     f"expected {self.skip_linear_in_dim}"
                 )
             y = y + self.skip_linear(u)
+        y = self.post_readout_transfer(y)
         if return_final_state:
             return y, None, x_final
         return y, trajs
@@ -525,6 +539,7 @@ class KirchhoffNetWithIO(nn.Module):
 
           - ``input_mapper.*``
           - ``output_mapper.*``
+          - ``post_readout_transfer.*``  (post-OutputMapper residual-relu-tanh)
           - ``drive_mappers.*``
           - ``skip_linear.*``  (skip connection, enabled via enable_skip_linear)
           - ``core.stages.N.z_logits``  (structural)
@@ -540,6 +555,7 @@ class KirchhoffNetWithIO(nn.Module):
         groups = {
             "input_mapper": 0,
             "output_mapper": 0,
+            "post_readout_transfer": 0,
             "drive_mappers": 0,
             "skip_linear": 0,
         }
@@ -552,6 +568,8 @@ class KirchhoffNetWithIO(nn.Module):
             total += n
             if name.startswith("input_mapper"):
                 groups["input_mapper"] += n
+            elif name.startswith("post_readout_transfer"):
+                groups["post_readout_transfer"] += n
             elif name.startswith("output_mapper"):
                 groups["output_mapper"] += n
             elif name.startswith("drive_mappers"):

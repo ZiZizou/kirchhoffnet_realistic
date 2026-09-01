@@ -23,3 +23,5 @@ auth_token.txt
 dagger_knet_best_model_selection_improvement_plan.md
 test_dagger_best_model_selection.py
 *output*
+augmented-cvae-ctle
+dry_run_knet_input_clipping.py

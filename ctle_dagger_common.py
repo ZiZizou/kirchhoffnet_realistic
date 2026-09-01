@@ -3,6 +3,7 @@
 Used by:
   - generative-distillation-improved-dagger-nuance-mlp.py (RegimeAwareMoE)
   - generative-distillation-plain-mlp.py (PlainMLP single-head control)
+  - dagger-mlp-distillation-kirchhoffnet.py (LocalKirchhoffStudentWrapper)
 
 This module is import-side-effect free: heavy artifact loads and the DAgger loop
 are exposed as :func:`setup` and :func:`run_dagger_training`. Importing symbols
@@ -11,6 +12,7 @@ are exposed as :func:`setup` and :func:`run_dagger_training`. Importing symbols
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import time
@@ -883,6 +885,177 @@ class FlowTeacherLabeler:
             )
             _logger.info(f"    relaxed (0.3): {relaxed_mask.sum()}/{n} passed")
         return params
+
+
+# ---------------------------------------------------------------------------
+# Teacher: PlainMLP (single-head MLP control)
+# ---------------------------------------------------------------------------
+def load_plain_mlp_teacher(ckpt_path, device=None, *, trunk_width=48, trunk_layers=3,
+                             activation=None, use_layernorm=False, input_preprocessing="knet"):
+    """Load a frozen PlainMLP teacher from a ``dagger_student_plain.pt`` checkpoint.
+
+    If ``outputs/<dir>/teacher_config.json`` exists alongside the .pt, its values
+    override the kwargs. Falls back to kwargs silently when absent (e.g., older
+    plain-mlp runs that did not persist teacher_config.json).
+
+    After construction the caller MUST call ``teacher.attach_scaler(...)`` with
+    the same Q75/knet scaler constants derived in :func:`setup` so that
+    ``teacher.scale_input`` matches the student preprocessing.
+    """
+    if device is None:
+        try:
+            device = _active_device()
+        except RuntimeError:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    ckpt_path = str(ckpt_path)
+    cfg_path = os.path.join(os.path.dirname(os.path.abspath(ckpt_path)),
+                             "teacher_config.json")
+    if os.path.exists(cfg_path):
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            trunk_width = int(cfg.get("trunk_width", trunk_width))
+            trunk_layers = int(cfg.get("trunk_layers", trunk_layers))
+            act_name = str(cfg.get("activation", "silu")).lower()
+            use_layernorm = bool(cfg.get("use_layernorm", use_layernorm))
+            input_preprocessing = str(cfg.get("input_preprocessing", input_preprocessing))
+            activation = {"silu": nn.SiLU, "gelu": nn.GELU}.get(act_name, nn.SiLU)
+            _logger.info(f"[MLP-TEACHER] loaded teacher_config.json: W={trunk_width} L={trunk_layers} "
+                         f"act={act_name} LN={use_layernorm} prep={input_preprocessing}")
+        except Exception as e:
+            _logger.warning(f"[MLP-TEACHER] Failed to read teacher_config.json ({cfg_path}): "
+                            f"{e}; using CLI defaults")
+    if activation is None:
+        activation = nn.SiLU
+    teacher = PlainMLP(
+        trunk_width=trunk_width,
+        trunk_layers=trunk_layers,
+        activation=activation,
+        use_layernorm=use_layernorm,
+        use_log_features=(input_preprocessing == "q75"),
+    )
+    state = torch.load(ckpt_path, map_location=device)
+    teacher.load_state_dict(state)
+    teacher = teacher.to(device)
+    teacher.eval()
+    for p in teacher.parameters():
+        p.requires_grad = False
+    _logger.info(
+        f"[MLP-TEACHER] Loaded PlainMLP teacher from {ckpt_path}: "
+        f"W={trunk_width} L={trunk_layers} act={activation.__name__} "
+        f"LN={use_layernorm} input_preprocessing={input_preprocessing}"
+    )
+    return teacher
+
+
+class MlpTeacherLabeler:
+    """Batched deterministic teacher: target specs -> canonical params via PlainMLP.
+
+    The PlainMLP is a single forward pass per spec; no candidate sampling /
+    ranking is involved (unlike :class:`FlowTeacherLabeler`). Labels are the
+    predicted 7 physical params in :data:`PARAM_COLS` order.
+    """
+    def __init__(self, teacher: PlainMLP, device=None, batch_size=1024):
+        self.teacher = teacher
+        if device is not None:
+            self.device = device
+        else:
+            try:
+                self.device = _active_device()
+            except RuntimeError:
+                # Fall back to teacher's device if active_ctx not set
+                try:
+                    self.device = next(teacher.parameters()).device
+                except StopIteration:
+                    self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.batch_size = int(batch_size)
+
+    @torch.no_grad()
+    def label_batch(self, target_specs):
+        """target_specs: np.ndarray shape (N, 4) in [power, jitter, height, width] order.
+        Returns np.ndarray shape (N, 7) in :data:`PARAM_COLS` order, physical units.
+        """
+        specs = np.asarray(target_specs, dtype=np.float32)
+        if specs.ndim == 1:
+            specs = specs.reshape(1, -1)
+        n = len(specs)
+        out = np.zeros((n, 7), dtype=np.float64)
+        param_names = list(self.teacher.param_log_bounds.keys())
+        for s in range(0, n, self.batch_size):
+            batch = torch.from_numpy(specs[s:s + self.batch_size]).to(self.device)
+            preds = self.teacher.predict(batch)
+            for j, name in enumerate(param_names):
+                out[s:s + len(batch), j] = preds[name].detach().cpu().numpy().astype(np.float64)
+        return out
+
+    def label_single(self, target_spec):
+        return self.label_batch(np.array(target_spec, dtype=np.float32).reshape(1, -1))[0]
+
+
+def create_mlp_distillation_dataset(df, n_samples=10000, boundary_ratio=0.3,
+                                     teacher_labeler: MlpTeacherLabeler | None = None,
+                                     scaler_X=None, zig_model=None, device=None):
+    """Build a distillation dataset with frozen PlainMLP teacher labels.
+
+    Mirrors :func:`create_flow_distillation_dataset` spec sampling (empirical
+    spec noise) but labels via a single deterministic MLP forward (no
+    candidate budget, no flow sampling). ZIG validity @ 0.5 filters invalid
+    labels; rows that fail validity are replaced by empirical k-NN fallback.
+
+    scaler_X/zig_model/device default to _active_ctx when not passed, so
+    standalone scripts that already hold globals can pass them explicitly
+    without needing setup().
+    """
+    if teacher_labeler is None:
+        raise RuntimeError("create_mlp_distillation_dataset requires a MlpTeacherLabeler")
+    targets = sample_target_specs(df, n_samples, boundary_ratio)
+    noisy_specs_batch = []
+    for t in targets:
+        noisy_power = t['power'] * np.random.uniform(0.95, 1.05)
+        noisy_height = t['height'] * np.random.uniform(0.9, 1.1) if t['height'] > 1 else np.random.uniform(0, 2)
+        noisy_width = t['width'] * np.random.uniform(0.9, 1.1) if t['width'] > 1 else np.random.uniform(0, 2)
+        noisy_jitter = np.clip(t['jitter'] * np.random.uniform(0.95, 1.05), 1.57, 100)
+        noisy_specs_batch.append([noisy_power, noisy_jitter, noisy_height, noisy_width])
+    noisy_specs_batch = np.array(noisy_specs_batch, dtype=np.float64)
+    canonical_params_batch = teacher_labeler.label_batch(noisy_specs_batch)
+    if scaler_X is None or zig_model is None or device is None:
+        try:
+            _sX, _sY = _active_scalers()
+            _zm = _active_zig()
+            _dev = _active_device()
+        except RuntimeError:
+            _sX = _zm = _dev = None
+        if scaler_X is None:
+            scaler_X = _sX
+        if zig_model is None:
+            zig_model = _zm
+        if device is None:
+            device = _dev
+    if scaler_X is None or zig_model is None or device is None:
+        raise RuntimeError("create_mlp_distillation_dataset requires scaler_X/zig_model/device — "
+                           "pass explicitly or call setup()/_set_active_context first")
+    DEVICE_local = device
+    keep_valid = filter_by_zig_validity(
+        canonical_params_batch, zig_model, scaler_X, threshold=0.5, device=DEVICE_local
+    )
+    n_invalid = int((~keep_valid).sum())
+    if n_invalid > 0:
+        _logger.info(f"MLP teacher produced {n_invalid}/{len(noisy_specs_batch)} low-validity labels; "
+                     f"replacing with empirical k-NN fallback")
+        for i in np.where(~keep_valid)[0]:
+            canonical_params_batch[i] = empirical_fallback_label(noisy_specs_batch[i], df, k=3)
+    data_list = []
+    for i in range(len(targets)):
+        data_list.append({
+            'power': float(noisy_specs_batch[i, 0]),
+            'height': float(noisy_specs_batch[i, 2]),
+            'width': float(noisy_specs_batch[i, 3]),
+            'jitter': float(noisy_specs_batch[i, 1]),
+            'params': canonical_params_batch[i],
+        })
+    _logger.info(f"MLP distillation dataset: {len(data_list)} samples ready "
+                 f"(noisy inputs -> frozen MLP labels)")
+    return data_list
 
 
 # ---------------------------------------------------------------------------

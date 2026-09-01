@@ -16,6 +16,7 @@ parameter-matched width.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -129,6 +130,23 @@ def main():
     _logger.info(f"  output: {result['output_dir']}")
     _logger.info(f"  predictions: {result['predictions_csv']}")
     _logger.info("=" * 80)
+
+    teacher_cfg = {
+        "trunk_width": student.trunk_width,
+        "trunk_layers": student.trunk_layers,
+        "activation": args.plain_activation,
+        "use_layernorm": student.use_layernorm,
+        "use_log_features": student.use_log_features,
+        "input_preprocessing": args.input_preprocessing,
+        "param_budget": args.param_budget,
+    }
+    teacher_cfg_path = os.path.join(result["output_dir"], "teacher_config.json")
+    try:
+        with open(teacher_cfg_path, "w", encoding="utf-8") as f:
+            json.dump(teacher_cfg, f, indent=2)
+        _logger.info(f"Wrote teacher_config.json -> {teacher_cfg_path}")
+    except Exception as e:
+        _logger.warning(f"Failed to write teacher_config.json: {e}")
 
 
 if __name__ == "__main__":

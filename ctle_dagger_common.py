@@ -927,13 +927,16 @@ def load_plain_mlp_teacher(ckpt_path, device=None, *, trunk_width=48, trunk_laye
                              use_log_features=None):
     """Load a frozen PlainMLP teacher from a ``dagger_student_plain.pt`` checkpoint.
 
-    If ``outputs/<dir>/teacher_config.json`` exists alongside the .pt, its values
-    override the kwargs. Falls back to kwargs silently when absent (e.g., older
-    plain-mlp runs that did not persist teacher_config.json).
+    Resolution order (first hit wins for architecture):
+      1. Embedded ``{"config": {...}}`` inside the checkpoint (if ``torch.save({"state_dict":..., "config":...})`` was used).
+      2. Sidecar ``teacher_config.json`` co-located with the checkpoint.
+      3. Explicit kwargs / defaults.
 
-    After construction the caller MUST call ``teacher.attach_scaler(...)`` with
-    the same Q75/knet scaler constants derived in :func:`setup` so that
-    ``teacher.scale_input`` matches the student preprocessing.
+    For ``schema_version >= 2`` sidecars/embedded configs the scaler constants
+    (``scaler_p_*``, ``eye_scale_*``, ``input_log_min/max``) are auto-attached
+    so the caller does **not** need to call ``teacher.attach_scaler(...)``.
+    Legacy checkpoints (no config or v1) fall back to shape inference via
+    :func:`_plain_mlp_arch_from_state` and still require manual ``attach_scaler``.
     """
     if device is None:
         try:
@@ -943,26 +946,43 @@ def load_plain_mlp_teacher(ckpt_path, device=None, *, trunk_width=48, trunk_laye
     ckpt_path = str(ckpt_path)
     cfg_path = os.path.join(os.path.dirname(os.path.abspath(ckpt_path)),
                              "teacher_config.json")
+    sidecar_cfg = None
     if os.path.exists(cfg_path):
         try:
             with open(cfg_path, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-            trunk_width = int(cfg.get("trunk_width", trunk_width))
-            trunk_layers = int(cfg.get("trunk_layers", trunk_layers))
-            act_name = str(cfg.get("activation", "silu")).lower()
-            use_layernorm = bool(cfg.get("use_layernorm", use_layernorm))
-            input_preprocessing = str(cfg.get("input_preprocessing", input_preprocessing))
-            if use_log_features is None and "use_log_features" in cfg:
-                use_log_features = bool(cfg["use_log_features"])
-            activation = {"silu": nn.SiLU, "gelu": nn.GELU}.get(act_name, nn.SiLU)
-            _logger.info(f"[MLP-TEACHER] loaded teacher_config.json: W={trunk_width} L={trunk_layers} "
-                         f"act={act_name} LN={use_layernorm} prep={input_preprocessing}")
+                sidecar_cfg = json.load(f)
         except Exception as e:
             _logger.warning(f"[MLP-TEACHER] Failed to read teacher_config.json ({cfg_path}): "
                             f"{e}; using CLI defaults")
-    state = torch.load(ckpt_path, map_location=device)
-    if isinstance(state, dict) and "state_dict" in state:
-        state = state["state_dict"]
+            sidecar_cfg = None
+
+    # Load checkpoint first so embedded config (if any) can take precedence.
+    raw = torch.load(ckpt_path, map_location=device)
+    embedded_cfg = None
+    if isinstance(raw, dict) and "config" in raw and isinstance(raw["config"], dict) and "trunk_width" in raw["config"]:
+        embedded_cfg = raw["config"]
+        _logger.info(f"[MLP-TEACHER] found embedded config in checkpoint (schema v{embedded_cfg.get('schema_version', '?')})")
+
+    # Architecture source: embedded > sidecar > kwargs
+    arch_cfg = embedded_cfg if isinstance(embedded_cfg, dict) else sidecar_cfg
+    if isinstance(arch_cfg, dict) and "trunk_width" in arch_cfg:
+        try:
+            trunk_width = int(arch_cfg.get("trunk_width", trunk_width))
+            trunk_layers = int(arch_cfg.get("trunk_layers", trunk_layers))
+            act_name = str(arch_cfg.get("activation", "silu")).lower()
+            use_layernorm = bool(arch_cfg.get("use_layernorm", use_layernorm))
+            input_preprocessing = str(arch_cfg.get("input_preprocessing", input_preprocessing))
+            if use_log_features is None and "use_log_features" in arch_cfg:
+                use_log_features = bool(arch_cfg["use_log_features"])
+            activation = {"silu": nn.SiLU, "gelu": nn.GELU}.get(act_name, nn.SiLU)
+            src = "embedded config" if arch_cfg is embedded_cfg else "teacher_config.json"
+            _logger.info(f"[MLP-TEACHER] loaded {src}: W={trunk_width} L={trunk_layers} "
+                         f"act={act_name} LN={use_layernorm} prep={input_preprocessing}")
+        except Exception as e:
+            _logger.warning(f"[MLP-TEACHER] Failed to apply arch from config: {e}; using CLI defaults")
+
+    # Extract state_dict (supports raw OrderedDict and {"state_dict": ...} wrappers)
+    state = raw["state_dict"] if isinstance(raw, dict) and "state_dict" in raw else raw
     inferred = _plain_mlp_arch_from_state(state)
     inferred_width, inferred_layers, inferred_ln, inferred_log = inferred
     requested = (int(trunk_width), int(trunk_layers), bool(use_layernorm),
@@ -986,6 +1006,40 @@ def load_plain_mlp_teacher(ckpt_path, device=None, *, trunk_width=48, trunk_laye
     )
     teacher.load_state_dict(state)
     teacher = teacher.to(device)
+
+    # Auto-attach scaler from v2 config (embedded > sidecar) if available.
+    # Legacy configs without scaler still require manual attach_scaler().
+    v2_cfg = None
+    if isinstance(embedded_cfg, dict) and int(embedded_cfg.get("schema_version", 0)) >= 2:
+        v2_cfg = embedded_cfg
+    elif isinstance(sidecar_cfg, dict) and int(sidecar_cfg.get("schema_version", 0)) >= 2:
+        v2_cfg = sidecar_cfg
+    if isinstance(v2_cfg, dict) and "scaler" in v2_cfg:
+        try:
+            scaler = v2_cfg.get("scaler") or {}
+            inp_min = v2_cfg.get("input_log_min")
+            inp_max = v2_cfg.get("input_log_max")
+            # Normalise lists -> np arrays (or None)
+            if inp_min is not None:
+                inp_min = np.asarray(inp_min, dtype=np.float32)
+            if inp_max is not None:
+                inp_max = np.asarray(inp_max, dtype=np.float32)
+            teacher.attach_scaler(
+                scaler_p_scale=float(scaler.get("scaler_p_scale")),
+                scaler_p_mean=float(scaler.get("scaler_p_mean")),
+                eye_scale_j=float(scaler.get("eye_scale_j")),
+                eye_scale_h=float(scaler.get("eye_scale_h")),
+                eye_scale_w=float(scaler.get("eye_scale_w")),
+                input_preprocessing=str(v2_cfg.get("input_preprocessing", input_preprocessing)),
+                input_log_min=inp_min,
+                input_log_max=inp_max,
+            )
+            _logger.info(f"[MLP-TEACHER] auto-attached scaler from v{v2_cfg.get('schema_version')} config "
+                         f"(prep={teacher.input_preprocessing})")
+        except Exception as e:
+            _logger.warning(f"[MLP-TEACHER] Failed to auto-attach scaler from v2 config: {e}; "
+                            "caller must call attach_scaler() manually")
+
     teacher.eval()
     for p in teacher.parameters():
         p.requires_grad = False

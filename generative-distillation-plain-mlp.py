@@ -19,15 +19,19 @@ import argparse
 import json
 import logging
 import os
+import subprocess
 import sys
+import time
 import warnings
 
+import numpy as np
 import torch
 
 warnings.filterwarnings("ignore")
 
 from ctle_dagger_common import (  # noqa: E402
     PlainMLP, plain_param_count, derive_plain_width,
+    PARAM_LOG_BOUNDS,
     setup, run_dagger_training, _logger,
     DEFAULT_TEACHER_DIR, DEFAULT_DATA_DIR, DEFAULT_OUTPUT_DIR,
     Timer,
@@ -106,6 +110,69 @@ def build_student(args) -> PlainMLP:
     return student
 
 
+def _git_commit_short() -> str | None:
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL
+        )
+        return out.decode("utf-8", errors="replace").strip() or None
+    except Exception:
+        return None
+
+
+def build_plain_teacher_config(student: PlainMLP, ctx: dict, args: argparse.Namespace) -> dict:
+    """Build v2 sidecar config that is sufficient to reconstruct without guessing."""
+    # Scaler constants live in ctx after setup()
+    scaler_y_p = ctx.get("scaler_y_p")
+    try:
+        scaler_p_scale = float(scaler_y_p.scale_[0]) if scaler_y_p is not None else None
+        scaler_p_mean = float(scaler_y_p.mean_[0]) if scaler_y_p is not None else None
+    except Exception:
+        scaler_p_scale = scaler_p_mean = None
+    input_log_min = ctx.get("input_log_min")
+    input_log_max = ctx.get("input_log_max")
+    # Normalise to JSON-serialisable lists (or None)
+    def _to_list_or_null(arr):
+        if arr is None:
+            return None
+        try:
+            return np.asarray(arr, dtype=np.float32).tolist()
+        except Exception:
+            return None
+    try:
+        ppc = plain_param_count(int(student.trunk_width), int(student.trunk_layers))
+    except Exception:
+        ppc = None
+    cfg: dict = {
+        "schema_version": 2,
+        "trunk_width": int(student.trunk_width),
+        "trunk_layers": int(student.trunk_layers),
+        "activation": str(args.plain_activation),
+        "use_layernorm": bool(student.use_layernorm),
+        "use_log_features": bool(student.use_log_features),
+        "input_preprocessing": str(args.input_preprocessing),
+        "param_budget": int(args.param_budget) if args.param_budget is not None else None,
+        "plain_param_count": int(ppc) if ppc is not None else None,
+        "scaler": {
+            "scaler_p_scale": scaler_p_scale,
+            "scaler_p_mean": scaler_p_mean,
+            "eye_scale_j": float(ctx.get("eye_scale_j")) if ctx.get("eye_scale_j") is not None else None,
+            "eye_scale_h": float(ctx.get("eye_scale_h")) if ctx.get("eye_scale_h") is not None else None,
+            "eye_scale_w": float(ctx.get("eye_scale_w")) if ctx.get("eye_scale_w") is not None else None,
+        },
+        "input_log_min": _to_list_or_null(input_log_min),
+        "input_log_max": _to_list_or_null(input_log_max),
+        "param_log_bounds": {k: [float(v[0]), float(v[1])] for k, v in PARAM_LOG_BOUNDS.items()},
+        "checkpoint": "dagger_student_plain.pt",
+        "meta": {
+            "seed": int(args.seed) if args.seed is not None else None,
+            "trained_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "git_commit": _git_commit_short(),
+        },
+    }
+    return cfg
+
+
 def main():
     args = parse_args()
     ctx = setup(args)
@@ -131,20 +198,14 @@ def main():
     _logger.info(f"  predictions: {result['predictions_csv']}")
     _logger.info("=" * 80)
 
-    teacher_cfg = {
-        "trunk_width": student.trunk_width,
-        "trunk_layers": student.trunk_layers,
-        "activation": args.plain_activation,
-        "use_layernorm": student.use_layernorm,
-        "use_log_features": student.use_log_features,
-        "input_preprocessing": args.input_preprocessing,
-        "param_budget": args.param_budget,
-    }
+    teacher_cfg = build_plain_teacher_config(student, ctx, args)
     teacher_cfg_path = os.path.join(result["output_dir"], "teacher_config.json")
     try:
-        with open(teacher_cfg_path, "w", encoding="utf-8") as f:
+        tmp_path = teacher_cfg_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(teacher_cfg, f, indent=2)
-        _logger.info(f"Wrote teacher_config.json -> {teacher_cfg_path}")
+        os.replace(tmp_path, teacher_cfg_path)
+        _logger.info(f"Wrote teacher_config.json (v{teacher_cfg.get('schema_version')}) -> {teacher_cfg_path}")
     except Exception as e:
         _logger.warning(f"Failed to write teacher_config.json: {e}")
 

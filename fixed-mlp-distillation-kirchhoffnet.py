@@ -37,6 +37,7 @@ from ctle_dagger_common import (
     HybridHurdleModel,
     PARAM_COLS,
     PARAM_LOG_BOUNDS,
+    PlainMLP,
     StudentEvaluator,
     _set_active_context,
     load_plain_mlp_teacher,
@@ -85,7 +86,20 @@ def parse_args() -> argparse.Namespace:
                         help="Optional deterministic cap after shuffling the empirical rows.")
     parser.add_argument("--eval-every", type=int, default=1)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--fixed-dataset-path", default=None,
+                        help="Shared immutable .npz cache. BO trials must point to one common path.")
     parser.add_argument("--count-params-only", action="store_true")
+    parser.add_argument("--prepare-fixed-dataset", action="store_true",
+                        help="Create/verify the immutable teacher-labelled cache then exit without student training.")
+    parser.add_argument("--bo-mode", action="store_true",
+                        help="Use validation metrics only; never evaluate or expose the held-out test split.")
+    parser.add_argument("--student-kind", choices=["knet", "mlp"], default="knet")
+    parser.add_argument("--student-width", type=int, default=48,
+                        help="PlainMLP student width; used only with --student-kind mlp.")
+    parser.add_argument("--student-layers", type=int, default=3,
+                        help="PlainMLP student trunk layers; used only with --student-kind mlp.")
+    parser.add_argument("--student-activation", choices=["silu", "gelu"], default="silu")
+    parser.add_argument("--student-use-layernorm", type=parse_bool, default=False)
     parser.add_argument("--zig-artifact-dir", default=None,
                         help="Directory containing the HybridHurdle/ZIG files; defaults to the teacher checkpoint directory.")
     parser.add_argument("--zig-validity-threshold", type=float, default=0.5)
@@ -221,6 +235,36 @@ class KirchhoffStudent(nn.Module):
         return self.log_lo + (self.log_hi - self.log_lo) * torch.sigmoid(self(specs))
 
 
+class PlainMLPStudent(PlainMLP):
+    """Plain student with the exact KNet log-min/max preprocessing convention."""
+
+    def __init__(self, args: argparse.Namespace, log_min: np.ndarray, log_max: np.ndarray):
+        activation = {"silu": nn.SiLU, "gelu": nn.GELU}[args.student_activation]
+        super().__init__(trunk_width=args.student_width, trunk_layers=args.student_layers,
+                         activation=activation, use_layernorm=args.student_use_layernorm,
+                         use_log_features=False)
+        self.attach_scaler(1.0, 0.0, 1.0, 1.0, 1.0, input_preprocessing="knet",
+                           input_log_min=log_min, input_log_max=log_max)
+
+    def predict_log_params(self, specs: torch.Tensor) -> torch.Tensor:
+        return self.log_lo + (self.log_hi - self.log_lo) * torch.sigmoid(self(specs))
+
+
+def build_student(args: argparse.Namespace, log_min: np.ndarray, log_max: np.ndarray) -> nn.Module:
+    if args.student_kind == "mlp":
+        return PlainMLPStudent(args, log_min, log_max)
+    return KirchhoffStudent(args, log_min, log_max)
+
+
+def log_model_summary(model: nn.Module, kind: str) -> None:
+    count = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+    logging.info("TRAINABLE_PARAMS=%d", count)
+    if kind == "knet":
+        logging.info("%s", format_parameter_breakdown(model.net.parameter_breakdown()))
+    else:
+        logging.info("PlainMLP student: width=%d layers=%d", model.trunk_width, model.trunk_layers)
+
+
 def teacher_identity(path: str) -> dict[str, int | str]:
     stat = os.stat(path)
     return {"path": os.path.abspath(path), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
@@ -230,7 +274,9 @@ def dataset_fingerprint(args: argparse.Namespace, df: pd.DataFrame) -> str:
     payload = {
         "seed": args.seed, "teacher": teacher_identity(args.mlp_teacher_ckpt), "rows": len(df),
         "max_samples": args.max_samples, "train_fraction": args.train_fraction,
-        "val_fraction": args.val_fraction, "spec_min": np.round(df[SPEC_COLS].min().values, 10).tolist(),
+        "val_fraction": args.val_fraction, "input_log_pad_frac": args.kn_input_log_pad_frac,
+        "teacher_preprocessing": args.mlp_teacher_input_preprocessing,
+        "spec_min": np.round(df[SPEC_COLS].min().values, 10).tolist(),
         "spec_max": np.round(df[SPEC_COLS].max().values, 10).tolist(),
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
@@ -239,12 +285,14 @@ def dataset_fingerprint(args: argparse.Namespace, df: pd.DataFrame) -> str:
 @torch.no_grad()
 def make_fixed_dataset(args: argparse.Namespace, df: pd.DataFrame, device: torch.device,
                        log_min: np.ndarray, log_max: np.ndarray, output: str) -> dict[str, np.ndarray]:
-    cache_path = os.path.join(output, "fixed_teacher_dataset.npz")
+    cache_path = args.fixed_dataset_path or os.path.join(output, "fixed_teacher_dataset.npz")
+    cache_path = os.path.abspath(cache_path)
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
     fingerprint = dataset_fingerprint(args, df)
-    if args.resume and os.path.exists(cache_path):
+    if (args.resume or args.fixed_dataset_path is not None) and os.path.exists(cache_path):
         cached = np.load(cache_path, allow_pickle=False)
         if str(cached["fingerprint"].item()) != fingerprint:
-            raise ValueError("--resume dataset fingerprint differs from fixed_teacher_dataset.npz; use a new output directory")
+            raise ValueError("fixed dataset fingerprint differs from this run; use a new shared dataset path")
         return {key: cached[key] for key in cached.files if key != "fingerprint"}
 
     order = np.random.default_rng(args.seed).permutation(len(df))
@@ -272,6 +320,7 @@ def make_fixed_dataset(args: argparse.Namespace, df: pd.DataFrame, device: torch
         "input_log_min": log_min, "input_log_max": log_max,
     }
     np.savez_compressed(cache_path, fingerprint=np.array(fingerprint), **fixed)
+    logging.info("Wrote fixed teacher-labelled dataset: %s", cache_path)
     return fixed
 
 
@@ -396,9 +445,8 @@ def main() -> None:
     if args.count_params_only:
         lo = np.array([-4.0, 0.0, -1.0, 0.0], dtype=np.float32)
         hi = np.array([-1.0, 3.0, 3.0, 3.0], dtype=np.float32)
-        model = KirchhoffStudent(args, lo, hi)
-        logging.info("Trainable parameters: %d", sum(p.numel() for p in model.parameters() if p.requires_grad))
-        logging.info("%s", format_parameter_breakdown(model.net.parameter_breakdown()))
+        model = build_student(args, lo, hi)
+        log_model_summary(model, args.student_kind)
         return
 
     df = load_ctle_specs(args.dataset_dir)
@@ -407,10 +455,12 @@ def main() -> None:
     fixed = make_fixed_dataset(args, df, device, log_min, log_max, args.output)
     logging.info("Fixed data: train=%d val=%d test=%d; teacher labels generated once",
                  len(fixed["train_idx"]), len(fixed["val_idx"]), len(fixed["test_idx"]))
+    if args.prepare_fixed_dataset:
+        logging.info("Fixed dataset prepared; exiting before student construction.")
+        return
 
-    model = KirchhoffStudent(args, fixed["input_log_min"], fixed["input_log_max"]).to(device)
-    logging.info("Trainable parameters: %d", sum(p.numel() for p in model.parameters() if p.requires_grad))
-    logging.info("%s", format_parameter_breakdown(model.net.parameter_breakdown()))
+    model = build_student(args, fixed["input_log_min"], fixed["input_log_max"]).to(device)
+    log_model_summary(model, args.student_kind)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     criterion = nn.MSELoss()
     train_data = loader(fixed, "train", args.batch_size, True)
@@ -455,20 +505,32 @@ def main() -> None:
                     "best_val": best_val, "history": history}, checkpoint_path)
 
     model.load_state_dict(torch.load(best_path, map_location=device, weights_only=True))
-    final = {"validation": evaluate(model, val_data, device), "test": evaluate(model, test_data, device)}
+    final = {"validation": evaluate(model, val_data, device)}
     test_idx = fixed["test_idx"]
-    with torch.no_grad():
-        test_specs = torch.from_numpy(fixed["specs"][test_idx]).to(device)
-        student_logits = model(test_specs).cpu().numpy()
-    np.savez_compressed(
-        os.path.join(args.output, "test_teacher_student_predictions.npz"),
-        specs=fixed["specs"][test_idx], teacher_logits=fixed["teacher_logits"][test_idx],
-        student_logits=student_logits,
-    )
+    if not args.bo_mode:
+        final["test"] = evaluate(model, test_data, device)
+        with torch.no_grad():
+            test_specs = torch.from_numpy(fixed["specs"][test_idx]).to(device)
+            student_logits = model(test_specs).cpu().numpy()
+        np.savez_compressed(
+            os.path.join(args.output, "test_teacher_student_predictions.npz"),
+            specs=fixed["specs"][test_idx], teacher_logits=fixed["teacher_logits"][test_idx],
+            student_logits=student_logits,
+        )
     teacher = load_teacher(args, device, fixed["input_log_min"], fixed["input_log_max"])
-    zig_summary, zig_arrays = evaluate_with_zig(args, teacher, model, fixed["specs"][test_idx], device)
-    final["zig_failure_comparison"] = zig_summary
-    np.savez_compressed(os.path.join(args.output, "zig_failure_comparison.npz"), **zig_arrays)
+    zig_val_summary, zig_val_arrays = evaluate_with_zig(
+        args, teacher, model, fixed["specs"][fixed["val_idx"]], device
+    )
+    final["zig_failure_comparison"] = {"validation": zig_val_summary}
+    zig_arrays_out = {f"validation_{key}": value for key, value in zig_val_arrays.items()}
+    zig_test_summary = None
+    if not args.bo_mode:
+        zig_test_summary, zig_test_arrays = evaluate_with_zig(
+            args, teacher, model, fixed["specs"][test_idx], device
+        )
+        final["zig_failure_comparison"]["test"] = zig_test_summary
+        zig_arrays_out.update({f"test_{key}": value for key, value in zig_test_arrays.items()})
+    np.savez_compressed(os.path.join(args.output, "zig_failure_comparison.npz"), **zig_arrays_out)
     torch.save(model.state_dict(), os.path.join(args.output, "student_final.pt"))
     torch.save({"model": model.state_dict(), "input_log_min": fixed["input_log_min"],
                 "input_log_max": fixed["input_log_max"], "args": vars(args)},
@@ -476,14 +538,21 @@ def main() -> None:
     with open(os.path.join(args.output, "metrics.json"), "w", encoding="utf-8") as handle:
         json.dump({"created_at": time.strftime("%Y-%m-%d %H:%M:%S"), "objective": "MSE(student_logits, teacher_logits)",
                    "final": final, "history": history, "args": vars(args)}, handle, indent=2)
-    verdict = "PASS" if zig_summary["isolation_pass"] else "FAIL"
-    logging.info("Best frozen-teacher agreement: val=%s test=%s", final["validation"], final["test"])
+    logging.info("Best frozen-teacher agreement: validation=%s", final["validation"])
+    logging.info("ZIG validation objective: teacher=%.2f%% student=%.2f%% logit_mse=%.8f",
+                 100.0 * zig_val_summary["teacher_failure_rate"],
+                 100.0 * zig_val_summary["student_failure_rate"], final["validation"]["logit_mse"])
+    if args.bo_mode:
+        logging.info("BO mode: held-out test evaluation intentionally skipped.")
+        return
+    assert zig_test_summary is not None
+    verdict = "PASS" if zig_test_summary["isolation_pass"] else "FAIL"
     logging.info(
         "ZIG isolation verdict: %s | teacher failure=%.2f%% student failure=%.2f%% gap=%.2f pp (tolerance %.2f pp)",
-        verdict, 100.0 * zig_summary["teacher_failure_rate"], 100.0 * zig_summary["student_failure_rate"],
-        zig_summary["absolute_gap_percentage_points"], zig_summary["tolerance_percentage_points"],
+        verdict, 100.0 * zig_test_summary["teacher_failure_rate"], 100.0 * zig_test_summary["student_failure_rate"],
+        zig_test_summary["absolute_gap_percentage_points"], zig_test_summary["tolerance_percentage_points"],
     )
-    if not zig_summary["isolation_pass"]:
+    if not zig_test_summary["isolation_pass"]:
         raise SystemExit(2)
 
 

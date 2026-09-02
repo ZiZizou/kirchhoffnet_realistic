@@ -80,6 +80,10 @@ def parse_args():
     parser.add_argument("--param-budget", type=int, default=None,
                         help="If set, auto-derive plain trunk width via derive_plain_width "
                              "so plain_param_count(W,L) <= param-budget. Overrides --plain-trunk-width.")
+    parser.add_argument("--count-params-only", action="store_true",
+                        help="Build the student (honoring --param-budget derivation), print "
+                             "TRAINABLE_PARAMS=<n> to stdout and exit before loading teacher "
+                             "artifacts or training (Bayes-opt preflight hook).")
     return parser.parse_args()
 
 
@@ -175,7 +179,6 @@ def build_plain_teacher_config(student: PlainMLP, ctx: dict, args: argparse.Name
 
 def main():
     args = parse_args()
-    ctx = setup(args)
     student = build_student(args)
     n_trainable = sum(p.numel() for p in student.parameters() if p.requires_grad)
     n_total = sum(p.numel() for p in student.parameters())
@@ -185,6 +188,16 @@ def main():
         f"act={args.plain_activation} LN={student.use_layernorm} "
         f"log_features={student.use_log_features})"
     )
+    if args.count_params_only:
+        # Machine-readable preflight output (mirrors fixed-mlp-distillation-kirchhoffnet.py).
+        print(f"TRAINABLE_PARAMS={n_trainable}")
+        print(f"TOTAL_PARAMS={n_total}")
+        print(f"TRUNK_WIDTH={student.trunk_width}")
+        print(f"TRUNK_LAYERS={student.trunk_layers}")
+        print(f"INPUT_PREPROCESSING={args.input_preprocessing}")
+        print(f"USE_LOG_FEATURES={student.use_log_features}")
+        return
+    ctx = setup(args)
 
     with Timer("plain-mlp DAgger training"):
         result = run_dagger_training(student, ctx, model_name='dagger_student_plain')

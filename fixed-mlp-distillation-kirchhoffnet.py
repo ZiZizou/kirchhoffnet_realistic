@@ -22,6 +22,7 @@ import os
 import random
 import time
 
+import joblib
 import numpy as np
 import pandas as pd
 import torch
@@ -33,8 +34,11 @@ from config import SOLVER, VCA
 from ctle_dagger_common import (
     COL_MAPPING,
     DATASET_CSV_FILES,
+    HybridHurdleModel,
     PARAM_COLS,
     PARAM_LOG_BOUNDS,
+    StudentEvaluator,
+    _set_active_context,
     load_plain_mlp_teacher,
 )
 from kirchhoff_net import format_parameter_breakdown
@@ -82,6 +86,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-every", type=int, default=1)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--count-params-only", action="store_true")
+    parser.add_argument("--zig-artifact-dir", default=None,
+                        help="Directory containing the HybridHurdle/ZIG files; defaults to the teacher checkpoint directory.")
+    parser.add_argument("--zig-validity-threshold", type=float, default=0.5)
+    parser.add_argument("--zig-degrade-threshold", type=float, default=0.20)
+    parser.add_argument("--zig-min-degraded-dims", type=int, default=2)
+    parser.add_argument("--isolation-tolerance-pp", type=float, default=3.0,
+                        help="Maximum absolute teacher/student failure-rate gap, in percentage points, for PASS.")
 
     # KNet defaults intentionally match dagger-mlp-distillation-kirchhoffnet.py.
     parser.add_argument("--kn-num-stages", type=int, default=4)
@@ -243,18 +254,7 @@ def make_fixed_dataset(args: argparse.Namespace, df: pd.DataFrame, device: torch
         raise ValueError("Need at least three fixed samples after --max-samples")
     specs = df.loc[order, SPEC_COLS].to_numpy(dtype=np.float32)
 
-    activation = {"silu": nn.SiLU, "gelu": nn.GELU}[args.mlp_teacher_activation]
-    teacher = load_plain_mlp_teacher(
-        args.mlp_teacher_ckpt, device, trunk_width=args.mlp_teacher_width,
-        trunk_layers=args.mlp_teacher_layers, activation=activation,
-        use_layernorm=args.mlp_teacher_use_layernorm,
-        input_preprocessing=args.mlp_teacher_input_preprocessing,
-    )
-    # For ``knet`` preprocessing these Q75 values are intentionally unused, but
-    # PlainMLP validates that all scaling fields have been attached.
-    teacher.attach_scaler(1.0, 0.0, 1.0, 1.0, 1.0,
-                          input_preprocessing=args.mlp_teacher_input_preprocessing,
-                          input_log_min=log_min, input_log_max=log_max)
+    teacher = load_teacher(args, device, log_min, log_max)
     batches = []
     for start in range(0, len(specs), args.batch_size):
         batches.append(teacher(torch.from_numpy(specs[start:start + args.batch_size]).to(device)).cpu())
@@ -293,6 +293,87 @@ def evaluate(model: KirchhoffStudent, data: DataLoader, device: torch.device) ->
         log_abs_error += torch.sum((model.predict_log_params(specs) - teacher_log_params).abs()).item()
         n += teacher_logits.numel()
     return {"logit_mse": sq_error / n, "log_param_mae": log_abs_error / n}
+
+
+def load_teacher(args: argparse.Namespace, device: torch.device,
+                 log_min: np.ndarray, log_max: np.ndarray) -> nn.Module:
+    activation = {"silu": nn.SiLU, "gelu": nn.GELU}[args.mlp_teacher_activation]
+    teacher = load_plain_mlp_teacher(
+        args.mlp_teacher_ckpt, device, trunk_width=args.mlp_teacher_width,
+        trunk_layers=args.mlp_teacher_layers, activation=activation,
+        use_layernorm=args.mlp_teacher_use_layernorm,
+        input_preprocessing=args.mlp_teacher_input_preprocessing,
+    )
+    # For ``knet`` preprocessing these Q75 values are intentionally unused, but
+    # PlainMLP validates that all scaling fields have been attached.
+    teacher.attach_scaler(1.0, 0.0, 1.0, 1.0, 1.0,
+                          input_preprocessing=args.mlp_teacher_input_preprocessing,
+                          input_log_min=log_min, input_log_max=log_max)
+    return teacher
+
+
+def evaluate_with_zig(args: argparse.Namespace, teacher: nn.Module,
+                      student: KirchhoffStudent, specs: np.ndarray,
+                      device: torch.device) -> tuple[dict[str, float | bool], dict[str, np.ndarray]]:
+    """Evaluate only; no ZIG output participates in labeling or optimization."""
+    artifact_dir = args.zig_artifact_dir or os.path.dirname(os.path.abspath(args.mlp_teacher_ckpt))
+    required = {
+        "model": "hybrid_hurdle_ctle_model.pt",
+        "scaler_x": "hybrid_hurdle_scaler_X.pkl",
+        "scaler_power": "hybrid_hurdle_scaler_y_power.pkl",
+        "config": "hybrid_hurdle_config.pkl",
+    }
+    paths = {key: os.path.join(artifact_dir, name) for key, name in required.items()}
+    absent = [path for path in paths.values() if not os.path.isfile(path)]
+    if absent:
+        raise FileNotFoundError(
+            "Final ZIG evaluation requires artifacts beside --mlp-teacher-ckpt (or --zig-artifact-dir). Missing: "
+            + ", ".join(absent)
+        )
+    scaler_x = joblib.load(paths["scaler_x"])
+    scaler_power = joblib.load(paths["scaler_power"])
+    zig_config = joblib.load(paths["config"])
+    zig = HybridHurdleModel(
+        dropout=0.0, per_target=bool(zig_config.get("per_target_hurdle", False))
+    ).to(device)
+    zig.load_state_dict(torch.load(paths["model"], map_location=device))
+    zig.eval()
+    for parameter in zig.parameters():
+        parameter.requires_grad = False
+    _set_active_context({
+        "DEVICE": device, "zig_model": zig, "scaler_X": scaler_x, "scaler_y_p": scaler_power,
+        "VALIDITY_THRESHOLD": args.zig_validity_threshold,
+        "DEGRADE_REL_THRESHOLD": args.zig_degrade_threshold,
+        "MIN_DEGRADED_DIMS": args.zig_min_degraded_dims,
+        "ERROR_THRESHOLD": 0.10,
+    })
+    evaluator_kwargs = dict(
+        scaler_X=scaler_x, zig_model=zig,
+        eye_scale_h=float(zig_config["eye_scale_h"]), eye_scale_w=float(zig_config["eye_scale_w"]),
+        eye_scale_j=float(zig_config["eye_scale_j"]), scaler_y_p=scaler_power, device=device,
+    )
+    teacher_failures, teacher_metrics = StudentEvaluator(teacher, **evaluator_kwargs).identify_failures(specs)
+    student_failures, student_metrics = StudentEvaluator(student, **evaluator_kwargs).identify_failures(specs)
+    teacher_rate = float(teacher_failures.mean())
+    student_rate = float(student_failures.mean())
+    gap_pp = abs(student_rate - teacher_rate) * 100.0
+    passed = gap_pp <= args.isolation_tolerance_pp
+    summary = {
+        "teacher_failure_rate": teacher_rate,
+        "student_failure_rate": student_rate,
+        "absolute_gap_percentage_points": gap_pp,
+        "tolerance_percentage_points": args.isolation_tolerance_pp,
+        "isolation_pass": passed,
+        "teacher_invalid_rate": float(teacher_metrics["invalid_mask"].mean()),
+        "student_invalid_rate": float(student_metrics["invalid_mask"].mean()),
+    }
+    arrays = {
+        "specs": specs, "teacher_failure_mask": teacher_failures,
+        "student_failure_mask": student_failures,
+        "teacher_pred_specs": teacher_metrics["pred_specs"],
+        "student_pred_specs": student_metrics["pred_specs"],
+    }
+    return summary, arrays
 
 
 def main() -> None:
@@ -384,6 +465,10 @@ def main() -> None:
         specs=fixed["specs"][test_idx], teacher_logits=fixed["teacher_logits"][test_idx],
         student_logits=student_logits,
     )
+    teacher = load_teacher(args, device, fixed["input_log_min"], fixed["input_log_max"])
+    zig_summary, zig_arrays = evaluate_with_zig(args, teacher, model, fixed["specs"][test_idx], device)
+    final["zig_failure_comparison"] = zig_summary
+    np.savez_compressed(os.path.join(args.output, "zig_failure_comparison.npz"), **zig_arrays)
     torch.save(model.state_dict(), os.path.join(args.output, "student_final.pt"))
     torch.save({"model": model.state_dict(), "input_log_min": fixed["input_log_min"],
                 "input_log_max": fixed["input_log_max"], "args": vars(args)},
@@ -391,7 +476,15 @@ def main() -> None:
     with open(os.path.join(args.output, "metrics.json"), "w", encoding="utf-8") as handle:
         json.dump({"created_at": time.strftime("%Y-%m-%d %H:%M:%S"), "objective": "MSE(student_logits, teacher_logits)",
                    "final": final, "history": history, "args": vars(args)}, handle, indent=2)
+    verdict = "PASS" if zig_summary["isolation_pass"] else "FAIL"
     logging.info("Best frozen-teacher agreement: val=%s test=%s", final["validation"], final["test"])
+    logging.info(
+        "ZIG isolation verdict: %s | teacher failure=%.2f%% student failure=%.2f%% gap=%.2f pp (tolerance %.2f pp)",
+        verdict, 100.0 * zig_summary["teacher_failure_rate"], 100.0 * zig_summary["student_failure_rate"],
+        zig_summary["absolute_gap_percentage_points"], zig_summary["tolerance_percentage_points"],
+    )
+    if not zig_summary["isolation_pass"]:
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

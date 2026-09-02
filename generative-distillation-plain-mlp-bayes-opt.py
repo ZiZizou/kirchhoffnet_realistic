@@ -95,6 +95,11 @@ def _knet_param_count(trunk_width: int, trunk_layers: int) -> int:
     trunk = 5W + (L-1)(W^2 + W);  head = 7W + 7.
     The legacy :func:`plain_param_count` assumes an 8 -> W first layer and
     returns 4W more; it is kept for comparability in the CSV only.
+
+    Note: this closed form does not include ``LayerNorm`` parameters
+    (``2*W`` per trunk layer when ``plain_use_layernorm=True``). The BO budget
+    gate is therefore optimistic; the subprocess ``--count-params-only``
+    preflight supplies the ground-truth torch count including LayerNorm.
     """
     if trunk_width < 1 or trunk_layers < 1:
         raise ValueError("trunk dimensions must be positive")
@@ -651,9 +656,24 @@ def main() -> None:
             "test_failure_rate": best.user_attrs.get("test_failure_rate"),
             "validation_failure_rate": best.user_attrs.get("validation_failure_rate"),
         },
+        "selected_checkpoint": str((run_dir / f"trial_{best.number:04d}"
+                                    / "dagger_student_plain.pt").resolve()),
+        "selected_teacher_config": str((run_dir / f"trial_{best.number:04d}"
+                                        / "teacher_config.json").resolve()),
     }
-    with open(run_dir / "bo_summary.json", "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
+    summary_path = run_dir / "bo_summary.json"
+    summary_tmp = summary_path.with_suffix(summary_path.suffix + ".tmp")
+    try:
+        with open(summary_tmp, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
+        os.replace(summary_tmp, summary_path)
+    except Exception as e:
+        try:
+            if summary_tmp.exists():
+                summary_tmp.unlink()
+        except Exception:
+            pass
+        print(f"[plain-bo] WARNING: failed to write bo_summary.json atomically: {e}")
 
     print(f"[plain-bo] artifacts in {run_dir}")
 

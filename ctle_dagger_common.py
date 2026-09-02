@@ -937,6 +937,15 @@ def load_plain_mlp_teacher(ckpt_path, device=None, *, trunk_width=48, trunk_laye
     so the caller does **not** need to call ``teacher.attach_scaler(...)``.
     Legacy checkpoints (no config or v1) fall back to shape inference via
     :func:`_plain_mlp_arch_from_state` and still require manual ``attach_scaler``.
+
+    One-liner for any ``output_dir`` produced by
+    ``generative-distillation-plain-mlp.py`` (always writes a v2 sidecar, with
+    BO-locked ``input_preprocessing == "knet"`` and ``use_log_features == False``)::
+
+        from ctle_dagger_common import load_plain_mlp_teacher
+        model = load_plain_mlp_teacher("path/to/dagger_student_plain.pt")
+        model.eval()
+        preds = model.predict(specs_tensor)  # knet 4-feature min-max log scaled, clipped [-4,4]
     """
     if device is None:
         try:
@@ -1242,13 +1251,13 @@ class RegimeAwareMoE(nn.Module):
         self._eye_scale_j = float(eye_scale_j) if eye_scale_j is not None else None
         self._eye_scale_h = float(eye_scale_h) if eye_scale_h is not None else None
         self._eye_scale_w = float(eye_scale_w) if eye_scale_w is not None else None
-        self.input_preprocessing = 'q75'
+        self.input_preprocessing = 'knet'
         self.input_log_min = None
         self.input_log_max = None
 
     def attach_scaler(self, scaler_p_scale, scaler_p_mean,
                       eye_scale_j, eye_scale_h, eye_scale_w,
-                      input_preprocessing='q75', input_log_min=None,
+                      input_preprocessing='knet', input_log_min=None,
                       input_log_max=None):
         self.scaler_p_scale = float(scaler_p_scale)
         self.scaler_p_mean = float(scaler_p_mean)
@@ -1376,13 +1385,22 @@ class PlainMLP(nn.Module):
     ``Linear(W -> 7)`` output head. No gating, no regime classifier, no
     auxiliary regime cross-entropy loss.
 
+    The class default ``input_preprocessing='knet'`` (4 log/min-max features
+    clipped to ``[-4, 4]``); ``use_log_features=True`` only takes effect when
+    the harness explicitly switches to ``q75`` preprocessing. The
+    ``generative-distillation-plain-mlp.py`` harness forces
+    ``use_log_features=False`` whenever preprocessing is ``knet`` (the BO
+    controller's locked default).
+
     Parameters
     ----------
     trunk_width, trunk_layers, activation, use_layernorm, use_log_features
         Defaults match the current best MoE shape (``width=45, layers=3, SiLU,
         no LN, log_features=True``) for an apples-to-apples "same backbone"
-        comparison. ``--param-budget`` can derive ``trunk_width`` automatically
-        via :func:`derive_plain_width`.
+        comparison under the legacy Q75 path. Under the knet path
+        ``use_log_features`` is forced to False (4->W first layer) regardless
+        of the constructor default. ``--param-budget`` can derive
+        ``trunk_width`` automatically via :func:`derive_plain_width`.
     """
     def __init__(self, trunk_width=45, trunk_layers=3,
                  activation=nn.SiLU, use_layernorm=False, use_log_features=True,
@@ -1421,15 +1439,23 @@ class PlainMLP(nn.Module):
         self._eye_scale_j = float(eye_scale_j) if eye_scale_j is not None else None
         self._eye_scale_h = float(eye_scale_h) if eye_scale_h is not None else None
         self._eye_scale_w = float(eye_scale_w) if eye_scale_w is not None else None
-        self.input_preprocessing = 'q75'
+        self.input_preprocessing = 'knet'
         self.input_log_min = None
         self.input_log_max = None
 
     def attach_scaler(self, scaler_p_scale, scaler_p_mean,
                       eye_scale_j, eye_scale_h, eye_scale_w,
-                      input_preprocessing='q75', input_log_min=None,
+                      input_preprocessing='knet', input_log_min=None,
                       input_log_max=None):
-        """Inject Q75 + StandardScaler constants required by :meth:`scale_input`."""
+        """Inject scaler constants required by :meth:`scale_input`.
+
+        For ``input_preprocessing='knet'`` the :meth:`scale_input` knet
+        branch (4 log/min-max features clipped to [-4, 4]) requires
+        ``input_log_min`` and ``input_log_max``. For ``'q75'`` it
+        additionally requires the Q75/StandardScaler ``scaler_p_*`` and
+        ``eye_scale_*`` constants. ``setup()``/``load_plain_mlp_teacher()``
+        always call this before any forward pass.
+        """
         self.scaler_p_scale = float(scaler_p_scale)
         self.scaler_p_mean = float(scaler_p_mean)
         self._eye_scale_j = float(eye_scale_j)

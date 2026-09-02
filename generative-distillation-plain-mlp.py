@@ -125,7 +125,18 @@ def _git_commit_short() -> str | None:
 
 
 def build_plain_teacher_config(student: PlainMLP, ctx: dict, args: argparse.Namespace) -> dict:
-    """Build v2 sidecar config that is sufficient to reconstruct without guessing."""
+    """Build v2 sidecar config that is sufficient to reconstruct without guessing.
+
+    After training this dict is atomically written to
+    ``output_dir/teacher_config.json`` (schema v2) and consumed by
+    :func:`ctle_dagger_common.load_plain_mlp_teacher`, which auto-resolves
+    architecture + scaler so callers do not need to read training logs::
+
+        from ctle_dagger_common import load_plain_mlp_teacher
+        model = load_plain_mlp_teacher("output_dir/dagger_student_plain.pt")
+        model.eval()
+        preds = model.predict(specs_tensor)
+    """
     # Scaler constants live in ctx after setup()
     scaler_y_p = ctx.get("scaler_y_p")
     try:

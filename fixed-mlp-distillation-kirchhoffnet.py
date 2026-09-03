@@ -21,6 +21,7 @@ import logging
 import os
 import random
 import time
+from pathlib import Path
 
 import joblib
 import numpy as np
@@ -63,7 +64,11 @@ def parse_bool(value: str | bool) -> bool:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mlp-teacher-ckpt", default=DEFAULT_TEACHER_CKPT)
+    teacher_source = parser.add_mutually_exclusive_group(required=False)
+    teacher_source.add_argument("--mlp-teacher-ckpt", default=None,
+                                help="Direct path to dagger_student_plain.pt.")
+    teacher_source.add_argument("--teacher-dir", default=None,
+                                help="Teacher trial directory, or a PlainMLP BO run directory containing bo_summary.json.")
     parser.add_argument("--mlp-teacher-width", type=int, default=48)
     parser.add_argument("--mlp-teacher-layers", type=int, default=3)
     parser.add_argument("--mlp-teacher-activation", choices=["silu", "gelu"], default="silu")
@@ -131,6 +136,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kn-vca-separate-core-bus", type=parse_bool, default=True)
     parser.add_argument("--vca-bias", type=parse_bool, default=False)
     return parser.parse_args()
+
+
+def resolve_teacher_checkpoint(ckpt: str | None, teacher_dir: str | None) -> str:
+    """Resolve a direct checkpoint or the selected teacher from a BO run directory."""
+    if ckpt:
+        path = Path(ckpt).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"--mlp-teacher-ckpt does not exist: {path}")
+        return str(path)
+    if not teacher_dir:
+        return DEFAULT_TEACHER_CKPT
+    root = Path(teacher_dir).expanduser().resolve()
+    direct = root / "dagger_student_plain.pt"
+    if direct.is_file():
+        return str(direct)
+    summary_path = root / "bo_summary.json"
+    if summary_path.is_file():
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            selected = Path(summary["selected_checkpoint"])
+            if selected.is_file():
+                return str(selected.resolve())
+            trial = int(summary["selected_trial"])
+            candidate = root / f"trial_{trial:04d}" / "dagger_student_plain.pt"
+            if candidate.is_file():
+                return str(candidate)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError(f"could not resolve selected teacher from {summary_path}: {exc}") from exc
+    raise FileNotFoundError(
+        f"{root} contains neither dagger_student_plain.pt nor a resolvable bo_summary.json"
+    )
 
 
 def set_seed(seed: int) -> None:
@@ -267,7 +303,13 @@ def log_model_summary(model: nn.Module, kind: str) -> None:
 
 def teacher_identity(path: str) -> dict[str, int | str]:
     stat = os.stat(path)
-    return {"path": os.path.abspath(path), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+    cfg = Path(path).with_name("teacher_config.json")
+    cfg_id = None
+    if cfg.is_file():
+        cfg_stat = cfg.stat()
+        cfg_id = {"size": cfg_stat.st_size, "mtime_ns": cfg_stat.st_mtime_ns}
+    return {"path": os.path.abspath(path), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
+            "teacher_config": cfg_id}
 
 
 def dataset_fingerprint(args: argparse.Namespace, df: pd.DataFrame) -> str:
@@ -353,11 +395,14 @@ def load_teacher(args: argparse.Namespace, device: torch.device,
         use_layernorm=args.mlp_teacher_use_layernorm,
         input_preprocessing=args.mlp_teacher_input_preprocessing,
     )
-    # For ``knet`` preprocessing these Q75 values are intentionally unused, but
-    # PlainMLP validates that all scaling fields have been attached.
-    teacher.attach_scaler(1.0, 0.0, 1.0, 1.0, 1.0,
-                          input_preprocessing=args.mlp_teacher_input_preprocessing,
-                          input_log_min=log_min, input_log_max=log_max)
+    if teacher.input_preprocessing != "knet":
+        raise ValueError(f"teacher config requests {teacher.input_preprocessing!r}; fixed benchmark requires knet")
+    # Schema-v2 teacher_config.json supplies the exact training scaler/bounds.
+    # Only legacy checkpoints require this fallback attachment.
+    if teacher.input_log_min is None or teacher.input_log_max is None:
+        teacher.attach_scaler(1.0, 0.0, 1.0, 1.0, 1.0, input_preprocessing="knet",
+                              input_log_min=log_min, input_log_max=log_max)
+        logging.warning("Teacher lacks a schema-v2 scaler config; attached bounds derived from the fixed CTLE data.")
     return teacher
 
 
@@ -427,6 +472,7 @@ def evaluate_with_zig(args: argparse.Namespace, teacher: nn.Module,
 
 def main() -> None:
     args = parse_args()
+    args.mlp_teacher_ckpt = resolve_teacher_checkpoint(args.mlp_teacher_ckpt, args.teacher_dir)
     if not 0 < args.train_fraction < 1 or not 0 < args.val_fraction < 1 or args.train_fraction + args.val_fraction >= 1:
         raise ValueError("--train-fraction and --val-fraction must be positive and sum to less than one")
     if args.epochs < 1 or args.batch_size < 1 or args.eval_every < 1:

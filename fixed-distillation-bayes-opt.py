@@ -28,12 +28,17 @@ HARNESS = ROOT / "fixed-mlp-distillation-kirchhoffnet.py"
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--student-kind", choices=["knet", "mlp"], required=True)
-    parser.add_argument("--mlp-teacher-ckpt", required=True)
+    teacher_source = parser.add_mutually_exclusive_group(required=True)
+    teacher_source.add_argument("--mlp-teacher-ckpt")
+    teacher_source.add_argument("--teacher-dir",
+                                help="PlainMLP BO run directory (bo_summary.json) or selected trial directory.")
     parser.add_argument("--mlp-teacher-width", type=int, default=48)
     parser.add_argument("--mlp-teacher-layers", type=int, default=3)
     parser.add_argument("--mlp-teacher-activation", choices=["silu", "gelu"], default="silu")
     parser.add_argument("--mlp-teacher-use-layernorm", default="False")
     parser.add_argument("--dataset-dir", required=True)
+    parser.add_argument("--zig-artifact-dir", default=None,
+                        help="HybridHurdle/ZIG artifact directory used only for validation and final test evaluation.")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--fixed-dataset-path", type=Path, default=None,
                         help="One shared cache path; pass the identical absolute path to both KNet and MLP BO runs.")
@@ -52,9 +57,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def base_command(args: argparse.Namespace, output: Path) -> list[str]:
-    return [
+    teacher_arg = (["--mlp-teacher-ckpt", args.mlp_teacher_ckpt]
+                   if args.mlp_teacher_ckpt else ["--teacher-dir", args.teacher_dir])
+    command = [
         args.python, str(HARNESS), "--student-kind", args.student_kind,
-        "--mlp-teacher-ckpt", args.mlp_teacher_ckpt,
+        *teacher_arg,
         "--mlp-teacher-width", str(args.mlp_teacher_width), "--mlp-teacher-layers", str(args.mlp_teacher_layers),
         "--mlp-teacher-activation", args.mlp_teacher_activation,
         "--mlp-teacher-use-layernorm", str(args.mlp_teacher_use_layernorm),
@@ -64,6 +71,9 @@ def base_command(args: argparse.Namespace, output: Path) -> list[str]:
         "--device", args.device, "--seed", str(args.seed), "--epochs", str(args.epochs),
         "--batch-size", str(args.batch_size), "--weight-decay", "0", "--bo-mode",
     ]
+    if args.zig_artifact_dir:
+        command += ["--zig-artifact-dir", args.zig_artifact_dir]
+    return command
 
 
 def sample_config(trial: optuna.Trial, kind: str) -> dict[str, str]:

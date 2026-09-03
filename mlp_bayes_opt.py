@@ -58,6 +58,8 @@ import optuna
 import torch
 from optuna.samplers import TPESampler
 
+import bo_param_sampling as bps
+
 
 def _recover_unfinished_trials(study: optuna.Study) -> tuple[list[dict[str, Any]], set[int]]:
     """Mark abandoned RUNNING trials as FAIL and re-queue their params.
@@ -139,15 +141,16 @@ def _penalized_objective(metric: float, actual_params: int,
                          reference_params: int, strength: float) -> float:
     """Scale the metric upward in proportion to the model size."""
     if actual_params < 0:
-        return float("inf")
+        # Unknown param count: finite sentinel instead of inf (optuna#3676).
+        return metric * (1.0 + strength)
+    normalized_params = actual_params / max(1, reference_params)
     normalized_params = actual_params / max(1, reference_params)
     return metric * (1.0 + strength * normalized_params)
 
 
 def _over_budget_objective(actual_params: int, budget: int, base: float) -> float:
     """Finite graded objective used by KNet for soft-budget violations."""
-    ratio = actual_params / max(1, budget)
-    return base * ratio * ratio
+    return bps.over_budget_objective(actual_params, budget, base)
 
 
 def moe_param_count(trunk_width: int, trunk_layers: int, num_experts: int,
@@ -159,12 +162,7 @@ def moe_param_count(trunk_width: int, trunk_layers: int, num_experts: int,
     head per expert.  Non-trainable output-bound tensors are intentionally not
     included, matching ``sum(p.numel() for p in student.parameters())``.
     """
-    if trunk_width < 1 or trunk_layers < 1 or num_experts < 1:
-        raise ValueError("MoE dimensions must be positive")
-    trunk = (input_dim + 1) * trunk_width + (trunk_layers - 1) * (trunk_width ** 2 + trunk_width)
-    routes = 2 * input_dim * num_experts
-    experts = num_experts * (7 * trunk_width + 7)
-    return trunk + routes + experts
+    return bps.moe_param_count(trunk_width, trunk_layers, num_experts, input_dim)
 
 
 def max_moe_width(*, trunk_layers: int, num_experts: int, param_limit: int,
@@ -422,9 +420,23 @@ def main() -> None:
     patience = args.epochs  # full fixed-budget run, no early stopping
 
     sampler = TPESampler(seed=args.seed, multivariate=True, group=True)
+    # Sampling fingerprint: changing (budget, tolerance, dataset, n_arches,
+    # width_range, layers_range) between runs of the same study.db would crash
+    # the second committed trial with "CategoricalDistribution does not
+    # support dynamic value space". Record on fresh creation; check on resume.
+    sampling_fingerprint = bps.make_sampling_fingerprint({
+        "dataset": args.dataset,
+        "param_budget": param_budget,
+        "param_tolerance": args.param_tolerance,
+        "n_layers_max": args.n_layers_max,
+        "input_preprocessing": args.input_preprocessing,
+        "arch_param_name": "moe_arch_idx" if args.dataset == "ctle" else "mlp_arch_idx",
+        "n_arches": (len(moe_feasible) if args.dataset == "ctle" else len(plain_feasible)),
+    })
     if args.resume and (run_dir / (study_name + ".db")).exists():
         study = optuna.load_study(study_name=study_name, storage=storage,
                                   sampler=sampler)
+        bps.check_sampling_fingerprint(study, sampling_fingerprint)
         retry_params, _ = _recover_unfinished_trials(study)
         if retry_params:
             print(f"[mlp_bayes_opt] recovered {len(retry_params)} unfinished trial(s); they will be retried")
@@ -433,6 +445,7 @@ def main() -> None:
     else:
         study = optuna.create_study(study_name=study_name, storage=storage,
                                     sampler=sampler, direction="minimize")
+        study.set_user_attr("sampling_fingerprint", sampling_fingerprint)
 
     # Mirror KNet's queued CTLE baseline, including when --resume is used.
     # This gives both optimizers one deterministic, budget-valid prior.
@@ -479,11 +492,54 @@ def main() -> None:
               f"every {args.ctle_earlystop_eval_every} epochs, "
               f"param_limit={param_budget * (1.0 + args.param_tolerance):.0f}")
 
+    # Joint feasible-architecture lists, computed once per study. Every
+    # suggested architecture satisfies the soft cap by construction; budget
+    # misses that survive (preflight mismatch) become finite graded penalties.
+    # Same soft cap as CTLE/MoE path: budget*(1+param_tolerance).
+    plain_soft_limit = int(param_budget * (1.0 + args.param_tolerance))
+    moe_soft_limit = plain_soft_limit
+    moe_feasible = bps.moe_feasible_arches(
+        soft_limit=moe_soft_limit,
+        layers_range=(2, 3),
+        experts_range=(2, 4),
+        width_range=(32, 64),
+        input_dim=4 if args.input_preprocessing == "knet" else 8,
+    )
+    # Non-CTLE plain-MLP feasible (num_layers, hidden_dim) tuples. Width range
+    # is derived analytically per depth (smallest to largest width fitting the
+    # soft cap) so uniform categorical sampling yields near-budget trials
+    # instead of being dominated by tiny models from a [1,4096] sweep.
+    plain_width_ranges = bps.mlp_feasible_width_ranges(
+        soft_limit=plain_soft_limit, in_dim=in_dim, out_dim=out_dim,
+        layers_range=(2, args.n_layers_max), ln=False,
+    )
+    plain_feasible = bps.mlp_feasible_arches(
+        soft_limit=plain_soft_limit,
+        in_dim=in_dim, out_dim=out_dim,
+        layers_range=(2, args.n_layers_max),
+        width_range=plain_width_ranges,
+        ln_options=(False,),
+    )
+    if args.dataset != "ctle":
+        bps.require_feasible(plain_feasible, "plain MLP", plain_soft_limit)
+    else:
+        bps.require_feasible(moe_feasible, "CTLE MoE", moe_soft_limit)
+        # The 44-width seed config must be in the feasible list; fall back to
+        # the nearest feasible tuple otherwise so the seed always runs.
+        if not any(l == 3 and w == 44 and e == 3 for l, e, w in moe_feasible):
+            print(f"[mlp_bayes_opt] WARNING: seed arch (44,3,3) not feasible "
+                  f"under soft cap {moe_soft_limit}; first feasible tuple will "
+                  "replace it in the seed trial")
+    print(f"[mlp_bayes_opt] feasible arches: moe={len(moe_feasible)} "
+          f"plain={len(plain_feasible)} (soft_limit={moe_soft_limit}, "
+          f"plain widths per layer: {plain_width_ranges})")
+
     def objective(trial: optuna.Trial) -> float:
         # ── CTLE fast DAgger proxy (4×100, Test 1000) ───────────────────
         if args.dataset == "ctle":
             # Use current defaults as trial 0 seed; otherwise sample MoE + DAgger knobs.
             is_seed = trial.user_attrs.get("seed_trial") is True
+            soft_limit = int(param_budget * (1.0 + args.param_tolerance))
             if is_seed:
                 trunk_width = 44
                 trunk_layers = 3
@@ -491,22 +547,17 @@ def main() -> None:
                 lr = 1e-3
                 weight_decay = 1e-4
                 batch_size = 256
+                # Seed arch must itself satisfy the soft cap; substitute the
+                # first feasible tuple otherwise so the seed always runs.
+                if bps.moe_param_count(trunk_width, trunk_layers, num_experts,
+                                       4 if args.input_preprocessing == "knet" else 8) > soft_limit:
+                    trunk_layers, num_experts, trunk_width = moe_feasible[0]
             else:
-                trunk_layers = trial.suggest_int("moe_trunk_layers", 2, 3)
-                num_experts = trial.suggest_int("moe_num_experts", 2, 4)
-                soft_limit = int(param_budget * (1.0 + args.param_tolerance))
-                width_max = max_moe_width(
-                    trunk_layers=trunk_layers, num_experts=num_experts,
-                    param_limit=soft_limit, lower=32, upper=64,
-                    input_dim=4 if args.input_preprocessing == "knet" else 8,
-                )
-                if width_max < 32:
-                    raise optuna.TrialPruned(
-                        f"No MoE width in [32, 64] fits soft cap {soft_limit}")
-                # A fixed-distribution fraction avoids Optuna's prohibition on
-                # changing ``suggest_int`` bounds across conditional trials.
-                width_fraction = trial.suggest_float("moe_width_fraction", 0.0, 1.0)
-                trunk_width = 32 + round(width_fraction * (width_max - 32))
+                # Joint feasible sampling: one fixed categorical over the whole
+                # (layers, experts, width) manifold under the soft cap. Replaces
+                # max_moe_width + moe_width_fraction + TrialPruned.
+                arch_idx = bps.sample_arch_idx(trial, "moe_arch_idx", moe_feasible)
+                trunk_layers, num_experts, trunk_width = moe_feasible[arch_idx]
                 lr = trial.suggest_float("lr", args.lr_min, args.lr_max, log=True)
                 weight_decay = trial.suggest_float("weight_decay", args.wd_min, args.wd_max, log=True)
                 batch_size = trial.suggest_categorical("batch_size", [256, 512, 1024])
@@ -517,8 +568,11 @@ def main() -> None:
                 trunk_width, trunk_layers, num_experts,
                 4 if args.input_preprocessing == "knet" else 8,
             )
-            soft_limit = int(param_budget * (1.0 + args.param_tolerance))
+            trial.set_user_attr("actual_params", expected_params)
             if expected_params > soft_limit:
+                trial.set_user_attr("penalized", True)
+                trial.set_user_attr("penalty_reason",
+                                    f"expected params={expected_params} > soft cap {soft_limit}")
                 return _over_budget_objective(
                     expected_params, soft_limit, args.invalid_param_objective)
             # 4×100 proxy: 4 DAgger iterations × 100 epochs, common-eval 1000 for speed
@@ -552,11 +606,18 @@ def main() -> None:
                 logf.flush()
                 proc = subprocess.run(cmd, stdout=logf, stderr=subprocess.STDOUT, text=True, cwd=str(repo_dir), creationflags=creationflags, env=sub_env)
             if proc.returncode != 0:
-                return float("inf")
+                trial.set_user_attr("penalized", True)
+                trial.set_user_attr("penalty_reason",
+                                    f"training subprocess failed ({proc.returncode})")
+                return _over_budget_objective(soft_limit + 1, soft_limit,
+                                              args.invalid_param_objective)
             text = log_path.read_text(encoding="utf-8", errors="ignore")
             m = re.search(r"Test failure rate:\s*([\d\.]+)%", text)
             if not m:
-                return float("inf")
+                trial.set_user_attr("penalized", True)
+                trial.set_user_attr("penalty_reason", "missing Test failure rate in log")
+                return _over_budget_objective(soft_limit + 1, soft_limit,
+                                              args.invalid_param_objective)
             test_rate = float(m.group(1)) / 100.0
             # Parse actual param count for --param-budget penalty (mlp dagger logs "Student model: X params")
             pm = re.search(r"Student model:\s*([0-9,]+)\s*params", text)
@@ -568,22 +629,24 @@ def main() -> None:
             trial.set_user_attr("moe_num_experts", num_experts)
             if param_count is not None:
                 trial.set_user_attr("param_count", param_count)
+                trial.set_user_attr("actual_params", param_count)
                 if param_count > soft_limit:
+                    trial.set_user_attr("penalized", True)
+                    trial.set_user_attr("penalty_reason",
+                                        f"post-run params={param_count} > soft cap {soft_limit}")
                     return _over_budget_objective(
                         param_count, soft_limit, args.invalid_param_objective)
             # Obey --param-budget via same penalized objective as kn_bayes/mlp non-CTLE
             penalized = _penalized_objective(test_rate, param_count or 0, param_budget, args.param_penalty)
             trial.set_user_attr("raw_test_rate", test_rate)
-            trial.set_user_attr("penalized", penalized)
+            trial.set_user_attr("penalized_value", penalized)
             return penalized
 
-        num_layers = trial.suggest_int("num_layers", 2, args.n_layers_max)
-        hidden_dim = derive_hidden_dim(num_layers=num_layers,
-                                       budget=param_budget,
-                                       in_dim=in_dim, out_dim=out_dim)
-        if hidden_dim < 1:
-            raise optuna.TrialPruned(
-                f"budget={param_budget} too small for num_layers={num_layers}")
+        # Joint feasible sampling over the (num_layers, hidden_dim) manifold
+        # under the budget. Replaces derive_hidden_dim (always max-W, no
+        # width exploration) + TrialPruned for infeasible depths.
+        arch_idx = bps.sample_arch_idx(trial, "mlp_arch_idx", plain_feasible)
+        num_layers, hidden_dim, _plain_ln = plain_feasible[arch_idx]
         lr = trial.suggest_float("lr", args.lr_min, args.lr_max, log=True)
         weight_decay = trial.suggest_float("weight_decay",
                                            args.wd_min, args.wd_max, log=True)
@@ -625,18 +688,24 @@ def main() -> None:
             trial.set_user_attr("subprocess_failed", True)
             trial.set_user_attr("subprocess_returncode", proc.returncode)
             trial.set_user_attr("subprocess_seconds", elapsed)
-            return float("inf")
+            trial.set_user_attr("penalized", True)
+            trial.set_user_attr("penalty_reason",
+                                f"training subprocess failed ({proc.returncode})")
+            return args.invalid_param_objective
 
         metrics = _parse_final_metrics(metrics_path)
         if args.objective not in metrics:
             trial.set_user_attr("subprocess_failed", True)
             trial.set_user_attr("subprocess_seconds", elapsed)
-            return float("inf")
+            trial.set_user_attr("penalized", True)
+            trial.set_user_attr("penalty_reason", "missing objective in final_metrics.txt")
+            return args.invalid_param_objective
 
         for k, v in metrics.items():
             trial.set_user_attr(k, v)
         trial.set_user_attr("hidden_dim", hidden_dim)
         actual_params = int(metrics.get("param_count", -1))
+        trial.set_user_attr("actual_params", actual_params)
         raw_objective = float(metrics[args.objective])
         normalized_params = actual_params / max(1, param_budget)
         objective_value = _penalized_objective(
@@ -705,6 +774,7 @@ def main() -> None:
             "best_val", "best_epoch", "best_rmse_orig", "best_mae_orig",
             "best_mape_orig", "final_val", "elapsed_seconds",
             "raw_objective", "normalized_param_count", "param_penalty",
+            "penalized", "penalized_value", "penalty_reason",
         ])
         for t in study.trials:
             actual_params = t.user_attrs.get("actual_params", -1)
@@ -731,6 +801,9 @@ def main() -> None:
                 t.user_attrs.get("raw_objective"),
                 t.user_attrs.get("normalized_param_count"),
                 t.user_attrs.get("param_penalty"),
+                t.user_attrs.get("penalized", False),
+                t.user_attrs.get("penalized_value", ""),
+                t.user_attrs.get("penalty_reason", ""),
             ])
 
     _plot_history(

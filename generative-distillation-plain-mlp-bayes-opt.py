@@ -6,14 +6,20 @@ preprocessing choice, it is hardcoded in :func:`base_command`. All sampled
 architectures therefore run the 4-feature ``PlainMLP.scale_input()`` knet
 branch (log / min-max, clipped to [-4, 4]).
 
-Width mode: **derived at budget**. The controller samples
-``plain_trunk_layers`` and derives ``plain_trunk_width`` so the network sits
-just under ``--param-budget``, exploring the depth/width degeneracy at (near)
-constant parameter count. Param counting uses a knet-corrected closed form
-(``_knet_param_count``) because the legacy :func:`plain_param_count` assumes an
-8->W first layer (Q75) and overcounts knet nets (4->W) by 4W. Budget gating
-uses the subprocess preflight (--count-params-only), so the gate is against
-PyTorch's own count, not the closed form.
+Width mode: **joint feasible-architecture sampling**. The controller
+precomputes every ``(layers, width, layernorm)`` tuple whose knet-corrected
+param count (including LayerNorm terms) sits at or under
+``budget * (1 + tolerance)`` and samples one joint tuple per trial via a
+single fixed-distribution categorical (see ``bo_param_sampling.py``).
+Budget gating still uses the subprocess preflight (--count-params-only)
+as ground truth; a preflight mismatch returns a finite graded penalty,
+never a prune.
+
+Resume incompatibility: studies created before this change sampled
+``plain_trunk_layers``/``plain_layernorm`` independently and derived the
+width; they have no ``plain_arch_idx`` param. Resuming an old study.db
+with the new sampler requires a fresh --output/--study-name; old studies
+are not migrated in code.
 
 Fidelity: BO trials default to a fast DAgger proxy (4 iterations x 100 epochs,
 common-eval 1000); ``--fidelity full`` restores the production 10 x 200
@@ -43,6 +49,8 @@ from typing import Any
 import optuna
 import torch
 from optuna.samplers import TPESampler
+
+import bo_param_sampling as bps
 
 
 SCRIPT = Path(__file__).resolve().parent / "generative-distillation-plain-mlp.py"
@@ -89,23 +97,14 @@ def _recover_unfinished_trials(study: optuna.Study) -> list[dict[str, Any]]:
     return retry_params
 
 
-def _knet_param_count(trunk_width: int, trunk_layers: int) -> int:
+def _knet_param_count(trunk_width: int, trunk_layers: int,
+                      use_layernorm: bool = False) -> int:
     """Exact trainable count of a knet PlainMLP (4 -> W first layer).
 
-    trunk = 5W + (L-1)(W^2 + W);  head = 7W + 7.
-    The legacy :func:`plain_param_count` assumes an 8 -> W first layer and
-    returns 4W more; it is kept for comparability in the CSV only.
-
-    Note: this closed form does not include ``LayerNorm`` parameters
-    (``2*W`` per trunk layer when ``plain_use_layernorm=True``). The BO budget
-    gate is therefore optimistic; the subprocess ``--count-params-only``
-    preflight supplies the ground-truth torch count including LayerNorm.
+    trunk = 5W + (L-1)(W^2 + W);  head = 7W + 7; LayerNorm adds 2*W*L when
+    enabled. Delegates to the shared module; kept for CSV comparability.
     """
-    if trunk_width < 1 or trunk_layers < 1:
-        raise ValueError("trunk dimensions must be positive")
-    trunk = 5 * trunk_width + (trunk_layers - 1) * (trunk_width ** 2 + trunk_width)
-    head = 7 * trunk_width + 7
-    return trunk + head
+    return bps.mlp_param_count(trunk_width, trunk_layers, 4, 7, use_layernorm)
 
 
 def _legacy_param_count(trunk_width: int, trunk_layers: int) -> int:
@@ -116,19 +115,18 @@ def _legacy_param_count(trunk_width: int, trunk_layers: int) -> int:
 
 
 def derive_knet_width(budget: int, trunk_layers: int) -> int:
-    """Largest W >= 1 with :func:`_knet_param_count`(W, L) <= budget.
+    """Legacy derive-at-max-width helper (CLI/back-compat only).
 
-    Returns -1 when no width fits (budget too small for the depth).
-    Mirrors :func:`derive_plain_width` semantics for the knet-corrected count.
+    The BO objective no longer uses this: it samples the joint feasible
+    (layers, width, layernorm) list instead. Kept because external callers
+    and tests may import it.
     """
     if trunk_layers < 1:
         raise ValueError("trunk_layers must be >= 1")
-    if _knet_param_count(1, trunk_layers) > budget:
-        return -1
     w = 1
     while _knet_param_count(w + 1, trunk_layers) <= budget:
         w += 1
-    return w
+    return w if _knet_param_count(w, trunk_layers) <= budget else -1
 
 
 def max_knet_width(*, trunk_layers: int, param_limit: int,
@@ -148,14 +146,14 @@ def _penalized_objective(metric: float, actual_params: int,
                          reference_params: int, strength: float) -> float:
     """Scale the metric upward in proportion to model size (0 strength disables)."""
     if actual_params < 0:
-        return float("inf")
+        # Unknown param count: finite sentinel instead of inf (optuna#3676).
+        return metric * (1.0 + strength)
     return metric * (1.0 + strength * actual_params / max(1, reference_params))
 
 
 def _over_budget_objective(actual_params: int, budget: int, base: float) -> float:
     """Finite graded objective for architectures above the soft cap."""
-    ratio = actual_params / max(1, budget)
-    return base * ratio * ratio
+    return bps.over_budget_objective(actual_params, budget, base)
 
 
 def parse_args() -> argparse.Namespace:
@@ -367,10 +365,44 @@ def main() -> None:
     seed_int = args.seed
     creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
+    # Joint feasible-architecture list: every (layers, width, layernorm) tuple
+    # with knet param count (LayerNorm included) <= soft_limit. Computed once
+    # per study; fail fast if the window admits zero architectures (the old
+    # derive-at-max-width scheme instead produced 30/30-penalized studies).
+    ln_options = tuple(s == "True" for s in args.layernorm_choices)
+    plain_feasible = bps.mlp_feasible_arches(
+        soft_limit=soft_limit,
+        in_dim=4, out_dim=7,
+        layers_range=(args.layers_min, args.layers_max),
+        width_range=(args.min_width, args.max_width),
+        ln_options=ln_options,
+    )
+    bps.require_feasible(plain_feasible, "PlainMLP (knet)", soft_limit)
+    print(f"[plain-bo] feasible arches: {len(plain_feasible)} "
+          f"(L {args.layers_min}-{args.layers_max}, W {args.min_width}-{args.max_width}, "
+          f"LN={args.layernorm_choices}) under soft cap {soft_limit}")
+
     sampler = TPESampler(seed=seed_int, multivariate=True, group=True)
     db_path = run_dir / (study_name + ".db")
+    # Sampling fingerprint: changing (budget, tolerance, layers_min/max,
+    # min/max_width, layernorm_choices, n_arches) between runs of the same
+    # study.db would crash the second committed trial with
+    # "CategoricalDistribution does not support dynamic value space". Record
+    # on fresh creation; check on resume.
+    sampling_fingerprint = bps.make_sampling_fingerprint({
+        "param_budget": args.param_budget,
+        "param_tolerance": args.param_tolerance,
+        "layers_min": args.layers_min,
+        "layers_max": args.layers_max,
+        "min_width": args.min_width,
+        "max_width": args.max_width,
+        "layernorm_choices": sorted(args.layernorm_choices),
+        "arch_param_name": "plain_arch_idx",
+        "n_arches": len(plain_feasible),
+    })
     if args.resume and db_path.exists():
         study = optuna.load_study(study_name=study_name, storage=storage, sampler=sampler)
+        bps.check_sampling_fingerprint(study, sampling_fingerprint)
         retry_params = _recover_unfinished_trials(study)
         if retry_params:
             print(f"[plain-bo] recovered {len(retry_params)} unfinished trial(s); they will be retried")
@@ -379,6 +411,7 @@ def main() -> None:
     else:
         study = optuna.create_study(study_name=study_name, storage=storage,
                                     sampler=sampler, direction="minimize")
+        study.set_user_attr("sampling_fingerprint", sampling_fingerprint)
 
     # Deterministic seed trial: current best plain shape (W=49 L=3 SiLU no-LN at
     # budget 5559, knet; legacy 8->W count gives 48) as trial 0, mirroring the
@@ -418,30 +451,26 @@ def main() -> None:
             batch_size = int(SEED_TRIAL["batch_size"])
             activation = "silu"
             use_layernorm = False
+            # Seed arch must itself be feasible under the soft cap; fall back
+            # to the first feasible tuple otherwise so the seed still runs.
+            seed_width = derive_knet_width(args.param_budget, trunk_layers)
+            if (seed_width < 1
+                    or _knet_param_count(seed_width, trunk_layers, use_layernorm) > soft_limit
+                    or seed_width < args.min_width or seed_width > args.max_width):
+                trunk_layers, trunk_width, use_layernorm = plain_feasible[0]
+            else:
+                trunk_width = seed_width
         else:
-            trunk_layers = trial.suggest_int("plain_trunk_layers",
-                                             args.layers_min, args.layers_max)
+            # Joint feasible sampling: one fixed categorical over the whole
+            # (layers, width, layernorm) manifold. Replaces the old
+            # derive-at-max-width + TrialPruned(min_width/soft-cap) scheme.
+            arch_idx = bps.sample_arch_idx(trial, "plain_arch_idx", plain_feasible)
+            trunk_layers, trunk_width, use_layernorm = plain_feasible[arch_idx]
             lr = trial.suggest_float("lr", args.lr_min, args.lr_max, log=True)
             weight_decay = trial.suggest_float("weight_decay", args.wd_min, args.wd_max, log=True)
             batch_size = trial.suggest_categorical("batch_size", args.batch_choices)
             activation = trial.suggest_categorical("plain_activation", args.activation_choices)
-            use_layernorm = trial.suggest_categorical(
-                "plain_layernorm", [s == "True" for s in args.layernorm_choices])
-
-        trunk_width = derive_knet_width(args.param_budget, trunk_layers)
-        if trunk_width == -1:
-            raise optuna.TrialPruned(
-                f"budget={args.param_budget} too small for L={trunk_layers} "
-                f"(no W>=1 fits)")
-        if trunk_width < args.min_width:
-            raise optuna.TrialPruned(
-                f"budget={args.param_budget} derives width {trunk_width} < min {args.min_width} "
-                f"for L={trunk_layers}")
-        trunk_width = min(trunk_width, args.max_width)
-        if _knet_param_count(trunk_width, trunk_layers) > soft_limit:
-            raise optuna.TrialPruned(
-                f"closed-form params {_knet_param_count(trunk_width, trunk_layers)} "
-                f"> soft cap {soft_limit}")
+        trial.set_user_attr("actual_params", _knet_param_count(trunk_width, trunk_layers, use_layernorm))
 
         trial_dir = run_dir / f"trial_{trial.number:04d}"
         trial_dir.mkdir(parents=True, exist_ok=True)
@@ -462,16 +491,25 @@ def main() -> None:
             raise optuna.TrialPruned("dry run")
 
         if args.skip_preflight:
-            expected_params = _knet_param_count(trunk_width, trunk_layers)
+            expected_params = _knet_param_count(trunk_width, trunk_layers, use_layernorm)
         else:
             expected_params = preflight_param_count(cmd, repo_dir)
             if expected_params is None:
-                raise optuna.TrialPruned("parameter preflight failed")
+                # Preflight failure becomes a finite penalty (mismatch-only
+                # guard), never a prune: pruned trials crash multi-obj TPE
+                # (optuna#5260).
+                trial.set_user_attr("penalized", True)
+                trial.set_user_attr("penalty_reason", "parameter preflight failed")
+                return _over_budget_objective(soft_limit + 1, soft_limit,
+                                              args.invalid_param_objective)
         trial.set_user_attr("param_count", expected_params)
         trial.set_user_attr("knet_param_count", expected_params)
         trial.set_user_attr("legacy_param_count",
                             _legacy_param_count(trunk_width, trunk_layers))
         if expected_params > soft_limit:
+            trial.set_user_attr("penalized", True)
+            trial.set_user_attr("penalty_reason",
+                                f"preflight params={expected_params} > soft cap {soft_limit}")
             return _over_budget_objective(expected_params, soft_limit,
                                           args.invalid_param_objective)
 
@@ -495,14 +533,21 @@ def main() -> None:
             trial.set_user_attr("subprocess_failed", True)
             trial.set_user_attr("subprocess_returncode", proc.returncode)
             trial.set_user_attr("subprocess_seconds", elapsed)
-            return float("inf")
+            trial.set_user_attr("penalized", True)
+            trial.set_user_attr("penalty_reason",
+                                f"training subprocess failed ({proc.returncode})")
+            return _over_budget_objective(soft_limit + 1, soft_limit,
+                                          args.invalid_param_objective)
 
         text = log_path.read_text(encoding="utf-8", errors="ignore")
         m = re.search(r"Test failure rate:\s*([\d\.]+)%", text)
         if not m:
             trial.set_user_attr("subprocess_failed", True)
             trial.set_user_attr("missing_test_rate", True)
-            return float("inf")
+            trial.set_user_attr("penalized", True)
+            trial.set_user_attr("penalty_reason", "missing Test failure rate in log")
+            return _over_budget_objective(soft_limit + 1, soft_limit,
+                                          args.invalid_param_objective)
         test_rate = float(m.group(1)) / 100.0
 
         # Subprocess-logged param count (source of truth for the penalty)
@@ -517,6 +562,7 @@ def main() -> None:
         trial.set_user_attr("test_failure_rate", test_rate)
         trial.set_user_attr("validation_failure_rate", val_rate)
         trial.set_user_attr("param_count", param_count)
+        trial.set_user_attr("actual_params", param_count)
         trial.set_user_attr("plain_trunk_width", trunk_width)
         trial.set_user_attr("plain_trunk_layers", trunk_layers)
         trial.set_user_attr("plain_activation", activation)
@@ -524,13 +570,16 @@ def main() -> None:
         trial.set_user_attr("subprocess_seconds", elapsed)
         trial.set_user_attr("gpu", gpu_idx)
         if param_count > soft_limit:
+            trial.set_user_attr("penalized", True)
+            trial.set_user_attr("penalty_reason",
+                                f"post-run params={param_count} > soft cap {soft_limit}")
             penalized = _over_budget_objective(param_count, soft_limit,
                                                args.invalid_param_objective)
         else:
             penalized = _penalized_objective(test_rate, param_count,
                                              args.param_budget, args.param_penalty)
         trial.set_user_attr("raw_test_rate", test_rate)
-        trial.set_user_attr("penalized", penalized)
+        trial.set_user_attr("penalized_value", penalized)
         print(f"[plain-bo] trial {trial.number:04d} W={trunk_width} L={trunk_layers} "
               f"act={activation} LN={int(use_layernorm)} bs={batch_size} "
               f"lr={lr:.2e} wd={weight_decay:.2e} params={param_count} gpu={gpu_idx} "
@@ -598,7 +647,8 @@ def main() -> None:
                     "plain_activation", "plain_layernorm", "lr", "weight_decay",
                     "batch_size", "param_count", "knet_param_count", "legacy_param_count",
                     "test_failure_rate", "validation_failure_rate", "raw_test_rate",
-                    "penalized", "objective_value", "gpu", "subprocess_seconds"])
+                    "penalized", "penalized_value", "penalty_reason", "actual_params",
+                    "objective_value", "gpu", "subprocess_seconds"])
         for t in study.trials:
             ua = t.user_attrs
             w.writerow([
@@ -616,7 +666,10 @@ def main() -> None:
                 ua.get("test_failure_rate", ""),
                 ua.get("validation_failure_rate", ""),
                 ua.get("raw_test_rate", ""),
-                ua.get("penalized", ""),
+                ua.get("penalized", False),
+                ua.get("penalized_value", ""),
+                ua.get("penalty_reason", ""),
+                ua.get("actual_params", ""),
                 t.value if t.value is not None else "",
                 ua.get("gpu", -1),
                 ua.get("subprocess_seconds", ""),
@@ -641,6 +694,11 @@ def main() -> None:
         "n_trials_requested": args.n_trials,
         "n_trials_completed": len(completed),
         "n_trials_pruned": len(pruned),
+        "n_penalized": sum(1 for t in study.trials
+                           if t.user_attrs.get("penalized") is True),
+        "penalty_value": list(bps.PENALTY_VALUES[:1]),
+        "feasible_arches": len(plain_feasible),
+        "soft_limit": soft_limit,
         "selected_trial": best.number,
         "selected_params": dict(best.params),
         "selected_arch": {

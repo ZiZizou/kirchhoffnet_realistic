@@ -44,6 +44,8 @@ def parse_args() -> argparse.Namespace:
                         help="One shared cache path; pass the identical absolute path to both KNet and MLP BO runs.")
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--prepare-device", default="cpu",
+                        help="Device for one-time teacher-label cache creation (default CPU, leaving the allocated GPU free for trials).")
     parser.add_argument("--seed", type=int, default=100)
     parser.add_argument("--epochs", type=int, default=110)
     parser.add_argument("--n-trials", type=int, default=30)
@@ -136,6 +138,8 @@ def main() -> None:
     args.fixed_dataset_path = fixed_path
     # Serialize cache creation before trials; this guarantees every trial sees byte-identical labels.
     prepare = base_command(args, args.output / "_dataset_prepare") + ["--prepare-fixed-dataset"]
+    prepare_device_index = prepare.index("--device") + 1
+    prepare[prepare_device_index] = args.prepare_device
     prepare_result = subprocess.run(prepare, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     (args.output / "dataset_prepare.log.txt").write_text(prepare_result.stdout, encoding="utf-8")
     if prepare_result.returncode != 0 or not fixed_path.exists():

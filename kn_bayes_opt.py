@@ -23,7 +23,8 @@ Search dimensions (15 dims per trial):
 Validity:
     num_hidden >= in_dim * fanout_count (enough distinct fanout targets)
     small_world_k even, 2 <= k < num_hidden, capped at 14
-    TrialPruned on any invalid combo
+    All budget-relevant dims are sampled as one joint feasible tuple
+    (bo_param_sampling); invalid combos cannot be suggested anymore
 
 Seed trial (trial 0):
     For datasets listed in ``START_POINTS`` (friedman1, friedman2, smooth2d)
@@ -89,6 +90,36 @@ import logging
 _logger = logging.getLogger("kn_bayes_opt")
 from optuna.samplers import TPESampler
 from optuna.pruners import NopPruner, SuccessiveHalvingPruner
+
+import bo_param_sampling as bps
+
+
+def _preset_use_robust(problem: str) -> bool:
+    """use_robust_input flag of the problem's base preset (generic KNet path)."""
+    from config import PRESETS
+    return bool(PRESETS.get(problem, {}).get("use_robust_input", False))
+
+
+def _kn_arch_tuple(trial_like, feasible_generic: list,
+                   feasible_ctle: list) -> tuple | None:
+    """Resolve the joint arch tuple for a (frozen or running) trial.
+
+    New studies carry a single ``kn_arch_idx`` categorical; resolved tuples
+    are also mirrored to ``user_attrs`` at sampling time so the CSV writer
+    works for seed/enqueued trials too. Returns None when unresolvable.
+    """
+    ua = trial_like.user_attrs
+    cached = ua.get("kn_arch_tuple")
+    if cached:
+        return tuple(json.loads(cached))
+    idx = (trial_like.params.get("kn_arch_idx")
+           if hasattr(trial_like, "params") else None)
+    if idx is None:
+        return None
+    arches = feasible_ctle if feasible_ctle else feasible_generic
+    if 0 <= int(idx) < len(arches):
+        return tuple(arches[int(idx)])
+    return None
 
 
 DATASETS: dict[str, dict[str, Any]] = {
@@ -257,7 +288,8 @@ def _penalized_objective(metric: float, actual_params: int,
                          reference_params: int, strength: float) -> float:
     """Scale the metric upward in proportion to the model size."""
     if actual_params < 0:
-        return float("inf")
+        # Unknown param count: finite sentinel instead of inf (optuna#3676).
+        return metric * (1.0 + strength)
     normalized_params = actual_params / max(1, reference_params)
     return metric * (1.0 + strength * normalized_params)
 
@@ -265,8 +297,7 @@ def _penalized_objective(metric: float, actual_params: int,
 def _over_budget_objective(actual_params: int, budget: int,
                            base: float) -> float:
     """Return a finite, graded objective for an over-budget architecture."""
-    ratio = actual_params / max(1, budget)
-    return base * ratio * ratio
+    return bps.over_budget_objective(actual_params, budget, base)
 
 
 def build_boundary_fan_out(in_dim: int, fanout_count: int, num_hidden: int) -> dict:
@@ -857,24 +888,11 @@ def main() -> None:
         if args.dataset == "ctle" and args.ctle_multifidelity
         else NopPruner()
     )
-    study_was_resumed = db_path.exists()
-    if study_was_resumed:
-        study = optuna.load_study(study_name=study_name, storage=storage,
-                                  sampler=sampler, pruner=pruner)
-        retry_params, recovered_seed_indices = _recover_unfinished_trials(
-            study, args.dataset
-        )
-        if retry_params:
-            print(f"[kn_bayes_opt] recovered {len(retry_params)} unfinished "
-                  "trial(s); they will be retried before new trials")
-        else:
-            recovered_seed_indices = set()
-    else:
-        study = optuna.create_study(study_name=study_name, storage=storage,
-                                    sampler=sampler, pruner=pruner,
-                                    direction="minimize")
-        retry_params = []
-        recovered_seed_indices = set()
+    # NOTE: study load/create is intentionally deferred until after the joint
+    # feasible-architecture list is built (see below). The sampling fingerprint
+    # depends on the feasible list length, and the resume guard must run
+    # against the loaded study BEFORE any ``suggest_*`` call. The fingerprint
+    # is computed in the same block that builds the feasible list.
 
     # Enqueue recovered parameter sets after the old RUNNING rows have been
     # finalized. Optuna will assign each retry a new trial number.
@@ -943,6 +961,84 @@ def main() -> None:
     print(f"[kn_bayes_opt] param_budget={param_budget} "
           f"param_limit={param_limit} param_reference={param_reference} "
           f"param_tolerance={args.param_tolerance}")
+
+    # Joint feasible-architecture lists (computed once per study). Every
+    # tuple's build-based param count (bo_param_sampling, cached) is at or
+    # under the soft cap by construction; preflight remains defense-in-depth.
+    soft_limit = int(param_limit) if param_limit is not None else None
+    if soft_limit is not None:
+        if args.dataset == "ctle":
+            knet_ctle_feasible = bps.knet_feasible_arches(
+                soft_limit=soft_limit,
+                in_dim=in_dim, out_dim=out_dim,
+                hidden_range=(num_hidden_min, num_hidden_max),
+                stages_range=(2, min(5, args.num_stages_max)),
+                k_choices=SMALL_WORLD_K_CHOICES,
+                rank_range=(2, 4),
+                fanout_choices=(2,),
+                dagger=True,
+                moe_experts_choices=(2, 3),
+                moe_gate_rank_choices=(1, 2, 3),
+                require_moe=True,
+            )
+            bps.require_feasible(knet_ctle_feasible, "CTLE KNet", soft_limit)
+            knet_generic_feasible = []
+        else:
+            knet_generic_feasible = bps.knet_feasible_arches(
+                soft_limit=soft_limit,
+                in_dim=in_dim, out_dim=out_dim,
+                hidden_range=(num_hidden_min, num_hidden_max),
+                stages_range=(1, args.num_stages_max),
+                k_choices=SMALL_WORLD_K_CHOICES,
+                rank_range=(args.vca_rank_min, args.vca_rank_max),
+                fanout_choices=tuple(FANOUT_COUNT_CHOICES),
+                use_robust_input=bool(_preset_use_robust(args.dataset)),
+                dagger=False,
+            )
+            bps.require_feasible(knet_generic_feasible, "KNet", soft_limit)
+            knet_ctle_feasible = []
+        print(f"[kn_bayes_opt] feasible arches: {len(knet_ctle_feasible or knet_generic_feasible)} "
+              f"under soft cap {soft_limit} (this may take a minute on first run)")
+    else:
+        knet_ctle_feasible = knet_generic_feasible = []
+
+    # Sampling fingerprint: changing (budget, tolerance, dataset, n_arches,
+    # arch_param_name) between runs of the same study.db would crash the
+    # second committed trial with "CategoricalDistribution does not support
+    # dynamic value space". Recorded on fresh creation; checked on resume.
+    feasible_now = knet_ctle_feasible if knet_ctle_feasible else knet_generic_feasible
+    sampling_fingerprint = bps.make_sampling_fingerprint({
+        "dataset": args.dataset,
+        "param_budget": param_budget,
+        "param_tolerance": args.param_tolerance,
+        "arch_param_name": "kn_arch_idx",
+        "n_arches": len(feasible_now) if feasible_now is not None else 0,
+    })
+
+    study_was_resumed = db_path.exists()
+    if study_was_resumed:
+        study = optuna.load_study(study_name=study_name, storage=storage,
+                                  sampler=sampler, pruner=pruner)
+        # Sampling fingerprint guard runs BEFORE RUNNING-trial recovery so
+        # that a mismatched resume does not mutate the DB (recovery flips
+        # RUNNING -> FAIL via storage writes; we'd rather leave the old
+        # study untouched when refusing it).
+        bps.check_sampling_fingerprint(study, sampling_fingerprint)
+        retry_params, recovered_seed_indices = _recover_unfinished_trials(
+            study, args.dataset
+        )
+        if retry_params:
+            print(f"[kn_bayes_opt] recovered {len(retry_params)} unfinished "
+                  "trial(s); they will be retried before new trials")
+        else:
+            recovered_seed_indices = set()
+    else:
+        study = optuna.create_study(study_name=study_name, storage=storage,
+                                    sampler=sampler, pruner=pruner,
+                                    direction="minimize")
+        study.set_user_attr("sampling_fingerprint", sampling_fingerprint)
+        retry_params = []
+        recovered_seed_indices = set()
     ctle_cache_dir: Path | None = None
     if args.dataset == "ctle":
         ctle_cache_dir = (args.ctle_initial_dataset_cache_dir
@@ -986,27 +1082,19 @@ def main() -> None:
                 x_max = sp["x_max"]
                 seed_boundary_map = sp["boundary_fan_out"]
             else:
-                # CTLE's known useful prior is two distinct boundary targets
-                # per input, so do not spend a DAgger trial on fanout=1.
-                fanout_count = 2
-                nh_low = max(num_hidden_min, in_dim * fanout_count)
-                num_hidden = trial.suggest_int("num_hidden", nh_low, num_hidden_max)
-                small_world_k = trial.suggest_categorical("small_world_k", SMALL_WORLD_K_CHOICES)
-                if small_world_k >= num_hidden:
-                    raise optuna.TrialPruned(f"small_world_k={small_world_k} must be < num_hidden={num_hidden}")
+                # Joint feasible sampling: one fixed categorical over the whole
+                # (hidden, stages, k, rank, fanout, moe_experts, moe_gate_rank)
+                # manifold under the soft cap. Replaces independent
+                # suggest_int(num_hidden) + fixed-choice small_world_k +
+                # TrialPruned(k >= hidden). t_span/lr/wd/batch stay independent
+                # (they never move the param count).
+                arch_idx = bps.sample_arch_idx(trial, "kn_arch_idx", knet_ctle_feasible)
+                (num_hidden, num_stages, small_world_k, vca_rank,
+                 fanout_count, moe_num_experts, moe_gate_rank) = knet_ctle_feasible[arch_idx]
+                trial.set_user_attr("kn_arch_tuple",
+                                    json.dumps(list(knet_ctle_feasible[arch_idx])))
                 small_world_p = SMALL_WORLD_P_FIXED
-                # CTLE-specific parameter names preserve compatibility when a
-                # pre-existing broad CTLE study is resumed from SQLite.
-                num_stages = trial.suggest_int("ctle_num_stages", 2, min(5, args.num_stages_max))
                 t_span = trial.suggest_float("ctle_t_span", max(3.0, args.t_span_min), min(7.0, args.t_span_max))
-                # Rank 2 is a demonstrated prior; nearby values retain a
-                # capacity ablation without wasting trials on ranks 1 and 5-8.
-                vca_rank = trial.suggest_categorical("ctle_vca_rank", [2, 3, 4])
-                # Each expert emits a complete candidate.  Keep M small so
-                # the hardware remains one shared dynamical fabric plus a
-                # compact VCA/current-mode readout, not replicated KNets.
-                moe_num_experts = trial.suggest_categorical("ctle_moe_num_experts", [2, 3])
-                moe_gate_rank = trial.suggest_categorical("ctle_moe_gate_rank", [1, 2, 3])
                 lr = trial.suggest_float("lr", args.lr_min, args.lr_max, log=True)
                 weight_decay = trial.suggest_float("weight_decay", args.wd_min, args.wd_max, log=True)
                 batch_size = trial.suggest_categorical("batch_size", BATCH_SIZE_CHOICES)
@@ -1065,10 +1153,15 @@ def main() -> None:
             preflight_params = _parse_trainable_param_count(preflight.stdout)
             if preflight.returncode != 0 or preflight_params is None:
                 trial.set_user_attr("preflight_failed", True)
-                return float("inf")
+                trial.set_user_attr("penalized", True)
+                trial.set_user_attr("penalty_reason", "CTLE parameter preflight failed")
+                return args.invalid_param_objective
             trial.set_user_attr("preflight_params", preflight_params)
             if param_limit is not None and preflight_params > param_limit:
                 trial.set_user_attr("actual_params", preflight_params)
+                trial.set_user_attr("penalized", True)
+                trial.set_user_attr("penalty_reason",
+                                    f"preflight params={preflight_params} > param_limit={param_limit:.0f}")
                 return _over_budget_objective(
                     preflight_params, int(param_limit), args.invalid_param_objective)
             # Run DAgger in resumable fidelity rungs.  The student script
@@ -1095,7 +1188,10 @@ def main() -> None:
                 if proc.returncode != 0:
                     print(f"[ctle] trial {trial.number} rung {rung_iterations} "
                           f"subprocess failed (code {proc.returncode})", flush=True)
-                    return float("inf")
+                    trial.set_user_attr("penalized", True)
+                    trial.set_user_attr("penalty_reason",
+                                        f"rung {rung_iterations} subprocess failed ({proc.returncode})")
+                    return args.invalid_param_objective
 
                 log_text = (log_path.read_text(encoding="utf-8", errors="ignore")
                             if log_path.exists() else "")
@@ -1103,7 +1199,10 @@ def main() -> None:
                 if validation_rate is None:
                     print(f"[ctle] trial {trial.number} rung {rung_iterations} "
                           "could not parse Validation failure rate", flush=True)
-                    return float("inf")
+                    trial.set_user_attr("penalized", True)
+                    trial.set_user_attr("penalty_reason",
+                                        f"rung {rung_iterations} missing Validation failure rate")
+                    return args.invalid_param_objective
                 trial.set_user_attr(
                     f"validation_failure_rate_iter_{rung_iterations}",
                     validation_rate,
@@ -1131,7 +1230,9 @@ def main() -> None:
             test_rate = _parse_dagger_test_failure(log_text)
             if test_rate is None:
                 print(f"[ctle] trial {trial.number} could not parse Test failure rate", flush=True)
-                return float("inf")
+                trial.set_user_attr("penalized", True)
+                trial.set_user_attr("penalty_reason", "missing Test failure rate in DAgger log")
+                return args.invalid_param_objective
             # Parse param count for penalty (optional)
             param_count = _parse_trainable_param_count(log_text)
             trial.set_user_attr("test_failure_rate", test_rate)
@@ -1149,39 +1250,44 @@ def main() -> None:
                     return float(args.invalid_param_objective) * (ratio ** 2)
             penalized = _penalized_objective(base_metric, param_count or 0, param_reference, args.param_penalty)
             trial.set_user_attr("raw_test_rate", base_metric)
-            trial.set_user_attr("penalized", penalized)
+            trial.set_user_attr("penalized_value", penalized)
             print(f"[ctle] trial {trial.number} Test {test_rate*100:.2f}% penalized {penalized*100:.2f}%", flush=True)
             return penalized
 
-        fanout_count = trial.suggest_categorical("fanout_count",
-                                                  FANOUT_COUNT_CHOICES)
-        min_hidden_for_fanout = in_dim * fanout_count
-        nh_low = max(num_hidden_min, min_hidden_for_fanout)
-        if nh_low > num_hidden_max:
-            raise optuna.TrialPruned(
-                f"fanout_count={fanout_count} requires "
-                f"num_hidden >= {min_hidden_for_fanout}, "
-                f"but max={num_hidden_max}"
-            )
-        num_hidden = trial.suggest_int("num_hidden", nh_low, num_hidden_max)
-        # Keep this distribution fixed across all trials. Optuna/RDBStorage
-        # rejects a parameter whose categorical choices change between trials
-        # (for example, num_hidden=8 makes k=8 invalid while num_hidden=25
-        # allows it). Invalid combinations are pruned below instead.
-        small_world_k = trial.suggest_categorical(
-            "small_world_k", SMALL_WORLD_K_CHOICES)
-        if small_world_k >= num_hidden:
-            raise optuna.TrialPruned(
-                f"small_world_k={small_world_k} must be < num_hidden={num_hidden}"
-            )
+        if is_seed_trial and args.dataset in START_POINTS:
+            # START_POINTS seed: resolve the arch from the enqueued config so
+            # its fixed boundary_fan_out map (targets sized to sp num_hidden)
+            # stays valid. Feasibility is guarded by the preflight gate.
+            sp = START_POINTS[args.dataset]
+            num_hidden = sp["num_hidden"]
+            small_world_k = sp["small_world_k"]
+            num_stages = sp["num_stages"]
+            fanout_count = sp["fanout_count"]
+            # Use vca_rank from START_POINTS when available; otherwise pick the
+            # dataset-typical default (rank 2, the demonstrated prior). Never
+            # ``suggest_int("vca_rank", ...)`` here: the seed trial is enqueued
+            # via ``study.enqueue_trial`` and any additional ``suggest_*`` would
+            # add a second ``IntDistribution`` for a name the rest of the study
+            # never touches (RDBStorage rejects missing-param trials but also
+            # the asymmetry is a landmine if the seed path ever reruns).
+            vca_rank = sp.get("vca_rank", 2)
+            trial.set_user_attr("kn_arch_tuple", json.dumps(
+                [num_hidden, num_stages, small_world_k, vca_rank, fanout_count]))
+        else:
+            # Joint feasible sampling: one fixed categorical over the whole
+            # (hidden, stages, k, rank, fanout) manifold under the soft cap.
+            # Replaces independent suggest_int(num_hidden) + fixed-choice
+            # small_world_k + TrialPruned(k >= hidden). t_span/lr/wd/batch and
+            # the physics dims stay independent (they don't move param count).
+            arch_idx = bps.sample_arch_idx(trial, "kn_arch_idx", knet_generic_feasible)
+            num_hidden, num_stages, small_world_k, vca_rank, fanout_count = \
+                knet_generic_feasible[arch_idx]
+            trial.set_user_attr("kn_arch_tuple",
+                                json.dumps(list(knet_generic_feasible[arch_idx])))
         small_world_p = SMALL_WORLD_P_FIXED
-        num_stages = trial.suggest_int(
-            "num_stages", 1, args.num_stages_max)
         t_span = trial.suggest_float(
             "t_span", args.t_span_min, args.t_span_max)
         num_steps = max(1, round(STEPS_PER_T_SPAN * t_span))
-        vca_rank = trial.suggest_int(
-            "vca_rank", args.vca_rank_min, args.vca_rank_max)
         lr = trial.suggest_float("lr", args.lr_min, args.lr_max, log=True)
         weight_decay = trial.suggest_float("weight_decay",
                                            args.wd_min, args.wd_max,
@@ -1266,7 +1372,9 @@ def main() -> None:
             trial.set_user_attr("subprocess_failed", True)
             trial.set_user_attr("preflight_failed", True)
             trial.set_user_attr("preflight_returncode", preflight.returncode)
-            return float("inf")
+            trial.set_user_attr("penalized", True)
+            trial.set_user_attr("penalty_reason", "parameter preflight failed")
+            return args.invalid_param_objective
         trial.set_user_attr("preflight_params", preflight_params)
         # Upfront gate: reject over-budget configs before training.
         # Uses --count-params-only preflight so housing and all other
@@ -1275,6 +1383,9 @@ def main() -> None:
             invalid_objective = _over_budget_objective(
                 preflight_params, int(param_limit),
                 args.invalid_param_objective)
+            trial.set_user_attr("penalized", True)
+            trial.set_user_attr("penalty_reason",
+                                f"preflight params={preflight_params} > param_limit={param_limit:.0f}")
             trial.set_user_attr("param_budget_exceeded", True)
             trial.set_user_attr("param_budget", param_budget)
             trial.set_user_attr("param_limit", param_limit)
@@ -1312,13 +1423,18 @@ def main() -> None:
             if resolved_trial_dir is not None:
                 trial.set_user_attr("resolved_trial_dir",
                                     str(resolved_trial_dir))
-            return float("inf")
+            trial.set_user_attr("penalized", True)
+            trial.set_user_attr("penalty_reason",
+                                f"training subprocess failed ({proc.returncode})")
+            return args.invalid_param_objective
 
         metrics = _parse_final_metrics(metrics_path)
         if args.objective not in metrics:
             trial.set_user_attr("subprocess_failed", True)
             trial.set_user_attr("subprocess_seconds", elapsed)
-            return float("inf")
+            trial.set_user_attr("penalized", True)
+            trial.set_user_attr("penalty_reason", "missing objective in final_metrics.txt")
+            return args.invalid_param_objective
 
         for k, v in metrics.items():
             trial.set_user_attr(k, v)
@@ -1327,6 +1443,9 @@ def main() -> None:
             invalid_objective = _over_budget_objective(
                 actual_params, int(param_limit),
                 args.invalid_param_objective)
+            trial.set_user_attr("penalized", True)
+            trial.set_user_attr("penalty_reason",
+                                f"post-run params={actual_params} > param_limit={param_limit:.0f}")
             trial.set_user_attr("param_budget_exceeded", True)
             trial.set_user_attr("param_budget", param_budget)
             trial.set_user_attr("param_limit", param_limit)
@@ -1452,20 +1571,27 @@ def main() -> None:
             "epochs_run", "elapsed_seconds", "raw_objective",
             "normalized_param_count", "param_penalty",
             "invalid_param_objective",
+            "penalized", "penalized_value", "penalty_reason",
         ])
         for t in study.trials:
+            # New studies carry arch dims inside the joint tuple via
+            # kn_arch_idx; older studies (pre-port) have them as params.
+            arch = (_kn_arch_tuple(t, knet_generic_feasible, knet_ctle_feasible)
+                    or (t.params.get("num_hidden"), t.params.get("small_world_k"),
+                        t.params.get("num_stages"), t.params.get("vca_rank"),
+                        t.params.get("fanout_count")))
             w.writerow([
                 t.number, t.state.name,
                 t.user_attrs.get("seed_trial", False),
-                t.params.get("num_hidden"),
-                t.params.get("small_world_k"),
+                arch[0],
+                arch[1],
                 SMALL_WORLD_P_FIXED,
-                t.params.get("num_stages"),
+                arch[2],
                 t.params.get("t_span"),
                 (max(1, round(STEPS_PER_T_SPAN * t.params.get("t_span")))
                  if t.params.get("t_span") is not None else None),
-                t.params.get("vca_rank"),
-                t.params.get("fanout_count"),
+                arch[3],
+                arch[4],
                 t.user_attrs.get("boundary_fan_out"),
                 t.params.get("lr"),
                 t.params.get("weight_decay"),
@@ -1492,6 +1618,9 @@ def main() -> None:
                 t.user_attrs.get("normalized_param_count"),
                 t.user_attrs.get("param_penalty"),
                 t.user_attrs.get("invalid_param_objective"),
+                t.user_attrs.get("penalized", False),
+                t.user_attrs.get("penalized_value", ""),
+                t.user_attrs.get("penalty_reason", ""),
             ])
 
     _plot_history(

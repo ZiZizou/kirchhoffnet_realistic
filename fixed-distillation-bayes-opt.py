@@ -21,6 +21,8 @@ import optuna
 from optuna.samplers import TPESampler
 from optuna.study import StudyDirection
 
+import bo_param_sampling as bps
+
 
 ROOT = Path(__file__).resolve().parent
 HARNESS = ROOT / "fixed-mlp-distillation-kirchhoffnet.py"
@@ -181,15 +183,24 @@ def base_command(args: argparse.Namespace, output: Path) -> list[str]:
 
 
 def sample_config(trial: optuna.Trial, kind: str,
-                  low: int, high: int) -> tuple[dict[str, str], str | None]:
+                  low: int, high: int,
+                  mlp_feasible: list | None = None,
+                  knet_feasible: list | None = None) -> tuple[dict[str, str], str | None]:
     """Budget-aware sampler: every suggested architecture lies in [low, high].
 
     ``low, high`` are derived from --param-budget/--param-tolerance in main().
-    For MLP the width is derived conditional on layers+layernorm via the analytic
-    param formula (_mlp_param_analytic). For KNet the hidden dimension is derived
-    conditional on stages+k+rank via _knet_param_analytic. This replaces the old
-    uniform 16-256 / 8-24 sampling that hit the 15%-tolerance window only ~1.5%
-    (MLP) / ~23% (KNet) of the time and caused 30/30-penalized failures.
+    For MLP the (layers, width, layernorm) tuple is sampled jointly from a
+    precomputed feasible list (``mlp_feasible``) via a single fixed-distribution
+    categorical. This replaces the old conditional per-(layers, layernorm)
+    width sampling that produced a "CategoricalDistribution does not support
+    dynamic value space" crash on trial 1 (RDBStorage rejects the second
+    commit's distribution as incompatible with the first trial's). For KNet
+    the (hidden, stages, k, rank) tuple is sampled jointly from the
+    precomputed feasible list (``knet_feasible``); ``x_max`` and
+    ``lr/batch_size`` remain independent (they do not move the param count).
+    ``knet_feasible`` falls back to ``_get_feasible_knet_arches(low, high)``
+    when not provided (e.g. legacy callers), but the main() path always
+    threads the precomputed list to skip the per-trial rebuild.
 
     Returns ``(cfg, penalty_reason)`` where penalty_reason is None iff the
     configuration is feasible. Callers must branch on the return value, not on
@@ -200,42 +211,16 @@ def sample_config(trial: optuna.Trial, kind: str,
         "--batch-size": str(trial.suggest_categorical("batch_size", [128, 256, 512, 1024])),
     }
     if kind == "mlp":
-        # First discover which layer counts admit ANY feasible width for either
-        # layernorm setting. This prevents sampling a dead layer (e.g. L=1 for
-        # budget 7000 has zero feasible widths and would always penalize).
-        feasible_layers = []
-        for cand_l in range(1, 6):
-            ok = False
-            for cand_ln in (False, True):
-                for cand_w in range(16, 257):
-                    if low <= _mlp_param_analytic(cand_w, cand_l, cand_ln) <= high:
-                        ok = True
-                        break
-                if ok:
-                    break
-            if ok:
-                feasible_layers.append(cand_l)
-        if not feasible_layers:
-            # No architecture at all fits this budget window -> signal penalty
-            # (main will surface the diagnostic). This should never happen for
-            # the paper budgets (e.g. 7000) but guards misconfigured windows.
+        if not mlp_feasible:
+            # Should never trigger because ``main`` builds the list and
+            # raises a fail-fast ``ValueError`` when empty. Guarded here so
+            # trial-time can never silently regress to "no feasible tuple".
             return cfg, f"no MLP architecture in param window [{low}, {high}]"
-        layers = int(trial.suggest_categorical("student_layers", feasible_layers))
-        layernorm = bool(trial.suggest_categorical("student_layernorm", [False, True]))
-        activation = trial.suggest_categorical("student_activation", ["silu", "gelu"])
-        # Now derive the feasible width set for this exact (layers, layernorm).
-        feasible_widths = [
-            w for w in range(16, 257)
-            if low <= _mlp_param_analytic(w, layers, layernorm) <= high
-        ]
-        if not feasible_widths:
-            # This (layers, layernorm) combo has no feasible width; caller will
-            # penalize this trial but TPE will learn to avoid this branch.
-            return cfg, f"no MLP width for layers={layers} layernorm={layernorm} in [{low}, {high}]"
-        # Sample width only among feasible values so every trial is counted.
-        # Use categorical over the feasible set so TPE sees a discrete choice
-        # with uniform prior (suggest_int with narrow bounds would skew).
-        width = int(trial.suggest_categorical("student_width", feasible_widths))
+        arch_idx = int(trial.suggest_categorical(
+            "mlp_arch_idx", list(range(len(mlp_feasible)))))
+        layers, width, layernorm = mlp_feasible[arch_idx]
+        activation = trial.suggest_categorical(
+            "student_activation", ["silu", "gelu"])
         cfg.update({
             "--student-width": str(width),
             "--student-layers": str(layers),
@@ -252,11 +237,11 @@ def sample_config(trial: optuna.Trial, kind: str,
         # budget-penalized) while still letting TPE explore the full feasible
         # manifold. x_max and lr/batch_size remain independent (they don't
         # affect param count).
-        feasible_arches = _get_feasible_knet_arches(low, high)
+        feasible_arches = (knet_feasible
+                           if knet_feasible is not None
+                           else _get_feasible_knet_arches(low, high))
         if not feasible_arches:
             return cfg, f"no KNet architecture in param window [{low}, {high}]"
-        # Sample uniformly among feasible arches; TPE's categorical prior is
-        # uniform over the 126 feasible arches for the paper budget 7000.
         arch_idx = int(trial.suggest_categorical("knet_arch_idx",
                                                  list(range(len(feasible_arches)))))
         hidden, num_stages, small_world_k, vca_rank = feasible_arches[arch_idx]
@@ -341,6 +326,46 @@ def main() -> None:
     storage = f"sqlite:///{(args.output / 'study.db').resolve()}"
     study_name = f"fixed_ctle_{args.student_kind}"
     expected_directions = [StudyDirection.MINIMIZE, StudyDirection.MINIMIZE]
+
+    # Compute the sampling fingerprint BEFORE opening the study so we can
+    # reject incompatible resumes (RDBStorage stores distributions per trial;
+    # changing budget/tolerance/kind/n_arches between runs causes the second
+    # committed trial to crash with "CategoricalDistribution does not support
+    # dynamic value space"). The fingerprint lives in ``study.user_attrs``.
+    low = int(args.param_budget * (1.0 - args.param_tolerance))
+    if args.student_kind == "mlp":
+        mlp_feasible_pre = [
+            (L, W, ln)
+            for L in range(1, 6)
+            for ln in (False, True)
+            for W in range(16, 257)
+            if low <= _mlp_param_analytic(W, L, ln) <= args.param_budget
+        ]
+        if not mlp_feasible_pre:
+            raise ValueError(
+                f"param window [{low}, {args.param_budget}] admits no MLP architecture "
+                f"(width 16-256, layers 1-5, layernorm True/False). "
+                "Widen --param-tolerance or adjust --param-budget."
+            )
+        feasible_count = len(mlp_feasible_pre)
+        arch_param_name = "mlp_arch_idx"
+    else:
+        if not _get_feasible_knet_arches(low, args.param_budget):
+            raise ValueError(
+                f"param window [{low}, {args.param_budget}] admits no KNet architecture "
+                f"(hidden 8-24, stages 2-5, k 2/4/6/8, rank 1-4). "
+                "Widen --param-tolerance or adjust --param-budget."
+            )
+        feasible_count = len(_get_feasible_knet_arches(low, args.param_budget))
+        arch_param_name = "knet_arch_idx"
+    sampling_fingerprint = bps.make_sampling_fingerprint({
+        "param_budget": args.param_budget,
+        "param_tolerance": args.param_tolerance,
+        "student_kind": args.student_kind,
+        "n_arches": feasible_count,
+        "arch_param_name": arch_param_name,
+    })
+
     if args.resume:
         if not (args.output / "study.db").exists():
             raise RuntimeError(
@@ -359,6 +384,7 @@ def main() -> None:
                 f"the fixed-distillation controller requires {expected_directions}. "
                 f"Pass --output to a fresh directory or delete {storage}."
             )
+        bps.check_sampling_fingerprint(study, sampling_fingerprint)
     else:
         # Without --resume we refuse to silently reuse an existing sqlite study
         # whose directions may not match. This prevents the inhomogeneous-shape
@@ -366,12 +392,20 @@ def main() -> None:
         if (args.output / "study.db").exists():
             raise RuntimeError(
                 f"study.db already exists at {storage}. Pass --resume to continue "
-                f"the existing study, or choose a fresh --output directory."
+                "the existing study, or choose a fresh --output directory."
             )
         study = optuna.create_study(study_name=study_name, storage=storage,
                                     directions=expected_directions,
                                     sampler=TPESampler(seed=args.seed, n_startup_trials=args.n_startup_trials),
                                     load_if_exists=False)
+        study.set_user_attr("sampling_fingerprint", sampling_fingerprint)
+
+    # Resume fingerprint guard: any change to (budget, tolerance, kind, n_arches)
+    # invalidates the SQLite distribution compatibility check on the second
+    # committed trial ("CategoricalDistribution does not support dynamic value
+    # space"). Refuse incompatible resumes with a clear remediation; the old
+    # trials' distributions cannot be migrated in-place. Skipped on fresh
+    # creation (fingerprint already set above).
 
     # Defense-in-depth: pre-optimize scan rejects pre-existing COMPLETE trials
     # with the wrong values shape. Even with direction-matched studies, a manually
@@ -410,35 +444,30 @@ def main() -> None:
         print(f"[fixed-bo] WARNING: {n_running} RUNNING trial(s) present; "
               "they may be retried by the next trial slot. Reap manually if stale.",
               flush=True)
-    low = int(args.param_budget * (1.0 - args.param_tolerance))
     print(f"[fixed-bo] kind={args.student_kind} trials={args.n_trials} epochs={args.epochs} "
           f"param window=[{low}, {args.param_budget}] fixed_dataset={fixed_path}", flush=True)
 
-    # Early feasibility check: fail fast if the budget window admits zero
-    # architectures for this student kind. Without this, every trial would be
-    # penalized and the study would end with "no eligible completed trials"
-    # (the 30/30 case reported for plainmlp with [5950,7000]).
+    # The sampling_fingerprint and joint feasible list are computed BEFORE
+    # study create/load (above) so the resume fingerprint guard runs before
+    # the second commit would crash RDBStorage. The actual mlp_feasible used
+    # by the objective is the same tuple built for the fingerprint; just
+    # alias it here. Same for the KNet list: precompute once, thread through
+    # the closure so the objective avoids a per-trial rebuild of
+    # ``_get_feasible_knet_arches``.
+    mlp_feasible = mlp_feasible_pre if args.student_kind == "mlp" else None
+    knet_feasible = (None if args.student_kind == "mlp"
+                     else _get_feasible_knet_arches(low, args.param_budget))
     if args.student_kind == "mlp":
-        mlp_feasible = any(
-            low <= _mlp_param_analytic(w, L, ln) <= args.param_budget
-            for L in range(1, 6) for ln in (False, True) for w in range(16, 257)
-        )
-        if not mlp_feasible:
-            raise ValueError(
-                f"param window [{low}, {args.param_budget}] admits no MLP architecture "
-                f"(width 16-256, layers 1-5, layernorm True/False). "
-                f"Widen --param-tolerance or adjust --param-budget."
-            )
+        print(f"[fixed-bo] MLP feasible tuples: {len(mlp_feasible)} "
+              f"(window=[{low}, {args.param_budget}])", flush=True)
     else:
-        if not _get_feasible_knet_arches(low, args.param_budget):
-            raise ValueError(
-                f"param window [{low}, {args.param_budget}] admits no KNet architecture "
-                f"(hidden 8-24, stages 2-5, k 2/4/6/8, rank 1-4). "
-                f"Widen --param-tolerance or adjust --param-budget."
-            )
+        print(f"[fixed-bo] KNet feasible tuples: {len(knet_feasible)} "
+              f"(window=[{low}, {args.param_budget}])", flush=True)
 
     def objective(trial: optuna.Trial) -> tuple[float, float]:
-        cfg, sample_penalty_reason = sample_config(trial, args.student_kind, low, args.param_budget)
+        cfg, sample_penalty_reason = sample_config(
+            trial, args.student_kind, low, args.param_budget,
+            mlp_feasible=mlp_feasible, knet_feasible=knet_feasible)
         if sample_penalty_reason is not None:
             trial.set_user_attr("config", cfg)
             trial.set_user_attr("penalized", True)

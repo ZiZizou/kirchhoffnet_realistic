@@ -1294,12 +1294,21 @@ output_ode_src: list[int] | None = None,
         t_span: float,
         num_steps: int,
         u_seq: torch.Tensor,
+        carry_keep: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Integrate over a sequence of per-sample inputs with state carryover.
 
         Processes ``u_seq`` as ``T`` consecutive sample windows. For each
         sample, runs ``num_steps`` Heun steps with that sample's ``u``
         value, threading the final state into the next sample.
+
+        ``carry_keep`` (E2 carry-mask ablation): optional ``(N,)`` 0/1 mask
+        applied to the carried state at every sample boundary (``x *= mask``
+        after each window). ``None`` (default) = full carryover, legacy
+        behavior. A mask of zeros on the hidden/proj slice and ones on the
+        output-accumulator slice implements "reset core, carry output".
+        The caller builds the mask (it knows the state layout); the stage
+        just applies it.
 
         This moves the per-sample Python loop into a single C++/CUDA call
         boundary, reducing interpreter overhead for evaluation and training.
@@ -1382,6 +1391,8 @@ output_ode_src: list[int] | None = None,
             x = self._call_heun_steps(x, u_t, dt, num_steps, i_edge_const,
                                       i_boundary_const, i_readout_const,
                                       gate_core_cached)
+            if carry_keep is not None:
+                x = x * carry_keep.to(dtype=x.dtype, device=x.device)
             states[t] = x
 
         return states

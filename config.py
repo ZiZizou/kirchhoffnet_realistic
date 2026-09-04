@@ -1164,6 +1164,7 @@ def make_narma_preset(
     edge_repeats: int = 1,
     t_span: float = 1.0,
     core_refresh_interval: int = 0,
+    leak_constant: float | None = None,
 ) -> dict:
     """Build the NARMA reservoir-task preset.
 
@@ -1230,7 +1231,7 @@ def make_narma_preset(
     # the whole grid (every hidden node gets a boundary edge from input 0).
     boundary_fan_out = {0: list(range(hidden_dim))}
 
-    return {
+    preset = {
         "stages": stages_cfg,
         "use_robust_input": False,
         "loss": "mse",
@@ -1263,7 +1264,20 @@ def make_narma_preset(
     },
     "tau_anneal": True,
     "core_refresh_interval": int(core_refresh_interval),
-}
+    }
+    # Optional fixed leak (E4 regime screen): when set, the stage uses a
+    # non-programmable scalar leak instead of the learnable per-node
+    # raw_leak. Consumed by topology.build_net_from_config via
+    # cfg['leak_mode']/cfg['leak_constant'] (same contract as the static
+    # grid presets). None (default) = programmable leak, unchanged.
+    if leak_constant is not None:
+        if leak_constant <= 0:
+            raise ValueError(
+                f"leak_constant must be > 0, got {leak_constant}"
+            )
+        preset["leak_mode"] = "non-programmable"
+        preset["leak_constant"] = float(leak_constant)
+    return preset
 
 
 PRESET_NARMA10 = make_narma_preset(order=10, hidden_dim=25)

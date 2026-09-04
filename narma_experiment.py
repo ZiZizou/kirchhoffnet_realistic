@@ -636,6 +636,7 @@ def train_fabric(
     use_amp: bool = True,
     standardize: bool = True,
     grad_clip: float = 1.0,
+    mapper_lr_scale: float = 1.0,
     val_every: int = 0,
     early_stop_patience: int = 0,
     progress: bool = True,
@@ -681,6 +682,11 @@ def train_fabric(
         use_amp: Mixed-precision training (no-op on CPU).
         standardize: If True, normalize y to zero-mean/unit-variance.
         grad_clip: Max gradient norm (AdamW clip).
+        mapper_lr_scale: Multiplier on the LR for the readout params
+            (``output_mapper`` + ``post_readout_transfer``). 1.0 (default)
+            keeps the legacy single-group AdamW; any other value splits a
+            second param group so the readout can train hotter/colder than
+            the fabric (E4 two-timescale screen).
         val_every: If >0, evaluate test-set NRMSE/R^2 every N epochs
             (using ``val_u_test``/``val_y_test``). Default 0 (disabled).
         early_stop_patience: If >0 (and ``val_every>0``), stop training when
@@ -759,8 +765,30 @@ def train_fabric(
             f"{tbptt_chunk} samples per stream."
         )
 
-    # Optimizer
-    optim = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=weight_decay)
+    # Optimizer. Two-timescale readout (E4 screen) splits the readout
+    # params into a second group ONLY when the scale differs from 1.0, so
+    # the default path keeps the exact legacy single-group AdamW (and old
+    # single-group checkpoints keep resuming byte-for-byte).
+    if mapper_lr_scale != 1.0:
+        _readout_tags = ("output_mapper", "post_readout")
+        _readout_params = [
+            p for n, p in net.named_parameters()
+            if any(tag in n for tag in _readout_tags)
+        ]
+        _readout_ids = {id(p) for p in _readout_params}
+        _fabric_params = [
+            p for p in net.parameters() if id(p) not in _readout_ids
+        ]
+        optim = torch.optim.AdamW(
+            [{"params": _fabric_params},
+             {"params": _readout_params, "lr": lr * mapper_lr_scale}],
+            lr=lr, weight_decay=weight_decay,
+        )
+        print(f"  two-timescale optimizer: fabric lr={lr:.1e}, "
+              f"readout lr={lr * mapper_lr_scale:.1e} "
+              f"({len(_readout_params)} readout params)")
+    else:
+        optim = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=weight_decay)
 
     # AMP
     amp_enabled = use_amp and device == "cuda"
@@ -769,6 +797,10 @@ def train_fabric(
     history: list[float] = []
     raw_leak_grad_history: list[float] = []
     hidden_rms_history: list[float] = []
+    # E1 saturation probe: per-epoch max |x| (over chunk-boundary states)
+    # and mean fraction of state entries with |x| > 0.9 * x_max.
+    sat_max_history: list[float] = []
+    sat_rail_history: list[float] = []
     val_nrmse_history: list[float] = []
     val_r2_history: list[float] = []
     val_epochs: list[int] = []
@@ -790,6 +822,8 @@ def train_fabric(
         history = list(ckpt.get("train_loss_history", []))
         raw_leak_grad_history = list(ckpt.get("raw_leak_grad_history", []))
         hidden_rms_history = list(ckpt.get("hidden_rms_history", []))
+        sat_max_history = list(ckpt.get("sat_max_history", []))
+        sat_rail_history = list(ckpt.get("sat_rail_history", []))
         val_nrmse_history = list(ckpt.get("val_nrmse_history", []))
         val_r2_history = list(ckpt.get("val_r2_history", []))
         val_epochs = list(ckpt.get("val_epochs", []))
@@ -823,6 +857,7 @@ def train_fabric(
     stage = net.core.stages[0]
     t_span = float(net.core.stage_times[0])
     num_steps = int(net.core.stage_steps[0])
+    stage_xmax = float(stage.x_max)
 
     # Initialise ``epoch`` so the post-loop return value is defined even
     # when the loop body never executes (e.g. resume from a checkpoint
@@ -843,6 +878,8 @@ def train_fabric(
         epoch_steps = 0
         epoch_raw_leak_grad = 0.0
         epoch_hidden_rms = 0.0
+        epoch_maxabs = 0.0
+        epoch_rail_sum = 0.0
 
         optim.zero_grad()
 
@@ -901,6 +938,19 @@ def train_fabric(
                     hidden_acc_sq = float(h.detach().pow(2).sum().item())
                     hidden_count = h.numel()
 
+                # E1 saturation probe (state-wide, includes output nodes):
+                # max |x| and rail fraction at the chunk boundary. Uses
+                # all_states[-1] directly (not final_state, which is only
+                # bound when hid_count > 0).
+                with torch.no_grad():
+                    _bnd = all_states[-1].detach()
+                    _m = float(_bnd.abs().max().item())
+                    if _m > epoch_maxabs:
+                        epoch_maxabs = _m
+                    epoch_rail_sum += float(
+                        (_bnd.abs() > 0.9 * stage_xmax).float().mean().item()
+                    )
+
                 # The new state for next chunk: the last sample's state.
                 state = all_states[-1]
 
@@ -948,6 +998,8 @@ def train_fabric(
         h_rms_avg = epoch_hidden_rms / max(epoch_steps, 1)
         raw_leak_grad_history.append(leak_grad_avg)
         hidden_rms_history.append(h_rms_avg)
+        sat_max_history.append(epoch_maxabs)
+        sat_rail_history.append(epoch_rail_sum / max(epoch_steps, 1))
 
         # Periodic validation: evaluate on a held-out test stream.
         # Uses _evaluate_fabric_direct (single-shot Heun over the whole
@@ -1005,6 +1057,8 @@ def train_fabric(
                     "train_loss_history": history,
                     "raw_leak_grad_history": raw_leak_grad_history,
                     "hidden_rms_history": hidden_rms_history,
+                    "sat_max_history": sat_max_history,
+                    "sat_rail_history": sat_rail_history,
                     "val_nrmse_history": val_nrmse_history,
                     "val_r2_history": val_r2_history,
                     "val_epochs": val_epochs,
@@ -1039,10 +1093,13 @@ def train_fabric(
                     f"  NRMSE={val_nrmse:.4f}  "
                     f"R^2={val_r2v:.4f}"
                 )
+            _sat_ratio = epoch_maxabs / stage_xmax if stage_xmax > 0 else float("nan")
+            _rail_pct = 100.0 * epoch_rail_sum / max(epoch_steps, 1)
             print(
                 f"  fabric epoch {epoch:3d}/{epochs}  loss={avg:.6f}  "
                 f"h_rms={h_rms_avg:.4f}  "
                 f"leak_grad={leak_grad_avg:.2e}  "
+                f"xmaxr={_sat_ratio:.2f}  rail={_rail_pct:.1f}%  "
                 f"{t_epoch:.1f}s  {eta_str}{val_str}"
             )
 
@@ -1058,6 +1115,8 @@ def train_fabric(
         "final_loss": history[-1] if history else float("nan"),
         "raw_leak_grad_history": raw_leak_grad_history,
         "hidden_rms_history": hidden_rms_history,
+        "sat_max_history": sat_max_history,
+        "sat_rail_history": sat_rail_history,
         "val_nrmse_history": val_nrmse_history,
         "val_r2_history": val_r2_history,
         "val_epochs": val_epochs,
@@ -1124,6 +1183,7 @@ def _evaluate_fabric_direct(
     device: str = "cpu",
     y_mean: torch.Tensor | None = None,
     y_std: torch.Tensor | None = None,
+    carry_keep: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Direct evaluation bypassing KirchhoffNetWithIO / KirchhoffNet wrappers.
 
@@ -1133,6 +1193,9 @@ def _evaluate_fabric_direct(
 
     If ``y_mean``/``y_std`` are provided, predictions are denormalized so
     they live on the same scale as ``y_test`` (needed for NRMSE/R²).
+
+    ``carry_keep``: optional E2 carry mask, forwarded to the sequence
+    integrator (None = full carryover).
     """
     net.eval()
     net.to(device)
@@ -1153,6 +1216,7 @@ def _evaluate_fabric_direct(
         t_span=t_span,
         num_steps=num_steps,
         u_seq=u_seq,
+        carry_keep=carry_keep,
     )
     x_read = all_states[:, :, read_slice]
     y_preds = output_mapper(x_read)
@@ -1168,10 +1232,15 @@ def collect_fabric_states(
     u: torch.Tensor,
     *,
     device: str = "cpu",
+    carry_keep: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Collect the per-sample fabric state (last layer only) for MC eval.
 
     Uses the direct-stage-call path to bypass wrapper overhead.
+
+    ``carry_keep``: optional E2 carry mask, forwarded to the sequence
+    integrator (None = full carryover). MC is then measured on the
+    masked (actually-carried) states.
 
     Returns:
         Tensor of shape ``(T, stage_width)`` — the final ODE state at
@@ -1193,6 +1262,7 @@ def collect_fabric_states(
         t_span=t_span,
         num_steps=num_steps,
         u_seq=u,
+        carry_keep=carry_keep,
     )
     return all_states[:, 0, :]  # (T, stage_width)
 
@@ -1380,6 +1450,81 @@ def run_baselines(order: int, seed: int, *, device: str = "cpu") -> dict[str, di
     }
 
 
+def _gen_narma_train_streams(
+    order: int, seed: int, n_streams: int, n: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Generate B raw (unscaled) NARMA streams: (B, n) inputs and targets."""
+    u_streams = []
+    y_streams = []
+    for b in range(n_streams):
+        u_b, y_b = narma(n, order=order, seed=seed + b * 7919)
+        u_streams.append(u_b)
+        y_streams.append(y_b)
+    return torch.stack(u_streams, dim=0), torch.stack(y_streams, dim=0)
+
+
+def _gen_narma_test(order: int, seed: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Generate the single raw (unscaled) test stream (fresh seed)."""
+    return narma(1000, order=order, seed=seed + 10000)
+
+
+def _scale_drive(
+    u: torch.Tensor, *, bipolar: bool, order: int, input_scale: float = 1.0,
+) -> torch.Tensor:
+    """Scale raw u to rail volts, then apply the E4 drive-scale factor."""
+    v = scale_input_to_rails(u, bipolar=bipolar, u_max=NARMA_INPUT_MAX[order])
+    if input_scale != 1.0:
+        v = v * float(input_scale)
+    return v
+
+
+def _build_fabric_net(
+    order: int,
+    seed: int,
+    freeze_read: bool,
+    *,
+    t_span: float | None,
+    num_steps: int | None,
+    cell_library: str,
+    core_refresh_interval: int,
+    leak_constant: float | None,
+    compile_sequence: bool,
+) -> tuple[nn.Module, float, int]:
+    """Build the NARMA fabric net (preset + topology + optional compile).
+
+    Shared by training (run_fabric_condition) and eval-only
+    (run_eval_masks) paths so both construct bit-identical architectures
+    from the same arguments. Returns ``(net, t_span, num_steps)`` with
+    CLI fallbacks resolved.
+    """
+    base = PRESET_NARMA20 if order == 20 else PRESET_NARMA10
+    if t_span is None:
+        t_span = base["stages"][0]["t_span"]
+    if num_steps is None:
+        num_steps = base["stages"][0]["num_steps"]
+    preset = make_narma_preset(
+        order=order,
+        hidden_dim=base["stages"][0]["num_hidden"],
+        t_span=t_span,
+        num_steps_per_sample=num_steps,
+        core_refresh_interval=core_refresh_interval,
+        leak_constant=leak_constant,
+    )
+    cell_lib = make_cell_library(cell_library)
+    torch.manual_seed(seed)
+    net = build_net_from_config(
+        cfg=preset,
+        cell_lib=cell_lib,
+        boundary_fan_out=preset["boundary_fan_out"],
+        enable_temporal_readout=True,
+        freeze_read=freeze_read,
+    )
+    if compile_sequence:
+        for stage in net.core.stages:
+            stage.enable_sequence_compile()
+    return net, t_span, num_steps
+
+
 def run_fabric_condition(
     order: int,
     seed: int,
@@ -1406,6 +1551,9 @@ def run_fabric_condition(
     checkpoint_path: Path | None = None,
     checkpoint_every: int = 0,
     init_from: Path | None = None,
+    mapper_lr_scale: float = 1.0,
+    input_scale: float = 1.0,
+    leak_constant: float | None = None,
 ) -> dict[str, Any]:
     """Train one fabric condition and return its results.
 
@@ -1439,6 +1587,15 @@ def run_fabric_condition(
             ``tanh_free``, ``tanh_realistic``, ``tanh_realistic_upgrade``,
             ``tanh_anti``, ``relu``). Defaults to ``tanh`` for backward
             compatibility.
+        mapper_lr_scale: LR multiplier for the readout params (E4
+            two-timescale screen; 1.0 = legacy single LR).
+        input_scale: Multiplicative factor applied to the rail-scaled
+            input drive (E4 drive screen; 1.0 = full-rail bipolar
+            ``[-x_max, +x_max]``, 0.5 = half swing).
+        leak_constant: Fixed scalar leak (E4 timescale screen). None
+            (default) = learnable per-node leak; otherwise the stage uses
+            non-programmable fixed leak (raw_leak params disappear, so
+            param counts shift slightly).
 
     Returns dict with:
         - "nrmse": test NRMSE on the washed test set
@@ -1457,40 +1614,17 @@ def run_fabric_condition(
         - "t_span": t_span actually used (after fallback)
         - "num_steps": num_steps actually used (after fallback)
     """
-    # Build the preset inline so CLI overrides (t_span, num_steps) take
-    # effect regardless of module-level PRESET_NARMA10/20 imports. This
-    # avoids the "patch _cfg.PRESETS doesn't reach run_fabric_condition"
-    # trap of binding a separate dict reference at import time.
-    base = PRESET_NARMA20 if order == 20 else PRESET_NARMA10
-    if t_span is None:
-        t_span = base["stages"][0]["t_span"]
-    if num_steps is None:
-        num_steps = base["stages"][0]["num_steps"]
-    preset = make_narma_preset(
-        order=order,
-        hidden_dim=base["stages"][0]["num_hidden"],
-        t_span=t_span,
-        num_steps_per_sample=num_steps,
+    # Build the net via the shared helper so CLI overrides (t_span,
+    # num_steps) take effect regardless of module-level
+    # PRESET_NARMA10/20 imports. This avoids the "patch _cfg.PRESETS
+    # doesn't reach run_fabric_condition" trap of binding a separate dict
+    # reference at import time.
+    net, t_span, num_steps = _build_fabric_net(
+        order, seed, freeze_read,
+        t_span=t_span, num_steps=num_steps, cell_library=cell_library,
         core_refresh_interval=core_refresh_interval,
+        leak_constant=leak_constant, compile_sequence=compile_sequence,
     )
-
-    cell_lib = make_cell_library(cell_library)
-    torch.manual_seed(seed)
-    net = build_net_from_config(
-        cfg=preset,
-        cell_lib=cell_lib,
-        boundary_fan_out=preset["boundary_fan_out"],
-        enable_temporal_readout=True,
-        freeze_read=freeze_read,
-    )
-
-    # Optionally wrap the per-sample Heun loop with torch.compile for
-    # ~2-3x speedup on GPU (fused CUDA kernels via Inductor). The first
-    # call adds ~10-30s compilation overhead, then subsequent calls run
-    # at compiled speed.
-    if compile_sequence:
-        for stage in net.core.stages:
-            stage.enable_sequence_compile()
 
     # ---- (Optional) Ridge-on-frozen-states diagnostic BEFORE training ----
     ridge_result: dict[str, float] = {}
@@ -1500,8 +1634,8 @@ def run_fabric_condition(
         u_diag, y_diag = narma(
             n_streams * train_samples_per_stream, order=order, seed=seed,
         )
-        u_diag = scale_input_to_rails(
-            u_diag, bipolar=bipolar, u_max=NARMA_INPUT_MAX[order],
+        u_diag = _scale_drive(
+            u_diag, bipolar=bipolar, order=order, input_scale=input_scale,
         )
         print("  [ridge diagnostic] running untrained fabric on train stream...")
         ridge_result = ridge_readout_diagnostic(
@@ -1513,24 +1647,21 @@ def run_fabric_condition(
         )
 
     # ---- Generate training data: B independent NARMA streams ----
-    u_streams = []
-    y_streams = []
-    for b in range(n_streams):
-        u_b, y_b = narma(
-            train_samples_per_stream, order=order, seed=seed + b * 7919,
-        )
-        u_streams.append(u_b)
-        y_streams.append(y_b)
-    u_train = torch.stack(u_streams, dim=0)        # (B, n_samples)
-    y_train = torch.stack(y_streams, dim=0)        # (B, n_samples)
+    u_train, y_train = _gen_narma_train_streams(
+        order, seed, n_streams, train_samples_per_stream,
+    )
 
     # Test data (single stream, fresh seed)
-    u_test, y_test = narma(1000, order=order, seed=seed + 10000)
+    u_test, y_test = _gen_narma_test(order, seed)
 
-    # Scale input to fabric rails (bipolar recommended).
-    input_u_max = NARMA_INPUT_MAX[order]
-    u_train = scale_input_to_rails(u_train, bipolar=bipolar, u_max=input_u_max)
-    u_test = scale_input_to_rails(u_test, bipolar=bipolar, u_max=input_u_max)
+    # Scale input to fabric rails (bipolar recommended), then apply the
+    # E4 drive-scale factor.
+    u_train = _scale_drive(
+        u_train, bipolar=bipolar, order=order, input_scale=input_scale,
+    )
+    u_test = _scale_drive(
+        u_test, bipolar=bipolar, order=order, input_scale=input_scale,
+    )
 
     res = train_fabric(
         net, u_train, y_train,
@@ -1540,6 +1671,7 @@ def run_fabric_condition(
         use_amp=use_amp,
         standardize=True,
         grad_clip=1.0,
+        mapper_lr_scale=mapper_lr_scale,
         val_every=val_every,
         early_stop_patience=early_stop_patience,
         progress=progress,
@@ -1591,6 +1723,8 @@ def run_fabric_condition(
         "train_loss_history": res["train_loss_history"],
         "raw_leak_grad_history": res.get("raw_leak_grad_history", []),
         "hidden_rms_history": res.get("hidden_rms_history", []),
+        "sat_max_history": res.get("sat_max_history", []),
+        "sat_rail_history": res.get("sat_rail_history", []),
         "val_nrmse_history": res.get("val_nrmse_history", []),
         "val_r2_history": res.get("val_r2_history", []),
         "val_epochs": res.get("val_epochs", []),
@@ -1599,6 +1733,9 @@ def run_fabric_condition(
         "t_span": t_span,
         "num_steps": num_steps,
         "cell_library": cell_library,
+        "mapper_lr_scale": mapper_lr_scale,
+        "input_scale": input_scale,
+        "leak_constant": leak_constant,
         "core_refresh_interval": int(getattr(net.core.stages[0], "core_refresh_interval", 0)),
         "cell_lib_evals_per_sample": cell_lib_evals_per_sample,
         "early_stopped": res.get("early_stopped", False),
@@ -1608,6 +1745,160 @@ def run_fabric_condition(
         out["ridge_nrmse"] = ridge_result["ridge_nrmse"]
         out["ridge_r2"] = ridge_result["ridge_r2"]
     return out
+
+
+CARRY_MASKS = ("full", "reset-hidden", "reset-all")
+
+
+def _carry_keep_vector(net: nn.Module, mask: str, device: str) -> torch.Tensor | None:
+    """Build the E2 carry-keep vector for ``mask`` (None = full carryover).
+
+    State layout is ``[hidden | proj | output_ode]`` (width
+    ``hid+proj+out``). ``reset-hidden`` zeroes hidden+proj and keeps the
+    output accumulator; ``reset-all`` zeroes everything.
+    """
+    if mask == "full":
+        return None
+    width = net.hid_count + net.proj_count + net.output_ode_count
+    keep = torch.ones(width, device=device)
+    if mask == "reset-hidden":
+        keep[: net.hid_count + net.proj_count] = 0.0
+    elif mask == "reset-all":
+        keep.zero_()
+    else:
+        raise ValueError(
+            f"unknown carry mask {mask!r}; expected one of {CARRY_MASKS}"
+        )
+    return keep
+
+
+def run_eval_masks(
+    ckpt_path: Path,
+    masks: list[str],
+    *,
+    order: int = 10,
+    seed: int = 0,
+    n_streams: int = 4,
+    train_samples_per_stream: int = 2500,
+    device: str = "cuda",
+    bipolar: bool = True,
+    input_scale: float = 1.0,
+    t_span: float | None = None,
+    num_steps: int | None = None,
+    cell_library: str = "tanh_free",
+    core_refresh_interval: int = 2,
+    freeze_read: bool = False,
+    leak_constant: float | None = None,
+    out_dir: Path | None = None,
+) -> list[dict[str, Any]]:
+    """E2 carry-mask ablation on a TRAINED checkpoint (no retraining).
+
+    Rebuilds the fabric net from the same feature arguments used in
+    training, loads ``model_state`` from ``ckpt_path`` (strict: architecture
+    mismatches raise immediately), then scores NRMSE/R² (test stream) and
+    memory capacity (first train stream) under each carry mask. Also
+    reports post-hoc E1 saturation stats (max|x|/x_max, rail fraction)
+    from the full-carry train states.
+
+    Architecture-affecting arguments (order, cell_library, t_span,
+    num_steps, core_refresh_interval, freeze_read, leak_constant) MUST
+    match the training run — ``leak_constant`` changes the parameter set
+    itself (raw_leak present or not), so a mismatch fails the strict load
+    by design rather than silently scoring the wrong net. ``input_scale``
+    must match too (it changes the drive, not the weights).
+
+    Returns the per-mask row dicts and writes ``carry_ablation.csv`` /
+    ``carry_ablation.txt`` into ``out_dir`` (created if given).
+    """
+    for m in masks:
+        if m not in CARRY_MASKS:
+            raise ValueError(f"unknown carry mask {m!r}; expected one of {CARRY_MASKS}")
+    ckpt = torch.load(Path(ckpt_path), map_location=device, weights_only=False)
+
+    net, t_span_used, num_steps_used = _build_fabric_net(
+        order, seed, freeze_read,
+        t_span=t_span, num_steps=num_steps, cell_library=cell_library,
+        core_refresh_interval=core_refresh_interval,
+        leak_constant=leak_constant, compile_sequence=False,
+    )
+    net.load_state_dict(ckpt["model_state"], strict=True)
+    net.to(device)
+    net.eval()
+    print(f"  loaded {ckpt_path} "
+          f"(ckpt epoch {ckpt.get('epoch', '?')}, "
+          f"n_params={sum(p.numel() for p in net.parameters() if p.requires_grad)})")
+
+    y_mean = ckpt["y_mean"]
+    y_std = ckpt["y_std"]
+    if not torch.is_tensor(y_mean):
+        y_mean = torch.as_tensor(y_mean)
+        y_std = torch.as_tensor(y_std)
+
+    u_train_raw, _ = _gen_narma_train_streams(
+        order, seed, n_streams, train_samples_per_stream,
+    )
+    u_test_raw, y_test = _gen_narma_test(order, seed)
+    u_train = _scale_drive(
+        u_train_raw, bipolar=bipolar, order=order, input_scale=input_scale,
+    )
+    u_test = _scale_drive(
+        u_test_raw, bipolar=bipolar, order=order, input_scale=input_scale,
+    )
+    xmax = float(net.core.stages[0].x_max)
+
+    rows: list[dict[str, Any]] = []
+    for mask in masks:
+        keep = _carry_keep_vector(net, mask, device)
+        y_pred, y_te = _evaluate_fabric_direct(
+            net, u_test, y_test, washout=200, device=device,
+            y_mean=y_mean, y_std=y_std, carry_keep=keep,
+        )
+        nr = nrmse(y_pred, y_te)
+        r2v = r2(y_pred, y_te)
+        states = collect_fabric_states(
+            net, u_train[0], device=device, carry_keep=keep,
+        )
+        mc_per_delay, mc_total = memory_capacity(
+            states, u_train[0].to(device), max_delay=20, ridge_l2=1e-2,
+        )
+        row = {"mask": mask, "nrmse": nr, "r2": r2v, "mc_total": mc_total}
+        rows.append(row)
+        print(f"  MASK {mask:>12}: NRMSE={nr:.4f}  R^2={r2v:.4f}  MC={mc_total:.2f}")
+
+    # E1 post-hoc saturation stats from the full-carry train states.
+    full_states = collect_fabric_states(net, u_train[0], device=device)
+    with torch.no_grad():
+        _a = full_states.detach().abs()
+        sat_max = float(_a.max().item())
+        sat_rail = float((_a > 0.9 * xmax).float().mean().item())
+    print(f"  SAT (full-carry train states): max|x|/x_max={sat_max / xmax:.2f}  "
+          f"rail_frac={100.0 * sat_rail:.1f}%  (x_max={xmax})")
+
+    if out_dir is not None:
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        lines = ["mask,nrmse,r2,mc_total"]
+        for row in rows:
+            lines.append(
+                f"{row['mask']},{row['nrmse']:.6f},{row['r2']:.6f},{row['mc_total']:.4f}"
+            )
+        (out_dir / "carry_ablation.csv").write_text("\n".join(lines) + "\n")
+        txt = [
+            f"carry ablation -- {ckpt_path} (order={order}, seed={seed})",
+            "=" * 60,
+        ]
+        for row in rows:
+            txt.append(
+                f"{row['mask']:>12}  NRMSE={row['nrmse']:.4f}  "
+                f"R^2={row['r2']:.4f}  MC={row['mc_total']:.2f}"
+            )
+        txt.append(
+            f"sat: max|x|/x_max={sat_max / xmax:.2f}  "
+            f"rail_frac={100.0 * sat_rail:.1f}%"
+        )
+        (out_dir / "carry_ablation.txt").write_text("\n".join(txt) + "\n")
+        print(f"  wrote {out_dir / 'carry_ablation.csv'}")
+    return rows
 
 
 def _decide_refresh_ladder(by_cond, band):
@@ -1762,6 +2053,29 @@ def parse_args() -> argparse.Namespace:
                         help="Cell library for fabric conditions (default 'tanh'). "
                              "'tanh_free' uses FreeTanhLibrary; 'tanh_realistic' uses "
                              "RealisticTanhLibrary; etc. See config.CELL_LIBRARIES.")
+    parser.add_argument("--mapper-lr-scale", type=float, default=1.0,
+                        help="LR multiplier for the readout params (E4 "
+                             "two-timescale screen; default 1.0 = legacy "
+                             "single LR for fabric + readout).")
+    parser.add_argument("--input-scale", type=float, default=1.0,
+                        help="Multiplicative factor on the rail-scaled input "
+                             "drive (E4 drive screen; default 1.0 = full-rail "
+                             "bipolar [-x_max, +x_max], 0.5 = half swing). "
+                             "Must be > 0.")
+    parser.add_argument("--leak-constant", type=float, default=None,
+                        help="Fixed scalar leak (E4 timescale screen). Default "
+                             "None = learnable per-node leak. When set, the "
+                             "stage uses non-programmable fixed leak (raw_leak "
+                             "params disappear, param counts shift slightly).")
+    parser.add_argument("--eval-masks", type=str, default=None,
+                        help="E2 carry-mask ablation (eval-only, no training): "
+                             "comma-separated subset of {full,reset-hidden,"
+                             "reset-all}. Requires --init-from <checkpoint.pt>; "
+                             "architecture flags (--order/--cell-library/"
+                             "--t-span/--num-steps/--core-refresh-interval/"
+                             "--leak-constant/--input-scale) must match the "
+                             "training run. Writes carry_ablation.csv/txt "
+                             "into --output and exits.")
     return parser.parse_args()
 
 
@@ -1868,6 +2182,43 @@ def main() -> int:
     # bindings are imported at module load and would silently ignore the
     # patch. The inline build guarantees the override actually takes effect.
 
+    # E2 eval-only mode: score carry masks on a trained checkpoint and exit
+    # (no baselines, no ladder, no training).
+    if args.eval_masks is not None:
+        if args.init_from is None:
+            print("ERROR: --eval-masks requires --init-from <checkpoint.pt>")
+            return 2
+        masks = [m.strip() for m in args.eval_masks.split(",") if m.strip()]
+        if not masks:
+            print("ERROR: --eval-masks parsed to an empty mask list")
+            return 2
+        if len(seeds) != 1:
+            print(f"  WARNING: --eval-masks uses seeds[0]={seeds[0]} "
+                  f"(ignoring the rest of --seeds)")
+        if args.input_scale <= 0:
+            print("ERROR: --input-scale must be > 0")
+            return 2
+        print(f"[narma] E2 carry ablation on {args.init_from}, masks={masks}")
+        run_eval_masks(
+            args.init_from, masks,
+            order=args.order, seed=seeds[0],
+            n_streams=args.n_streams,
+            train_samples_per_stream=args.train_samples,
+            device=args.device, bipolar=not args.unipolar,
+            input_scale=args.input_scale,
+            t_span=args.t_span, num_steps=args.num_steps,
+            cell_library=args.cell_library,
+            core_refresh_interval=args.core_refresh_interval,
+            leak_constant=args.leak_constant,
+            out_dir=out_dir,
+        )
+        print(f"\n[narma] ablation written to {out_dir}")
+        return 0
+
+    if args.input_scale <= 0:
+        print("ERROR: --input-scale must be > 0")
+        return 2
+
     all_results: list[dict[str, Any]] = []
 
     if not args.fabric_only:
@@ -1953,6 +2304,9 @@ def main() -> int:
                 init_from=init_from,
                 cell_library=args.cell_library,
                 core_refresh_interval=refresh_k,
+                mapper_lr_scale=args.mapper_lr_scale,
+                input_scale=args.input_scale,
+                leak_constant=args.leak_constant,
             )
             result_row = {
                 "seed": seed,
@@ -1976,6 +2330,16 @@ def main() -> int:
             extra = ""
             if "ridge_nrmse" in res:
                 extra = f"  ridge_NRMSE={res['ridge_nrmse']:.4f}"
+            # E4 leg bookkeeping in the log line (CSV schema unchanged).
+            _e4 = []
+            if args.mapper_lr_scale != 1.0:
+                _e4.append(f"maplr x{args.mapper_lr_scale:g}")
+            if args.input_scale != 1.0:
+                _e4.append(f"drive x{args.input_scale:g}")
+            if args.leak_constant is not None:
+                _e4.append(f"leak={args.leak_constant:g}")
+            if _e4:
+                extra += "  [" + " ".join(_e4) + "]"
             epochs_done = res.get("epochs_completed", args.epochs)
             stopped_tag = " (early-stopped)" if res.get("early_stopped") else ""
             print(

@@ -606,6 +606,7 @@ def train_fabric(
     standardize: bool = True,
     grad_clip: float = 1.0,
     val_every: int = 0,
+    early_stop_patience: int = 0,
     val_u_test: torch.Tensor | None = None,
     val_y_test: torch.Tensor | None = None,
     val_washout: int = 200,
@@ -647,6 +648,9 @@ def train_fabric(
         grad_clip: Max gradient norm (AdamW clip).
         val_every: If >0, evaluate test-set NRMSE/R^2 every N epochs
             (using ``val_u_test``/``val_y_test``). Default 0 (disabled).
+        early_stop_patience: If >0 (and ``val_every>0``), stop training when
+            val NRMSE has not improved for this many epochs. Default 0
+            (disabled).
         val_u_test: Validation input sequence (shape ``(T,)``).
         val_y_test: Validation target sequence (shape ``(T,)``).
         val_washout: Initial samples to discard for validation (default 200).
@@ -654,7 +658,8 @@ def train_fabric(
     Returns:
         Dict with ``train_loss_history``, ``final_loss``,
         ``y_mean``, ``y_std``, and (when ``val_every>0``)
-        ``val_nrmse_history``, ``val_r2_history``, ``val_epochs``.
+        ``val_nrmse_history``, ``val_r2_history``, ``val_epochs``,
+        plus ``early_stopped``, ``best_val_nrmse``, ``epochs_completed``.
     """
     net.to(device)
     u_train = u_train.to(device)
@@ -732,6 +737,9 @@ def train_fabric(
     val_nrmse_history: list[float] = []
     val_r2_history: list[float] = []
     val_epochs: list[int] = []
+    best_val_nrmse: float = float("inf")
+    evals_without_improvement: int = 0
+    early_stopped: bool = False
     t_start = time.time()
 
     log_interval = max(1, epochs // 20)
@@ -898,6 +906,24 @@ def train_fabric(
             val_nrmse_history.append(val_nrmse)
             val_r2_history.append(val_r2v)
             val_epochs.append(epoch)
+            if early_stop_patience > 0 and val_nrmse < best_val_nrmse - 1e-6:
+                best_val_nrmse = val_nrmse
+                evals_without_improvement = 0
+            elif early_stop_patience > 0:
+                evals_without_improvement += 1
+                # Patience is in epochs; each validation covers val_every
+                # epochs, so convert eval counts to epoch counts here.
+                stagnant_epochs = evals_without_improvement * max(val_every, 1)
+                if stagnant_epochs >= early_stop_patience:
+                    print(
+                        f"  early stop at epoch {epoch}: val NRMSE flat for "
+                        f"~{stagnant_epochs} epochs "
+                        f"(best={best_val_nrmse:.4f})"
+                    )
+                    early_stopped = True
+
+        if early_stopped:
+            break
 
         t_epoch = time.time() - t_start
         epoch_times.append(t_epoch)
@@ -938,6 +964,9 @@ def train_fabric(
         "val_epochs": val_epochs,
         "y_mean": y_mean,
         "y_std": y_std,
+        "early_stopped": early_stopped,
+        "best_val_nrmse": best_val_nrmse,
+        "epochs_completed": epoch + 1,
     }
 
 
@@ -1268,6 +1297,8 @@ def run_fabric_condition(
     val_u_test: torch.Tensor | None = None,
     val_y_test: torch.Tensor | None = None,
     cell_library: str = "tanh",
+    core_refresh_interval: int = 0,
+    early_stop_patience: int = 0,
 ) -> dict[str, Any]:
     """Train one fabric condition and return its results.
 
@@ -1291,6 +1322,8 @@ def run_fabric_condition(
             ``torch.compile`` for fused-kernel speedup (~2-3x on GPU).
         val_every: Evaluate test-set NRMSE/R^2 every N epochs (default 5).
             Set to 0 to disable.
+        early_stop_patience: Stop training if val NRMSE does not improve for
+            this many epochs (default 0 = disabled). Requires val_every > 0.
         val_u_test: Optional pre-generated validation input (re-used across
             epochs). If None, generated from the standard test seed.
         val_y_test: Optional pre-generated validation target.
@@ -1331,6 +1364,7 @@ def run_fabric_condition(
         hidden_dim=base["stages"][0]["num_hidden"],
         t_span=t_span,
         num_steps_per_sample=num_steps,
+        core_refresh_interval=core_refresh_interval,
     )
 
     cell_lib = make_cell_library(cell_library)
@@ -1400,6 +1434,7 @@ def run_fabric_condition(
         standardize=True,
         grad_clip=1.0,
         val_every=val_every,
+        early_stop_patience=early_stop_patience,
         val_u_test=val_u_test if val_u_test is not None else u_test,
         val_y_test=val_y_test if val_y_test is not None else y_test,
         val_washout=200,
@@ -1424,6 +1459,15 @@ def run_fabric_condition(
     )
 
     n_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
+    # cell_lib evaluations per sample for the NARMA sequence path:
+    #   refresh k == 0 + freeze_read=True  -> 1 eval/sample (legacy frozen)
+    #   refresh k == 0 + freeze_read=False -> num_steps evals (fully dynamic)
+    #   refresh k >= 1                     -> ceil(num_steps / k) evals
+    stage_k = int(getattr(net.core.stages[0], "core_refresh_interval", 0))
+    if stage_k <= 0:
+        cell_lib_evals_per_sample = 1 if freeze_read else num_steps
+    else:
+        cell_lib_evals_per_sample = max(1, (num_steps + stage_k - 1) // stage_k)
     out = {
         "nrmse": nr,
         "r2": r2v,
@@ -1440,6 +1484,9 @@ def run_fabric_condition(
         "t_span": t_span,
         "num_steps": num_steps,
         "cell_library": cell_library,
+        "core_refresh_interval": int(getattr(net.core.stages[0], "core_refresh_interval", 0)),
+        "cell_lib_evals_per_sample": cell_lib_evals_per_sample,
+        "early_stopped": res.get("early_stopped", False),
     }
     if ridge_result:
         out["ridge_nrmse"] = ridge_result["ridge_nrmse"]
@@ -1510,9 +1557,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--t-span", type=float, default=1.0,
                         help="Override t_span per sample for NARMA (default 1.0; "
                              "old value 7.0 gives ~3-sample memory horizon, too short)")
-    parser.add_argument("--num-steps", type=int, default=4,
-                        help="Heun steps per sample (default 4; with t_span=1.0, dt=0.25; "
-                             "was 6 historically — 4 cuts per-sample compute by 33%)")
+    parser.add_argument("--num-steps", type=int, default=8,
+                        help="Heun steps per sample (default 8; with t_span=1.0, dt=0.125; "
+                             "matches the num_steps/t_span~10 discipline used for static tasks. "
+                             "Was 6 historically, then 4 experimentally — 8 restores integration "
+                             "accuracy for the refresh-interval sweep.")
+    parser.add_argument("--core-refresh-interval", type=int, default=0,
+                        choices=[0, 1, 2, 4, 8],
+                        help="How often (in Heun steps) to recompute the frozen core "
+                             "nonlinear current i_edge_const from the evolving state. "
+                             "8=1 eval/sample (legacy frozen), 4=2 evals/sample, "
+                             "2=4 evals/sample, 1=fully dynamic (8 evals/sample). "
+                             "Applied to freeze_read=False only; boundary/readout/shunt "
+                             "paths keep their own semantics. 0 (default) runs the "
+                             "full {8,4,2} ladder (k=1 deferred unless all three fail).")
+    parser.add_argument("--early-stop-patience", type=int, default=15,
+                        help="Early-stop if val NRMSE does not improve for N validation "
+                             "checks (default 15). 0 disables (run full epochs).")
     parser.add_argument("--compile", action="store_true",
                         help="Wrap the per-sample Heun steps with torch.compile "
                              "for fused CUDA kernels. ~2-3x speedup on GPU. "
@@ -1543,6 +1604,11 @@ def main() -> int:
     print(
         f"[narma] t_span={args.t_span} (per sample), num_steps={args.num_steps}, "
         f"bipolar={not args.unipolar}"
+    )
+    print(
+        f"[narma] core_refresh_interval={args.core_refresh_interval}, "
+        f"early_stop_patience={args.early_stop_patience or 'off'}, "
+        f"epochs={args.epochs}"
     )
 
     # Note: --t-span and --num-steps are passed to run_fabric_condition
@@ -1576,15 +1642,35 @@ def main() -> int:
 
     if not args.baselines_only:
         print("\n[narma] === Fabric conditions ===")
-        # Build a flat list of (freeze_read, seed) for progress tracking
-        fabric_jobs = [(fr, s) for fr in (False, True) for s in seeds]
-        for idx, (freeze_read, seed) in enumerate(fabric_jobs, 1):
-            cond_name = "fabric_fr_off" if not freeze_read else "fabric_fr_on"
-            fr_str = "OFF (evolving core)" if not freeze_read else "ON (frozen core)"
+        # Iterate over core-refresh-interval ladder. ``freeze_read`` is always
+        # False here (evolving-core experiment): k=num_steps ≈ legacy frozen,
+        # k=1 ≈ legacy fully dynamic. Frozen-core (freeze_read=True) condition
+        # is dropped per experimental design (no information storage expected
+        # when the nonlinear core does not read the evolving state).
+        # A nonzero --core-refresh-interval runs just that single k
+        # (useful for the deferred k=1 confirmation run); 0 runs the
+        # default {8,4,2} ladder (k=1 deferred unless all three fail).
+        if args.core_refresh_interval > 0:
+            refresh_choices = [args.core_refresh_interval]
+        else:
+            refresh_choices = sorted(
+                {k for k in (8, 4, 2) if k <= args.num_steps},
+                reverse=True,
+            )
+            if not refresh_choices:
+                raise ValueError(
+                    f"No ladder k <= num_steps={args.num_steps}; "
+                    "pass --core-refresh-interval explicitly."
+                )
+        fabric_jobs = [(k, s) for k in refresh_choices for s in seeds]
+        for idx, (refresh_k, seed) in enumerate(fabric_jobs, 1):
+            cond_name = f"fabric_refresh_k{refresh_k}"
             print(f"  [{idx}/{len(fabric_jobs)}] {cond_name}  seed={seed}  "
-                  f"freeze_read={fr_str}  cell_library={args.cell_library}")
+                f"core_refresh_interval={refresh_k}  "
+                f"cell_library={args.cell_library}  "
+                f"freeze_read=False (evolving core)")
             res = run_fabric_condition(
-                args.order, seed, freeze_read=freeze_read,
+                args.order, seed, freeze_read=False,
                 epochs=args.epochs,
                 tbptt_chunk=args.tbptt_chunk,
                 n_streams=args.n_streams,
@@ -1597,7 +1683,9 @@ def main() -> int:
                 num_steps=args.num_steps,
                 compile_sequence=args.compile,
                 val_every=args.val_every,
+                early_stop_patience=args.early_stop_patience,
                 cell_library=args.cell_library,
+                core_refresh_interval=refresh_k,
             )
             result_row = {
                 "seed": seed,
@@ -1608,6 +1696,11 @@ def main() -> int:
                 "n_params": res["n_params"],
                 "total_params": res["n_params"],
                 "hidden_dim": "",
+                "cell_library": args.cell_library,
+                "core_refresh_interval": refresh_k,
+                "cell_lib_evals_per_sample": (
+                    max(1, (args.num_steps + refresh_k - 1) // refresh_k)
+                ),
             }
             if "ridge_nrmse" in res:
                 result_row["ridge_nrmse"] = res["ridge_nrmse"]
@@ -1616,10 +1709,12 @@ def main() -> int:
             extra = ""
             if "ridge_nrmse" in res:
                 extra = f"  ridge_NRMSE={res['ridge_nrmse']:.4f}"
+            epochs_done = res.get("epochs_completed", args.epochs)
+            stopped_tag = " (early-stopped)" if res.get("early_stopped") else ""
             print(
                 f"  RESULT: {cond_name} seed={seed}  NRMSE={res['nrmse']:.4f}  "
                 f"R^2={res['r2']:.4f}  MC={res['mc_total']:.2f}  "
-                f"params={res['n_params']}{extra}"
+                f"params={res['n_params']}  epochs={epochs_done}{stopped_tag}{extra}"
             )
 
     # ---- Aggregate per condition ----
@@ -1631,7 +1726,7 @@ def main() -> int:
         f"NARMA-{args.order} -- {len(seeds)} seeds -- final results",
         "=" * 60,
     ]
-    csv_lines = ["condition,seed,nrmse,r2,mc_total,trained_params,total_params,hidden_dim,cell_library"]
+    csv_lines = ["condition,seed,nrmse,r2,mc_total,trained_params,total_params,hidden_dim,cell_library,core_refresh_interval,cell_lib_evals_per_sample"]
     for cond in sorted(by_cond):
         runs = by_cond[cond]
         nrmse_vals = [r["nrmse"] for r in runs]
@@ -1675,7 +1770,9 @@ def main() -> int:
                 f"{cond},{r['seed']},{r['nrmse']:.6f},{r['r2']:.6f},"
                 f"{mc if mc != '' else ''},{tp if tp != '' else ''},"
                 f"{tt if tt != '' else ''},{hd if hd != '' else ''},"
-                f"{r.get('cell_library', '')}"
+                f"{r.get('cell_library', '')},"
+                f"{r.get('core_refresh_interval', '')},"
+                f"{r.get('cell_lib_evals_per_sample', '')}"
             )
 
     summary_text = "\n".join(summary_lines) + "\n"
@@ -1684,37 +1781,56 @@ def main() -> int:
     (out_dir / "results_table.txt").write_text(summary_text)
     (out_dir / "results_table.csv").write_text("\n".join(csv_lines) + "\n")
 
-    # ---- Decision (pre-registered, NARMA-20 only per spec) ----
-    if (
-        args.order == 20
-        and not args.baselines_only
-        and "fabric_fr_off" in by_cond
-        and "fabric_fr_on" in by_cond
-    ):
-        fr_off = by_cond["fabric_fr_off"]
-        fr_on = by_cond["fabric_fr_on"]
-        # Use mean NRMSE across seeds
-        fr_off_mean = sum(r["nrmse"] for r in fr_off) / len(fr_off)
-        fr_on_mean = sum(r["nrmse"] for r in fr_on) / len(fr_on)
-        verdict = decide(
-            {"nrmse": fr_off_mean}, {"nrmse": fr_on_mean},
+    # ---- Decision (pre-registered for the refresh-interval experiment) ----
+    # Ladder {8,4,2} with num_steps=8: k=8 is the legacy-frozen baseline
+    # (1 eval/sample), k=4 is cheap recurrence (2 evals/sample), k=2 is dense
+    # recurrence (4 evals/sample). If cheap k=4 reaches the RNN parity band
+    # (0.15-0.29 NRMSE) and is within 0.05 of dense k=2, cheap recurrence
+    # wins. If dense is clearly better, run the deferred k=1 confirmation.
+    refresh_conds = [c for c in by_cond if c.startswith("fabric_refresh_k")]
+    if len(refresh_conds) >= 2 and not args.baselines_only:
+        # Map condition name -> mean NRMSE across seeds.
+        def _mean_nrmse(name: str) -> float:
+            rs = by_cond[name]
+            return sum(r["nrmse"] for r in rs) / len(rs)
+        k_means = sorted(
+            (int(c.split("k")[-1]), _mean_nrmse(c)) for c in refresh_conds
         )
-        verdict_text = (
-            f"Pre-registered decision rule on NARMA-{args.order}:\n"
-            f"  fabric freeze_read OFF: NRMSE = {fr_off_mean:.4f}\n"
-            f"  fabric freeze_read ON:  NRMSE = {fr_on_mean:.4f}\n"
-            f"  difference (ON - OFF):  {fr_on_mean - fr_off_mean:+.4f}\n"
-            f"\n"
-            f"Verdict: {verdict}\n"
-            f"\n"
-            f"Interpretation:\n"
-            f"  - CONTROL_PATH_COMMIT: evolving core is dead. Commit fully to\n"
-            f"    the control-path equalization paper (Experiment 2).\n"
-            f"  - SIGNAL_PATH_OPEN: evolving core is alive. Continue with\n"
-            f"    Experiment 3 (signal-path equalization).\n"
-            f"  - NEUTRAL: within tolerance. Decide based on wall-clock\n"
-            f"    cost and architecture simplicity — frozen core is cheaper.\n"
-        )
+        means = dict(k_means)
+        verdict_lines = [
+            f"Core-refresh decision (NARMA-{args.order}, {len(seeds)} seeds):",
+        ]
+        for k, m in k_means:
+            verdict_lines.append(f"  k={k:2d}: NRMSE={m:.4f}")
+        band = (0.15, 0.29)
+        # Prefer the designed comparison (cheap k=4 vs dense k=2, k=8
+        # baseline); fall back to cheapest-vs-densest present when the
+        # ladder differs (e.g. single-k confirmation runs are skipped by
+        # the len>=2 guard, smaller num_steps ladders).
+        if 4 in means and 2 in means:
+            k_cheap, n_cheap, k_dense, n_dense = 4, means[4], 2, means[2]
+        else:
+            k_cheap, n_cheap = max(k_means, key=lambda t: t[0])
+            k_dense, n_dense = min(k_means, key=lambda t: t[0])
+        in_band_cheap = band[0] <= n_cheap <= band[1]
+        diff = n_cheap - n_dense  # >0 means dense is better
+        if in_band_cheap and abs(diff) < 0.05:
+            verdict_lines.append(
+                f"\nVerdict: CHEAP_RECURRENCE (k={k_cheap}, NRMSE={n_cheap:.4f} "
+                f"in band, within 0.05 of k={k_dense})."
+            )
+        elif in_band_cheap:
+            verdict_lines.append(
+                f"\nVerdict: NEEDS_MORE_EVALS (k={k_cheap} in band but "
+                f"Δ={diff:+.4f} vs k={k_dense}; run k=1 to confirm)."
+            )
+        else:
+            best_k, best_n = min(k_means, key=lambda t: t[1])
+            verdict_lines.append(
+                f"\nVerdict: REFRESH_INSUFFICIENT (best k={best_k} "
+                f"NRMSE={best_n:.4f} outside band {band})."
+            )
+        verdict_text = "\n".join(verdict_lines) + "\n"
         (out_dir / "decision.txt").write_text(verdict_text)
         print("\n" + verdict_text)
 

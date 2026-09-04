@@ -1163,6 +1163,7 @@ def make_narma_preset(
     bidirectional: bool = False,
     edge_repeats: int = 1,
     t_span: float = 1.0,
+    core_refresh_interval: int = 0,
 ) -> dict:
     """Build the NARMA reservoir-task preset.
 
@@ -1249,19 +1250,20 @@ def make_narma_preset(
         # Narma order stored for the experiment script to read.
         "narma_order": order,
         "narma_x_max_rail": PHYS["x_max"],
-        # Mild regularizers; NARMA is a regression task so heavy gate
-        # pressure tends to over-prune. Keep the same defaults as the
-        # grid presets.
-        "lambdas": {
-            "sparsity": 1e-6,
-            "edge_gate": 0,
-            "node_gate": 0.0,
-            "power": 1e-6,
-            "capacitance": 0.0,
-            "rail": 0.1,
-        },
-        "tau_anneal": True,
-    }
+    # Mild regularizers; NARMA is a regression task so heavy gate
+    # pressure tends to over-prune. Keep the same defaults as the
+    # grid presets.
+    "lambdas": {
+        "sparsity": 1e-6,
+        "edge_gate": 0,
+        "node_gate": 0.0,
+        "power": 1e-6,
+        "capacitance": 0.0,
+        "rail": 0.1,
+    },
+    "tau_anneal": True,
+    "core_refresh_interval": int(core_refresh_interval),
+}
 
 
 PRESET_NARMA10 = make_narma_preset(order=10, hidden_dim=25)

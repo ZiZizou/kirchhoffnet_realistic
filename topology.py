@@ -1034,6 +1034,7 @@ def prune_stage(
         vca_enabled=False,
         vca_rank=VCA["rank"],
         vca_in_dim=0,
+        core_refresh_interval=int(getattr(stage, "core_refresh_interval", 0)),
     )
 
     if transfer_params:
@@ -1325,6 +1326,7 @@ def topology_to_stage(
     vca_gate_shunt: bool = False,
     vca_separate_core_bus: bool = False,
     vca_bias: bool | None = None,
+    core_refresh_interval: int = 0,
 ) -> tuple[DifferentialStage, list[int], dict[int, int]]:
     """Convert a SparseTopology into a DifferentialStage.
 
@@ -1569,6 +1571,7 @@ def topology_to_stage(
         vca_gate_shunt=vca_gate_shunt,
         vca_separate_core_bus=vca_separate_core_bus,
         vca_bias=vca_bias,
+        core_refresh_interval=core_refresh_interval,
     )
     return stage, active_nodes, id_map
 
@@ -1608,6 +1611,7 @@ def build_net_from_preset(
     vca_bias: bool | None = None,
     x_max: float | None = None,
     c_eff: float | None = None,
+    core_refresh_interval: int = 0,
 ):
     """Build a full KirchhoffNetWithIO from a config.PRESETS entry.
 
@@ -1733,6 +1737,7 @@ def build_net_from_preset(
         vca_bias=vca_bias,
         x_max=x_max,
         c_eff=c_eff,
+        core_refresh_interval=core_refresh_interval,
     )
 
 
@@ -1761,6 +1766,7 @@ def build_net_from_config(
     vca_bias: bool | None = None,
     x_max: float | None = None,
     c_eff: float | None = None,
+    core_refresh_interval: int = 0,
 ):
     """Build a KirchhoffNetWithIO from a full config dict.
 
@@ -1825,6 +1831,12 @@ def build_net_from_config(
     if drive_mode not in ("fan_out", "projection"):
         raise ValueError(
             f"drive_mode must be 'fan_out' or 'projection', got {drive_mode!r}"
+        )
+    # Resolve core_refresh_interval: explicit kwarg > cfg.
+    core_refresh_interval = int(cfg.get("core_refresh_interval", core_refresh_interval))
+    if core_refresh_interval < 0:
+        raise ValueError(
+            f"core_refresh_interval must be >= 0, got {core_refresh_interval}"
         )
     encoder_type = cfg.get("encoder_type", "linear")
     decoder_type = cfg.get("decoder_type", "linear")
@@ -2186,6 +2198,7 @@ def build_net_from_config(
             vca_bias=vca_bias_effective,
             x_max=x_max,
             c_eff=c_eff,
+            core_refresh_interval=core_refresh_interval,
         )
         stage_modules.append(stage)
         stage_times.append(float(stages_cfg[stage_idx].get("t_span", 0.5)))

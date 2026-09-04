@@ -171,6 +171,7 @@ output_ode_src: list[int] | None = None,
         vca_gate_shunt: bool = False,
         vca_separate_core_bus: bool = False,
         vca_bias: bool | None = None,
+        core_refresh_interval: int = 0,
     ) -> None:
         super().__init__()
         self.num_nodes = int(num_nodes)
@@ -179,6 +180,22 @@ output_ode_src: list[int] | None = None,
         self.freeze_read = bool(freeze_read)
         self.freeze_boundary = bool(freeze_boundary)
         self.freeze_temporal_read = bool(freeze_temporal_read)
+        # Periodic refresh of the core nonlinear current ``i_edge_const``
+        # inside the Heun inner loop (counted in Heun steps).
+        #   0  -> legacy ``freeze_read`` only (1 eval / window for NARMA,
+        #          1 eval / stage for static). Default for backward compat.
+        #   >=1 -> recompute ``i_edge_const`` from the evolving state every
+        #          k Heun steps (legacy equivalence: ``k >= num_steps`` ==
+        #          legacy ``freeze_read=True``; ``k == 1`` == legacy
+        #          ``freeze_read=False``). Layered on top of the
+        #          ``freeze_boundary`` / ``freeze_temporal_read`` /
+        #          resistive-shunt paths which keep their own dynamic /
+        #          frozen semantics.
+        if core_refresh_interval < 0:
+            raise ValueError(
+                f"core_refresh_interval must be >= 0, got {core_refresh_interval}"
+            )
+        self.core_refresh_interval = int(core_refresh_interval)
         if leak_mode not in ("programmable", "non-programmable"):
             raise ValueError(f"leak_mode must be 'programmable' or 'non-programmable', got {leak_mode!r}")
         self.leak_mode = leak_mode
@@ -817,6 +834,55 @@ output_ode_src: list[int] | None = None,
         acc_o.index_add_(1, self.output_ode_dst, i_edge.float())
         return acc_o.to(dtype=x0.dtype)
 
+    def _compute_i_edge_const(
+        self,
+        x_src_state: torch.Tensor,
+        gate_core_cached: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Compute the core nonlinear KCL contribution that ``freeze_read`` holds.
+
+        Centralizes the Heun-path precompute so ``freeze_read=True`` and the
+        periodic ``core_refresh_interval`` refresh share one code path. Recomputes
+        the cell library (or ``forward_tanh`` when a parallel resistive shunt
+        exists — so the resistive term stays dynamic in ``rhs``), folds in the
+        per-edge gate, optional budget gate, and core VCA gate, and returns
+        the ``[batch, num_nodes]`` KCL accumulator in ``x_src_state``'s dtype.
+
+        Args:
+            x_src_state: Source state tensor ``[B, num_nodes]`` to read
+                ``x[src]`` and ``x[dst]`` from. For NARMA per-sample frozen
+                precompute this is the running state at window start; for
+                periodic refresh this is the current ``x`` at the refresh
+                boundary.
+            gate_core_cached: Precomputed ``[B, E_core]`` VCA gate (when VCA
+                is enabled on the core family), or ``None``.
+
+        Returns:
+            ``[batch, num_nodes]`` tensor in ``x_src_state``'s dtype.
+        """
+        x_src0 = x_src_state[:, self.src]
+        x_dst0 = x_src_state[:, self.dst]
+        if self._has_resistive and hasattr(self.cell_lib, "forward_tanh"):
+            i_edge = self.cell_lib.forward_tanh(
+                x_src=x_src0, x_dst=x_dst0, x_max=self.x_max,
+            )
+        else:
+            i_edge = self.cell_lib(
+                x_src=x_src0, x_dst=x_dst0, x_max=self.x_max,
+            )
+        edge_mask = torch.sigmoid(self.z_logits)
+        if self.budget_enabled:
+            edge_mask = edge_mask * self._compute_budget_gate()
+        i_edge = i_edge * edge_mask.unsqueeze(0)
+        if gate_core_cached is not None:
+            i_edge = i_edge * gate_core_cached
+        i_edge_f32 = i_edge.float()
+        acc_const = torch.zeros_like(x_src_state, dtype=torch.float32)
+        acc_const.index_add_(1, self.dst, i_edge_f32)
+        if not self.read_only_source:
+            acc_const.index_add_(1, self.src, -i_edge_f32)
+        return acc_const.to(dtype=x_src_state.dtype)
+
     def rhs(self, x: torch.Tensor,
             u: torch.Tensor | None = None,
             x_drive: torch.Tensor | None = None, drive_scale: float = 0.0,
@@ -1161,37 +1227,22 @@ output_ode_src: list[int] | None = None,
         self._gate_core_cached = gate_core_cached
 
         # freeze_read: precompute edge currents (cell_lib + edge gate + budget
-        # gate + VCA core gate + KCL scatter-add) once from x0 and hold them
+        # gate + core VCA gate + KCL scatter-add) once from x0 and hold them
         # constant across all sub-steps. Leak, clip, drive, and boundary-edge
         # currents still read the current x (boundary terminals are fixed but
         # the dynamic target node voltage evolves, so the OTA current is
         # per-step). For cell libraries with a parallel resistive shunt, use
         # ``forward_tanh`` here so the resistive term stays dynamic in ``rhs``
         # (the resistive current is added per-step from evolving voltages).
+        # ``core_refresh_interval`` (k): when > 0, recompute every k Heun
+        # steps in the loop below. The precompute here still fires at step 0
+        # so the very first Heun step sees a frozen value identical to the
+        # legacy path; periodic refresh is layered on top in the loop.
+        # (The NARMA sequence path instead refreshes inside ``_heun_steps``;
+        # both loops share the same every-k-step rule.)
         i_edge_const = None
-        if self.freeze_read:
-            x_src0 = x0[:, self.src]
-            x_dst0 = x0[:, self.dst]
-            if self._has_resistive and hasattr(self.cell_lib, "forward_tanh"):
-                i_edge = self.cell_lib.forward_tanh(x_src=x_src0, x_dst=x_dst0, x_max=self.x_max)
-            else:
-                i_edge = self.cell_lib(x_src=x_src0, x_dst=x_dst0, x_max=self.x_max)
-            edge_mask = torch.sigmoid(self.z_logits)
-            if self.budget_enabled:
-                edge_mask = edge_mask * self._compute_budget_gate()
-            i_edge = i_edge * edge_mask.unsqueeze(0)
-            # Fold the core VCA gate into the frozen KCL contribution
-            # when core VCA is enabled. Per-sample, so b(u) becomes
-            # input-dependent and the matrix-exponential integrator
-            # precompute survives per-sample (just not once-per-stage).
-            if gate_core_cached is not None:
-                i_edge = i_edge * gate_core_cached
-            i_edge_f32 = i_edge.float()
-            acc_const = torch.zeros_like(x0, dtype=torch.float32)
-            acc_const.index_add_(1, self.dst, i_edge_f32)
-            if not self.read_only_source:
-                acc_const.index_add_(1, self.src, -i_edge_f32)
-            i_edge_const = acc_const.to(dtype=x0.dtype)
+        if self.freeze_read or self.core_refresh_interval > 0:
+            i_edge_const = self._compute_i_edge_const(x0, gate_core_cached)
 
         # freeze_boundary: precompute the boundary tanh KCL contribution once
         # from (u, x0). Mirrors the freeze_read pattern for this edge family.
@@ -1210,7 +1261,10 @@ output_ode_src: list[int] | None = None,
         x = x0
         traj_chunks = [x] if store_trajectory else None
 
-        for _ in range(num_steps):
+        refresh_k = int(self.core_refresh_interval)
+        for step in range(num_steps):
+            if refresh_k > 0 and step > 0 and step % refresh_k == 0:
+                i_edge_const = self._compute_i_edge_const(x, gate_core_cached)
             k1 = self.rhs(x, u=u, x_drive=x_drive, drive_scale=drive_scale,
                           i_edge_const=i_edge_const,
                           i_boundary_const=i_boundary_const,
@@ -1297,31 +1351,17 @@ output_ode_src: list[int] | None = None,
                 gate_core_cached = self._compute_core_gate(u_t)
             self._gate_core_cached = gate_core_cached
 
-            # freeze_read: precompute edge currents from the current state
-            # (each sample window freezes from its own starting state, matching
-            # the per-sample _forward_heun semantics). Fold the core VCA gate
-            # into the frozen KCL contribution (per-sample precompute, so the
-            # matrix-exponential integrator survives per-sample).
+            # freeze_read / core_refresh_interval: precompute edge currents
+            # from the current state (each sample window freezes from its own
+            # starting state, matching the per-sample _forward_heun semantics).
+            # Fold the core VCA gate into the frozen KCL contribution (per-
+            # sample precompute). When ``core_refresh_interval > 0``, the
+            # step-0 value is the seed for periodic refresh inside
+            # ``_heun_steps``; the legacy ``freeze_read=True`` path (no
+            # refresh) holds the value across the whole window byte-for-byte.
             i_edge_const = None
-            if self.freeze_read:
-                x_src0 = x[:, self.src]
-                x_dst0 = x[:, self.dst]
-                if self._has_resistive and hasattr(self.cell_lib, "forward_tanh"):
-                    i_edge = self.cell_lib.forward_tanh(x_src=x_src0, x_dst=x_dst0, x_max=self.x_max)
-                else:
-                    i_edge = self.cell_lib(x_src=x_src0, x_dst=x_dst0, x_max=self.x_max)
-                edge_mask = torch.sigmoid(self.z_logits)
-                if self.budget_enabled:
-                    edge_mask = edge_mask * self._compute_budget_gate()
-                i_edge = i_edge * edge_mask.unsqueeze(0)
-                if gate_core_cached is not None:
-                    i_edge = i_edge * gate_core_cached
-                i_edge_f32 = i_edge.float()
-                acc_const = torch.zeros_like(x, dtype=torch.float32)
-                acc_const.index_add_(1, self.dst, i_edge_f32)
-                if not self.read_only_source:
-                    acc_const.index_add_(1, self.src, -i_edge_f32)
-                i_edge_const = acc_const.to(dtype=x.dtype)
+            if self.freeze_read or self.core_refresh_interval > 0:
+                i_edge_const = self._compute_i_edge_const(x, gate_core_cached)
 
             # freeze_boundary / freeze_temporal_read: per-sample precompute so
             # the frozen boundary/readout contributions track the running
@@ -1360,7 +1400,12 @@ output_ode_src: list[int] | None = None,
         and falls back to the original Python implementation so training
         can proceed.
         """
-        if getattr(self, "_heun_steps_compiled", False):
+        # Periodic refresh path uses an uncompiled loop so the ``self``
+        # capture stays Python and the refresh interval check is cheap.
+        # When refresh is disabled (default), the compiled path is used
+        # exactly as before.
+        use_refresh = self.core_refresh_interval > 0
+        if getattr(self, "_heun_steps_compiled", False) and not use_refresh:
             try:
                 return self._heun_steps_compiled_fn(
                     x, u_t, dt, num_steps,
@@ -1373,11 +1418,6 @@ output_ode_src: list[int] | None = None,
                     f"  [torch.compile] falling back to uncompiled Heun steps."
                 )
                 self._heun_steps_compiled = False
-                return self._heun_steps(
-                    x, u_t, dt, num_steps,
-                    i_edge_const, i_boundary_const, i_readout_const,
-                    vca_gate_core,
-                )
         return self._heun_steps(
             x, u_t, dt, num_steps,
             i_edge_const, i_boundary_const, i_readout_const,
@@ -1402,8 +1442,36 @@ output_ode_src: list[int] | None = None,
         per-sample loop in ``_forward_heun_sequence`` stays Python so the
         torch.compile recompilation cost is paid only once per
         (B, N) shape combination, not per (T, num_steps) slice.
+
+        Periodic refresh (``core_refresh_interval = k > 0``): the core
+        nonlinear KCL contribution ``i_edge_const`` is recomputed from the
+        current state every k Heun steps. ``i_boundary_const`` /
+        ``i_readout_const`` and the resistive shunt keep their own
+        ``freeze_*`` semantics. When ``k >= num_steps`` the refresh never
+        fires inside the loop and behaviour matches legacy frozen (with the
+        step-0 seed computed by the caller).
         """
-        for _ in range(num_steps):
+        k = int(self.core_refresh_interval)
+        if k <= 0:
+            for _ in range(num_steps):
+                k1 = self.rhs(x, u=u_t, x_drive=None, drive_scale=0.0,
+                              i_edge_const=i_edge_const,
+                              i_boundary_const=i_boundary_const,
+                              i_readout_const=i_readout_const,
+                              vca_gate_core=vca_gate_core)
+                x_pred = x + dt * k1
+                k2 = self.rhs(x_pred, u=u_t, x_drive=None, drive_scale=0.0,
+                              i_edge_const=i_edge_const,
+                              i_boundary_const=i_boundary_const,
+                              i_readout_const=i_readout_const,
+                              vca_gate_core=vca_gate_core)
+                x = x + 0.5 * dt * (k1 + k2)
+            return x
+        # Refresh path: recompute ``i_edge_const`` every k Heun steps.
+        # Step 0 already has the caller's seed value.
+        for step in range(num_steps):
+            if step > 0 and step % k == 0:
+                i_edge_const = self._compute_i_edge_const(x, vca_gate_core)
             k1 = self.rhs(x, u=u_t, x_drive=None, drive_scale=0.0,
                           i_edge_const=i_edge_const,
                           i_boundary_const=i_boundary_const,
@@ -1464,7 +1532,18 @@ output_ode_src: list[int] | None = None,
         closure so the backward pass (re-evaluated by torchdeq's IFT) uses
         the same leak_floor as the forward solve. Solver runs in fp32;
         autocast is disabled by the solver adapter.
+
+        Note: ``core_refresh_interval`` has no effect on the DEQ path (the
+        fixed-point iterations always read the evolving ``x``). A warning
+        is emitted if it is set so static-task users are not misled.
         """
+        if int(self.core_refresh_interval) > 0:
+            warnings.warn(
+                "core_refresh_interval has no effect on the DEQ solver path "
+                "(fixed-point iterations always use evolving x); "
+                "the setting is ignored for this forward call.",
+                stacklevel=2,
+            )
         from deq_solver import solve_equilibrium
 
         cfg = dict(DEQ)

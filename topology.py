@@ -1832,7 +1832,8 @@ def build_net_from_config(
         raise ValueError(
             f"drive_mode must be 'fan_out' or 'projection', got {drive_mode!r}"
         )
-    # Resolve core_refresh_interval: explicit kwarg > cfg.
+    # Resolve core_refresh_interval: cfg > explicit kwarg (matches the
+    # freeze_read/freeze_boundary/freeze_temporal_read precedence above).
     core_refresh_interval = int(cfg.get("core_refresh_interval", core_refresh_interval))
     if core_refresh_interval < 0:
         raise ValueError(

@@ -75,6 +75,11 @@ class DifferentialStage(nn.Module):
             throughout all Heun / DEQ sub-iterations. Leak, clip, and drive
             current still read the evolving ``x`` at each step. Default
             ``False`` (standard behavior: read and write at the same time).
+            When ``core_refresh_interval > 0`` the core current is
+            recomputed every ``k`` Heun steps regardless of ``freeze_read``;
+            this lets a single ``freeze_read=False`` model emulate the
+            legacy ``freeze_read=True`` baseline (``k >= num_steps``) up
+            to fully dynamic (``k == 1``) by varying only the interval.
         freeze_boundary: When ``True``, boundary fan-out edge currents (the
             tanh cell contribution with edge gate + VCA gate folded in) are
             computed **once** from ``(u, x0)`` and held constant across all

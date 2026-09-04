@@ -39,6 +39,36 @@ HARNESS = ROOT / "fixed-mlp-distillation-kirchhoffnet.py"
 PENALTY_VALUES: tuple[float, float] = (1.0, 1e6)
 
 
+# Boundary map rule (knet-bo-repair audit finding): the harness-default
+# validated map {"0":[2,4],"1":[1,3],"2":[12,5],"3":[7,9]} needs hidden>=13
+# (target 12), which admits exactly ONE arch at the 5000 budget — unusable
+# for BO. The diagonal rule below fits every hidden>=8, keeps 8 unique
+# targets (same boundary param count as the validated map), and is the map
+# used by the Alliance CTLE dagger runs. Sampler, analytic counter, and
+# every trial subprocess MUST use this one rule so counts stay exact.
+def knet_fanout(num_hidden: int) -> dict[str, list[int]]:
+    return {str(i): [i, i + 4] for i in range(4)}
+
+# Prior-biased KNet arch enumeration (knet-bo-repair): depth (stages 3-5)
+# and VCA rank (>=2) over hidden width, k near the proven 4. Full grid gave
+# 99 tuples at [4250,5000]; this gives 17 (37 at [5950,7000]) — enough for
+# TPE while skipping shallow/rank-1/k=2/8 corners that never won.
+KNET_PRIOR_STAGES = (3, 4, 5)
+KNET_PRIOR_KS = (4, 6)
+KNET_PRIOR_RANKS = (2, 3, 4)
+
+# Sampler revision bumped whenever suggest distributions or the arch
+# enumeration change; part of the study fingerprint so stale studies
+# fail fast instead of crashing RDBStorage on the second commit.
+SAMPLER_REV = 2
+
+# Seed-trial config (manual-style, scaled into the 5000 window):
+# (hidden=10, stages=4, k=4, rank=2) is feasible at [4250,5000].
+SEED_KNET_ARCH = (10, 4, 4, 2)
+SEED_KNET_LR = 0.0025
+SEED_KNET_BATCH = 256
+
+
 def _mlp_param_analytic(width: int, layers: int, layernorm: bool) -> int:
     """Analytic trainable-param count for the fixed-harness PlainMLP.
 
@@ -55,24 +85,50 @@ def _mlp_param_analytic(width: int, layers: int, layernorm: bool) -> int:
 
 from functools import lru_cache
 
+_feasible_mlp_arches_cache: dict[tuple[int, int], list[tuple[int, int, bool]]] = {}
+
+
+def _get_feasible_mlp_arches(low: int, high: int) -> list[tuple[int, int, bool]]:
+    """All (layers, width, layernorm) tuples whose param count lies in [low, high].
+
+    Cached per budget window. Mirrors the KNet fallback so legacy callers
+    (e.g. test_bo_guard, which calls sample_config without precomputed
+    lists) get 0% budget-penalized sampling instead of a fail-fast penalty.
+    """
+    key = (low, high)
+    if key in _feasible_mlp_arches_cache:
+        return _feasible_mlp_arches_cache[key]
+    arches = [
+        (layers, width, layernorm)
+        for layers in range(1, 6)
+        for layernorm in (False, True)
+        for width in range(16, 257)
+        if low <= _mlp_param_analytic(width, layers, layernorm) <= high
+    ]
+    _feasible_mlp_arches_cache[key] = arches
+    return arches
+
+
 _feasible_knet_arches_cache: dict[tuple[int, int], list[tuple[int, int, int, int]]] = {}
 
 
 def _get_feasible_knet_arches(low: int, high: int) -> list[tuple[int, int, int, int]]:
-    """All (hidden, stages, k, rank) tuples whose param count lies in [low, high].
+    """All prior-biased (hidden, stages, k, rank) tuples with params in [low, high].
 
-    Cached per budget window. For the paper budget 7000±15% this is 126 arches.
+    Cached per budget window. Enumeration is restricted to KNET_PRIOR_STAGES /
+    KNET_PRIOR_KS / KNET_PRIOR_RANKS (knet-bo-repair): 17 arches at
+    [4250,5000], 37 at [5950,7000].
     """
     key = (low, high)
     if key in _feasible_knet_arches_cache:
         return _feasible_knet_arches_cache[key]
     arches: list[tuple[int, int, int, int]] = []
     for hs in range(8, 25):
-        for stages in range(2, 6):
-            for k in (2, 4, 6, 8):
+        for stages in KNET_PRIOR_STAGES:
+            for k in KNET_PRIOR_KS:
                 if k >= hs:
                     continue
-                for rank in (1, 2, 3, 4):
+                for rank in KNET_PRIOR_RANKS:
                     try:
                         p = _knet_param_analytic(hs, stages, k, rank)
                     except Exception:
@@ -88,8 +144,9 @@ def _knet_param_analytic(num_hidden: int, num_stages: int,
     """Fast analytic KNet param count by building the net (no training).
 
     Uses the same build_net_from_config path as the harness so the count is
-    exact. Fanout and x_max do not affect param count except via num_hidden.
-    Imported lazily so module import stays lightweight.
+    exact. The boundary map is knet_fanout() shared with the sampler and
+    every trial (same 8-target rule, so counts match); x_max does not
+    affect the count. Imported lazily so module import stays lightweight.
     """
     return _knet_param_analytic_cached(num_hidden, num_stages, small_world_k, vca_rank)
 
@@ -117,7 +174,7 @@ def _knet_param_analytic_cached(num_hidden: int, num_stages: int,
         "out_dim": 7, "write_mode": "sparse_proj", "read_mode": "dense",
         "use_robust_input": False,
     }
-    fanout = {i: [i, i + 4] for i in range(4)}
+    fanout = {int(k): list(v) for k, v in knet_fanout(num_hidden).items()}
     net = build_net_from_config(
         cfg, cell_lib=make_cell_library("tanh_free"), leak_mode="non-programmable",
         freeze_read=True, interstage_activation="residual-relu-tanh",
@@ -159,6 +216,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--n-startup-trials", type=int, default=8)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--no-seed-trial", action="store_true",
+                        help="Skip the enqueued manual-style KNet seed trial (trial 0).")
+    parser.add_argument("--probe-epochs", type=int, default=25,
+                        help="TPE-safe multi-fidelity probe length; 0 disables gating "
+                             "(every trial runs full --epochs).")
+    parser.add_argument("--probe-mse-max", type=float, default=0.15,
+                        help="Kill threshold: probe val_logit_mse above this returns "
+                             "finite probe values without promotion.")
+    parser.add_argument("--probe-failure-max", type=float, default=0.40,
+                        help="Kill threshold: probe validation failure rate above this "
+                             "returns finite probe values without promotion.")
     return parser.parse_args()
 
 
@@ -194,7 +262,9 @@ def sample_config(trial: optuna.Trial, kind: str,
     categorical. This replaces the old conditional per-(layers, layernorm)
     width sampling that produced a "CategoricalDistribution does not support
     dynamic value space" crash on trial 1 (RDBStorage rejects the second
-    commit's distribution as incompatible with the first trial's). For KNet
+    commit's distribution as incompatible with the first trial's).
+    ``mlp_feasible`` falls back to ``_get_feasible_mlp_arches(low, high)``
+    when not provided (same legacy-caller contract as KNet). For KNet
     the (hidden, stages, k, rank) tuple is sampled jointly from the
     precomputed feasible list (``knet_feasible``); ``x_max`` and
     ``lr/batch_size`` remain independent (they do not move the param count).
@@ -202,23 +272,37 @@ def sample_config(trial: optuna.Trial, kind: str,
     when not provided (e.g. legacy callers), but the main() path always
     threads the precomputed list to skip the per-trial rebuild.
 
+    ``lr``/``batch_size`` are suggested EXACTLY ONCE per trial with
+    kind-conditional ranges (studies are single-kind, so the distribution
+    stays fixed within a study). Re-suggesting the same name with a
+    different distribution in one trial either silently ignores the second
+    call (float: RuntimeWarning, first distribution wins) or raises
+    ``ValueError: CategoricalDistribution does not support dynamic value
+    space`` — so the KNet branch must NOT re-suggest them.
+
     Returns ``(cfg, penalty_reason)`` where penalty_reason is None iff the
     configuration is feasible. Callers must branch on the return value, not on
     trial.user_attrs round-trips.
     """
+    if kind == "mlp":
+        _lr_low_f = 2e-4
+        _bs_choices = [128, 256, 512, 1024]
+    else:
+        _lr_low_f = 1e-3
+        _bs_choices = [128, 256]
     cfg: dict[str, str] = {
-        "--lr": f"{trial.suggest_float('lr', 2e-4, 5e-3, log=True):.8g}",
-        "--batch-size": str(trial.suggest_categorical("batch_size", [128, 256, 512, 1024])),
+        "--lr": f"{trial.suggest_float('lr', _lr_low_f, 5e-3, log=True):.8g}",
+        "--batch-size": str(trial.suggest_categorical("batch_size", _bs_choices)),
     }
     if kind == "mlp":
-        if not mlp_feasible:
-            # Should never trigger because ``main`` builds the list and
-            # raises a fail-fast ``ValueError`` when empty. Guarded here so
-            # trial-time can never silently regress to "no feasible tuple".
+        feasible_mlp = (mlp_feasible
+                        if mlp_feasible is not None
+                        else _get_feasible_mlp_arches(low, high))
+        if not feasible_mlp:
             return cfg, f"no MLP architecture in param window [{low}, {high}]"
         arch_idx = int(trial.suggest_categorical(
-            "mlp_arch_idx", list(range(len(mlp_feasible)))))
-        layers, width, layernorm = mlp_feasible[arch_idx]
+            "mlp_arch_idx", list(range(len(feasible_mlp)))))
+        layers, width, layernorm = feasible_mlp[arch_idx]
         activation = trial.suggest_categorical(
             "student_activation", ["silu", "gelu"])
         cfg.update({
@@ -232,11 +316,11 @@ def sample_config(trial: optuna.Trial, kind: str,
         # KNet: joint feasible-architecture sampling guarantees every trial
         # lands inside [low, high]. The old per-dim uniform hidden sampling
         # hit the window only ~14% (MLP 1.5%) of the time and caused the
-        # 30/30-penalized report. Joint sampling over the precomputed feasible
-        # (hidden, stages, k, rank) tuples makes every trial feasible (0%
-        # budget-penalized) while still letting TPE explore the full feasible
-        # manifold. x_max and lr/batch_size remain independent (they don't
-        # affect param count).
+        # 30/30-penalized report. Joint sampling over the precomputed
+        # prior-biased (hidden, stages, k, rank) tuples makes every trial
+        # feasible (0% budget-penalized) while still letting TPE explore the
+        # depth+VCA-rank manifold. x_max is fixed at 4.0 (proven) and
+        # lr/batch_size use narrowed KNet ranges (see above).
         feasible_arches = (knet_feasible
                            if knet_feasible is not None
                            else _get_feasible_knet_arches(low, high))
@@ -245,15 +329,17 @@ def sample_config(trial: optuna.Trial, kind: str,
         arch_idx = int(trial.suggest_categorical("knet_arch_idx",
                                                  list(range(len(feasible_arches)))))
         hidden, num_stages, small_world_k, vca_rank = feasible_arches[arch_idx]
-        x_max = trial.suggest_float('kn_x_max', 2.0, 6.0)
-        fanout = {str(index): [index, index + 4] for index in range(4)}
+        x_max = 4.0
+        fanout = knet_fanout(hidden)
         cfg.update({
             "--kn-num-hidden": str(hidden),
             "--kn-num-stages": str(num_stages),
             "--kn-small-world-k": str(small_world_k),
             "--kn-small-world-p": "0.2", "--kn-vca-rank": str(vca_rank),
-            "--kn-x-max": f"{x_max:.6g}",
-            "--boundary-fan-out": json.dumps(fanout),
+            "--kn-x-max": f"{x_max:.6g}", "--boundary-fan-out": json.dumps(fanout),
+            # NOTE: --lr/--batch-size already suggested once above with the
+            # KNet ranges; re-suggesting here would crash (categorical) or
+            # be silently ignored (float). Do not add them here.
         })
         return cfg, None
 
@@ -334,13 +420,7 @@ def main() -> None:
     # dynamic value space"). The fingerprint lives in ``study.user_attrs``.
     low = int(args.param_budget * (1.0 - args.param_tolerance))
     if args.student_kind == "mlp":
-        mlp_feasible_pre = [
-            (L, W, ln)
-            for L in range(1, 6)
-            for ln in (False, True)
-            for W in range(16, 257)
-            if low <= _mlp_param_analytic(W, L, ln) <= args.param_budget
-        ]
+        mlp_feasible_pre = _get_feasible_mlp_arches(low, args.param_budget)
         if not mlp_feasible_pre:
             raise ValueError(
                 f"param window [{low}, {args.param_budget}] admits no MLP architecture "
@@ -353,7 +433,8 @@ def main() -> None:
         if not _get_feasible_knet_arches(low, args.param_budget):
             raise ValueError(
                 f"param window [{low}, {args.param_budget}] admits no KNet architecture "
-                f"(hidden 8-24, stages 2-5, k 2/4/6/8, rank 1-4). "
+                f"(prior-biased: hidden 8-24, stages {list(KNET_PRIOR_STAGES)}, "
+                f"k {list(KNET_PRIOR_KS)}, rank {list(KNET_PRIOR_RANKS)}). "
                 "Widen --param-tolerance or adjust --param-budget."
             )
         feasible_count = len(_get_feasible_knet_arches(low, args.param_budget))
@@ -364,6 +445,7 @@ def main() -> None:
         "student_kind": args.student_kind,
         "n_arches": feasible_count,
         "arch_param_name": arch_param_name,
+        "sampler_rev": SAMPLER_REV,
     })
 
     if args.resume:
@@ -464,6 +546,54 @@ def main() -> None:
         print(f"[fixed-bo] KNet feasible tuples: {len(knet_feasible)} "
               f"(window=[{low}, {args.param_budget}])", flush=True)
 
+    # Seed trial (knet-bo-repair): enqueue one manual-style config as trial 0
+    # so TPE starts from proven territory instead of 8 random startup trials.
+    # Only on a study with no trials yet (fresh, or created-but-crashed).
+    # enqueue_trial stores fixed values; the trial still runs objective()
+    # (including the probe gate) normally.
+    if (args.student_kind == "knet" and not args.no_seed_trial
+            and len(study.trials) == 0):
+        seed_arch = SEED_KNET_ARCH if SEED_KNET_ARCH in knet_feasible else None
+        if seed_arch is None:
+            scored = sorted(knet_feasible,
+                            key=lambda t: (args.param_budget - _knet_param_analytic(*t),
+                                           -t[1], -t[3]))
+            seed_arch = scored[0] if scored else None
+        if seed_arch is None:
+            print("[fixed-bo] WARNING: no feasible arch; skipping seed trial.", flush=True)
+        else:
+            seed_idx = list(knet_feasible).index(seed_arch)
+            study.enqueue_trial({"lr": SEED_KNET_LR, "batch_size": SEED_KNET_BATCH,
+                                 "knet_arch_idx": seed_idx})
+            print(f"[fixed-bo] seed trial enqueued: arch={seed_arch} idx={seed_idx} "
+                  f"lr={SEED_KNET_LR} batch={SEED_KNET_BATCH}", flush=True)
+
+    probe_epochs = args.probe_epochs
+    if not (0 < probe_epochs < args.epochs):
+        if probe_epochs != 0:
+            print(f"[fixed-bo] WARNING: --probe-epochs={probe_epochs} not in "
+                  f"(0, {args.epochs}); gating disabled.", flush=True)
+        probe_epochs = 0
+    if probe_epochs:
+        print(f"[fixed-bo] multi-fidelity gate ON: {probe_epochs}-epoch probe, "
+              f"promote iff val_logit_mse<={args.probe_mse_max} and "
+              f"val_failure<={args.probe_failure_max} "
+              f"(killed trials return finite probe values, never pruned).",
+              flush=True)
+
+    def run_harness(command: list[str], trial_dir: Path) -> int | str:
+        """Run one harness subprocess; return returncode or exception repr."""
+        try:
+            run = subprocess.run(command, text=True,
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 timeout=24 * 3600)
+            (trial_dir / "run.log.txt").write_text(run.stdout, encoding="utf-8")
+            return run.returncode
+        except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired) as exc:
+            print(f"[fixed-bo] training subprocess raised {exc!r}; treating as penalty",
+                  flush=True)
+            return f"exception ({exc!r})"
+
     def objective(trial: optuna.Trial) -> tuple[float, float]:
         cfg, sample_penalty_reason = sample_config(
             trial, args.student_kind, low, args.param_budget,
@@ -474,8 +604,9 @@ def main() -> None:
             trial.set_user_attr("penalty_reason", sample_penalty_reason)
             return PENALTY_VALUES
         trial_dir = args.output / f"trial_{trial.number:04d}"
-        command = base_command(args, trial_dir) + flat_args(cfg)
-        actual_params = param_count(command)
+        trial_dir.mkdir(parents=True, exist_ok=True)
+        full_command = base_command(args, trial_dir) + flat_args(cfg)
+        actual_params = param_count(full_command)
         if actual_params is None:
             trial.set_user_attr("config", cfg)
             trial.set_user_attr("penalized", True)
@@ -488,23 +619,50 @@ def main() -> None:
             trial.set_user_attr("penalty_reason",
                                 f"params={actual_params} outside [{low}, {args.param_budget}]")
             return PENALTY_VALUES
-        trial_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            run = subprocess.run(command, text=True,
-                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                 timeout=24 * 3600)
-            (trial_dir / "run.log.txt").write_text(run.stdout, encoding="utf-8")
-            if run.returncode != 0:
+        if probe_epochs:
+            probe_command = list(full_command)
+            probe_idx = probe_command.index("--epochs") + 1
+            probe_command[probe_idx] = str(probe_epochs)
+            probe_rc = run_harness(probe_command, trial_dir)
+            if probe_rc != 0:
                 trial.set_user_attr("penalized", True)
                 trial.set_user_attr("penalty_reason",
-                                    f"training subprocess failed ({run.returncode})")
+                                    f"probe subprocess failed ({probe_rc})")
                 return PENALTY_VALUES
-        except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired) as exc:
-            print(f"[fixed-bo] training subprocess raised {exc!r}; treating as penalty",
-                  flush=True)
-            trial.set_user_attr("penalized", True)
-            trial.set_user_attr("penalty_reason", f"training subprocess exception ({exc!r})")
-            return PENALTY_VALUES
+            probe_values = metrics(trial_dir)
+            if probe_values is None:
+                trial.set_user_attr("penalized", True)
+                trial.set_user_attr("penalty_reason", "probe metrics parse failed")
+                return PENALTY_VALUES
+            probe_failure, probe_mse = probe_values
+            trial.set_user_attr("probe_failure_rate", probe_failure)
+            trial.set_user_attr("probe_logit_mse", probe_mse)
+            # TPE-safe kill: killed trials are COMPLETE with finite probe
+            # values (never TrialPruned/None — optuna#5260 — nor inf,
+            # optuna#3676). Pessimistic (25ep) values sort after promoted
+            # full-fidelity trials, exactly like successive halving.
+            if not (probe_mse <= args.probe_mse_max
+                    and probe_failure <= args.probe_failure_max):
+                trial.set_user_attr("promoted", False)
+                print(f"[fixed-bo] trial={trial.number:04d} params={actual_params} "
+                      f"KILLED at probe: val_failure={probe_failure * 100:.2f}% "
+                      f"val_logit_mse={probe_mse:.8f}", flush=True)
+                return probe_failure, probe_mse
+            trial.set_user_attr("promoted", True)
+            resume_command = full_command + ["--resume"]
+            resume_rc = run_harness(resume_command, trial_dir)
+            if resume_rc != 0:
+                trial.set_user_attr("penalized", True)
+                trial.set_user_attr("penalty_reason",
+                                    f"resume subprocess failed ({resume_rc})")
+                return PENALTY_VALUES
+        else:
+            rc = run_harness(full_command, trial_dir)
+            if rc != 0:
+                trial.set_user_attr("penalized", True)
+                trial.set_user_attr("penalty_reason",
+                                    f"training subprocess failed ({rc})")
+                return PENALTY_VALUES
         failure_imitation = metrics(trial_dir)
         if failure_imitation is None:
             trial.set_user_attr("penalized", True)
@@ -590,7 +748,7 @@ def main() -> None:
         writer = csv.writer(handle)
         writer.writerow(["trial", "state", "validation_failure_rate",
                          "validation_logit_mse", "param_count", "penalized",
-                         "penalty_reason", "params"])
+                         "penalty_reason", "promoted", "params"])
         for trial in study.trials:
             v0, v1 = "", ""
             if trial.values and len(trial.values) >= 2:
@@ -600,6 +758,7 @@ def main() -> None:
                              trial.user_attrs.get("actual_params", ""),
                              penalized,
                              trial.user_attrs.get("penalty_reason", ""),
+                             trial.user_attrs.get("promoted", ""),
                              json.dumps(trial.params, sort_keys=True)])
     print(f"[fixed-bo] selected trial {selected.number}; artifacts: {args.output}", flush=True)
 

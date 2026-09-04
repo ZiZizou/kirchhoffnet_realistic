@@ -568,11 +568,37 @@ def _progress_iter(iterable, desc, total=None, disable=False):
 
     ``ascii=True`` keeps the bar to plain ASCII so redirected logs (no TTY,
     non-UTF8 locale) don't fill with ``�`` replacement glyphs.
+    ``mininterval=5.0`` throttles updates so 100-chunk epochs don't emit
+    thousands of lines.
+
+    When disabled (or tqdm missing), a thin wrapper is returned that still
+    exposes ``set_postfix`` / ``update`` / ``close`` / ``refresh`` as no-ops
+    so callers don't need to gate on the disabled flag.
     """
+    class _NoOpBar:
+        def __init__(self, it):
+            self._it = it
+        def __iter__(self):
+            # iter() passthrough: works whether the wrapped object is an
+            # iterator (e.g. enumerate, the current call site) or a plain
+            # iterable (list/range — returning it directly would raise
+            # "iter() returned non-iterator").
+            return iter(self._it)
+        def set_postfix(self, *args, **kwargs):
+            pass
+        def update(self, n=1):
+            pass
+        def close(self):
+            pass
+        def refresh(self):
+            pass
+        def set_description(self, *args, **kwargs):
+            pass
+
     if _HAS_TQDM and not disable:
         return _tqdm(iterable, desc=desc, total=total, leave=False, ascii=True,
                      mininterval=5.0)
-    return iterable
+    return _NoOpBar(iterable)
 
 
 def _standardize_targets(
@@ -758,6 +784,9 @@ def train_fabric(
         ckpt = torch.load(Path(init_from), map_location=device, weights_only=False)
         net.load_state_dict(ckpt["model_state"])
         optim.load_state_dict(ckpt["optim_state"])
+        scaler_state = ckpt.get("scaler_state")
+        if amp_enabled and scaler_state is not None:
+            scaler.load_state_dict(scaler_state)
         history = list(ckpt.get("train_loss_history", []))
         raw_leak_grad_history = list(ckpt.get("raw_leak_grad_history", []))
         hidden_rms_history = list(ckpt.get("hidden_rms_history", []))
@@ -765,6 +794,9 @@ def train_fabric(
         val_r2_history = list(ckpt.get("val_r2_history", []))
         val_epochs = list(ckpt.get("val_epochs", []))
         best_val_nrmse = float(ckpt.get("best_val_nrmse", float("inf")))
+        evals_without_improvement = int(
+            ckpt.get("evals_without_improvement", 0)
+        )
         start_epoch = int(ckpt.get("epoch", -1)) + 1
         print(f"  resumed from {init_from}: continuing at epoch {start_epoch}")
     t_start = time.time()
@@ -792,6 +824,10 @@ def train_fabric(
     t_span = float(net.core.stage_times[0])
     num_steps = int(net.core.stage_steps[0])
 
+    # Initialise ``epoch`` so the post-loop return value is defined even
+    # when the loop body never executes (e.g. resume from a checkpoint
+    # that already completed ``epochs``).
+    epoch = start_epoch - 1
     for epoch in range(start_epoch, epochs):
         net.train()
         # Carry state across chunks; detach only at chunk boundaries.
@@ -903,7 +939,7 @@ def train_fabric(
             epoch_loss += float(loss.item())
             epoch_steps += 1
 
-            if _HAS_TQDM and verbose:
+            if _HAS_TQDM and verbose and progress:
                 epoch_iter.set_postfix(loss=f"{loss.item():.4f}")
 
         avg = epoch_loss / max(epoch_steps, 1)
@@ -962,6 +998,10 @@ def train_fabric(
                     "epoch": epoch,  # last completed epoch (0-based)
                     "model_state": net.state_dict(),
                     "optim_state": optim.state_dict(),
+                    "scaler_state": (
+                        scaler.state_dict() if amp_enabled else None
+                    ),
+                    "evals_without_improvement": evals_without_improvement,
                     "train_loss_history": history,
                     "raw_leak_grad_history": raw_leak_grad_history,
                     "hidden_rms_history": hidden_rms_history,
@@ -1025,7 +1065,11 @@ def train_fabric(
         "y_std": y_std,
         "early_stopped": early_stopped,
         "best_val_nrmse": best_val_nrmse,
-        "epochs_completed": epoch + 1,
+        # ``len(history)`` is the source of truth: identical to ``epoch + 1``
+        # when the loop runs; equals the resumed count when ``start_epoch``
+        # skipped past the end of the loop (resume from a completed
+        # checkpoint starts at epoch == epochs and the body never executes).
+        "epochs_completed": len(history),
     }
 
 
@@ -1528,11 +1572,15 @@ def run_fabric_condition(
     n_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
     # cell_lib evaluations per sample for the NARMA sequence path:
     #   refresh k == 0 + freeze_read=True  -> 1 eval/sample (legacy frozen)
-    #   refresh k == 0 + freeze_read=False -> num_steps evals (fully dynamic)
+    #   refresh k == 0 + freeze_read=False -> 2*num_steps evals (legacy fully
+    #     dynamic: rhs() evaluates cell_lib on every call, 2 calls per Heun
+    #     step). Note k=1 costs only num_steps evals (one recompute per step
+    #     reused for both rhs calls), so k=1 is near-dynamic at half the
+    #     eval cost of legacy dynamic — not byte-identical to it.
     #   refresh k >= 1                     -> ceil(num_steps / k) evals
     stage_k = int(getattr(net.core.stages[0], "core_refresh_interval", 0))
     if stage_k <= 0:
-        cell_lib_evals_per_sample = 1 if freeze_read else num_steps
+        cell_lib_evals_per_sample = 1 if freeze_read else 2 * num_steps
     else:
         cell_lib_evals_per_sample = max(1, (num_steps + stage_k - 1) // stage_k)
     out = {
@@ -1554,6 +1602,7 @@ def run_fabric_condition(
         "core_refresh_interval": int(getattr(net.core.stages[0], "core_refresh_interval", 0)),
         "cell_lib_evals_per_sample": cell_lib_evals_per_sample,
         "early_stopped": res.get("early_stopped", False),
+        "epochs_completed": int(res.get("epochs_completed", epochs)),
     }
     if ridge_result:
         out["ridge_nrmse"] = ridge_result["ridge_nrmse"]
@@ -1561,26 +1610,69 @@ def run_fabric_condition(
     return out
 
 
-def decide(fr_off_res: dict[str, Any], fr_on_res: dict[str, Any],
-           threshold: float = 0.05, abs_nrmse_threshold: float = 0.5) -> str:
-    """Pre-registered decision rule.
+def _decide_refresh_ladder(by_cond, band):
+    """Decision rule for the refresh-interval ladder.
 
-    Returns one of:
-        "CONTROL_PATH_COMMIT" — evolving core adds no value
-        "SIGNAL_PATH_OPEN"    — evolving core is alive
-        "NEUTRAL"             — within tolerance or both conditions too poor
+    Returns a list of verdict lines (joined by callers) describing whether
+    cheap recurrence (``k=4``) reaches the parity band and how it compares
+    to dense recurrence (``k=2``). Skips a condition whose seed mean is NaN
+    or non-finite (diverged runs) and flags it.
     """
-    # If both conditions have poor absolute NRMSE, neither is working
-    # well enough to draw conclusions.
-    if fr_off_res["nrmse"] > abs_nrmse_threshold:
-        return "NEUTRAL"
-    diff = fr_on_res["nrmse"] - fr_off_res["nrmse"]
-    if abs(diff) < threshold * 0.5:
-        return "NEUTRAL"
-    if diff > 0:
-        # freeze_read on is worse than off -> evolving core wins
-        return "SIGNAL_PATH_OPEN"
-    return "CONTROL_PATH_COMMIT"
+
+    def _safe_mean(name: str):
+        vals = [r["nrmse"] for r in by_cond[name]]
+        finite = [v for v in vals if math.isfinite(v)]
+        if not finite:
+            return float("nan"), False
+        return sum(finite) / len(finite), len(finite) < len(vals)
+
+    refresh_conds = sorted(
+        c for c in by_cond if c.startswith("fabric_refresh_k")
+    )
+    if len(refresh_conds) < 2:
+        return None
+    lines = []
+    k_means = []
+    diverged = []
+    for c in refresh_conds:
+        m, was_filtered = _safe_mean(c)
+        if not math.isfinite(m):
+            diverged.append(c)
+            continue
+        # rsplit on the LAST "k": condition names are fabric_refresh_k<N>.
+        k_num = c.rsplit("k", 1)[-1]
+        k_means.append((int(k_num), m))
+        tag = " (some seeds diverged)" if was_filtered else ""
+        lines.append(f"  k={k_num}: NRMSE={m:.4f}{tag}")
+    if diverged:
+        lines.insert(0, "  (skipped diverged conditions: " + ", ".join(diverged) + ")")
+    if not k_means:
+        return lines
+    means = dict(k_means)
+    if 4 in means and 2 in means:
+        k_cheap, n_cheap, k_dense, n_dense = 4, means[4], 2, means[2]
+    else:
+        k_cheap, n_cheap = max(k_means, key=lambda t: t[0])
+        k_dense, n_dense = min(k_means, key=lambda t: t[0])
+    in_band = band[0] <= n_cheap <= band[1]
+    diff = n_cheap - n_dense
+    if in_band and abs(diff) < 0.05:
+        lines.append(
+            f"\nVerdict: CHEAP_RECURRENCE (k={k_cheap}, NRMSE={n_cheap:.4f} "
+            f"in band, within 0.05 of k={k_dense})."
+        )
+    elif in_band:
+        lines.append(
+            f"\nVerdict: NEEDS_MORE_EVALS (k={k_cheap} in band but "
+            f"Δ={diff:+.4f} vs k={k_dense}; run k=1 to confirm)."
+        )
+    else:
+        best_k, best_n = min(k_means, key=lambda t: t[1])
+        lines.append(
+            f"\nVerdict: REFRESH_INSUFFICIENT (best k={best_k} "
+            f"NRMSE={best_n:.4f} outside band {band})."
+        )
+    return lines
 
 
 # ---------------------------------------------------------------------------
@@ -1612,7 +1704,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--baselines-only", action="store_true",
                         help="Only run the baselines (ridge, esn, mlp, mlp_large, lstm, lstm_large); skip fabric training")
     parser.add_argument("--fabric-only", action="store_true",
-                        help="Only run the two fabric conditions; skip baselines")
+                        help="Only run fabric conditions (core-refresh ladder); skip baselines")
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"],
                         help="Device (default cpu)")
     parser.add_argument("--unipolar", action="store_true",
@@ -1896,7 +1988,7 @@ def main() -> int:
             # on disk (the final write below just overwrites with the same
             # content plus any remaining jobs).
             try:
-                _write_partial_tables(out_dir, all_results, args.order)
+                _write_partial_tables(out_dir, all_results, args.order, seeds)
             except Exception as e:
                 print(f"  WARNING: partial table flush failed: {e}")
 
@@ -1916,52 +2008,13 @@ def main() -> int:
     # recurrence (4 evals/sample). If cheap k=4 reaches the RNN parity band
     # (0.15-0.29 NRMSE) and is within 0.05 of dense k=2, cheap recurrence
     # wins. If dense is clearly better, run the deferred k=1 confirmation.
-    refresh_conds = [c for c in by_cond if c.startswith("fabric_refresh_k")]
-    if len(refresh_conds) >= 2 and not args.baselines_only:
-        # Map condition name -> mean NRMSE across seeds.
-        def _mean_nrmse(name: str) -> float:
-            rs = by_cond[name]
-            return sum(r["nrmse"] for r in rs) / len(rs)
-        k_means = sorted(
-            (int(c.split("k")[-1]), _mean_nrmse(c)) for c in refresh_conds
-        )
-        means = dict(k_means)
-        verdict_lines = [
-            f"Core-refresh decision (NARMA-{args.order}, {len(seeds)} seeds):",
-        ]
-        for k, m in k_means:
-            verdict_lines.append(f"  k={k:2d}: NRMSE={m:.4f}")
-        band = (0.15, 0.29)
-        # Prefer the designed comparison (cheap k=4 vs dense k=2, k=8
-        # baseline); fall back to cheapest-vs-densest present when the
-        # ladder differs (e.g. single-k confirmation runs are skipped by
-        # the len>=2 guard, smaller num_steps ladders).
-        if 4 in means and 2 in means:
-            k_cheap, n_cheap, k_dense, n_dense = 4, means[4], 2, means[2]
-        else:
-            k_cheap, n_cheap = max(k_means, key=lambda t: t[0])
-            k_dense, n_dense = min(k_means, key=lambda t: t[0])
-        in_band_cheap = band[0] <= n_cheap <= band[1]
-        diff = n_cheap - n_dense  # >0 means dense is better
-        if in_band_cheap and abs(diff) < 0.05:
-            verdict_lines.append(
-                f"\nVerdict: CHEAP_RECURRENCE (k={k_cheap}, NRMSE={n_cheap:.4f} "
-                f"in band, within 0.05 of k={k_dense})."
-            )
-        elif in_band_cheap:
-            verdict_lines.append(
-                f"\nVerdict: NEEDS_MORE_EVALS (k={k_cheap} in band but "
-                f"Δ={diff:+.4f} vs k={k_dense}; run k=1 to confirm)."
-            )
-        else:
-            best_k, best_n = min(k_means, key=lambda t: t[1])
-            verdict_lines.append(
-                f"\nVerdict: REFRESH_INSUFFICIENT (best k={best_k} "
-                f"NRMSE={best_n:.4f} outside band {band})."
-            )
-        verdict_text = "\n".join(verdict_lines) + "\n"
-        (out_dir / "decision.txt").write_text(verdict_text)
-        print("\n" + verdict_text)
+    if not args.baselines_only:
+        verdict_lines = _decide_refresh_ladder(by_cond, band=(0.15, 0.29))
+        if verdict_lines:
+            head = f"Core-refresh decision (NARMA-{args.order}, {len(seeds)} seeds):\n"
+            verdict_text = head + "\n".join(verdict_lines) + "\n"
+            (out_dir / "decision.txt").write_text(verdict_text)
+            print("\n" + verdict_text)
 
     print(f"\n[narma] Results written to {out_dir}")
     return 0

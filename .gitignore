@@ -31,3 +31,4 @@ probe_study_db.py
 test_bo_guard.py
 *test*
 *audit*
+*db*

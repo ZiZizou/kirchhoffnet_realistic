@@ -13,8 +13,10 @@ import csv
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import optuna
@@ -348,6 +350,170 @@ def flat_args(cfg: dict[str, str]) -> list[str]:
     return [item for pair in cfg.items() for item in pair]
 
 
+# ---------------------------------------------------------------------------
+# Mid-run file logging (outside SQLite, glanceable without any tooling)
+# ---------------------------------------------------------------------------
+# Every trial appends one ``sampled`` line (exact CLI flags + re-runnable
+# command) the moment it is sampled, and the ``finished`` callback appends
+# the outcome plus refreshes ``trial_table.txt`` / ``results_live.csv``.
+# All three live in the BO ``--output`` directory next to ``study.db``.
+TRIAL_LOG_NAME = "trial_log.jsonl"
+TRIAL_TABLE_NAME = "trial_table.txt"
+RESULTS_LIVE_NAME = "results_live.csv"
+RESULTS_FINAL_NAME = "results.csv"
+
+
+def _utc_now() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+
+
+def append_trial_event(output: Path, event: dict) -> None:
+    """Append one JSON line to the mid-run trial log (append-only, crash-safe)."""
+    with open(output / TRIAL_LOG_NAME, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"ts": _utc_now(), **event}, sort_keys=True) + "\n")
+
+
+def trial_command_string(args: argparse.Namespace, trial_number: int,
+                         cfg: dict[str, str]) -> str:
+    """Reconstruct the exact re-runnable harness command for one trial."""
+    trial_dir = args.output / f"trial_{trial_number:04d}"
+    return " ".join(shlex.quote(part)
+                    for part in base_command(args, trial_dir) + flat_args(cfg))
+
+
+def trial_arch_fields(kind: str, trial: optuna.Trial) -> dict[str, str]:
+    """Human-readable architecture fields for one trial, from stored ``config``.
+
+    Falls back to the raw ``arch_idx`` when decoded flags are absent so the
+    table never goes blank on other sampler revisions.
+    """
+    cfg = trial.user_attrs.get("config") or {}
+    if kind == "mlp":
+        fields = {
+            "layers": str(cfg.get("--student-layers", "")),
+            "width": str(cfg.get("--student-width", "")),
+            "ln": str(cfg.get("--student-use-layernorm", "")),
+            "act": str(cfg.get("--student-activation", "")),
+        }
+        if not fields["layers"] and "mlp_arch_idx" in trial.params:
+            fields["arch_idx"] = str(trial.params["mlp_arch_idx"])
+        return fields
+    fields = {
+        "hidden": str(cfg.get("--kn-num-hidden", "")),
+        "stages": str(cfg.get("--kn-num-stages", "")),
+        "k": str(cfg.get("--kn-small-world-k", "")),
+        "rank": str(cfg.get("--kn-vca-rank", "")),
+        "x_max": str(cfg.get("--kn-x-max", "")),
+    }
+    if not fields["hidden"] and "knet_arch_idx" in trial.params:
+        fields["arch_idx"] = str(trial.params["knet_arch_idx"])
+    return fields
+
+
+def _fmt_opt_float(value: object, *, percent: bool = False) -> str:
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return ""
+    if percent:
+        return f"{100.0 * number:.2f}"
+    return f"{number:.8g}"
+
+
+def trial_table_text(study: optuna.Study, kind: str) -> str:
+    """Fixed-width table of every trial; safe to call mid-run (RUNNING rows included)."""
+    if kind == "mlp":
+        columns = ["trial", "state", "layers", "width", "ln", "act",
+                   "lr", "batch", "params", "fail%", "mse", "note"]
+    else:
+        columns = ["trial", "state", "hidden", "stages", "k", "rank", "x_max",
+                   "lr", "batch", "params", "fail%", "mse", "note"]
+    ordered = sorted(study.trials, key=lambda t: t.number)
+    if any("arch_idx" in trial_arch_fields(kind, trial) for trial in ordered):
+        columns.insert(columns.index("lr"), "arch_idx")
+    rows: list[list[str]] = []
+    for trial in ordered:
+        arch = trial_arch_fields(kind, trial)
+        values = list(trial.values) if trial.values else []
+        note = ""
+        if trial.user_attrs.get("penalized") is True:
+            note = str(trial.user_attrs.get("penalty_reason", "penalized"))[:60]
+        elif trial.user_attrs.get("promoted") is False:
+            note = "probe-only"
+        elif trial.state.name == "RUNNING":
+            note = "running"
+        row = {
+            "trial": f"{trial.number:04d}",
+            "state": trial.state.name,
+            "lr": str(trial.params.get("lr", "")),
+            "batch": str(trial.params.get("batch_size", "")),
+            "params": str(trial.user_attrs.get("actual_params", "")),
+            "fail%": _fmt_opt_float(values[0], percent=True) if len(values) > 0 else "",
+            "mse": _fmt_opt_float(values[1]) if len(values) > 1 else "",
+            "note": note,
+            **arch,
+        }
+        rows.append([row.get(col, "") for col in columns])
+    widths = [len(col) for col in columns]
+    for row in rows:
+        for pos, cell in enumerate(row):
+            widths[pos] = max(widths[pos], len(cell))
+    lines = ["  ".join(col.ljust(widths[pos]) for pos, col in enumerate(columns))]
+    lines += ["  ".join(cell.ljust(widths[pos]) for pos, cell in enumerate(row))
+              for row in rows]
+    return "\n".join(lines) + "\n"
+
+
+def write_trial_table(output: Path, study: optuna.Study, kind: str) -> None:
+    (output / TRIAL_TABLE_NAME).write_text(trial_table_text(study, kind), encoding="utf-8")
+
+
+def results_fieldnames() -> list[str]:
+    # NOTE: ``promoted`` column belongs to the rev-2 multi-fidelity gate;
+    # keep it in both live and final CSVs so schemas never diverge.
+    return ["trial", "state", "validation_failure_rate",
+            "validation_logit_mse", "param_count", "penalized",
+            "penalty_reason", "promoted", "params"]
+
+
+def write_results_csv(path: Path, study: optuna.Study) -> None:
+    """Write the results CSV (used live after every trial and once at the end)."""
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(results_fieldnames())
+        for trial in study.trials:
+            v0, v1 = "", ""
+            if trial.values and len(trial.values) >= 2:
+                v0, v1 = trial.values[0], trial.values[1]
+            penalized = trial.user_attrs.get("penalized", False)
+            writer.writerow([trial.number, trial.state.name, v0, v1,
+                             trial.user_attrs.get("actual_params", ""),
+                             penalized,
+                             trial.user_attrs.get("penalty_reason", ""),
+                             trial.user_attrs.get("promoted", ""),
+                             json.dumps(trial.params, sort_keys=True)])
+
+
+def make_progress_callback(output: Path, kind: str):
+    """Optuna callback: after every trial, log the outcome + refresh live files."""
+    def _callback(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
+        append_trial_event(output, {
+            "event": "finished",
+            "trial": trial.number,
+            "state": trial.state.name,
+            "values": list(trial.values) if trial.values else None,
+            "optuna_params": dict(trial.params),
+            "config": dict(trial.user_attrs.get("config") or {}),
+            "actual_params": trial.user_attrs.get("actual_params"),
+            "penalized": bool(trial.user_attrs.get("penalized", False)),
+            "penalty_reason": str(trial.user_attrs.get("penalty_reason", "")),
+            "promoted": trial.user_attrs.get("promoted", ""),
+        })
+        write_trial_table(output, study, kind)
+        write_results_csv(output / RESULTS_LIVE_NAME, study)
+    return _callback
+
+
 def param_count(command: list[str]) -> int | None:
     """Return trainable-param count, or None on any failure (returncode, parse, OSError)."""
     try:
@@ -598,6 +764,16 @@ def main() -> None:
         cfg, sample_penalty_reason = sample_config(
             trial, args.student_kind, low, args.param_budget,
             mlp_feasible=mlp_feasible, knet_feasible=knet_feasible)
+        # Mid-run visibility: exact CLI flags + re-runnable command, outside SQLite.
+        append_trial_event(args.output, {
+            "event": "sampled",
+            "trial": trial.number,
+            "kind": args.student_kind,
+            "optuna_params": dict(trial.params),
+            "config": dict(cfg),
+            "sample_penalty_reason": sample_penalty_reason,
+            "command": trial_command_string(args, trial.number, cfg),
+        })
         if sample_penalty_reason is not None:
             trial.set_user_attr("config", cfg)
             trial.set_user_attr("penalized", True)
@@ -675,7 +851,18 @@ def main() -> None:
               f"val_failure={failure * 100:.2f}% val_logit_mse={imitation:.8f}", flush=True)
         return failure, imitation
 
-    study.optimize(objective, n_trials=args.n_trials, n_jobs=1)
+    append_trial_event(args.output, {
+        "event": "study_started",
+        "kind": args.student_kind,
+        "n_trials": args.n_trials,
+        "epochs": args.epochs,
+        "param_window": [low, args.param_budget],
+        "fixed_dataset": str(fixed_path),
+    })
+    print(f"[fixed-bo] live files: {TRIAL_LOG_NAME} {TRIAL_TABLE_NAME} {RESULTS_LIVE_NAME}",
+          flush=True)
+    study.optimize(objective, n_trials=args.n_trials, n_jobs=1,
+                   callbacks=[make_progress_callback(args.output, args.student_kind)])
     n_expected = len(expected_directions)
     complete = [trial for trial in study.trials
                 if trial.state == optuna.trial.TrialState.COMPLETE
@@ -744,22 +931,8 @@ def main() -> None:
     }
     with open(args.output / "bo_summary.json", "w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
-    with open(args.output / "results.csv", "w", newline="", encoding="utf-8") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(["trial", "state", "validation_failure_rate",
-                         "validation_logit_mse", "param_count", "penalized",
-                         "penalty_reason", "promoted", "params"])
-        for trial in study.trials:
-            v0, v1 = "", ""
-            if trial.values and len(trial.values) >= 2:
-                v0, v1 = trial.values[0], trial.values[1]
-            penalized = trial.user_attrs.get("penalized", False)
-            writer.writerow([trial.number, trial.state.name, v0, v1,
-                             trial.user_attrs.get("actual_params", ""),
-                             penalized,
-                             trial.user_attrs.get("penalty_reason", ""),
-                             trial.user_attrs.get("promoted", ""),
-                             json.dumps(trial.params, sort_keys=True)])
+    write_results_csv(args.output / RESULTS_FINAL_NAME, study)
+    write_trial_table(args.output, study, args.student_kind)
     print(f"[fixed-bo] selected trial {selected.number}; artifacts: {args.output}", flush=True)
 
 

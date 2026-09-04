@@ -1399,13 +1399,14 @@ output_ode_src: list[int] | None = None,
         ``enable_sequence_compile()`` time. This wrapper catches such errors
         and falls back to the original Python implementation so training
         can proceed.
+
+        The periodic-refresh branch (``core_refresh_interval > 0``) is also
+        compiled: the interval is a per-run constant so Inductor specializes
+        on it (one specialization per k). If compilation fails for any
+        reason the eager path below is used instead — correctness is never
+        at risk, only speed.
         """
-        # Periodic refresh path uses an uncompiled loop so the ``self``
-        # capture stays Python and the refresh interval check is cheap.
-        # When refresh is disabled (default), the compiled path is used
-        # exactly as before.
-        use_refresh = self.core_refresh_interval > 0
-        if getattr(self, "_heun_steps_compiled", False) and not use_refresh:
+        if getattr(self, "_heun_steps_compiled", False):
             try:
                 return self._heun_steps_compiled_fn(
                     x, u_t, dt, num_steps,

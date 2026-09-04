@@ -564,9 +564,14 @@ def ridge_readout_diagnostic(
 # ---------------------------------------------------------------------------
 
 def _progress_iter(iterable, desc, total=None, disable=False):
-    """Wrap an iterable with tqdm if available, else pass through."""
+    """Wrap an iterable with tqdm if available, else pass through.
+
+    ``ascii=True`` keeps the bar to plain ASCII so redirected logs (no TTY,
+    non-UTF8 locale) don't fill with ``�`` replacement glyphs.
+    """
     if _HAS_TQDM and not disable:
-        return _tqdm(iterable, desc=desc, total=total, leave=False)
+        return _tqdm(iterable, desc=desc, total=total, leave=False, ascii=True,
+                     mininterval=5.0)
     return iterable
 
 
@@ -607,6 +612,10 @@ def train_fabric(
     grad_clip: float = 1.0,
     val_every: int = 0,
     early_stop_patience: int = 0,
+    progress: bool = True,
+    checkpoint_path: Path | None = None,
+    checkpoint_every: int = 0,
+    init_from: Path | None = None,
     val_u_test: torch.Tensor | None = None,
     val_y_test: torch.Tensor | None = None,
     val_washout: int = 200,
@@ -740,6 +749,24 @@ def train_fabric(
     best_val_nrmse: float = float("inf")
     evals_without_improvement: int = 0
     early_stopped: bool = False
+    start_epoch: int = 0
+    # Resume: warm-start model + optimizer + histories from a checkpoint
+    # written by an earlier (killed) run. The carried ODE state is re-zeroed
+    # each epoch anyway, so only weights/optimizer/histories are restored.
+    # Chunk-order RNG is NOT restored (order differs after resume; negligible).
+    if init_from is not None:
+        ckpt = torch.load(Path(init_from), map_location=device, weights_only=False)
+        net.load_state_dict(ckpt["model_state"])
+        optim.load_state_dict(ckpt["optim_state"])
+        history = list(ckpt.get("train_loss_history", []))
+        raw_leak_grad_history = list(ckpt.get("raw_leak_grad_history", []))
+        hidden_rms_history = list(ckpt.get("hidden_rms_history", []))
+        val_nrmse_history = list(ckpt.get("val_nrmse_history", []))
+        val_r2_history = list(ckpt.get("val_r2_history", []))
+        val_epochs = list(ckpt.get("val_epochs", []))
+        best_val_nrmse = float(ckpt.get("best_val_nrmse", float("inf")))
+        start_epoch = int(ckpt.get("epoch", -1)) + 1
+        print(f"  resumed from {init_from}: continuing at epoch {start_epoch}")
     t_start = time.time()
 
     log_interval = max(1, epochs // 20)
@@ -765,7 +792,7 @@ def train_fabric(
     t_span = float(net.core.stage_times[0])
     num_steps = int(net.core.stage_steps[0])
 
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         net.train()
         # Carry state across chunks; detach only at chunk boundaries.
         state = torch.zeros(B, state_width, device=device)
@@ -785,7 +812,7 @@ def train_fabric(
 
         epoch_iter = _progress_iter(
             enumerate(chunk_order), desc=f"chunks",
-            total=n_chunks, disable=not verbose,
+            total=n_chunks, disable=(not verbose or not progress),
         )
         for _, ci in epoch_iter:
             cs = int(chunk_starts[int(ci)].item())
@@ -921,6 +948,38 @@ def train_fabric(
                         f"(best={best_val_nrmse:.4f})"
                     )
                     early_stopped = True
+
+        # Periodic checkpoint: model + optimizer + loop state so a killed
+        # job can resume with --init-from instead of restarting from epoch 0.
+        # The fabric is tiny (~1-8k params); each file is a few hundred KB.
+        if (
+            checkpoint_path is not None
+            and checkpoint_every > 0
+            and ((epoch + 1) % checkpoint_every == 0 or early_stopped)
+        ):
+            try:
+                ckpt = {
+                    "epoch": epoch,  # last completed epoch (0-based)
+                    "model_state": net.state_dict(),
+                    "optim_state": optim.state_dict(),
+                    "train_loss_history": history,
+                    "raw_leak_grad_history": raw_leak_grad_history,
+                    "hidden_rms_history": hidden_rms_history,
+                    "val_nrmse_history": val_nrmse_history,
+                    "val_r2_history": val_r2_history,
+                    "val_epochs": val_epochs,
+                    "best_val_nrmse": best_val_nrmse,
+                    "y_mean": y_mean,
+                    "y_std": y_std,
+                    "standardize": standardize,
+                }
+                ckpt_path = Path(checkpoint_path)
+                ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(ckpt, ckpt_path)
+                if verbose:
+                    print(f"  checkpoint saved: {ckpt_path} (epoch {epoch})")
+            except Exception as e:
+                print(f"  WARNING: checkpoint save failed: {e}")
 
         if early_stopped:
             break
@@ -1299,6 +1358,10 @@ def run_fabric_condition(
     cell_library: str = "tanh",
     core_refresh_interval: int = 0,
     early_stop_patience: int = 0,
+    progress: bool = True,
+    checkpoint_path: Path | None = None,
+    checkpoint_every: int = 0,
+    init_from: Path | None = None,
 ) -> dict[str, Any]:
     """Train one fabric condition and return its results.
 
@@ -1435,6 +1498,10 @@ def run_fabric_condition(
         grad_clip=1.0,
         val_every=val_every,
         early_stop_patience=early_stop_patience,
+        progress=progress,
+        checkpoint_path=checkpoint_path,
+        checkpoint_every=checkpoint_every,
+        init_from=init_from,
         val_u_test=val_u_test if val_u_test is not None else u_test,
         val_y_test=val_y_test if val_y_test is not None else y_test,
         val_washout=200,
@@ -1572,8 +1639,24 @@ def parse_args() -> argparse.Namespace:
                              "paths keep their own semantics. 0 (default) runs the "
                              "full {8,4,2} ladder (k=1 deferred unless all three fail).")
     parser.add_argument("--early-stop-patience", type=int, default=15,
-                        help="Early-stop if val NRMSE does not improve for N validation "
-                             "checks (default 15). 0 disables (run full epochs).")
+                        help="Early-stop if val NRMSE does not improve for N epochs "
+                             "(default 15). 0 disables (run full epochs). "
+                             "Requires --val-every > 0.")
+    parser.add_argument("--no-progress", action="store_true",
+                        help="Disable the per-chunk tqdm progress bar. Recommended for "
+                             "batch/log-file runs: cuts thousands of log lines and "
+                             "avoids non-ASCII bar glyphs in non-UTF8 locales. "
+                             "Epoch prints and validation lines are unaffected.")
+    parser.add_argument("--checkpoint-every", type=int, default=10,
+                        help="Save a resume checkpoint (model + optimizer + histories) "
+                             "every N epochs to <output>/<condition>_seed<N>.pt "
+                             "(default 10). 0 disables. Checkpoints are tiny "
+                             "(fabric is ~1-8k params).")
+    parser.add_argument("--init-from", type=Path, default=None,
+                        help="Resume a killed run from a checkpoint .pt written by an "
+                             "earlier run. Only used when exactly one fabric job runs "
+                             "(single --core-refresh-interval value + single seed); "
+                             "otherwise ignored with a warning.")
     parser.add_argument("--compile", action="store_true",
                         help="Wrap the per-sample Heun steps with torch.compile "
                              "for fused CUDA kernels. ~2-3x speedup on GPU. "
@@ -1588,6 +1671,82 @@ def parse_args() -> argparse.Namespace:
                              "'tanh_free' uses FreeTanhLibrary; 'tanh_realistic' uses "
                              "RealisticTanhLibrary; etc. See config.CELL_LIBRARIES.")
     return parser.parse_args()
+
+
+def _write_partial_tables(
+    out_dir: Path,
+    all_results: list[dict[str, Any]],
+    order: int,
+    seeds: list[int],
+) -> str:
+    """Write ``results_table.txt``/``results_table.csv`` from results so far.
+
+    Called after every fabric job (incremental flush: a killed run still
+    leaves completed jobs' metrics on disk) and once at the end of ``main``
+    for the final tables. Returns the summary text.
+    """
+    by_cond: dict[str, list[dict[str, Any]]] = {}
+    for r in all_results:
+        by_cond.setdefault(r["condition"], []).append(r)
+
+    summary_lines = [
+        f"NARMA-{order} -- {len(seeds)} seeds -- final results",
+        "=" * 60,
+    ]
+    csv_lines = ["condition,seed,nrmse,r2,mc_total,trained_params,total_params,hidden_dim,cell_library,core_refresh_interval,cell_lib_evals_per_sample"]
+    for cond in sorted(by_cond):
+        runs = by_cond[cond]
+        nrmse_vals = [r["nrmse"] for r in runs]
+        r2_vals = [r["r2"] for r in runs]
+        mc_vals = [r.get("mc_total") for r in runs if "mc_total" in r]
+        mc_str = (
+            f"  MC={sum(mc_vals) / len(mc_vals):.2f} +/- "
+            f"{(sum((m - sum(mc_vals) / len(mc_vals)) ** 2 for m in mc_vals) / len(mc_vals)) ** 0.5:.2f}"
+            if mc_vals else ""
+        )
+        # Complexity string: trained/total params + hidden_dim
+        tp_vals = [r.get("total_params") for r in runs if r.get("total_params") != ""]
+        tp_str = ""
+        if tp_vals:
+            tp = tp_vals[0]
+            if isinstance(tp, (int, float)) and tp > 0:
+                # Check if trained differs from total (ESN case)
+                tr_vals = [r.get("n_params") for r in runs if r.get("n_params") != ""]
+                tr = tr_vals[0] if tr_vals else tp
+                if tr != tp:
+                    tp_str = f"  params={tr}t/{tp}T"
+                else:
+                    hd_vals = [r.get("hidden_dim") for r in runs if r.get("hidden_dim") != ""]
+                    if hd_vals and hd_vals[0] != "":
+                        tp_str = f"  params={tp} (hid={hd_vals[0]})"
+                    else:
+                        tp_str = f"  params={tp}"
+        summary_lines.append(
+            f"{cond:>14}  NRMSE={sum(nrmse_vals) / len(nrmse_vals):.4f} +/- "
+            f"{(sum((v - sum(nrmse_vals) / len(nrmse_vals)) ** 2 for v in nrmse_vals) / len(nrmse_vals)) ** 0.5:.4f}  "
+            f"R^2={sum(r2_vals) / len(r2_vals):.4f} +/- "
+            f"{(sum((v - sum(r2_vals) / len(r2_vals)) ** 2 for v in r2_vals) / len(r2_vals)) ** 0.5:.4f}"
+            f"{mc_str}{tp_str}"
+        )
+        for r in runs:
+            mc = r.get("mc_total", "")
+            tp = r.get("n_params", "")
+            tt = r.get("total_params", "")
+            hd = r.get("hidden_dim", "")
+            csv_lines.append(
+                f"{cond},{r['seed']},{r['nrmse']:.6f},{r['r2']:.6f},"
+                f"{mc if mc != '' else ''},{tp if tp != '' else ''},"
+                f"{tt if tt != '' else ''},{hd if hd != '' else ''},"
+                f"{r.get('cell_library', '')},"
+                f"{r.get('core_refresh_interval', '')},"
+                f"{r.get('cell_lib_evals_per_sample', '')}"
+            )
+
+    summary_text = "\n".join(summary_lines) + "\n"
+    csv_text = "\n".join(csv_lines) + "\n"
+    (out_dir / "results_table.txt").write_text(summary_text)
+    (out_dir / "results_table.csv").write_text(csv_text)
+    return summary_text
 
 
 def main() -> int:
@@ -1663,12 +1822,24 @@ def main() -> int:
                     "pass --core-refresh-interval explicitly."
                 )
         fabric_jobs = [(k, s) for k in refresh_choices for s in seeds]
+        # --init-from only makes sense for a single job (one checkpoint file
+        # maps to one (k, seed) job). Ignore with a warning otherwise.
+        init_from = args.init_from
+        if init_from is not None and len(fabric_jobs) != 1:
+            print(
+                f"  WARNING: --init-from {init_from} ignored: it applies to "
+                f"single-job runs only, got {len(fabric_jobs)} jobs. "
+                "Re-run with a single --core-refresh-interval value and "
+                "single seed to resume."
+            )
+            init_from = None
         for idx, (refresh_k, seed) in enumerate(fabric_jobs, 1):
             cond_name = f"fabric_refresh_k{refresh_k}"
             print(f"  [{idx}/{len(fabric_jobs)}] {cond_name}  seed={seed}  "
                 f"core_refresh_interval={refresh_k}  "
                 f"cell_library={args.cell_library}  "
                 f"freeze_read=False (evolving core)")
+            ckpt_path = out_dir / f"{cond_name}_seed{seed}.pt"
             res = run_fabric_condition(
                 args.order, seed, freeze_read=False,
                 epochs=args.epochs,
@@ -1684,6 +1855,10 @@ def main() -> int:
                 compile_sequence=args.compile,
                 val_every=args.val_every,
                 early_stop_patience=args.early_stop_patience,
+                progress=not args.no_progress,
+                checkpoint_path=ckpt_path,
+                checkpoint_every=args.checkpoint_every,
+                init_from=init_from,
                 cell_library=args.cell_library,
                 core_refresh_interval=refresh_k,
             )
@@ -1716,70 +1891,24 @@ def main() -> int:
                 f"R^2={res['r2']:.4f}  MC={res['mc_total']:.2f}  "
                 f"params={res['n_params']}  epochs={epochs_done}{stopped_tag}{extra}"
             )
+            # Incremental flush: rewrite the aggregate tables after every
+            # job so a killed run still leaves the completed jobs' metrics
+            # on disk (the final write below just overwrites with the same
+            # content plus any remaining jobs).
+            try:
+                _write_partial_tables(out_dir, all_results, args.order)
+            except Exception as e:
+                print(f"  WARNING: partial table flush failed: {e}")
 
     # ---- Aggregate per condition ----
     by_cond: dict[str, list[dict[str, Any]]] = {}
     for r in all_results:
         by_cond.setdefault(r["condition"], []).append(r)
 
-    summary_lines = [
-        f"NARMA-{args.order} -- {len(seeds)} seeds -- final results",
-        "=" * 60,
-    ]
-    csv_lines = ["condition,seed,nrmse,r2,mc_total,trained_params,total_params,hidden_dim,cell_library,core_refresh_interval,cell_lib_evals_per_sample"]
-    for cond in sorted(by_cond):
-        runs = by_cond[cond]
-        nrmse_vals = [r["nrmse"] for r in runs]
-        r2_vals = [r["r2"] for r in runs]
-        mc_vals = [r.get("mc_total") for r in runs if "mc_total" in r]
-        mc_str = (
-            f"  MC={sum(mc_vals) / len(mc_vals):.2f} +/- "
-            f"{(sum((m - sum(mc_vals) / len(mc_vals)) ** 2 for m in mc_vals) / len(mc_vals)) ** 0.5:.2f}"
-            if mc_vals else ""
-        )
-        # Complexity string: trained/total params + hidden_dim
-        tp_vals = [r.get("total_params") for r in runs if r.get("total_params") != ""]
-        tp_str = ""
-        if tp_vals:
-            tp = tp_vals[0]
-            if isinstance(tp, (int, float)) and tp > 0:
-                # Check if trained differs from total (ESN case)
-                tr_vals = [r.get("n_params") for r in runs if r.get("n_params") != ""]
-                tr = tr_vals[0] if tr_vals else tp
-                if tr != tp:
-                    tp_str = f"  params={tr}t/{tp}T"
-                else:
-                    hd_vals = [r.get("hidden_dim") for r in runs if r.get("hidden_dim") != ""]
-                    if hd_vals and hd_vals[0] != "":
-                        tp_str = f"  params={tp} (hid={hd_vals[0]})"
-                    else:
-                        tp_str = f"  params={tp}"
-        summary_lines.append(
-            f"{cond:>14}  NRMSE={sum(nrmse_vals) / len(nrmse_vals):.4f} +/- "
-            f"{(sum((v - sum(nrmse_vals) / len(nrmse_vals)) ** 2 for v in nrmse_vals) / len(nrmse_vals)) ** 0.5:.4f}  "
-            f"R^2={sum(r2_vals) / len(r2_vals):.4f} +/- "
-            f"{(sum((v - sum(r2_vals) / len(r2_vals)) ** 2 for v in r2_vals) / len(r2_vals)) ** 0.5:.4f}"
-            f"{mc_str}{tp_str}"
-        )
-        for r in runs:
-            mc = r.get("mc_total", "")
-            tp = r.get("n_params", "")
-            tt = r.get("total_params", "")
-            hd = r.get("hidden_dim", "")
-            csv_lines.append(
-                f"{cond},{r['seed']},{r['nrmse']:.6f},{r['r2']:.6f},"
-                f"{mc if mc != '' else ''},{tp if tp != '' else ''},"
-                f"{tt if tt != '' else ''},{hd if hd != '' else ''},"
-                f"{r.get('cell_library', '')},"
-                f"{r.get('core_refresh_interval', '')},"
-                f"{r.get('cell_lib_evals_per_sample', '')}"
-            )
-
-    summary_text = "\n".join(summary_lines) + "\n"
+    # Final write (identical content to the incremental flush after the last
+    # job, plus the printed summary).
+    summary_text = _write_partial_tables(out_dir, all_results, args.order, seeds)
     print("\n" + summary_text)
-
-    (out_dir / "results_table.txt").write_text(summary_text)
-    (out_dir / "results_table.csv").write_text("\n".join(csv_lines) + "\n")
 
     # ---- Decision (pre-registered for the refresh-interval experiment) ----
     # Ladder {8,4,2} with num_steps=8: k=8 is the legacy-frozen baseline

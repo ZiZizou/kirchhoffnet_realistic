@@ -62,11 +62,14 @@ KNET_PRIOR_RANKS = (2, 3, 4)
 # Sampler revision bumped whenever suggest distributions or the arch
 # enumeration change; part of the study fingerprint so stale studies
 # fail fast instead of crashing RDBStorage on the second commit.
-SAMPLER_REV = 2
+# Rev 3 (round 1): KNet lr low 1e-3->2e-4, batch choices {128,256}->{128,256,
+# 384,512}, new kn_x_max/weight_decay/kn_solver_scale distributions,
+# multivariate+grouped TPE, rank-based two-rung halving.
+SAMPLER_REV = 3
 
-# Seed-trial config (manual-style, scaled into the 5000 window):
-# (hidden=10, stages=4, k=4, rank=2) is feasible at [4250,5000].
-SEED_KNET_ARCH = (10, 4, 4, 2)
+# Default-seed fallback values used when --seed-trial-from omits a field.
+# Round 1 seeds are full tuples (H,S,K,R,lr,batch[,wd,xmax,solver_scale]);
+# these constants are only the fallback lr/batch for incomplete entries.
 SEED_KNET_LR = 0.0025
 SEED_KNET_BATCH = 256
 
@@ -220,15 +223,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--no-seed-trial", action="store_true",
                         help="Skip the enqueued manual-style KNet seed trial (trial 0).")
-    parser.add_argument("--probe-epochs", type=int, default=25,
-                        help="TPE-safe multi-fidelity probe length; 0 disables gating "
-                             "(every trial runs full --epochs).")
+    # ── Multi-fidelity (rank-based halving, round 1; default ON) ─────────────
+    parser.add_argument("--probe-epochs", type=int, default=15,
+                        help="Rung-1 length. Set 0 to disable gating (every trial runs "
+                             "full --epochs).")
+    parser.add_argument("--rung2-epochs", type=int, default=0,
+                        help="Rung-2 length. Defaults to --epochs when > probe-epochs; "
+                             "0 means 'use --epochs'. Two-rung halving needs "
+                             "rung1 < rung2 (verified at startup).")
+    parser.add_argument("--halving-eta", type=int, default=3,
+                        help="Halving reduction factor; promote iff rank < max(1, N//eta).")
+    parser.add_argument("--halving-warmup", type=int, default=4,
+                        help="First N trials always promote (leaderboard seeding).")
     parser.add_argument("--probe-mse-max", type=float, default=0.15,
-                        help="Kill threshold: probe val_logit_mse above this returns "
-                             "finite probe values without promotion.")
+                        help="Hard upper bound on rung-1 val_logit_mse; rung-1 trials "
+                             "above this are killed before ranking. Defensive cap for "
+                             "obvious blow-ups only; primary decision is rank-based.")
     parser.add_argument("--probe-failure-max", type=float, default=0.40,
-                        help="Kill threshold: probe validation failure rate above this "
-                             "returns finite probe values without promotion.")
+                        help="Hard upper bound on rung-1 validation failure rate; rung-1 "
+                             "trials above this are killed before ranking.")
+    parser.add_argument("--seed-trial-from", type=str, nargs="+", default=None,
+                        help="Optional seed-trial tuples (each 'H,S,K,R,lr,batch' or "
+                             "'H,S,K,R,lr,batch,wd,xmax,solver_scale'). Re-resolved "
+                             "against the current feasible list; out-of-window tuples "
+                             "log a warning and are skipped (no silent substitution). "
+                             "Two seeds enqueued by default if omitted (manual + DB best).")
     return parser.parse_args()
 
 
@@ -245,7 +264,7 @@ def base_command(args: argparse.Namespace, output: Path) -> list[str]:
         "--dataset-dir", args.dataset_dir, "--output", str(output),
         "--fixed-dataset-path", str(args.fixed_dataset_path),
         "--device", args.device, "--seed", str(args.seed), "--epochs", str(args.epochs),
-        "--batch-size", str(args.batch_size), "--weight-decay", "0", "--bo-mode",
+        "--bo-mode",
     ]
     if args.zig_artifact_dir:
         command += ["--zig-artifact-dir", args.zig_artifact_dir]
@@ -268,11 +287,12 @@ def sample_config(trial: optuna.Trial, kind: str,
     ``mlp_feasible`` falls back to ``_get_feasible_mlp_arches(low, high)``
     when not provided (same legacy-caller contract as KNet). For KNet
     the (hidden, stages, k, rank) tuple is sampled jointly from the
-    precomputed feasible list (``knet_feasible``); ``x_max`` and
-    ``lr/batch_size`` remain independent (they do not move the param count).
-    ``knet_feasible`` falls back to ``_get_feasible_knet_arches(low, high)``
-    when not provided (e.g. legacy callers), but the main() path always
-    threads the precomputed list to skip the per-trial rebuild.
+    precomputed feasible list (``knet_feasible``); ``x_max``, ``weight_decay``,
+    ``solver_scale`` and ``lr/batch_size`` remain independent (they do not move
+    the param count). ``knet_feasible`` falls back to
+    ``_get_feasible_knet_arches(low, high)`` when not provided (e.g. legacy
+    callers), but the main() path always threads the precomputed list to skip
+    the per-trial rebuild.
 
     ``lr``/``batch_size`` are suggested EXACTLY ONCE per trial with
     kind-conditional ranges (studies are single-kind, so the distribution
@@ -285,13 +305,17 @@ def sample_config(trial: optuna.Trial, kind: str,
     Returns ``(cfg, penalty_reason)`` where penalty_reason is None iff the
     configuration is feasible. Callers must branch on the return value, not on
     trial.user_attrs round-trips.
+
+    Round-1 KNet dims: ``lr`` log[2e-4, 5e-3], ``batch_size`` {128,256,384,512},
+    ``kn_x_max`` [2, 8], ``weight_decay`` log[1e-6, 1e-2], ``kn_solver_scale``
+    [0.5, 2.0] — all param-count-neutral; only the arch tuple moves the count.
     """
     if kind == "mlp":
         _lr_low_f = 2e-4
         _bs_choices = [128, 256, 512, 1024]
     else:
-        _lr_low_f = 1e-3
-        _bs_choices = [128, 256]
+        _lr_low_f = 2e-4
+        _bs_choices = [128, 256, 384, 512]
     cfg: dict[str, str] = {
         "--lr": f"{trial.suggest_float('lr', _lr_low_f, 5e-3, log=True):.8g}",
         "--batch-size": str(trial.suggest_categorical("batch_size", _bs_choices)),
@@ -321,8 +345,12 @@ def sample_config(trial: optuna.Trial, kind: str,
         # 30/30-penalized report. Joint sampling over the precomputed
         # prior-biased (hidden, stages, k, rank) tuples makes every trial
         # feasible (0% budget-penalized) while still letting TPE explore the
-        # depth+VCA-rank manifold. x_max is fixed at 4.0 (proven) and
-        # lr/batch_size use narrowed KNet ranges (see above).
+        # depth+VCA-rank manifold.
+        # Round-1 expanded search: wd, x_max, solver_scale (the missing
+        # dimensions that the synthetic kn_bayes_opt covers) are added here.
+        # All three are param-count-neutral by construction, so the budget
+        # gate stays exact (count-invariance verified, 6775 across
+        # solver_scale in {0.5, 1, 2} and x_max in {2, 4, 8}).
         feasible_arches = (knet_feasible
                            if knet_feasible is not None
                            else _get_feasible_knet_arches(low, high))
@@ -331,14 +359,19 @@ def sample_config(trial: optuna.Trial, kind: str,
         arch_idx = int(trial.suggest_categorical("knet_arch_idx",
                                                  list(range(len(feasible_arches)))))
         hidden, num_stages, small_world_k, vca_rank = feasible_arches[arch_idx]
-        x_max = 4.0
+        x_max = trial.suggest_float("kn_x_max", 2.0, 8.0)
+        solver_scale = trial.suggest_float("kn_solver_scale", 0.5, 2.0)
+        weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True)
         fanout = knet_fanout(hidden)
         cfg.update({
             "--kn-num-hidden": str(hidden),
             "--kn-num-stages": str(num_stages),
             "--kn-small-world-k": str(small_world_k),
             "--kn-small-world-p": "0.2", "--kn-vca-rank": str(vca_rank),
-            "--kn-x-max": f"{x_max:.6g}", "--boundary-fan-out": json.dumps(fanout),
+            "--kn-x-max": f"{x_max:.6g}",
+            "--kn-solver-scale": f"{solver_scale:.6g}",
+            "--weight-decay": f"{weight_decay:.8g}",
+            "--boundary-fan-out": json.dumps(fanout),
             # NOTE: --lr/--batch-size already suggested once above with the
             # KNet ranges; re-suggesting here would crash (categorical) or
             # be silently ignored (float). Do not add them here.
@@ -348,6 +381,36 @@ def sample_config(trial: optuna.Trial, kind: str,
 
 def flat_args(cfg: dict[str, str]) -> list[str]:
     return [item for pair in cfg.items() for item in pair]
+
+
+def rung1_promotion_decision(rung1_history: list[tuple[float | None, float | None]],
+                             n_seen_so_far: int,
+                             probe_failure: float, probe_mse: float,
+                             eta: int, warmup: int
+                             ) -> tuple[int, int, int, bool, bool]:
+    """Rank-based successive-halving promotion for one rung-1 trial.
+
+    ``rung1_history`` holds ``(probe_failure, probe_mse)`` of every COMPLETE
+    peer that reached rung 1 (entries with a ``None`` component are ignored —
+    defensive; the caller only stores finite pairs). ``n_seen_so_far`` counts
+    non-RUNNING config trials on the study (leaderboard seeding).
+
+    Returns ``(rank, n_peers, promote_quota, in_warmup, promoted)`` where
+    ``rank`` is the number of strictly-better peers under lexicographic
+    ``(failure, mse)`` ordering, ``promote_quota = max(1, n_peers // eta)``,
+    and promotion holds during warmup or iff ``rank < promote_quota``.
+    Pure function (no Optuna I/O) so the halving math is unit-testable.
+    """
+    peers = [(pf, pm) for (pf, pm) in rung1_history
+             if pf is not None and pm is not None]
+    n_peers = len(peers)
+    rank = sum(1 for (pf, pm) in peers
+               if (pf < probe_failure)
+               or (pf == probe_failure and pm < probe_mse))
+    promote_quota = max(1, n_peers // eta) if n_peers else 1
+    in_warmup = n_seen_so_far <= warmup
+    promoted = in_warmup or rank < promote_quota
+    return rank, n_peers, promote_quota, in_warmup, promoted
 
 
 # ---------------------------------------------------------------------------
@@ -426,8 +489,9 @@ def trial_table_text(study: optuna.Study, kind: str) -> str:
         columns = ["trial", "state", "layers", "width", "ln", "act",
                    "lr", "batch", "params", "fail%", "mse", "note"]
     else:
-        columns = ["trial", "state", "hidden", "stages", "k", "rank", "x_max",
-                   "lr", "batch", "params", "fail%", "mse", "note"]
+        columns = ["trial", "state", "hidden", "stages", "k", "rank",
+                   "x_max", "scl", "wd", "lr", "batch", "params",
+                   "fail%", "mse", "r1", "q", "w", "prom", "note"]
     ordered = sorted(study.trials, key=lambda t: t.number)
     if any("arch_idx" in trial_arch_fields(kind, trial) for trial in ordered):
         columns.insert(columns.index("lr"), "arch_idx")
@@ -439,7 +503,8 @@ def trial_table_text(study: optuna.Study, kind: str) -> str:
         if trial.user_attrs.get("penalized") is True:
             note = str(trial.user_attrs.get("penalty_reason", "penalized"))[:60]
         elif trial.user_attrs.get("promoted") is False:
-            note = "probe-only"
+            kill_reason = trial.user_attrs.get("kill_reason", "rank")
+            note = f"rung1-only ({kill_reason})"
         elif trial.state.name == "RUNNING":
             note = "running"
         row = {
@@ -450,6 +515,17 @@ def trial_table_text(study: optuna.Study, kind: str) -> str:
             "params": str(trial.user_attrs.get("actual_params", "")),
             "fail%": _fmt_opt_float(values[0], percent=True) if len(values) > 0 else "",
             "mse": _fmt_opt_float(values[1]) if len(values) > 1 else "",
+            "wd": _fmt_opt_float(trial.params.get("weight_decay")) if kind == "knet" else "",
+            "x_max": _fmt_opt_float(trial.params.get("kn_x_max")) if kind == "knet" else "",
+            "scl": _fmt_opt_float(trial.params.get("kn_solver_scale")) if kind == "knet" else "",
+            "r1": (str(trial.user_attrs.get("rung1_rank", ""))
+                   if "rung1_rank" in trial.user_attrs else ""),
+            "q": (str(trial.user_attrs.get("promote_quota", ""))
+                  if "promote_quota" in trial.user_attrs else ""),
+            "w": ("Y" if trial.user_attrs.get("warmup") is True
+                  else ("N" if "warmup" in trial.user_attrs else "")),
+            "prom": ("Y" if trial.user_attrs.get("promoted") is True
+                     else ("N" if "promoted" in trial.user_attrs else "")),
             "note": note,
             **arch,
         }
@@ -469,11 +545,14 @@ def write_trial_table(output: Path, study: optuna.Study, kind: str) -> None:
 
 
 def results_fieldnames() -> list[str]:
-    # NOTE: ``promoted`` column belongs to the rev-2 multi-fidelity gate;
-    # keep it in both live and final CSVs so schemas never diverge.
+    # NOTE: ``promoted`` / ``rung1_rank`` / ``promote_quota`` / ``warmup`` columns
+    # belong to the rank-based halving gate; keep them in both live and final
+    # CSVs so schemas never diverge. ``kill_reason`` distinguishes hard-cap
+    # kills from rank-kills.
     return ["trial", "state", "validation_failure_rate",
             "validation_logit_mse", "param_count", "penalized",
-            "penalty_reason", "promoted", "params"]
+            "penalty_reason", "promoted", "kill_reason", "warmup",
+            "rung1_rank", "rung1_peers", "promote_quota", "params"]
 
 
 def write_results_csv(path: Path, study: optuna.Study) -> None:
@@ -491,6 +570,11 @@ def write_results_csv(path: Path, study: optuna.Study) -> None:
                              penalized,
                              trial.user_attrs.get("penalty_reason", ""),
                              trial.user_attrs.get("promoted", ""),
+                             trial.user_attrs.get("kill_reason", ""),
+                             trial.user_attrs.get("warmup", ""),
+                             trial.user_attrs.get("rung1_rank", ""),
+                             trial.user_attrs.get("rung1_peers", ""),
+                             trial.user_attrs.get("promote_quota", ""),
                              json.dumps(trial.params, sort_keys=True)])
 
 
@@ -612,6 +696,15 @@ def main() -> None:
         "n_arches": feasible_count,
         "arch_param_name": arch_param_name,
         "sampler_rev": SAMPLER_REV,
+        "sampler": "tpe_multivariate_grouped",
+        "kn_search_dims": [
+            "lr", "batch_size", "kn_x_max", "weight_decay", "kn_solver_scale",
+        ] if args.student_kind == "knet" else [],
+        "mlp_search_dims": ["lr", "batch_size", "student_activation"] if args.student_kind == "mlp" else [],
+        "rung1_epochs": args.probe_epochs,
+        "rung2_epochs": (args.rung2_epochs or args.epochs),
+        "halving_eta": args.halving_eta,
+        "halving_warmup": args.halving_warmup,
     })
 
     if args.resume:
@@ -644,7 +737,10 @@ def main() -> None:
             )
         study = optuna.create_study(study_name=study_name, storage=storage,
                                     directions=expected_directions,
-                                    sampler=TPESampler(seed=args.seed, n_startup_trials=args.n_startup_trials),
+                                    sampler=TPESampler(seed=args.seed,
+                                                       n_startup_trials=args.n_startup_trials,
+                                                       multivariate=True,
+                                                       group=True),
                                     load_if_exists=False)
         study.set_user_attr("sampling_fingerprint", sampling_fingerprint)
 
@@ -712,40 +808,112 @@ def main() -> None:
         print(f"[fixed-bo] KNet feasible tuples: {len(knet_feasible)} "
               f"(window=[{low}, {args.param_budget}])", flush=True)
 
-    # Seed trial (knet-bo-repair): enqueue one manual-style config as trial 0
-    # so TPE starts from proven territory instead of 8 random startup trials.
-    # Only on a study with no trials yet (fresh, or created-but-crashed).
-    # enqueue_trial stores fixed values; the trial still runs objective()
-    # (including the probe gate) normally.
+    # Seed trial (knet-bo-repair, round-1 expansion): enqueue up to two
+    # configs as trial 0 so TPE starts from proven territory instead of N
+    # random startup trials. Seeds are addressed by arch **tuple** and the
+    # categorical index is re-resolved against the *current* feasible list
+    # (indices shift when the budget changes, so persisting raw indices
+    # across rounds is unsafe). Two seeds by default (manual Kaggle winner
+    # and DB trial-3 winner) but --seed-trial-from overrides.
     if (args.student_kind == "knet" and not args.no_seed_trial
             and len(study.trials) == 0):
-        seed_arch = SEED_KNET_ARCH if SEED_KNET_ARCH in knet_feasible else None
-        if seed_arch is None:
-            scored = sorted(knet_feasible,
-                            key=lambda t: (args.param_budget - _knet_param_analytic(*t),
-                                           -t[1], -t[3]))
-            seed_arch = scored[0] if scored else None
-        if seed_arch is None:
-            print("[fixed-bo] WARNING: no feasible arch; skipping seed trial.", flush=True)
+        if args.seed_trial_from:
+            raw_seeds = []
+            for spec in args.seed_trial_from:
+                parts = [p.strip() for p in spec.split(",")]
+                try:
+                    parts_f = [float(p) for p in parts]
+                except ValueError as exc:
+                    raise ValueError(
+                        f"--seed-trial-from token {spec!r}: expected comma-separated "
+                        f"floats (H,S,K,R,lr,batch[,wd,xmax,solver_scale])"
+                    ) from exc
+                raw_seeds.append(tuple(parts_f))
         else:
-            seed_idx = list(knet_feasible).index(seed_arch)
-            study.enqueue_trial({"lr": SEED_KNET_LR, "batch_size": SEED_KNET_BATCH,
-                                 "knet_arch_idx": seed_idx})
-            print(f"[fixed-bo] seed trial enqueued: arch={seed_arch} idx={seed_idx} "
-                  f"lr={SEED_KNET_LR} batch={SEED_KNET_BATCH}", flush=True)
+            # Seed 1: manual Kaggle winner (14,4,4,2), 6775 params.
+            # Seed 2: DB trial-3 topology (stages=3, k=4, rank=4, lr=3.3e-3,
+            # batch=128) scaled to hidden=14 -> (14,3,4,4), 6110 params.
+            # The literal DB arch (10,3,4,4)=4482 falls below the round-1
+            # window and would be skipped; the hidden-14 analog preserves
+            # the depth+VCA-rank hypothesis in-window.
+            raw_seeds = [
+                (14.0, 4.0, 4.0, 2.0, 1e-3, 256.0),
+                (14.0, 3.0, 4.0, 4.0, 3.3e-3, 128.0),
+            ]
+        for raw in raw_seeds:
+            arch = tuple(int(round(x)) for x in raw[:4])
+            if arch not in knet_feasible:
+                try:
+                    params = _knet_param_analytic(*arch)
+                except Exception:
+                    params = -1
+                print(f"[fixed-bo] seed trial arch={arch} (params~{params}) NOT in "
+                      f"feasible window; skipping (no silent substitution).",
+                      flush=True)
+                continue
+            seed_idx = list(knet_feasible).index(arch)
+            seed_lr = float(raw[4]) if len(raw) > 4 else SEED_KNET_LR
+            seed_batch = int(raw[5]) if len(raw) > 5 else SEED_KNET_BATCH
+            # Fail fast on out-of-distribution seed fields: Optuna would
+            # otherwise raise an obscure error at suggest time mid-study.
+            if not 2e-4 <= seed_lr <= 5e-3:
+                raise ValueError(f"--seed-trial-from lr={seed_lr} outside [2e-4, 5e-3]")
+            if seed_batch not in (128, 256, 384, 512):
+                raise ValueError(
+                    f"--seed-trial-from batch={seed_batch} not in {{128, 256, 384, 512}}")
+            payload = {"lr": seed_lr, "batch_size": seed_batch,
+                       "knet_arch_idx": seed_idx}
+            if len(raw) > 6:
+                seed_wd = float(raw[6])
+                if not 1e-6 <= seed_wd <= 1e-2:
+                    raise ValueError(f"--seed-trial-from wd={seed_wd} outside [1e-6, 1e-2]")
+                payload["weight_decay"] = seed_wd
+            if len(raw) > 7:
+                seed_xmax = float(raw[7])
+                if not 2.0 <= seed_xmax <= 8.0:
+                    raise ValueError(f"--seed-trial-from xmax={seed_xmax} outside [2, 8]")
+                payload["kn_x_max"] = seed_xmax
+            if len(raw) > 8:
+                seed_scl = float(raw[8])
+                if not 0.5 <= seed_scl <= 2.0:
+                    raise ValueError(
+                        f"--seed-trial-from solver_scale={seed_scl} outside [0.5, 2.0]")
+                payload["kn_solver_scale"] = seed_scl
+            study.enqueue_trial(payload)
+            extras = ""
+            if len(raw) > 6:
+                extras = f" wd={payload['weight_decay']:.2e}"
+                if "kn_x_max" in payload:
+                    extras += f" xmax={payload['kn_x_max']:.3g}"
+                if "kn_solver_scale" in payload:
+                    extras += f" scl={payload['kn_solver_scale']:.3g}"
+            print(f"[fixed-bo] seed trial enqueued: arch={arch} idx={seed_idx} "
+                  f"lr={payload['lr']:.3g} batch={payload['batch_size']}{extras}",
+                  flush=True)
 
     probe_epochs = args.probe_epochs
+    rung2_epochs = args.rung2_epochs or args.epochs
     if not (0 < probe_epochs < args.epochs):
         if probe_epochs != 0:
             print(f"[fixed-bo] WARNING: --probe-epochs={probe_epochs} not in "
                   f"(0, {args.epochs}); gating disabled.", flush=True)
         probe_epochs = 0
     if probe_epochs:
-        print(f"[fixed-bo] multi-fidelity gate ON: {probe_epochs}-epoch probe, "
-              f"promote iff val_logit_mse<={args.probe_mse_max} and "
-              f"val_failure<={args.probe_failure_max} "
+        if rung2_epochs <= probe_epochs:
+            raise ValueError(
+                f"--rung2-epochs={rung2_epochs} must be greater than "
+                f"--probe-epochs={probe_epochs} for two-rung halving. "
+                "Use --probe-epochs 0 to disable gating."
+            )
+        if args.halving_eta < 2:
+            raise ValueError("--halving-eta must be >= 2 (successive-halving requires eta>=2)")
+        print(f"[fixed-bo] rank-based halving ON: rung1={probe_epochs}ep -> "
+              f"rung2={rung2_epochs}ep, eta={args.halving_eta}, warmup={args.halving_warmup}, "
+              f"hard cap probe-mse<={args.probe_mse_max} probe-failure<={args.probe_failure_max} "
               f"(killed trials return finite probe values, never pruned).",
               flush=True)
+    else:
+        rung2_epochs = args.epochs
 
     def run_harness(command: list[str], trial_dir: Path) -> int | str:
         """Run one harness subprocess; return returncode or exception repr."""
@@ -813,24 +981,72 @@ def main() -> None:
             probe_failure, probe_mse = probe_values
             trial.set_user_attr("probe_failure_rate", probe_failure)
             trial.set_user_attr("probe_logit_mse", probe_mse)
-            # TPE-safe kill: killed trials are COMPLETE with finite probe
-            # values (never TrialPruned/None — optuna#5260 — nor inf,
-            # optuna#3676). Pessimistic (25ep) values sort after promoted
-            # full-fidelity trials, exactly like successive halving.
-            if not (probe_mse <= args.probe_mse_max
-                    and probe_failure <= args.probe_failure_max):
+            # Defense-in-depth hard cap (kill obvious blow-ups before ranking):
+            if (probe_mse > args.probe_mse_max
+                or probe_failure > args.probe_failure_max):
                 trial.set_user_attr("promoted", False)
+                trial.set_user_attr("kill_reason", "hard_cap")
                 print(f"[fixed-bo] trial={trial.number:04d} params={actual_params} "
-                      f"KILLED at probe: val_failure={probe_failure * 100:.2f}% "
+                      f"KILLED at probe (hard cap): val_failure={probe_failure * 100:.2f}% "
                       f"val_logit_mse={probe_mse:.8f}", flush=True)
                 return probe_failure, probe_mse
-            trial.set_user_attr("promoted", True)
-            resume_command = full_command + ["--resume"]
-            resume_rc = run_harness(resume_command, trial_dir)
-            if resume_rc != 0:
+            # Rank-based halving (successive halving, hand-rolled): among all
+            # rung-1 COMPLETE trials on this study so far (including warmup),
+            # rank by lexicographic (failure, mse). Promote iff rank <
+            # max(1, N//eta). First --halving-warmup trials always promote
+            # (leaderboard seeding). Killed trials return finite probe values
+            # (never TrialPruned/None — optuna#5260 — never inf —
+            # optuna#3676); TPE treats them as pessimistic.
+            rung1_history = [
+                (t.user_attrs.get("probe_failure_rate"),
+                 t.user_attrs.get("probe_logit_mse"))
+                for t in study.trials
+                if t.state == optuna.trial.TrialState.COMPLETE
+                and "probe_failure_rate" in t.user_attrs
+                and "probe_logit_mse" in t.user_attrs
+                and "config" in t.user_attrs
+            ]
+            n_seen_so_far = sum(
+                1 for t in study.trials
+                if t.state != optuna.trial.TrialState.RUNNING
+                and "config" in t.user_attrs
+            )
+            rank, n_peers, promote_quota, in_warmup, promoted = rung1_promotion_decision(
+                rung1_history, n_seen_so_far,
+                probe_failure, probe_mse,
+                args.halving_eta, args.halving_warmup)
+            trial.set_user_attr("rung1_rank", rank)
+            trial.set_user_attr("rung1_peers", n_peers)
+            trial.set_user_attr("promoted", bool(promoted))
+            trial.set_user_attr("promote_quota", promote_quota)
+            trial.set_user_attr("warmup", bool(in_warmup))
+            append_trial_event(args.output, {
+                "event": "rung1_decision",
+                "trial": trial.number,
+                "probe_failure": probe_failure,
+                "probe_mse": probe_mse,
+                "rung1_rank": rank,
+                "rung1_peers": n_peers,
+                "promote_quota": promote_quota,
+                "warmup": in_warmup,
+                "promoted": bool(promoted),
+            })
+            print(f"[fixed-bo] trial={trial.number:04d} rung1 rank={rank}/{n_peers} "
+                  f"quota={promote_quota} warmup={in_warmup} promoted={promoted} "
+                  f"probe_fail={probe_failure*100:.2f}% probe_mse={probe_mse:.6f}",
+                  flush=True)
+            if not promoted:
+                trial.set_user_attr("kill_reason", "rank")
+                return probe_failure, probe_mse
+            rung2_command = list(full_command)
+            rung2_idx = rung2_command.index("--epochs") + 1
+            rung2_command[rung2_idx] = str(rung2_epochs)
+            rung2_command += ["--resume"]
+            rung2_rc = run_harness(rung2_command, trial_dir)
+            if rung2_rc != 0:
                 trial.set_user_attr("penalized", True)
                 trial.set_user_attr("penalty_reason",
-                                    f"resume subprocess failed ({resume_rc})")
+                                    f"rung2 subprocess failed ({rung2_rc})")
                 return PENALTY_VALUES
         else:
             rc = run_harness(full_command, trial_dir)

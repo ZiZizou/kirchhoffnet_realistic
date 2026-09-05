@@ -129,6 +129,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kn-input-rail", type=float, default=4.0)
     parser.add_argument("--kn-x-max", type=float, default=4.0)
     parser.add_argument("--kn-input-log-pad-frac", type=float, default=0.05)
+    parser.add_argument("--kn-solver-scale", type=float, default=1.0,
+                        help="Multiplier on per-stage t_span and num_steps (param-count-neutral; "
+                             "preserves the SOLVER step-per-t-span resolution). Default 1.0.")
     parser.add_argument("--kn-vca", type=parse_bool, default=True)
     parser.add_argument("--kn-vca-rank", type=int, default=2)
     parser.add_argument("--kn-vca-core", type=parse_bool, default=True)
@@ -232,8 +235,9 @@ class KirchhoffStudent(nn.Module):
         self.register_buffer("log_lo", torch.tensor([v[0] for v in PARAM_LOG_BOUNDS.values()], dtype=torch.float32))
         self.register_buffer("log_hi", torch.tensor([v[1] for v in PARAM_LOG_BOUNDS.values()], dtype=torch.float32))
 
-        stage_t_span = SOLVER["t_span"] / args.kn_num_stages
-        stage_steps = max(1, int(round(SOLVER["num_steps"] / args.kn_num_stages)))
+        solver_scale = float(args.kn_solver_scale)
+        stage_t_span = SOLVER["t_span"] / args.kn_num_stages * solver_scale
+        stage_steps = max(1, int(round(SOLVER["num_steps"] / args.kn_num_stages * solver_scale)))
         cfg = {
             "stages": [{
                 "num_inputs": 4, "num_hidden": args.kn_num_hidden, "num_proj": 0, "num_outputs": 0,
@@ -482,6 +486,10 @@ def main() -> None:
             "This isolation baseline currently supports the requested --mlp-teacher-input-preprocessing knet only. "
             "A q75 teacher requires its original fitted Q75/ZIG scaling artifacts and must not be labelled with placeholders."
         )
+    if args.student_kind == "knet" and float(args.kn_solver_scale) <= 0:
+        raise ValueError(f"--kn-solver-scale must be positive, got {args.kn_solver_scale}")
+    if args.student_kind == "knet" and float(args.kn_x_max) <= 0:
+        raise ValueError(f"--kn-x-max must be positive, got {args.kn_x_max}")
     os.makedirs(args.output, exist_ok=True)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     device = resolve_device(args.device)

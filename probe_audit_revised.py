@@ -465,4 +465,398 @@ with tempfile.TemporaryDirectory(prefix="audit_e0_resume_") as _tmp:
     assert _p3["build"]["use_small_world"] is True
 print("AUDIT_M_E0_RESUME_OK prefix-resume exact; build-mismatch reruns")
 
+# --- N. Round-2 §13.1 sparse-drive plumbing: _build_fabric_net forwards
+# boundary_fan_out; canonical behavior unchanged; sparse build finite.
+torch.manual_seed(0)
+_n_canon, _, _ = ne._build_fabric_net(
+    order=10, seed=0, freeze_read=False,
+    t_span=1.0, num_steps=8, cell_library="tanh_free",
+    core_refresh_interval=0, leak_constant=None,
+    compile_sequence=False,
+)
+_n_params_canon = sum(p.numel() for p in _n_canon.parameters() if p.requires_grad)
+# Canonical full fan-out, passed explicitly, must match the legacy build
+# byte-for-byte.
+torch.manual_seed(0)
+_n_full, _, _ = ne._build_fabric_net(
+    order=10, seed=0, freeze_read=False,
+    t_span=1.0, num_steps=8, cell_library="tanh_free",
+    core_refresh_interval=0, leak_constant=None,
+    compile_sequence=False,
+    boundary_fan_out={0: list(range(25))},
+)
+_n_params_full = sum(p.numel() for p in _n_full.parameters() if p.requires_grad)
+assert _n_params_canon == _n_params_full, (
+    f"canonical full fan-out must match legacy param count: "
+    f"{_n_params_canon} vs {_n_params_full}"
+)
+# Sparse drive reduces the boundary edge count and the param count.
+torch.manual_seed(0)
+_n_sparse, _, _ = ne._build_fabric_net(
+    order=10, seed=0, freeze_read=False,
+    t_span=1.0, num_steps=8, cell_library="tanh_free",
+    core_refresh_interval=0, leak_constant=None,
+    compile_sequence=False,
+    boundary_fan_out={0: [0, 5, 10, 15, 20]},
+)
+_n_params_sparse = sum(p.numel() for p in _n_sparse.parameters() if p.requires_grad)
+assert _n_params_sparse < _n_params_canon, (
+    f"sparse drive reduces boundary params: {_n_params_sparse} vs "
+    f"{_n_params_canon}"
+)
+# Forward a small stream; states must be finite.
+_u, _ = ne._gen_narma_train_streams(10, 0, 1, 100)
+_u_d = ne._scale_drive(_u[0], bipolar=True, order=10, input_scale=1.0)
+_n_sparse.eval()
+with torch.no_grad():
+    _y_pred, _y_te = ne._evaluate_fabric_direct(
+        _n_sparse, _u_d, torch.zeros_like(_u_d),
+        washout=10, device="cpu",
+    )
+assert torch.isfinite(_y_pred).all(), "sparse net forward finite"
+# Out-of-range target raises.
+try:
+    ne._build_fabric_net(
+        order=10, seed=0, freeze_read=False,
+        t_span=1.0, num_steps=8, cell_library="tanh_free",
+        core_refresh_interval=0, leak_constant=None,
+        compile_sequence=False,
+        boundary_fan_out={0: [0, 99]},
+    )
+    raise AssertionError("expected ValueError on out-of-range target")
+except ValueError:
+    pass
+# Duplicate target raises.
+try:
+    ne._build_fabric_net(
+        order=10, seed=0, freeze_read=False,
+        t_span=1.0, num_steps=8, cell_library="tanh_free",
+        core_refresh_interval=0, leak_constant=None,
+        compile_sequence=False,
+        boundary_fan_out={0: [3, 3]},
+    )
+    raise AssertionError("expected ValueError on duplicate target")
+except ValueError:
+    pass
+print(
+    f"AUDIT_N_SPARSE_DRIVE_OK canon={_n_params_canon} sparse={_n_params_sparse}; "
+    f"finite forward + out-of-range + duplicate-target guards"
+)
+
+# --- O. Round-2 §13.2 VCA-boundary plumbing: vca_* kwargs build the gate,
+# default canonical leg has vca_enabled=False, sparse + VCA forward finite.
+torch.manual_seed(0)
+_n_vca, _, _ = ne._build_fabric_net(
+    order=10, seed=0, freeze_read=False,
+    t_span=1.0, num_steps=8, cell_library="tanh_free",
+    core_refresh_interval=2, leak_constant=None, compile_sequence=False,
+    boundary_fan_out={0: [0, 5, 10, 15, 20]},
+    vca_enabled=True, vca_rank=2, vca_bias=False,
+)
+_s = _n_vca.core.stages[0]
+assert _s.vca_enabled is True
+assert _s._vca_core_enabled is False, (
+    f"VCA-boundary must hardcode core off, got {_s._vca_core_enabled}"
+)
+assert _s.vca_gate_shunt is False, "gate_shunt must be off (canonical)"
+assert _s.vca_separate_core_bus is False, "separate_core_bus must be off (canonical)"
+assert _s.vca_v_boundary is not None
+assert _s.vca_v_boundary.shape == (5, 2), (
+    f"vca_v_boundary shape: {_s.vca_v_boundary.shape}"
+)
+assert _s.vca_v_core is None, "vca_v_core must be None (core off)"
+assert _s.vca_W.shape == (1, 2), f"vca_W shape: {_s.vca_W.shape}"
+# Positive control for the no-vca-params assertion below: the VCA-on net
+# MUST expose vca_* entries in named_parameters (same dotted matching).
+assert any(
+    ".vca_" in k or k.startswith("vca_")
+    for k in dict(_n_vca.named_parameters()).keys()
+), "vca_enabled=True must allocate vca_* params"
+# Default vca_enabled=False leaves the canonical param count unchanged.
+_n_vcaoff, _, _ = ne._build_fabric_net(
+    order=10, seed=0, freeze_read=False,
+    t_span=1.0, num_steps=8, cell_library="tanh_free",
+    core_refresh_interval=0, leak_constant=None, compile_sequence=False,
+    boundary_fan_out={0: [0, 5, 10, 15, 20]},
+    vca_enabled=False, vca_rank=None, vca_bias=None,
+)
+_n_params_vcaoff = sum(p.numel() for p in _n_vcaoff.parameters() if p.requires_grad)
+# NOTE: stage param names are prefixed ("core.stages.0.vca_W"), so match
+# on the dotted suffix, not the start of the string. Also assert the
+# stage flag itself is off.
+assert _n_vcaoff.core.stages[0].vca_enabled is False
+assert not any(
+    ".vca_" in k or k.startswith("vca_")
+    for k in dict(_n_vcaoff.named_parameters()).keys()
+), "vca_enabled=False must not allocate any vca_* params"
+assert _n_params_vcaoff < _n_params_canon, (
+    "sparse drive without VCA still has fewer params than canonical full"
+)
+# VCA-on with no boundary family raises.
+try:
+    ne._build_fabric_net(
+        order=10, seed=0, freeze_read=False,
+        t_span=1.0, num_steps=8, cell_library="tanh_free",
+        core_refresh_interval=0, leak_constant=None,
+        compile_sequence=False,
+        boundary_fan_out={},
+        vca_enabled=True, vca_rank=2,
+    )
+    raise AssertionError("expected ValueError on VCA-on with no boundary")
+except ValueError:
+    pass
+# VCA net forward finite.
+_u_d2 = ne._scale_drive(_u[0], bipolar=True, order=10, input_scale=1.0)
+_n_vca.eval()
+with torch.no_grad():
+    _y_pred_vca, _y_te_vca = ne._evaluate_fabric_direct(
+        _n_vca, _u_d2, torch.zeros_like(_u_d2),
+        washout=10, device="cpu",
+    )
+assert torch.isfinite(_y_pred_vca).all(), "VCA net forward finite"
+print(
+    f"AUDIT_O_VCA_BOUNDARY_OK vca_v_boundary={tuple(_s.vca_v_boundary.shape)} "
+    f"vca_W={tuple(_s.vca_W.shape)} canonical_vcaoff={_n_params_vcaoff} "
+    f"core_off + no-family-guard"
+)
+
+# --- P. Round-2 §13.3 init-override (--gain-init / --leak-init) plumbed
+# through run_fabric_condition: gain fill is correct, leak mode dispatches
+# to hetero / randomized / numeric. Use the same small-stream 1-epoch
+# train to confirm the path does not crash.
+_nrp = nrp
+# Sparse + VCA factory build (canonical Round-2 control VCA-2 corner).
+torch.manual_seed(0)
+net_vca2, _, _, log_vca2 = _nrp.build_vca_boundary_sparse_drive_net(
+    order=10, seed=0, freeze_read=False,
+    boundary_fan_out=_nrp.DEFAULT_SPARSE_DRIVE_BFO,
+    vca_enabled=True, vca_rank=2,
+)
+assert log_vca2["vca_core_enabled"] is False
+assert log_vca2["vca_gate_shunt"] is False
+assert log_vca2["vca_separate_core_bus"] is False
+# Sparse + VCA forward finite (200 samples, full train stream).
+net_vca2.eval()
+with torch.no_grad():
+    _y_pred_vca2, _ = ne._evaluate_fabric_direct(
+        net_vca2, _u_d2, torch.zeros_like(_u_d2),
+        washout=10, device="cpu",
+    )
+assert torch.isfinite(_y_pred_vca2).all(), "sparse + VCA forward finite"
+# Helper rejects VCA-on with empty fan-out.
+try:
+    _nrp.build_vca_boundary_sparse_drive_net(
+        order=10, seed=0, freeze_read=False,
+        boundary_fan_out={}, vca_enabled=True,
+    )
+    raise AssertionError("expected ValueError on VCA-on with empty fan-out")
+except ValueError:
+    pass
+# Sparse + no VCA control arm.
+torch.manual_seed(0)
+net_plain, _, _, log_plain = _nrp.build_vca_boundary_sparse_drive_net(
+    order=10, seed=0, freeze_read=False,
+    boundary_fan_out=_nrp.DEFAULT_SPARSE_DRIVE_BFO,
+    vca_enabled=False,
+)
+assert log_plain["vca_enabled"] is False
+_n_params_plain = sum(p.numel() for p in net_plain.parameters() if p.requires_grad)
+assert _n_params_plain < _n_params_canon, (
+    "plain sparse has fewer params than canonical full"
+)
+# Default canonical sparse-drive flag (5 evenly spaced targets).
+assert _nrp.DEFAULT_SPARSE_DRIVE_BFO == {0: [0, 5, 10, 15, 20]}
+print(
+    f"AUDIT_P_VCA_SPARSE_FACTORY_OK canonical sparse={_n_params_plain} "
+    f"VCA-on + VCA-off arms build + forward; empty-fan-out guard"
+)
+
+# --- Q. Round-2 §13.1 sparse E0 corner tags: canonical tag unchanged,
+# sparse tag distinct, resume progress file distinguishes the two builds.
+_n_canon_tag = npr._e0_config_tag(
+    order=10, seed=0, device="cpu", hidden_dim=25, refresh=0,
+    t_span=1.0, num_steps=8, gm_init=-2.0, leak_mode="slow-fixed",
+    drive=0.25, washout=50, jacobian_samples=1,
+    boundary_fan_out=None,
+)
+_n_canon_tag2 = npr._e0_config_tag(
+    order=10, seed=0, device="cpu", hidden_dim=25, refresh=0,
+    t_span=1.0, num_steps=8, gm_init=-2.0, leak_mode="slow-fixed",
+    drive=0.25, washout=50, jacobian_samples=1,
+    boundary_fan_out={0: list(range(25))},
+)
+_n_sparse_tag = npr._e0_config_tag(
+    order=10, seed=0, device="cpu", hidden_dim=25, refresh=0,
+    t_span=1.0, num_steps=8, gm_init=-2.0, leak_mode="slow-fixed",
+    drive=0.25, washout=50, jacobian_samples=1,
+    boundary_fan_out={0: [0, 5, 10, 15, 20]},
+)
+assert _n_canon_tag == _n_canon_tag2, (
+    f"canonical full fan-out must match None tag: {_n_canon_tag!r} "
+    f"vs {_n_canon_tag2!r}"
+)
+assert _n_canon_tag != _n_sparse_tag, (
+    f"sparse tag must be distinct from canonical: {_n_canon_tag!r} "
+    f"vs {_n_sparse_tag!r}"
+)
+# Build-key JSON ordering: corner resume distinguishes sparse from full.
+import tempfile
+with tempfile.TemporaryDirectory(prefix="audit_e0_fanout_") as _tmp:
+    _prog = Path(_tmp) / "e0_progress.json"
+    # Pass 1: full fan-out, 2 corners.
+    _r1 = npr.e0_sweep(
+        order=10, seed=0, device="cpu",
+        gain_grid=(0.0,), leak_grid=["slow-fixed"],
+        drive_grid=(0.25, 0.5),
+        n_streams=1, train_samples_per_stream=200,
+        washout=50, jacobian_samples=1,
+        t_span=1.0, num_steps=8, hidden_dim=25,
+        progress_json=_prog,
+        boundary_fan_out=None,
+    )
+    _bkey_full = json.loads(_prog.read_text())["build"]["boundary_fan_out"]
+    assert _bkey_full == "canonical-full", (
+        f"full-fan-out build_key marker: {_bkey_full}"
+    )
+    _full_tags_pass1 = [r.config_tag for r in _r1]
+    # Pass 2: sparse fan-out -> build mismatch -> full rerun.
+    _r2 = npr.e0_sweep(
+        order=10, seed=0, device="cpu",
+        gain_grid=(0.0,), leak_grid=["slow-fixed"],
+        drive_grid=(0.25, 0.5),
+        n_streams=1, train_samples_per_stream=200,
+        washout=50, jacobian_samples=1,
+        t_span=1.0, num_steps=8, hidden_dim=25,
+        progress_json=_prog,
+        boundary_fan_out={0: [0, 5, 10, 15, 20]},
+    )
+    _bkey_sparse = json.loads(_prog.read_text())["build"]["boundary_fan_out"]
+    assert _bkey_sparse != _bkey_full, (
+        f"sparse vs full build_key distinct: {_bkey_sparse} vs {_bkey_full}"
+    )
+    _sparse_tags = [r.config_tag for r in _r2]
+    assert all("_fan" in t for t in _sparse_tags), (
+        f"sparse tags must carry _fan suffix: {_sparse_tags}"
+    )
+    # Pass 3: same sparse run -> resume from sparse progress.
+    _r3 = npr.e0_sweep(
+        order=10, seed=0, device="cpu",
+        gain_grid=(0.0,), leak_grid=["slow-fixed"],
+        drive_grid=(0.25, 0.5),
+        n_streams=1, train_samples_per_stream=200,
+        washout=50, jacobian_samples=1,
+        t_span=1.0, num_steps=8, hidden_dim=25,
+        progress_json=_prog,
+        boundary_fan_out={0: [0, 5, 10, 15, 20]},
+    )
+    assert [r.config_tag for r in _r3] == _sparse_tags, (
+        "sparse resume row order/tags match"
+    )
+print(
+    f"AUDIT_Q_FANOUT_RESUME_OK canon tag untouched, sparse tag has _fan "
+    f"suffix, build_key distinguishes full vs sparse, resume keys correctly"
+)
+
+# --- R. Round-2 CLI surface (the Round-1 bug class: flags that parse but
+# never execute). R1 runs the e0 CLI with --boundary-fan-out end to end;
+# R2/R3 exercise the narma_experiment VCA guard in both directions.
+# R1: e0 CLI with a sparse fan-out JSON runs and tags the corner _fan.
+with tempfile.TemporaryDirectory(prefix="audit_e0_fanout_cli_") as _tmp:
+    _proc = subprocess.run(
+        [sys.executable, "-B", "narma_advisor_probes.py", "e0",
+         "--order", "10", "--seed", "0", "--device", "cpu",
+         "--gain-grid=0.0",
+         "--leak-grid=slow-fixed",
+         "--drive-grid=0.5",
+         "--max-corners", "1",
+         "--n-streams", "1", "--train-samples", "300",
+         "--jacobian-samples", "1",
+         "--hidden-dim", "25",
+         "--boundary-fan-out", '{"0": [0, 5, 10, 15, 20]}',
+         "--output", _tmp],
+        cwd=str(_here), capture_output=True, text=True, timeout=300,
+    )
+    assert _proc.returncode == 0, (
+        f"e0 CLI --boundary-fan-out rc={_proc.returncode}: "
+        f"{_proc.stderr[-2000:]}"
+    )
+    _summary = json.loads((Path(_tmp) / "e0_sweep.json").read_text())
+    assert _summary["n_corners"] == 1, (
+        f"e0 CLI --boundary-fan-out corners: {_summary['n_corners']}"
+    )
+    assert "_fan" in _summary["rows"][0]["config_tag"], (
+        f"e0 CLI sparse corner tag missing _fan suffix: "
+        f"{_summary['rows'][0]['config_tag']}"
+    )
+    assert _summary["canonical_net"]["boundary_fan_out"] == {"0": [0, 5, 10, 15, 20]}, (
+        f"e0 CLI canonical_net must record the fan-out override: "
+        f"{_summary['canonical_net']['boundary_fan_out']}"
+    )
+    # Bad JSON and out-of-range targets fail fast with a clean message.
+    for _bad_args, _needle in (
+        (["--boundary-fan-out", "{not-json"], "invalid JSON"),
+        (["--boundary-fan-out", '{"0": [0, 99]}'], "out of range"),
+    ):
+        _bad = subprocess.run(
+            [sys.executable, "-B", "narma_advisor_probes.py", "e0",
+             "--order", "10", "--seed", "0", "--device", "cpu",
+             "--gain-grid=0.0", "--leak-grid=slow-fixed",
+             "--drive-grid=0.5",
+             "--n-streams", "1", "--train-samples", "300",
+             *_bad_args, "--output", _tmp],
+            cwd=str(_here), capture_output=True, text=True, timeout=120,
+        )
+        assert _bad.returncode != 0, (
+            f"e0 CLI should reject {_bad_args}, rc={_bad.returncode}"
+        )
+        assert _needle in (_bad.stdout + _bad.stderr), (
+            f"e0 CLI rejection of {_bad_args} should mention {_needle!r}: "
+            f"{(_bad.stdout + _bad.stderr)[-500:]}"
+        )
+print("AUDIT_R1_E0_FANOUT_CLI_OK sparse corner runs, _fan tag, guards fail fast")
+
+# R2: --vca-boundary with an explicitly empty '{}' is rejected (rc=2)
+# before any training starts.
+with tempfile.TemporaryDirectory(prefix="audit_vca_guard_") as _tmp:
+    _proc = subprocess.run(
+        [sys.executable, "-B", "narma_experiment.py",
+         "--order", "10", "--seeds", "0",
+         "--epochs", "1", "--device", "cpu",
+         "--core-refresh-interval", "2",
+         "--cell-library", "tanh_free",
+         "--vca-boundary", "--boundary-fan-out", "{}",
+         "--fabric-only",
+         "--output", _tmp],
+        cwd=str(_here), capture_output=True, text=True, timeout=120,
+    )
+    assert _proc.returncode == 2, (
+        f"VCA-on with empty fan-out must exit 2, got {_proc.returncode}: "
+        f"{(_proc.stdout + _proc.stderr)[-1000:]}"
+    )
+    assert "no gated family" in (_proc.stdout + _proc.stderr), (
+        "VCA guard must explain the empty-fan-out rejection"
+    )
+print("AUDIT_R2_VCA_GUARD_OK empty fan-out rejected with rc=2 + message")
+
+# R3: --vca-boundary WITHOUT --boundary-fan-out is the valid VCA-1
+# full-drive configuration (must NOT be rejected). Both *_only flags make
+# this a parse-and-exit smoke with no training.
+with tempfile.TemporaryDirectory(prefix="audit_vca_full_") as _tmp:
+    _proc = subprocess.run(
+        [sys.executable, "-B", "narma_experiment.py",
+         "--order", "10", "--seeds", "0",
+         "--epochs", "1", "--device", "cpu",
+         "--core-refresh-interval", "2",
+         "--cell-library", "tanh_free",
+         "--vca-boundary",
+         "--baselines-only", "--fabric-only",
+         "--output", _tmp],
+        cwd=str(_here), capture_output=True, text=True, timeout=120,
+    )
+    assert _proc.returncode == 0, (
+        f"VCA-1 full-drive config must parse cleanly, rc={_proc.returncode}: "
+        f"{(_proc.stdout + _proc.stderr)[-1000:]}"
+    )
+print("AUDIT_R3_VCA_FULL_DRIVE_OK VCA-1 config (no fan-out flag) accepted")
+
 print("\nALL_AUDITS_OK")

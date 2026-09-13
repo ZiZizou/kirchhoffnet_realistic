@@ -45,6 +45,16 @@ Provides:
      flips ``hidden_family`` from ``torus`` to ``small_world`` with the
      given ``k``, ``p``, ``seed``; passes through to ``build_net_from_config``.
 
+4. **Round-2 sparse-drive / VCA-boundary helpers** (plan §13):
+
+   - :func:`build_vca_boundary_sparse_drive_net` -- Round-2 §13.2 VCA-boundary
+     plumbing wrapped as a single factory. Forwards ``boundary_fan_out``,
+     ``vca_enabled``, ``vca_rank``, ``vca_bias`` through ``_build_fabric_net``
+     (canonical Round-2 controls). Returns ``(net, t_span, num_steps, log)``
+     with the VCA parameters logged for the audit trail. ``vca_core``,
+     ``vca_gate_shunt``, ``vca_separate_core_bus`` are hardcoded off per
+     the revised plan sec. 6 / 8 -- VCA on boundary edges only.
+
 The CLI in :mod:`main` exposes ``memory``, ``esn-cal``, and
 ``hetero-leak-init`` modes for smoke runs. Heavy grid sweeps are meant
 for Alliance GPU; local smoke is sized so a 2-corner E0 / 1-ESN-corner
@@ -606,6 +616,119 @@ def build_small_world_narma_preset(
             "bidirectional": False,
         }
     return preset
+
+
+# ---------------------------------------------------------------------------
+# Round-2 §13.2 VCA-boundary net factory
+# ---------------------------------------------------------------------------
+
+
+# Canonical sparse-drive boundary fan-out used in the Round-2 §13.1 E0 grid
+# (plan: "5 evenly spaced nodes — maximal inter-drive distance, simplest to
+# reason about"). Stays here so the batch script, the audit, and the train
+# legs all agree on the same default; override via ``boundary_fan_out`` to
+# use a different map (the cross-attribute comparison still works).
+DEFAULT_SPARSE_DRIVE_BFO: dict[int, list[int]] = {0: [0, 5, 10, 15, 20]}
+
+
+def build_vca_boundary_sparse_drive_net(
+    order: int, seed: int, *,
+    freeze_read: bool = False,
+    cell_library: str = "tanh_free",
+    t_span: float = 1.0,
+    num_steps: int = 8,
+    core_refresh_interval: int = 2,
+    leak_constant: float | None = None,
+    hidden_dim: int = 25,
+    readout: str = "temporal",
+    boundary_fan_out: dict[int, list[int]] | None = None,
+    vca_enabled: bool = True,
+    vca_rank: int | None = None,
+    vca_bias: bool | None = None,
+) -> tuple[nn.Module, float, int, dict[str, Any]]:
+    """Build a NARMA fabric with VCA-boundary + optional sparse drive (Round-2 §13.2).
+
+    Thin wrapper around :func:`narma_experiment._build_fabric_net` that:
+
+    - forwards ``boundary_fan_out`` (None -> canonical full fan-out);
+    - forwards ``vca_enabled`` / ``vca_rank`` / ``vca_bias``;
+    - hardcodes ``vca_core_enabled=False``, ``vca_gate_shunt=False``,
+      ``vca_separate_core_bus=False`` (the canonical Round-2 ablation:
+      VCA only on boundary edges per the revised plan sec. 6 / 8).
+
+    Args:
+        boundary_fan_out: Sparse drive map. ``None`` -> use the canonical
+            preset full fan-out (no sparsification; valid for VCA --
+            this is the VCA-1 full-drive configuration). A non-empty dict
+            -> sparse fan-out. An explicitly empty ``{}`` disables boundary
+            terminals and is rejected when ``vca_enabled=True`` (the gate
+            would have nothing to modulate).
+        vca_enabled: Enable the VCA gate on boundary edges.
+        vca_rank: VCA projection rank; ``None`` -> ``config.VCA['rank']``.
+        vca_bias: Per-edge affine offset; ``None`` -> ``config.VCA['bias']``.
+
+    Returns:
+        ``(net, t_span, num_steps, log)``. The ``log`` dict carries the
+        effective boundary fan-out and VCA settings so the audit trail
+        can join against the train-leg row.
+    """
+    if boundary_fan_out is None:
+        bfo = None  # _build_fabric_net interprets None as "use preset default"
+    else:
+        bfo = {int(k): [int(v) for v in vs] for k, vs in boundary_fan_out.items()}
+        # VCA-on with an explicitly empty fan-out is the user-mistake
+        # case: the canonical preset's full fan-out is NOT applied here
+        # (the caller passed an override, however empty), so the
+        # differential-stage validator would reject it with a less
+        # specific message. Catch the cheap case up-front.
+        if vca_enabled and not bfo:
+            raise ValueError(
+                "build_vca_boundary_sparse_drive_net: vca_enabled=True with "
+                "an empty --boundary-fan-out rejects the build (the gate "
+                "has nothing to modulate); either pass a non-empty map or "
+                "drop --vca-boundary. Passing boundary_fan_out=None uses "
+                "the canonical preset full fan-out, which is fine for "
+                "VCA (see TEST 3 / VCA-1)."
+            )
+    net, t_used, n_used = ne._build_fabric_net(
+        order=order, seed=seed, freeze_read=freeze_read,
+        t_span=t_span, num_steps=num_steps, cell_library=cell_library,
+        core_refresh_interval=core_refresh_interval,
+        leak_constant=leak_constant, compile_sequence=False,
+        hidden_dim=hidden_dim, readout=readout,
+        boundary_fan_out=bfo,
+        vca_enabled=vca_enabled, vca_rank=vca_rank, vca_bias=vca_bias,
+    )
+    if vca_enabled:
+        # Fail fast if the boundary-only ablation ever stops holding
+        # (e.g. a preset starts enabling core VCA by default) -- the
+        # Round-2 attribution depends on core/shunt staying off.
+        for _st in net.core.stages:
+            assert not bool(getattr(_st, "_vca_core_enabled", False)), (
+                "VCA-boundary helper requires vca_core off"
+            )
+            assert not bool(getattr(_st, "vca_gate_shunt", False)), (
+                "VCA-boundary helper requires vca_gate_shunt off"
+            )
+            assert not bool(getattr(_st, "vca_separate_core_bus", False)), (
+                "VCA-boundary helper requires vca_separate_core_bus off"
+            )
+    log = {
+        "boundary_fan_out": bfo,
+        "vca_enabled": bool(vca_enabled),
+        "vca_rank": (
+            None if vca_rank is None else int(vca_rank)
+        ),
+        "vca_bias": (
+            None if vca_bias is None else bool(vca_bias)
+        ),
+        "vca_core_enabled": False,
+        "vca_gate_shunt": False,
+        "vca_separate_core_bus": False,
+        "t_span": float(t_used),
+        "num_steps": int(n_used),
+    }
+    return net, t_used, n_used, log
 
 
 # ---------------------------------------------------------------------------

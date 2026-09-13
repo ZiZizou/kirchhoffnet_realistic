@@ -111,6 +111,12 @@ class E0SweepRow:
     gm_init: float
     leak_mode: str  # "slow-fixed" | "randomized" | "constant:<val>"
     drive: float
+    # Round-2 §13.1 sparse-drive bookkeeping. Empty string (default) is
+    # the canonical full fan-out ``{0: range(hidden_dim)}``; a non-empty
+    # value appears when the CLI was passed ``--boundary-fan-out <json>``
+    # (JSON-encoded, sorted keys). Kept as a string so CSV dumps stay
+    # single-row.
+    boundary_fan_out: str
     ridge_nrmse: float
     ridge_r2: float
     mc_total_washout_corrected: float
@@ -776,19 +782,50 @@ def _e0_config_tag(
     *, order: int, seed: int, device: str, hidden_dim: int, refresh: int,
     t_span: float, num_steps: int, gm_init: float, leak_mode: Any,
     drive: float, washout: int, jacobian_samples: int,
+    boundary_fan_out: dict[int, list[int]] | None = None,
 ) -> str:
     """Corner identity shared by :func:`_e0_row` and the resume matcher.
 
-    Byte-identical to the historical tag format: progress files written
-    by older runs match only if this string is unchanged, so do not
-    restyle it (add new axes as suffixes only).
+    Round-2 §13.1: the canonical full fan-out (``{0: range(hidden_dim)}``,
+    or ``None``) keeps the historical tag format **byte-identical** so
+    progress files written by older runs still match. A non-canonical
+    sparse fan-out appends a stable ``_fan<tgt>-<tgt>-...`` suffix built
+    from the sorted unique target set. Add new axes here as suffixes only.
     """
-    return (
+    base = (
         f"order{order}_seed{seed}_{device}_tanhfree"
         f"_h{int(hidden_dim)}_k{int(refresh)}"
         f"_tspan{float(t_span):g}_steps{int(num_steps)}"
         f"_gm{float(gm_init):g}_leak{leak_mode}_drive{float(drive):g}"
         f"_washout{int(washout)}_jac{int(jacobian_samples)}"
+    )
+    if boundary_fan_out is None:
+        return base
+    canon_targets = list(range(int(hidden_dim)))
+    sparse_targets = sorted(
+        {t for tgts in boundary_fan_out.values() for t in tgts}
+    )
+    if sparse_targets == canon_targets:
+        return base
+    _short = "-".join(str(t) for t in sparse_targets[:6])
+    if len(sparse_targets) > 6:
+        _short += "-etc"
+    return f"{base}_fan{_short}"
+
+
+def _bfo_json(boundary_fan_out: dict[Any, Any] | None) -> str:
+    """Canonical JSON encoding for a boundary fan-out map (Round-2 §13.1).
+
+    ``None`` -> ``""`` (canonical full fan-out; keeps CSV cells and resume
+    keys readable). Otherwise ``{int(k): [int, ...]}`` with sorted keys so
+    ``{"0": [...]}`` and ``{0: [...]}`` encode identically and resume
+    matching is order-stable.
+    """
+    if boundary_fan_out is None:
+        return ""
+    return json.dumps(
+        {int(k): [int(v) for v in vs] for k, vs in sorted(boundary_fan_out.items())},
+        sort_keys=True,
     )
 
 
@@ -823,6 +860,7 @@ def _e0_row(
     gm_init: float, leak_mode: Any, drive: float,
     raw_leak_init_seed: int = 0, washout: int = PROBE_WASHOUT,
     jacobian_samples: int = 3,
+    boundary_fan_out: dict[int, list[int]] | None = None,
 ) -> E0SweepRow:
     """Score one E0 sweep corner from normal and boundary-only passes."""
     if len(list(net.core.stages)) != 1:
@@ -901,6 +939,7 @@ def _e0_row(
         t_span=t_span, num_steps=num_steps,
         gm_init=gm_init, leak_mode=leak_mode, drive=drive,
         washout=washout, jacobian_samples=jacobian_samples,
+        boundary_fan_out=boundary_fan_out,
     )
     return E0SweepRow(
         config_tag=config_tag,
@@ -909,6 +948,12 @@ def _e0_row(
         gm_init=float(gm_init),
         leak_mode=str(leak_mode),
         drive=float(drive),
+        # Round-2 §13.1: store the JSON-encoded fan-out so CSV dumps
+        # carry the build flag. The e0_sweep caller overrides this
+        # with the canonical-form string on the way out; defaulting to
+        # an empty string keeps legacy code that constructs E0SweepRow
+        # directly (resume path) working.
+        boundary_fan_out="",
         ridge_nrmse=normal["ridge_nrmse"],
         ridge_r2=normal["ridge_r2"],
         mc_total_washout_corrected=normal["mc_total"],
@@ -957,6 +1002,7 @@ def e0_sweep(
     small_world_p: float = 0.2,
     small_world_seed: int = 1,
     progress_json: Path | str | None = None,
+    boundary_fan_out: dict[int, list[int]] | None = None,
 ) -> list[E0SweepRow]:
     """Run the locked E0 (zero-training) gain/leak/drive sweep.
 
@@ -1030,6 +1076,9 @@ def e0_sweep(
     # RNG so corner reproducibility holds (corners share the same seed).
     # Capture custom-factory status BEFORE resolution: a caller-supplied
     # factory has an opaque build, so it disables progress resume below.
+    # Round-2 §13.1: ``boundary_fan_out`` is forwarded into the build so
+    # sparse-drive E0 corners use the same plumbing as the training path.
+    # ``None`` keeps the canonical full fan-out untouched.
     _allow_resume = net_factory is None
     if net_factory is None:
         if use_small_world:
@@ -1050,9 +1099,13 @@ def e0_sweep(
                 )
                 torch.manual_seed(seed)
                 cell_lib = make_cell_library("tanh_free")
+                _bfo = (
+                    preset["boundary_fan_out"]
+                    if boundary_fan_out is None else boundary_fan_out
+                )
                 return build_net_from_config(
                     cfg=preset, cell_lib=cell_lib,
-                    boundary_fan_out=preset["boundary_fan_out"],
+                    boundary_fan_out=_bfo,
                     enable_temporal_readout=True,
                     freeze_read=False,
                 )
@@ -1068,6 +1121,7 @@ def e0_sweep(
                     core_refresh_interval=0,
                     leak_constant=None,
                     compile_sequence=False,
+                    boundary_fan_out=boundary_fan_out,
                 )
                 return net
 
@@ -1093,6 +1147,14 @@ def e0_sweep(
         "num_steps": int(num_steps),
         "washout": int(washout),
         "jacobian_samples": int(jacobian_samples),
+        # Round-2 §13.1: include the boundary-fan-out map so resume can
+        # distinguish sparse-drive corners from full-fan-out corners.
+        # ``None`` encodes as the "canonical-full" marker; an explicit map
+        # (even a canonical-equivalent one) encodes as JSON.
+        "boundary_fan_out": (
+            "canonical-full" if boundary_fan_out is None
+            else _bfo_json(boundary_fan_out)
+        ),
     }
     _done: dict[str, dict[str, Any]] = {}
     if _progress_path is not None and _allow_resume:
@@ -1137,6 +1199,7 @@ def e0_sweep(
             gm_init=float(gm_init), leak_mode=leak_mode,
             drive=float(drive), washout=washout,
             jacobian_samples=jacobian_samples,
+            boundary_fan_out=boundary_fan_out,
         )
         if _allow_resume and _tag in _done:
             try:
@@ -1160,13 +1223,20 @@ def e0_sweep(
         # reproducible and no corner inherits another corner's override.
         net = net_factory()
         net.to(device)
-        rows.append(_e0_row(
+        row = _e0_row(
             net, u_drive, y_drive,
             order=order, seed=seed, device=device,
             gm_init=float(gm_init), leak_mode=leak_mode,
             drive=drive_value, raw_leak_init_seed=seed,
             washout=washout, jacobian_samples=jacobian_samples,
-        ))
+            boundary_fan_out=boundary_fan_out,
+        )
+        # Stamp the JSON-encoded boundary_fan_out so the CSV row joins
+        # against the build flag (canonical runs keep an empty string so
+        # the column reads naturally). Direct assignment: the dataclass is
+        # mutable, so no reconstruction is needed.
+        row.boundary_fan_out = _bfo_json(boundary_fan_out)
+        rows.append(row)
         if _progress_path is not None:
             _write_e0_progress(
                 _progress_path, _progress_payload(rows, complete=False),
@@ -1329,6 +1399,17 @@ def main(argv: list[str] | None = None) -> int:
     p_e0.add_argument("--small-world-k", type=int, default=4)
     p_e0.add_argument("--small-world-p", type=float, default=0.2)
     p_e0.add_argument("--small-world-seed", type=int, default=1)
+    p_e0.add_argument(
+        "--boundary-fan-out", type=str, default=None,
+        dest="boundary_fan_out",
+        help="Round-2 §13.1 sparse-drive E0: JSON dict overriding the "
+             "canonical full boundary fan-out {0: range(hidden_dim)}. "
+             "Targets must be unique, in [0, hidden_dim), and the input "
+             "key must be in [0, in_dim). 'None' (default) preserves the "
+             "canonical full fan-out exactly. Sparse runs get a "
+             "_fan<tgt>... config-tag suffix and a separate resume key, "
+             "so the canonical progress file is untouched.",
+    )
 
     args = parser.parse_args(argv)
     # Pre-registered thresholds and locked grids are NARMA-10-specific.
@@ -1454,6 +1535,56 @@ def main(argv: list[str] | None = None) -> int:
             drive_grid, leak_grid, gain_grid,
             args.max_corners if args.max_corners > 0 else None,
         )
+        # Round-2 §13.1 sparse-drive E0: parse the JSON boundary-fan-out
+        # spec. ``None`` keeps the canonical full fan-out exactly (zero
+        # behavior change vs the legacy 48-corner legs).
+        bfo_parsed: dict[int, list[int]] | None = None
+        if args.boundary_fan_out is not None:
+            try:
+                bfo_raw = json.loads(args.boundary_fan_out)
+            except json.JSONDecodeError as e:
+                raise SystemExit(f"--boundary-fan-out: invalid JSON: {e}")
+            if not isinstance(bfo_raw, dict):
+                raise SystemExit(
+                    "--boundary-fan-out must be a JSON object, got "
+                    f"{type(bfo_raw).__name__}"
+                )
+            bfo_parsed = {}
+            for k, v in bfo_raw.items():
+                try:
+                    ik = int(k)
+                except (TypeError, ValueError):
+                    raise SystemExit(
+                        f"--boundary-fan-out: input keys must be ints, "
+                        f"got {k!r}"
+                    )
+                if ik < 0:
+                    raise SystemExit(
+                        f"--boundary-fan-out: input keys must be "
+                        f"non-negative, got {k!r}"
+                    )
+                if not isinstance(v, list) or not all(isinstance(x, int) for x in v):
+                    raise SystemExit(
+                        f"--boundary-fan-out: target list for input {ik} "
+                        f"must be int[], got {v!r}"
+                    )
+                if any(x < 0 for x in v):
+                    raise SystemExit(
+                        f"--boundary-fan-out: targets must be non-negative, "
+                        f"got {v!r}"
+                    )
+                bfo_parsed[ik] = [int(x) for x in v]
+            # Quick out-of-range guard before the sweep starts. Full
+            # validation (uniqueness, in_dim coverage) lives in
+            # build_net_from_config; this catches the cheap failures
+            # up-front so the loop isn't wasted on a corner that won't
+            # build.
+            for k, v in bfo_parsed.items():
+                if any(t < 0 or t >= args.hidden_dim for t in v):
+                    raise SystemExit(
+                        f"--boundary-fan-out: target {v} for input {k} "
+                        f"out of range [0, {args.hidden_dim})"
+                    )
         t0 = time.time()
         rows = e0_sweep(
             order=args.order, seed=args.seed, device=args.device,
@@ -1469,6 +1600,7 @@ def main(argv: list[str] | None = None) -> int:
             small_world_p=args.small_world_p,
             small_world_seed=args.small_world_seed,
             progress_json=args.output / "e0_progress.json",
+            boundary_fan_out=bfo_parsed,
         )
         elapsed = time.time() - t0
         row_dicts = [asdict(r) for r in rows]
@@ -1477,6 +1609,8 @@ def main(argv: list[str] | None = None) -> int:
         # Plain-text summary.
         hdr = (f"E0 sweep -- order={args.order} seed={args.seed} "
                f"{len(rows)} corners in {elapsed:.1f}s")
+        if bfo_parsed is not None:
+            hdr += f"  (sparse fan-out: {bfo_parsed})"
         lines = [
             f"{'gm':>6} {'leak':>28} {'drive':>5} {'ridge':>7} "
             f"{'mc':>6} {'sPR':>6} {'gzR':>7} {'gzMC':>6} "
@@ -1538,6 +1672,10 @@ def main(argv: list[str] | None = None) -> int:
                 "small_world_k": args.small_world_k,
                 "small_world_p": args.small_world_p,
                 "small_world_seed": args.small_world_seed,
+                # Round-2 §13.1: record the boundary-fan-out override used
+                # for this sweep so JSON consumers can join against the
+                # canonical full-fan-out legs without re-reading the CLI.
+                "boundary_fan_out": bfo_parsed,
             },
             "n_streams": args.n_streams,
             "train_samples": args.train_samples,

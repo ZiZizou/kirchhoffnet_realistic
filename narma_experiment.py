@@ -1484,6 +1484,49 @@ def _scale_drive(
     return v
 
 
+def _parse_boundary_fan_out_spec(spec: str | None) -> dict[int, list[int]] | None:
+    """Parse a ``--boundary-fan-out`` JSON spec into a dict; ``None`` -> None.
+
+    Same convention as ``train_script.py`` / ``fixed-mlp-distillation-*``:
+    top-level JSON object, string keys parsed as ``int``, target lists parsed
+    as ``int``. Negative indices rejected (target validation handled by
+    ``build_net_from_config``).
+    """
+    if spec is None:
+        return None
+    try:
+        raw = json.loads(spec)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid --boundary-fan-out JSON: {e}") from e
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"--boundary-fan-out must be a JSON object, got {type(raw).__name__}"
+        )
+    parsed: dict[int, list[int]] = {}
+    for k, v in raw.items():
+        try:
+            ik = int(k)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"--boundary-fan-out: input keys must be ints, got {k!r}"
+            ) from None
+        if ik < 0:
+            raise ValueError(
+                f"--boundary-fan-out: input keys must be non-negative, got {k}"
+            )
+        if not isinstance(v, list) or not all(isinstance(x, int) for x in v):
+            raise ValueError(
+                f"--boundary-fan-out: target list for input {ik} must be int[], "
+                f"got {v!r}"
+            )
+        if any(x < 0 for x in v):
+            raise ValueError(
+                f"--boundary-fan-out: targets must be non-negative, got {v!r}"
+            )
+        parsed[ik] = [int(x) for x in v]
+    return parsed
+
+
 def _build_fabric_net(
     order: int,
     seed: int,
@@ -1497,6 +1540,10 @@ def _build_fabric_net(
     compile_sequence: bool,
     hidden_dim: int | None = None,
     readout: str = "temporal",
+    boundary_fan_out: dict[int, list[int]] | None = None,
+    vca_enabled: bool = False,
+    vca_rank: int | None = None,
+    vca_bias: bool | None = None,
 ) -> tuple[nn.Module, float, int]:
     """Build the NARMA fabric net (preset + topology + optional compile).
 
@@ -1519,6 +1566,25 @@ def _build_fabric_net(
     the revised plan sec. 6). Training, evaluation, and state collection
     paths already handle ``enable_temporal_readout=False``; the only
     change here is preset override + the build call.
+
+    ``boundary_fan_out`` (Round-2 §13.1 sparse-drive E0): overrides the
+    canonical full fan-out ``{0: list(range(hidden_dim))}`` with a caller
+    supplied ``{input_idx: [target_node_ids, ...]}`` map. ``None`` (default)
+    preserves the canonical full fan-out exactly (zero behavior change).
+    Target uniqueness and in-range validation is delegated to
+    ``build_net_from_config``.
+
+    ``vca_enabled`` (Round-2 §13.2 VCA-boundary plumbing): enables the
+    low-rank input-driven VCA gate on boundary edges only (``vca_core`` /
+    ``vca_gate_shunt`` / ``vca_separate_core_bus`` are hardcoded off
+    per the revised plan sec. 6 / 8; the gate is the candidate product
+    path, not the separability fix). ``vca_rank`` defaults to
+    ``config.VCA['rank']``; ``vca_bias`` defaults to ``config.VCA['bias']``.
+    Requires a non-empty boundary family: ``boundary_fan_out=None`` uses
+    the canonical preset full fan-out (satisfies the requirement), but an
+    explicitly empty ``{}`` disables boundary terminals and the
+    differential-stage validator raises (the gate would have nothing to
+    modulate).
     """
     base = PRESET_NARMA20 if order == 20 else PRESET_NARMA10
     if t_span is None:
@@ -1537,6 +1603,17 @@ def _build_fabric_net(
     )
     cell_lib = make_cell_library(cell_library)
     torch.manual_seed(seed)
+    # Resolve effective boundary fan-out: explicit override wins over the
+    # preset default. ``None`` keeps ``preset["boundary_fan_out"]`` (the
+    # canonical full fan-out for NARMA). An empty dict (no entries)
+    # disables boundary terminals entirely -- the differential-stage
+    # validator rejects that combination with VCA enabled, so it is only
+    # legal when ``vca_enabled=False``.
+    effective_bfo: dict[int, list[int]] | None
+    if boundary_fan_out is None:
+        effective_bfo = preset["boundary_fan_out"]
+    else:
+        effective_bfo = boundary_fan_out
     if readout == "dense":
         # Step 3 readout: drop the OTA mesh + accumulator tail, plain
         # dense OutputMapper over hidden states. The preset's
@@ -1566,17 +1643,23 @@ def _build_fabric_net(
         net = build_net_from_config(
             cfg=preset,
             cell_lib=cell_lib,
-            boundary_fan_out=preset["boundary_fan_out"],
+            boundary_fan_out=effective_bfo,
             enable_temporal_readout=False,
             freeze_read=freeze_read,
+            vca_enabled=vca_enabled,
+            vca_rank=vca_rank,
+            vca_bias=vca_bias,
         )
     elif readout == "temporal":
         net = build_net_from_config(
             cfg=preset,
             cell_lib=cell_lib,
-            boundary_fan_out=preset["boundary_fan_out"],
+            boundary_fan_out=effective_bfo,
             enable_temporal_readout=True,
             freeze_read=freeze_read,
+            vca_enabled=vca_enabled,
+            vca_rank=vca_rank,
+            vca_bias=vca_bias,
         )
     else:
         raise ValueError(
@@ -1619,6 +1702,12 @@ def run_fabric_condition(
     input_scale: float = 1.0,
     leak_constant: float | None = None,
     readout: str = "temporal",
+    boundary_fan_out: dict[int, list[int]] | None = None,
+    vca_enabled: bool = False,
+    vca_rank: int | None = None,
+    vca_bias: bool | None = None,
+    gain_init: float | None = None,
+    leak_init: str | float | None = None,
 ) -> dict[str, Any]:
     """Train one fabric condition and return its results.
 
@@ -1690,7 +1779,55 @@ def run_fabric_condition(
         core_refresh_interval=core_refresh_interval,
         leak_constant=leak_constant, compile_sequence=compile_sequence,
         readout=readout,
+        boundary_fan_out=boundary_fan_out,
+        vca_enabled=vca_enabled, vca_rank=vca_rank, vca_bias=vca_bias,
     )
+    # Round-2 §13.3 VCA-leg init overrides: post-build apply the
+    # ``--gain-init`` / ``--leak-init`` overrides if supplied. Each axis
+    # is independent: ``None`` leaves that axis at the cell-library
+    # default (zero behavior change vs legacy train legs). The leak mode
+    # accepts the same E0-compatible token strings (``slow-fixed``,
+    # ``randomized``, ``hetero:1.0:40.0``, ``0.15``, ...) so the same
+    # value travels through both the E0 and training paths.
+    if gain_init is not None:
+        _gm = float(gain_init)
+        for _stage in net.core.stages:
+            for _lib_name in (
+                "cell_lib", "boundary_cell_lib", "output_ode_cell_lib",
+            ):
+                _lib = getattr(_stage, _lib_name, None)
+                if _lib is None:
+                    continue
+                if hasattr(_lib, "gm_raw"):
+                    with torch.no_grad():
+                        _lib.gm_raw.data.fill_(_gm)
+                if hasattr(_lib, "isat_raw"):
+                    with torch.no_grad():
+                        _lib.isat_raw.data.fill_(_gm)
+    if leak_init is not None:
+        from narma_advisor_probes import apply_gain_override as _ago
+        # apply_gain_override always fills gm/isat as well, so preserve
+        # the (possibly just-overridden) gains by reading them back and
+        # passing them through unchanged. The leak dispatch is what we
+        # actually want from this call.
+        _cur_gm: float | None = None
+        for _stage in net.core.stages:
+            _cl = getattr(_stage, "cell_lib", None)
+            if _cl is not None and hasattr(_cl, "gm_raw"):
+                try:
+                    _cur_gm = float(_cl.gm_raw.detach().flatten()[0].item())
+                except (IndexError, RuntimeError, ValueError):
+                    _cur_gm = None
+                break
+        if _cur_gm is None:
+            # No readable gain (unexpected for a fabric net): fall back to
+            # the symmetric default used by the E0 sweep's gm grid base.
+            _cur_gm = float(gain_init) if gain_init is not None else -5.0
+        _ago(
+            net, gm_init=_cur_gm, isat_init=_cur_gm,
+            leak_mode=leak_init,
+            raw_leak_init_seed=int(seed),
+        )
 
     # ---- (Optional) Ridge-on-frozen-states diagnostic BEFORE training ----
     ridge_result: dict[str, float] = {}
@@ -1806,6 +1943,30 @@ def run_fabric_condition(
         "cell_lib_evals_per_sample": cell_lib_evals_per_sample,
         "early_stopped": res.get("early_stopped", False),
         "epochs_completed": int(res.get("epochs_completed", epochs)),
+        # Round-2 sparsity / VCA bookkeeping (plan §13.1/§13.2). Recorded
+        # in the result dict and flushed into the CSV summary below so
+        # post-hoc comparisons can join on the same condition name without
+        # re-reading the CLI args.
+        "boundary_fan_out": (
+            None if boundary_fan_out is None
+            else {int(k): [int(v) for v in vs] for k, vs in boundary_fan_out.items()}
+        ),
+        "vca_enabled": bool(vca_enabled),
+        "vca_rank": (
+            None if vca_rank is None else int(vca_rank)
+        ),
+        "vca_bias": (
+            None if vca_bias is None else bool(vca_bias)
+        ),
+        # Round-2 §13.3 VCA-leg init overrides. ``None`` means "default
+        # cell-library init left in place" so the CSV column tells the
+        # reader which legs were deliberately pinned to a starting point.
+        "gain_init": (
+            None if gain_init is None else float(gain_init)
+        ),
+        "leak_init": (
+            None if leak_init is None else str(leak_init)
+        ),
     }
     if ridge_result:
         out["ridge_nrmse"] = ridge_result["ridge_nrmse"]
@@ -1855,6 +2016,11 @@ def run_eval_masks(
     core_refresh_interval: int = 2,
     freeze_read: bool = False,
     leak_constant: float | None = None,
+    readout: str = "temporal",
+    boundary_fan_out: dict[int, list[int]] | None = None,
+    vca_enabled: bool = False,
+    vca_rank: int | None = None,
+    vca_bias: bool | None = None,
     out_dir: Path | None = None,
 ) -> list[dict[str, Any]]:
     """E2 carry-mask ablation on a TRAINED checkpoint (no retraining).
@@ -1867,7 +2033,8 @@ def run_eval_masks(
     from the full-carry train states.
 
     Architecture-affecting arguments (order, cell_library, t_span,
-    num_steps, core_refresh_interval, freeze_read, leak_constant) MUST
+    num_steps, core_refresh_interval, freeze_read, leak_constant,
+    readout, boundary_fan_out, vca_enabled, vca_rank, vca_bias) MUST
     match the training run — ``leak_constant`` changes the parameter set
     itself (raw_leak present or not), so a mismatch fails the strict load
     by design rather than silently scoring the wrong net. ``input_scale``
@@ -1886,6 +2053,9 @@ def run_eval_masks(
         t_span=t_span, num_steps=num_steps, cell_library=cell_library,
         core_refresh_interval=core_refresh_interval,
         leak_constant=leak_constant, compile_sequence=False,
+        readout=readout,
+        boundary_fan_out=boundary_fan_out,
+        vca_enabled=vca_enabled, vca_rank=vca_rank, vca_bias=vca_bias,
     )
     net.load_state_dict(ckpt["model_state"], strict=True)
     net.to(device)
@@ -2139,9 +2309,10 @@ def parse_args() -> argparse.Namespace:
                              "reset-all}. Requires --init-from <checkpoint.pt>; "
                              "architecture flags (--order/--cell-library/"
                              "--t-span/--num-steps/--core-refresh-interval/"
-                             "--leak-constant/--input-scale) must match the "
-                             "training run. Writes carry_ablation.csv/txt "
-                             "into --output and exits.")
+                             "--leak-constant/--readout/--boundary-fan-out/"
+                             "--vca-boundary/--vca-rank/--input-scale) must "
+                             "match the training run. Writes "
+                             "carry_ablation.csv/txt into --output and exits.")
     parser.add_argument("--readout", type=str, default="temporal",
                         choices=["temporal", "dense"],
                         help="Readout family (Step 3 of the revised NARMA plan). "
@@ -2152,6 +2323,72 @@ def parse_args() -> argparse.Namespace:
                              "over all hidden states (26 params for NARMA-10). "
                              "'dense' is the readout-rank fix candidate (plan sec. 6); "
                              "the OTA dynamics are unchanged either way.")
+    parser.add_argument("--boundary-fan-out", type=str, default=None,
+                        dest="boundary_fan_out",
+                        help="Round-2 §13.1 sparse-drive E0: JSON dict mapping "
+                             "input index -> list of target hidden node ids, "
+                             "e.g. '{\"0\": [0, 5, 10, 15, 20]}'. The NARMA "
+                             "preset defaults to the canonical full fan-out "
+                             "{0: list(range(hidden_dim))}. Pass this flag to "
+                             "sparsify the drive -- targets must be unique, in "
+                             "range [0, hidden_dim), and the input index must "
+                             "be in [0, in_dim). Validation lives in "
+                             "build_net_from_config; bad specs raise with the "
+                             "offending indices in the message.")
+    parser.add_argument("--vca-boundary", dest="vca_enabled",
+                        action="store_true", default=False,
+                        help="Round-2 §13.2 VCA-boundary plumbing: enable the "
+                             "low-rank input-driven VCA gate on boundary edges "
+                             "only. vca_core / vca_gate_shunt / "
+                             "vca_separate_core_bus stay off (canonical ablation "
+                             "mode per plan sec. 6 / 8). The gate is the candidate "
+                             "product path; the sparability lever is owned by "
+                             "the static W-in masks (deferred). Requires a "
+                             "non-empty boundary family: the default "
+                             "(no --boundary-fan-out flag) uses the canonical "
+                             "preset full fan-out and works; an explicitly "
+                             "empty '{}' is rejected (the validator rejects "
+                             "VCA-on with no gated family).")
+    parser.add_argument("--vca-rank", type=int, default=None,
+                        dest="vca_rank",
+                        help="VCA projection rank r (default: config.VCA['rank'] "
+                             "= 2). Larger r gives the optimiser more axes to "
+                             "express input-edge alignment. Must be >= "
+                             "config.VCA['min_rank'].")
+    parser.add_argument("--no-vca-bias", dest="vca_bias",
+                        action="store_const", const=False, default=None,
+                        help="Opt out of the per-edge VCA affine offset (gate_e "
+                             "= 2*sigmoid((u@W)@v_e); default follows "
+                             "config.VCA['bias']).")
+    parser.add_argument("--vca-bias", dest="vca_bias",
+                        action="store_const", const=True, default=None,
+                        help="Force per-edge VCA affine offsets on "
+                             "(gate_e = 2*sigmoid(b_e + (u@W)@v_e); default "
+                             "follows config.VCA['bias']). Prefer the "
+                             "--no-vca-bias form for ablation clarity.")
+    parser.add_argument("--gain-init", type=float, default=None,
+                        dest="gain_init",
+                        help="Round-2 §13.3 VCA-leg init: post-build gm/isat "
+                             "fill value (symmetric override). None (default) "
+                             "leaves the cell-library init untouched so legacy "
+                             "training legs are unaffected. Combined with "
+                             "--leak-init this gives full control over the "
+                             "starting point without re-seeding the cell-lib "
+                             "defaults (e.g. -2 = soft saturation; -5 = near-"
+                             "linear).")
+    parser.add_argument("--leak-init", default=None,
+                        dest="leak_init",
+                        help="Round-2 §13.3 VCA-leg init: post-build leak "
+                             "mode. Same token format as the E0 sweep --leak-"
+                             "grid: 'slow-fixed' (non-programmable legacy), "
+                             "'randomized' (programmable N(-3,1) draw), "
+                             "'hetero:<tau_lo>:<tau_hi>' (log-uniform per-"
+                             "node tau), or a numeric scalar (fixed leak). "
+                             "None (default) leaves the cell-library init "
+                             "untouched. The E0 sweep also accepts '0.15'-"
+                             "style numerics; colons in the hetero token "
+                             "prevent the comma-grid splitter from fracturing "
+                             "it.")
     return parser.parse_args()
 
 
@@ -2175,7 +2412,7 @@ def _write_partial_tables(
         f"NARMA-{order} -- {len(seeds)} seeds -- final results",
         "=" * 60,
     ]
-    csv_lines = ["condition,seed,nrmse,r2,mc_total,trained_params,total_params,hidden_dim,cell_library,core_refresh_interval,cell_lib_evals_per_sample,readout"]
+    csv_lines = ["condition,seed,nrmse,r2,mc_total,trained_params,total_params,hidden_dim,cell_library,core_refresh_interval,cell_lib_evals_per_sample,readout,boundary_fan_out,vca_enabled,vca_rank,vca_bias,gain_init,leak_init"]
     for cond in sorted(by_cond):
         runs = by_cond[cond]
         nrmse_vals = [r["nrmse"] for r in runs]
@@ -2204,7 +2441,7 @@ def _write_partial_tables(
                     else:
                         tp_str = f"  params={tp}"
         summary_lines.append(
-            f"{cond:>14}  NRMSE={sum(nrmse_vals) / len(nrmse_vals):.4f} +/- "
+            f"{cond:>30}  NRMSE={sum(nrmse_vals) / len(nrmse_vals):.4f} +/- "
             f"{(sum((v - sum(nrmse_vals) / len(nrmse_vals)) ** 2 for v in nrmse_vals) / len(nrmse_vals)) ** 0.5:.4f}  "
             f"R^2={sum(r2_vals) / len(r2_vals):.4f} +/- "
             f"{(sum((v - sum(r2_vals) / len(r2_vals)) ** 2 for v in r2_vals) / len(r2_vals)) ** 0.5:.4f}"
@@ -2215,6 +2452,14 @@ def _write_partial_tables(
             tp = r.get("n_params", "")
             tt = r.get("total_params", "")
             hd = r.get("hidden_dim", "")
+            # The boundary_fan_out JSON contains commas, so it must be
+            # RFC-4180 quoted (double the inner quotes) to keep the CSV
+            # single-row-per-job. All other new columns are comma-free.
+            _bfo_raw = r.get("boundary_fan_out", "")
+            _bfo_cell = (
+                "" if not _bfo_raw
+                else '"' + str(_bfo_raw).replace('"', '""') + '"'
+            )
             csv_lines.append(
                 f"{cond},{r['seed']},{r['nrmse']:.6f},{r['r2']:.6f},"
                 f"{mc if mc != '' else ''},{tp if tp != '' else ''},"
@@ -2222,7 +2467,13 @@ def _write_partial_tables(
                 f"{r.get('cell_library', '')},"
                 f"{r.get('core_refresh_interval', '')},"
                 f"{r.get('cell_lib_evals_per_sample', '')},"
-                f"{r.get('readout', '')}"
+                f"{r.get('readout', '')},"
+                f"{_bfo_cell},"
+                f"{r.get('vca_enabled', False)},"
+                f"{r.get('vca_rank', '')},"
+                f"{r.get('vca_bias', '')},"
+                f"{r.get('gain_init', '')},"
+                f"{r.get('leak_init', '')}"
             )
 
     summary_text = "\n".join(summary_lines) + "\n"
@@ -2259,6 +2510,35 @@ def main() -> int:
     # bindings are imported at module load and would silently ignore the
     # patch. The inline build guarantees the override actually takes effect.
 
+    # Round-2 §13.1 / §13.2 plumbing: parse the boundary-fan-out JSON spec
+    # (None -> canonical full fan-out) and validate the VCA flag combination.
+    # The hidden-dim / num-inputs ranges are enforced inside
+    # ``_build_fabric_net`` -> ``build_net_from_config`` (so the same guards
+    # cover training and eval paths). Parsed BEFORE the eval-masks block so
+    # both paths share it.
+    boundary_fan_out_parsed = _parse_boundary_fan_out_spec(args.boundary_fan_out)
+    if (
+        args.vca_enabled
+        and boundary_fan_out_parsed is not None
+        and not boundary_fan_out_parsed
+    ):
+        # Explicitly empty '{}' fan-out -> no boundary family ->
+        # differential-stage validator raises. Catch the user error here
+        # with a clearer message before any training starts. Note
+        # ``None`` (flag absent) uses the canonical preset full fan-out
+        # and is VALID for VCA (VCA-1 full-drive leg).
+        print(
+            "ERROR: --vca-boundary with an explicitly empty "
+            "--boundary-fan-out '{}' has no gated family (the gate has "
+            "nothing to modulate). Drop the flag to use the canonical "
+            "full fan-out, or pass a non-empty map."
+        )
+        return 2
+
+    if args.input_scale <= 0:
+        print("ERROR: --input-scale must be > 0")
+        return 2
+
     # E2 eval-only mode: score carry masks on a trained checkpoint and exit
     # (no baselines, no ladder, no training).
     if args.eval_masks is not None:
@@ -2271,10 +2551,7 @@ def main() -> int:
             return 2
         if len(seeds) != 1:
             print(f"  WARNING: --eval-masks uses seeds[0]={seeds[0]} "
-                  f"(ignoring the rest of --seeds)")
-        if args.input_scale <= 0:
-            print("ERROR: --input-scale must be > 0")
-            return 2
+                   f"(ignoring the rest of --seeds)")
         print(f"[narma] E2 carry ablation on {args.init_from}, masks={masks}")
         run_eval_masks(
             args.init_from, masks,
@@ -2287,14 +2564,15 @@ def main() -> int:
             cell_library=args.cell_library,
             core_refresh_interval=args.core_refresh_interval,
             leak_constant=args.leak_constant,
+            readout=args.readout,
+            boundary_fan_out=boundary_fan_out_parsed,
+            vca_enabled=args.vca_enabled,
+            vca_rank=args.vca_rank,
+            vca_bias=args.vca_bias,
             out_dir=out_dir,
         )
         print(f"\n[narma] ablation written to {out_dir}")
         return 0
-
-    if args.input_scale <= 0:
-        print("ERROR: --input-scale must be > 0")
-        return 2
 
     all_results: list[dict[str, Any]] = []
 
@@ -2357,15 +2635,58 @@ def main() -> int:
             # Readout-suffixed condition name FIRST so the checkpoint file,
             # the log line, and the results table all agree (a dense run
             # must not overwrite a temporal checkpoint of the same (k, seed)).
-            cond_name = (
-                f"fabric_refresh_k{refresh_k}_{args.readout}"
-                if args.readout != "temporal"
-                else f"fabric_refresh_k{refresh_k}"
-            )
+            # Round-2 §13.2: append ``_vca`` suffix when VCA-boundary is on
+            # so checkpoints do not collide with the canonical temporal /
+            # dense legs.
+            cond_parts = [
+                f"fabric_refresh_k{refresh_k}",
+                args.readout if args.readout != "temporal" else None,
+                "vca" if args.vca_enabled else None,
+            ]
+            cond_name = "_".join(p for p in cond_parts if p)
+            # Sparse-fan-out marker (Round-2 §13.1): when the user passed an
+            # explicit --boundary-fan-out AND it differs from the canonical
+            # full fan-out, append a stable ``_fan<short>`` suffix so a
+            # sparse checkpoint cannot silently overwrite its full-drive
+            # twin. The short tag is the comma-joined sorted unique target
+            # list (length capped to keep file names short).
+            if boundary_fan_out_parsed is not None:
+                # Canonical width comes from the preset (order-dependent),
+                # not a hardcoded constant, so a future non-25 preset still
+                # compares correctly.
+                _canon_base = PRESET_NARMA20 if args.order == 20 else PRESET_NARMA10
+                _canon_hidden = int(_canon_base["stages"][0]["num_hidden"])
+                canon_targets = list(range(_canon_hidden))
+                sparse_targets = sorted(
+                    {t for tgts in boundary_fan_out_parsed.values() for t in tgts}
+                )
+                if sparse_targets != canon_targets:
+                    _short = "-".join(str(t) for t in sparse_targets[:6])
+                    if len(sparse_targets) > 6:
+                        _short += f"-etc"
+                    cond_name = f"{cond_name}_fan{_short}"
+            # Round-2 §13.3 init-override marker: append ``_gi<gm>_le<leak>``
+            # when ``--gain-init`` / ``--leak-init`` are set, so a
+            # deliberately-pinned starting point never collides with the
+            # default-init legs on disk. Leak tokens are sanitised so the
+            # ``hetero:1.0:40.0`` colon form survives intact in the
+            # filename.
+            if args.gain_init is not None or args.leak_init is not None:
+                _gi = (
+                    f"gi{args.gain_init:g}"
+                    if args.gain_init is not None else "giDFLT"
+                )
+                _leak_token = (
+                    str(args.leak_init).replace(":", "_").replace("/", "_")
+                    if args.leak_init is not None else "leDFLT"
+                )
+                cond_name = f"{cond_name}_{_gi}_{_leak_token}"
             print(f"  [{idx}/{len(fabric_jobs)}] {cond_name}  seed={seed}  "
                 f"core_refresh_interval={refresh_k}  "
                 f"cell_library={args.cell_library}  "
                 f"readout={args.readout}  "
+                f"vca={args.vca_enabled}  "
+                f"gain_init={args.gain_init}  leak_init={args.leak_init}  "
                 f"freeze_read=False (evolving core)")
             ckpt_path = out_dir / f"{cond_name}_seed{seed}.pt"
             res = run_fabric_condition(
@@ -2393,6 +2714,12 @@ def main() -> int:
                 input_scale=args.input_scale,
                 leak_constant=args.leak_constant,
                 readout=args.readout,
+                boundary_fan_out=boundary_fan_out_parsed,
+                vca_enabled=args.vca_enabled,
+                vca_rank=args.vca_rank,
+                vca_bias=args.vca_bias,
+                gain_init=args.gain_init,
+                leak_init=args.leak_init,
             )
             result_row = {
                 "seed": seed,
@@ -2409,6 +2736,26 @@ def main() -> int:
                     max(1, (args.num_steps + refresh_k - 1) // refresh_k)
                 ),
                 "readout": args.readout,
+                # Round-2 bookkeeping. JSON-encoded boundary_fan_out keeps
+                # the CSV single-row-per-job.
+                "boundary_fan_out": (
+                    json.dumps(res.get("boundary_fan_out"), sort_keys=True)
+                    if res.get("boundary_fan_out") is not None else ""
+                ),
+                "vca_enabled": res.get("vca_enabled", False),
+                "vca_rank": (
+                    "" if res.get("vca_rank") is None
+                    else int(res["vca_rank"])
+                ),
+                "vca_bias": (
+                    "" if res.get("vca_bias") is None
+                    else bool(res["vca_bias"])
+                ),
+                "gain_init": (
+                    "" if res.get("gain_init") is None
+                    else float(res["gain_init"])
+                ),
+                "leak_init": res.get("leak_init") or "",
             }
             if "ridge_nrmse" in res:
                 result_row["ridge_nrmse"] = res["ridge_nrmse"]

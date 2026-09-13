@@ -113,13 +113,15 @@ def build_parser() -> argparse.ArgumentParser:
     # ----- model -----
     p.add_argument("--model-kind",
                    choices=["knet", "mlp", "moe", "knet-distill"],
-                   required=True,
+                   required=False, default=None,
                    help="Which checkpoint family to load. 'knet' keeps its "
                         "current SystemExit-to-bridge behaviour; 'moe' loads "
                         "RegimeAwareMoE; 'knet-distill' rebuilds the KNet "
-                        "DAgger student from explicit flags.")
-    p.add_argument("--ckpt", required=True, type=Path,
-                   help="Path to the trained .pt checkpoint.")
+                        "DAgger student from explicit flags. "
+                        "Not required with --score-run-dir / --offline-csv.")
+    p.add_argument("--ckpt", required=False, type=Path, default=None,
+                   help="Path to the trained .pt checkpoint. "
+                        "Not required with --score-run-dir / --offline-csv.")
     p.add_argument("--device", default="cpu",
                    help="Torch device for inference (default: cpu; 'cuda' on GPU hosts).")
 
@@ -208,7 +210,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--input-preprocessing", choices=["knet", "q75"], default="knet")
 
     # ----- specs -----
-    spec_src = p.add_mutually_exclusive_group(required=True)
+    spec_src = p.add_mutually_exclusive_group(required=False)
     spec_src.add_argument("--specs-npz", type=Path, default=None,
                           help="Canonical Phase-A .npz with 'specs' key "
                                "(N×4 in SPEC_INPUT_COLS order).")
@@ -1624,19 +1626,19 @@ def summarize(rows: list[dict], args: argparse.Namespace, ckpt_sha: str,
             "height":  dim_rates[2],
             "width":   dim_rates[3],
         },
-        "ckpt": str(args.ckpt),
+        "ckpt": str(getattr(args, "ckpt", None)),
         "ckpt_sha256": ckpt_sha,
         "template_sha256": template_sha,
         "degrade_thr": args.degrade_thr,
         "min_degraded_dims": args.min_degraded_dims,
-        "key_map": args.key_map_dict,
-        "model_kind": args.model_kind,
-        "specs_source": str(args.specs_npz or args.specs_csv),
-        "n_specs_requested": args.n_specs,
-        "spec_offset": args.spec_offset,
-        "seed": args.seed,
-        "enable_ocean": args.enable_ocean,
-        "dry_run": args.dry_run,
+        "key_map": getattr(args, "key_map_dict", DEFAULT_KEY_MAP),
+        "model_kind": getattr(args, "model_kind", None),
+        "specs_source": str(getattr(args, "specs_npz", None) or getattr(args, "specs_csv", None) or getattr(args, "score_run_dir", "")),
+        "n_specs_requested": getattr(args, "n_specs", None),
+        "spec_offset": getattr(args, "spec_offset", 0),
+        "seed": getattr(args, "seed", None),
+        "enable_ocean": getattr(args, "enable_ocean", False),
+        "dry_run": getattr(args, "dry_run", False),
         "hostname": socket.gethostname(),
         "date": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "python": sys.version.split()[0],
@@ -1817,6 +1819,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return run_score_run_dir(args)
     if args.dump_keys:
         return run_dump_keys(args)
+
+    # Normal run requires model + specs.
+    if args.model_kind is None or args.ckpt is None:
+        raise SystemExit("--model-kind and --ckpt are required (unless using --score-run-dir / --offline-csv)")
+    if args.specs_npz is None and args.specs_csv is None:
+        raise SystemExit("--specs-npz or --specs-csv is required (unless using --score-run-dir / --offline-csv)")
 
     # 1. Specs.
     specs = load_specs(args)

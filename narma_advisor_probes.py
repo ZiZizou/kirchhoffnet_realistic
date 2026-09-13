@@ -109,8 +109,12 @@ class E0SweepRow:
     hidden_dim: int
     n_params: int
     gm_init: float
+    isat_init: float  # NaN sentinel: same as gm_init (legacy coupled)
     leak_mode: str  # "slow-fixed" | "randomized" | "constant:<val>"
     drive: float
+    # Regime-transplant: per-library override dict encoded as JSON, or
+    # empty string when the coupled single-fill path was used (default).
+    per_lib_overrides_json: str
     # Round-2 §13.1 sparse-drive bookkeeping. Empty string (default) is
     # the canonical full fan-out ``{0: range(hidden_dim)}``; a non-empty
     # value appears when the CLI was passed ``--boundary-fan-out <json>``
@@ -467,22 +471,34 @@ def apply_gain_override(
     gm_init: float, isat_init: float | None = None,
     leak_mode: str = "slow-fixed", raw_leak_init_seed: int = 0,
     raw_leak_init_mean: float = -3.0, raw_leak_init_std: float = 1.0,
+    per_lib_overrides: dict[str, dict[str, float | None]] | None = None,
 ) -> dict[str, Any]:
     """Override the gain / leak init of a built fabric net (post-build).
 
     Args:
         net: A built ``KirchhoffNetWithIO`` (output of
             ``_build_fabric_net`` or ``build_net_from_config``).
-        gm_init: Value to fill ``gm_raw`` with on every cell library.
+        gm_init: Value to fill ``gm_raw`` with on every cell library
+            (default scalar fill, used when ``per_lib_overrides`` is
+            ``None`` or doesn't cover a library).
         isat_init: Value to fill ``isat_raw`` with. ``None`` (default)
             mirrors ``gm_init`` (symmetric override).
         leak_mode: One of ``"slow-fixed"`` (non-programmable leak
             ``0.0486``), ``"randomized"`` (programmable leak filled
             with mean=``raw_leak_init_mean``, std=``raw_leak_init_std``
-            using ``raw_leak_init_seed``), or a numeric value used as a
+            using ``raw_leak_init_seed``), ``"raw:<val>"``
+            (regime-transplant: programmable leak with ``raw_leak``
+            filled to scalar ``val``), or a numeric value used as a
             fixed scalar leak.
         raw_leak_init_seed / raw_leak_init_mean / raw_leak_init_std:
             Controls the randomized ``raw_leak`` init.
+        per_lib_overrides: Optional regime-transplant hook. Dict keyed by
+            ``"cell_lib"`` / ``"boundary_cell_lib"`` / ``"output_ode_cell_lib"``;
+            values are ``{"gm": float, "isat": float | None}``. A library
+            listed here gets its own fill values instead of the scalar
+            ``gm_init`` / ``isat_init``; libraries missing from the dict
+            (or ``None`` entries) fall back to the scalars. Default
+            (``None``) keeps the legacy coupled-fill path byte-identical.
 
     Returns:
         A small dict with the overrides applied (for the probe row log).
@@ -500,17 +516,41 @@ def apply_gain_override(
         "leak_mode": leak_mode,
     }
 
+    # Per-library override support (regime-transplant plan): a dict
+    # ``{lib_name: {"gm": float, "isat": float | None}}`` overrides that
+    # one library's fill values; missing libraries fall back to the
+    # scalar gm_init / isat_init. ``None`` keeps the old scalar behaviour
+    # byte-identical.
+    per_lib: dict[str, dict[str, float]] | None = None
+    if isinstance(per_lib_overrides, dict):
+        per_lib = {}
+        for lib_name, ov in per_lib_overrides.items():
+            if ov is None:
+                continue
+            entry: dict[str, float] = {}
+            if "gm" in ov and ov["gm"] is not None:
+                entry["gm"] = float(ov["gm"])
+            if "isat" in ov and ov["isat"] is not None:
+                entry["isat"] = float(ov["isat"])
+            per_lib[str(lib_name)] = entry
+
     for stage_idx, stage in enumerate(net.core.stages):
         for lib_name in ("cell_lib", "boundary_cell_lib", "output_ode_cell_lib"):
             lib = getattr(stage, lib_name, None)
             if lib is None:
                 continue
+            ov_gm = gm_init
+            ov_isat = isat_init
+            if per_lib is not None and lib_name in per_lib:
+                e = per_lib[lib_name]
+                ov_gm = float(e.get("gm", gm_init))
+                ov_isat = float(e.get("isat", isat_init))
             if hasattr(lib, "gm_raw"):
                 with torch.no_grad():
-                    lib.gm_raw.data.fill_(float(gm_init))
+                    lib.gm_raw.data.fill_(float(ov_gm))
             if hasattr(lib, "isat_raw"):
                 with torch.no_grad():
-                    lib.isat_raw.data.fill_(float(isat_init))
+                    lib.isat_raw.data.fill_(float(ov_isat))
 
         # Leak dispatch.
         if leak_mode == "randomized":
@@ -557,6 +597,31 @@ def apply_gain_override(
                 seed=int(raw_leak_init_seed),
             )
             log.update({f"stage{stage_idx}_{k}": v for k, v in hl_log.items()})
+        elif isinstance(leak_mode, str) and leak_mode.startswith("raw:"):
+            # Regime-transplant hook: programmable scalar raw_leak fill.
+            # Format: ``raw:<val>`` (e.g. ``raw:-0.5``). Sets
+            # ``leak_mode="programmable"`` and fills every node's
+            # ``raw_leak`` with the scalar, giving an effective leak of
+            # ``softplus(val)`` (heun path has leak_floor=0.0). This is
+            # NOT the same as numeric leak_mode (which sets the fixed
+            # ``leak_constant`` directly): ``raw:-0.5`` -> leak ~0.47,
+            # while ``-0.5`` as a bare number -> leak_constant=-0.5
+            # (negative leak, anti-damping). Colons, never commas, so
+            # the token survives --leak-grid splitting intact.
+            if not hasattr(stage, "raw_leak"):
+                raise ValueError(
+                    f"leak_mode={leak_mode!r} requires programmable leak "
+                    f"on stage (no raw_leak found)."
+                )
+            try:
+                _raw_val = float(leak_mode[len("raw:"):])
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"raw leak_mode must be 'raw:<val>', got {leak_mode!r}"
+                )
+            with torch.no_grad():
+                stage.raw_leak.data.fill_(_raw_val)
+            stage.leak_mode = "programmable"
         else:
             try:
                 leak_val = float(leak_mode)
@@ -564,7 +629,7 @@ def apply_gain_override(
                 raise ValueError(
                     f"unknown leak_mode {leak_mode!r}; expected "
                     "'slow-fixed' | 'randomized' | 'hetero:<tau_lo>:<tau_hi>' "
-                    "| <numeric scalar>"
+                    "| 'raw:<val>' | <numeric scalar>"
                 )
             stage.leak_mode = "non-programmable"
             stage.leak_constant = leak_val
@@ -758,18 +823,37 @@ def _score_state_trajectory(
 def _select_corner_subset(
     drive_grid: Iterable[float], leak_grid: Iterable[Any],
     gain_grid: Iterable[float], max_corners: int | None,
-) -> list[tuple[float, Any, float]]:
+    isat_grid: Iterable[float | None] | None = None,
+) -> list[tuple[float, Any, float, float | None]]:
     """Select the sweep corners without changing their traversal order.
 
     The full sweep traverses drive, then leak, then gain.  A positive
     ``max_corners`` returns exactly that prefix; otherwise the full grid
     is returned.
+
+    Regime-transplant: ``isat_grid`` pairs with ``gain_grid`` POSITIONALLY
+    (``zip``, not a ``gm -> isat`` dict) so duplicate gm entries keep
+    distinct Isat values -- e.g. ``gain=(-3.5, -3.5)`` with
+    ``isat=(None, -2.0)`` yields one coupled and one decoupled corner.
+    A dict keyed by gm value would collapse the duplicates and silently
+    drop a corner. ``None`` entries mean coupled (``isat == gm``).
     """
+    gain_list = [float(g) for g in gain_grid]
+    if isat_grid is None:
+        pairs = [(g, None) for g in gain_list]
+    else:
+        isat_list = [None if v is None else float(v) for v in isat_grid]
+        if len(isat_list) != len(gain_list):
+            raise ValueError(
+                f"isat_grid length ({len(isat_list)}) must match gain_grid "
+                f"length ({len(gain_list)}) when provided"
+            )
+        pairs = list(zip(gain_list, isat_list))
     full = [
-        (float(drive), leak_mode, float(gm_init))
+        (float(drive), leak_mode, gm_init, isat_init)
         for drive in drive_grid
         for leak_mode in leak_grid
-        for gm_init in gain_grid
+        for gm_init, isat_init in pairs
     ]
     if not full:
         raise ValueError("gain, leak, and drive grids must all be non-empty")
@@ -783,6 +867,8 @@ def _e0_config_tag(
     t_span: float, num_steps: int, gm_init: float, leak_mode: Any,
     drive: float, washout: int, jacobian_samples: int,
     boundary_fan_out: dict[int, list[int]] | None = None,
+    isat_init: float | None = None,
+    per_lib_overrides: dict[str, dict[str, float | None]] | None = None,
 ) -> str:
     """Corner identity shared by :func:`_e0_row` and the resume matcher.
 
@@ -791,6 +877,12 @@ def _e0_config_tag(
     progress files written by older runs still match. A non-canonical
     sparse fan-out appends a stable ``_fan<tgt>-<tgt>-...`` suffix built
     from the sorted unique target set. Add new axes here as suffixes only.
+
+    Regime-transplant: when ``isat_init`` is set or ``per_lib_overrides``
+    is non-None, append ``_isat<...>`` and/or ``_plib<...>`` suffixes so
+    two corners with the same gm/leak/drive but different fills don't
+    collide on resume. Empty / None values leave the tag unchanged
+    (legacy byte-identity preserved).
     """
     base = (
         f"order{order}_seed{seed}_{device}_tanhfree"
@@ -800,17 +892,35 @@ def _e0_config_tag(
         f"_washout{int(washout)}_jac{int(jacobian_samples)}"
     )
     if boundary_fan_out is None:
-        return base
-    canon_targets = list(range(int(hidden_dim)))
-    sparse_targets = sorted(
-        {t for tgts in boundary_fan_out.values() for t in tgts}
-    )
-    if sparse_targets == canon_targets:
-        return base
-    _short = "-".join(str(t) for t in sparse_targets[:6])
-    if len(sparse_targets) > 6:
-        _short += "-etc"
-    return f"{base}_fan{_short}"
+        _tag_with_fan = base
+    else:
+        canon_targets = list(range(int(hidden_dim)))
+        sparse_targets = sorted(
+            {t for tgts in boundary_fan_out.values() for t in tgts}
+        )
+        if sparse_targets == canon_targets:
+            _tag_with_fan = base
+        else:
+            _short = "-".join(str(t) for t in sparse_targets[:6])
+            if len(sparse_targets) > 6:
+                _short += "-etc"
+            _tag_with_fan = f"{base}_fan{_short}"
+    if isat_init is not None:
+        _tag_with_fan = f"{_tag_with_fan}_isat{float(isat_init):g}"
+    if per_lib_overrides:
+        # Stable encoding: sorted library names, gm and isat rounded to
+        # ``:g`` to avoid float drift making two equivalent dicts
+        # produce different tags.
+        _plibs = sorted(per_lib_overrides.items())
+        _parts = []
+        for _lib, _ov in _plibs:
+            _g = _ov.get("gm") if isinstance(_ov, dict) else None
+            _i = _ov.get("isat") if isinstance(_ov, dict) else None
+            _g_str = f"g{float(_g):g}" if _g is not None else "g-"
+            _i_str = f"i{float(_i):g}" if _i is not None else "i-"
+            _parts.append(f"{_lib[0]}{_g_str}{_i_str}")
+        _tag_with_fan = f"{_tag_with_fan}_plib{'-'.join(_parts)}"
+    return _tag_with_fan
 
 
 def _bfo_json(boundary_fan_out: dict[Any, Any] | None) -> str:
@@ -861,6 +971,9 @@ def _e0_row(
     raw_leak_init_seed: int = 0, washout: int = PROBE_WASHOUT,
     jacobian_samples: int = 3,
     boundary_fan_out: dict[int, list[int]] | None = None,
+    isat_init: float | None = None,
+    per_lib_overrides: dict[str, dict[str, float | None]] | None = None,
+    skip_override: bool = False,
 ) -> E0SweepRow:
     """Score one E0 sweep corner from normal and boundary-only passes."""
     if len(list(net.core.stages)) != 1:
@@ -883,11 +996,18 @@ def _e0_row(
         )
     net.eval()
     # Gain + leak override (cell_library defaults untouched).  Drive is
-    # already represented by the scaled input sequence.
-    apply_gain_override(
-        net, gm_init=gm_init, isat_init=gm_init, leak_mode=leak_mode,
-        raw_leak_init_seed=raw_leak_init_seed,
-    )
+    # already represented by the scaled input sequence. ``isat_init``
+    # decouples Isat from gm when set; ``per_lib_overrides`` overrides
+    # individual cell libraries (regime-transplant hook). Both default to
+    # the legacy coupled/symmetric path byte-identically.
+    # ``skip_override=True`` is used by the exact-tensor anchor corner
+    # so the canonical override does NOT overwrite the pre-filled tensors.
+    if not skip_override:
+        apply_gain_override(
+            net, gm_init=gm_init, isat_init=isat_init, leak_mode=leak_mode,
+            raw_leak_init_seed=raw_leak_init_seed,
+            per_lib_overrides=per_lib_overrides,
+        )
     stage = net.core.stages[0]
     state_width = net.hid_count + net.proj_count + net.output_ode_count
     x0 = u_train.new_zeros(1, state_width)
@@ -940,14 +1060,29 @@ def _e0_row(
         gm_init=gm_init, leak_mode=leak_mode, drive=drive,
         washout=washout, jacobian_samples=jacobian_samples,
         boundary_fan_out=boundary_fan_out,
+        # Regime-transplant: the row tag must carry the same isat /
+        # per-lib suffixes as the resume key in e0_sweep, or resume
+        # never matches and every rerun recomputes decoupled corners.
+        isat_init=isat_init,
+        per_lib_overrides=per_lib_overrides,
     )
     return E0SweepRow(
         config_tag=config_tag,
         hidden_dim=hidden_dim,
         n_params=n_params,
         gm_init=float(gm_init),
+        # NaN sentinel: caller didn't pass a decoupled isat_init, so the
+        # legacy coupled fill was used. CSV/log readers can detect this
+        # via float('nan') to mean "isat == gm for this corner".
+        isat_init=(
+            float(isat_init) if isat_init is not None else float("nan")
+        ),
         leak_mode=str(leak_mode),
         drive=float(drive),
+        per_lib_overrides_json=(
+            json.dumps(per_lib_overrides, sort_keys=True)
+            if per_lib_overrides else ""
+        ),
         # Round-2 §13.1: store the JSON-encoded fan-out so CSV dumps
         # carry the build flag. The e0_sweep caller overrides this
         # with the canonical-form string on the way out; defaulting to
@@ -987,6 +1122,104 @@ def _e0_row(
     )
 
 
+def _make_anchor_pre_fill(ckpt_path: str | None, device: str) -> Any:
+    """Return a ``(net) -> None`` hook that pre-fills dynamics tensors.
+
+    Loads ``ckpt_path`` once and returns a closure suitable for
+    ``e0_sweep(..., pre_fill=...)``. The closure copies the checkpoint's
+    dynamics tensors (per-library ``gm_raw`` / ``isat_raw``, per-stage
+    ``raw_leak``, gate logits ``z_logits`` / ``boundary_z_logits`` /
+    ``output_ode_z_logits`` / ``u_logits``, and the remaining trainable
+    cell params ``a/b/s/theta/g_resistive_raw``) from the checkpoint into
+    the freshly built net. Readout tensors (``output_mapper.*``,
+    ``post_readout_transfer.*``) are NEVER copied -- E0 refits the
+    readout via ridge, so copying them would only pretend the anchor
+    carries a trained readout. Index buffers (``src``/``dst`` maps) are
+    skipped: they describe topology, not regime, and must come from the
+    fresh build.
+
+    Strict load: every expected dynamics key must be present in the
+    checkpoint with a matching shape (e.g. same hidden_dim / cell
+    library); a missing or mismatched key hard-fails instead of scoring
+    a half-filled net. The caller is responsible for ensuring the ckpt
+    and the build are compatible.
+
+    Returns ``None`` when ``ckpt_path`` is ``None`` (no pre-fill).
+    """
+    if ckpt_path is None:
+        return None
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    state = ckpt.get("model_state", ckpt)
+    if not isinstance(state, dict):
+        raise ValueError(
+            f"--anchor-ckpt: not a state_dict container, got {type(state).__name__}"
+        )
+
+    # Readout prefixes are never copied (ridge refit owns the readout).
+    # Index buffers are topology, not regime (fresh build owns them).
+    _SKIP_PREFIXES = ("output_mapper.", "post_readout_transfer.")
+    _SKIP_SUFFIXES = ("_src", "_dst", "_drive_idx", "_drive_mask")
+    _REQUIRED_SUBSTRINGS = ("gm_raw", "isat_raw", "raw_leak")
+
+    def _pre_fill(net: nn.Module) -> None:
+        net.to("cpu")
+        own = dict(net.named_parameters())
+        own_bufs = dict(net.named_buffers())
+        # Expected dynamics keys: every gm_raw/isat_raw/raw_leak tensor
+        # the fresh build owns must be covered by the checkpoint.
+        expected = {
+            k for k in list(own) + list(own_bufs)
+            if any(s in k for s in _REQUIRED_SUBSTRINGS)
+        }
+        missing = [k for k in sorted(expected) if k not in state]
+        if missing:
+            raise ValueError(
+                f"--anchor-ckpt: checkpoint is missing {len(missing)} "
+                f"dynamics tensor(s), e.g. {missing[0]!r}; build and ckpt "
+                f"are incompatible (different hidden_dim / cell library?)"
+            )
+        copied = 0
+        for k, src in state.items():
+            if k.startswith(_SKIP_PREFIXES) or k.endswith(_SKIP_SUFFIXES):
+                continue
+            src_t = src.detach().to("cpu") if torch.is_tensor(src) else src
+            if not torch.is_tensor(src_t):
+                continue
+            if k in own:
+                tgt = own[k]
+                if tuple(tgt.shape) != tuple(src_t.shape):
+                    raise ValueError(
+                        f"--anchor-ckpt: shape mismatch on {k!r} "
+                        f"(ckpt {tuple(src_t.shape)} vs net "
+                        f"{tuple(tgt.shape)}); build and ckpt are "
+                        f"incompatible"
+                    )
+                with torch.no_grad():
+                    tgt.data.copy_(src_t.to(tgt.dtype))
+                copied += 1
+            elif k in own_bufs:
+                tgt = own_bufs[k]
+                if tuple(tgt.shape) != tuple(src_t.shape):
+                    raise ValueError(
+                        f"--anchor-ckpt: shape mismatch on buffer {k!r}"
+                    )
+                tgt.data.copy_(src_t.to(tgt.dtype))
+                copied += 1
+            # Silently skip checkpoint-only keys the fresh build doesn't
+            # own (e.g. optimizer-adjacent extras); the strict gate above
+            # already guaranteed every expected dynamics key was covered.
+        if copied == 0:
+            raise ValueError(
+                "--anchor-ckpt: no dynamics tensors copied; ckpt is "
+                "incompatible with the build (different cell library / "
+                "topology?)"
+            )
+        net.to(device)
+
+    return _pre_fill
+
+
+
 def e0_sweep(
     order: int, seed: int, *, device: str = "cpu",
     gain_grid: Iterable[float] = E0_GAIN_GRID,
@@ -996,7 +1229,12 @@ def e0_sweep(
     washout: int = PROBE_WASHOUT, jacobian_samples: int = 3,
     t_span: float = 1.0, num_steps: int = 8, hidden_dim: int = 25,
     net_factory: Any | None = None,
-    selected_corners: Iterable[tuple[float, Any, float]] | None = None,
+    selected_corners: Iterable[tuple] | None = None,
+    isat_grid: Iterable[float | None] | None = None,
+    per_lib_overrides: dict[str, dict[str, float | None]] | None = None,
+    pre_fill: Any | None = None,
+    pre_fill_overrides_after: bool = False,
+    refresh: int = 0,
     use_small_world: bool = False,
     small_world_k: int = 4,
     small_world_p: float = 0.2,
@@ -1021,9 +1259,23 @@ def e0_sweep(
         net_factory: Optional callable ``() -> nn.Module``.  If omitted,
             uses the canonical NARMA fabric built via
             ``narma_experiment._build_fabric_net``.
-        selected_corners: Optional explicit ``(drive, leak, gm)`` list.
-            Used by ``--max-corners`` so smoke runs take an exact prefix of
+        selected_corners: Optional explicit corner list. Entries are
+            ``(drive, leak, gm)`` or ``(drive, leak, gm, isat)``
+            (3-tuples pad ``isat=None`` = coupled). Used by
+            ``--max-corners`` so smoke runs take an exact prefix of
             the traversal order.
+        isat_grid: Optional per-gain Isat values, paired with
+            ``gain_grid`` POSITIONALLY (see :func:`_select_corner_subset`).
+            ``None`` entries restore the legacy coupled-isat behaviour
+            for that gm. Duplicate gm entries keep distinct Isat values.
+        refresh: ``core_refresh_interval`` applied to every built stage
+            (default 0 = legacy frozen). The exact-tensor anchor corner
+            must use the checkpoint's own ``k`` (k2 ckpt -> ``refresh=2``)
+            or the forward won't reproduce the trained trajectory.
+        pre_fill: Optional ``(net) -> None`` hook (see
+            :func:`_make_anchor_pre_fill`). Runs BEFORE the gm/Isat/leak
+            override pass when ``pre_fill_overrides_after`` is True, or
+            replaces it (``skip_override``) when False (pure anchor).
         use_small_world: If True, build the NARMA net with
             ``hidden_family='small_world'`` (Step 4 grid axis). Replaces
             the canonical 5x5 torus with a Watts-Strogatz graph of the
@@ -1053,11 +1305,32 @@ def e0_sweep(
         raise ValueError(f"num_steps must be positive, got {num_steps}")
     if hidden_dim < 1:
         raise ValueError(f"hidden_dim must be positive, got {hidden_dim}")
+    if refresh < 0:
+        raise ValueError(f"refresh must be non-negative, got {refresh}")
+    # Regime-transplant: isat pairs with gain POSITIONALLY via
+    # _select_corner_subset (duplicate gm entries keep distinct Isat).
     if selected_corners is None:
-        corners = _select_corner_subset(drive_grid, leak_grid, gain_grid, None)
+        corners = _select_corner_subset(
+            drive_grid, leak_grid, gain_grid, None,
+            isat_grid=isat_grid,
+        )
     else:
-        corners = [(float(drive), leak_mode, float(gm_init))
-                   for drive, leak_mode, gm_init in selected_corners]
+        corners = []
+        for _c in selected_corners:
+            if len(_c) == 3:
+                _d, _l, _g = _c
+                corners.append((float(_d), _l, float(_g), None))
+            elif len(_c) == 4:
+                _d, _l, _g, _i = _c
+                corners.append((
+                    float(_d), _l, float(_g),
+                    None if _i is None else float(_i),
+                ))
+            else:
+                raise ValueError(
+                    "selected_corners entries must be (drive, leak, gm) or "
+                    f"(drive, leak, gm, isat), got {tuple(_c)!r}"
+                )
         if not corners:
             raise ValueError("selected_corners must be non-empty")
 
@@ -1094,7 +1367,7 @@ def e0_sweep(
                     t_span=t_span, small_world_k=small_world_k,
                     small_world_p=small_world_p,
                     small_world_seed=small_world_seed,
-                    core_refresh_interval=0,
+                    core_refresh_interval=refresh,
                     leak_constant=None,
                 )
                 torch.manual_seed(seed)
@@ -1118,7 +1391,7 @@ def e0_sweep(
                     t_span=t_span, num_steps=num_steps,
                     cell_library="tanh_free",
                     hidden_dim=hidden_dim,
-                    core_refresh_interval=0,
+                    core_refresh_interval=refresh,
                     leak_constant=None,
                     compile_sequence=False,
                     boundary_fan_out=boundary_fan_out,
@@ -1137,7 +1410,7 @@ def e0_sweep(
     _build_key: dict[str, Any] = {
         "cell_library": "tanh_free",
         "freeze_read": False,
-        "core_refresh_interval": 0,
+        "core_refresh_interval": int(refresh),
         "use_small_world": bool(use_small_world),
         "small_world_k": int(small_world_k),
         "small_world_p": float(small_world_p),
@@ -1180,9 +1453,13 @@ def e0_sweep(
             "device": device,
             "build": _build_key,
             "grids": {
-                "gain": [float(g) for _, _, g in corners],
-                "leak": [_leak_json(m) for _, m, _ in corners],
-                "drive": [float(d) for d, _, _ in corners],
+                "gain": [float(g) for _, _, g, _ in corners],
+                "leak": [_leak_json(m) for _, m, _, _ in corners],
+                "drive": [float(d) for d, _, _, _ in corners],
+                "isat": [
+                    (None if i is None else float(i))
+                    for _, _, _, i in corners
+                ],
             },
             "n_corners_total": len(corners),
             "n_corners_done": len(_rows),
@@ -1192,14 +1469,18 @@ def e0_sweep(
 
     rows: list[E0SweepRow] = []
     scaled_cache: dict[float, torch.Tensor] = {}
-    for drive, leak_mode, gm_init in corners:
+    for drive, leak_mode, gm_init, isat_for_corner in corners:
         _tag = _e0_config_tag(
             order=order, seed=seed, device=device, hidden_dim=hidden_dim,
-            refresh=0, t_span=t_span, num_steps=num_steps,
+            refresh=refresh, t_span=t_span, num_steps=num_steps,
             gm_init=float(gm_init), leak_mode=leak_mode,
             drive=float(drive), washout=washout,
             jacobian_samples=jacobian_samples,
             boundary_fan_out=boundary_fan_out,
+            isat_init=(
+                isat_for_corner if isat_for_corner is not None else None
+            ),
+            per_lib_overrides=per_lib_overrides,
         )
         if _allow_resume and _tag in _done:
             try:
@@ -1223,6 +1504,17 @@ def e0_sweep(
         # reproducible and no corner inherits another corner's override.
         net = net_factory()
         net.to(device)
+        # Regime-transplant: optional exact-tensor pre-fill. When set,
+        # overwrite the freshly-built net's dynamics tensors with values
+        # from a reference checkpoint (e.g. the k2 epoch-54 artifact)
+        # before the gm/Isat/leak override pass. With
+        # ``pre_fill_overrides_after=False`` (pure anchor) the override
+        # pass is skipped via ``skip_override`` so the exact tensors
+        # survive; with True the canonical override runs on top of the
+        # pre-fill (partial pre-fill + override handles the rest).
+        _skip = not (pre_fill is None or pre_fill_overrides_after)
+        if pre_fill is not None:
+            pre_fill(net)
         row = _e0_row(
             net, u_drive, y_drive,
             order=order, seed=seed, device=device,
@@ -1230,6 +1522,9 @@ def e0_sweep(
             drive=drive_value, raw_leak_init_seed=seed,
             washout=washout, jacobian_samples=jacobian_samples,
             boundary_fan_out=boundary_fan_out,
+            isat_init=isat_for_corner,
+            per_lib_overrides=per_lib_overrides,
+            skip_override=_skip,
         )
         # Stamp the JSON-encoded boundary_fan_out so the CSV row joins
         # against the build flag (canonical runs keep an empty string so
@@ -1246,6 +1541,136 @@ def e0_sweep(
             _progress_path, _progress_payload(rows, complete=True),
         )
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Regime-transplant grid + canary (plan narma-regime-transplant)
+# ---------------------------------------------------------------------------
+
+# Full transplant grid (feature spec regime-transplant-grid): 2 gm x 3 Isat
+# x 3 raw-leak x 3 swing = 54 corners. Gain/Isat pair POSITIONALLY (duplicate
+# gm entries keep distinct Isat values -- see _select_corner_subset).
+# ``None`` Isat = coupled (isat == gm). Raw leaks map to effective leaks
+# softplus(raw) = 0.20 / 0.47 / 0.97 (heun leak_floor=0.0); swings below the
+# historical 0.25 floor ride the existing input-scale path.
+TRANSPLANT_GM_GRID: tuple[float, ...] = (-3.5, -3.5, -3.5, -3.0, -3.0, -3.0)
+TRANSPLANT_ISAT_GRID: tuple[float | None, ...] = (
+    None, -2.0, -6.0, None, -2.0, -6.0,
+)
+TRANSPLANT_LEAK_GRID: tuple[str, ...] = ("raw:-1.5", "raw:-0.5", "raw:0.5")
+TRANSPLANT_DRIVE_GRID: tuple[float, ...] = (0.1, 0.2, 0.3)
+
+# Advisor priority canary corner: high core Isat at moderate core gm, fast
+# leak, swing 0.2. The core library differs (per-lib override); boundary
+# and output libraries use the coupled global fill.
+TRANSPLANT_CANARY_GM: float = -3.5
+TRANSPLANT_CANARY_LEAK: str = "raw:-0.5"
+TRANSPLANT_CANARY_DRIVE: float = 0.2
+TRANSPLANT_CANARY_PER_LIB: dict[str, dict[str, float | None]] = {
+    "cell_lib": {"gm": -3.5, "isat": -2.0},
+}
+
+# Canary verdict gates (spec; deliberately looser than the E0 sweep's
+# pass_all, which also requires state-PR >= 6).
+CANARY_PASS_MC_ABOVE: float = 4.0
+CANARY_PASS_RIDGE_BELOW: float = 0.6
+CANARY_ANCHOR_BAND: tuple[float, float] = (0.60, 0.68)
+CANARY_BLIND_AT_OR_ABOVE: float = 0.72
+# Gate-zero "flip": core edges carry information when forcing them off
+# degrades the ridge by more than this (and MC drops too).
+CANARY_GZ_FLIP_DELTA: float = 0.05
+
+
+def transplant_corner_count() -> int:
+    """Number of corners in the full transplant grid (spec: ~54)."""
+    return (
+        len(TRANSPLANT_GM_GRID)
+        * len(TRANSPLANT_LEAK_GRID)
+        * len(TRANSPLANT_DRIVE_GRID)
+    )
+
+
+def canary_verdict(
+    anchor_ridge: float, canary: E0SweepRow,
+) -> dict[str, Any]:
+    """Apply the pre-registered 4-outcome canary table.
+
+    Returns a dict with ``outcome`` (one of ``EXPAND-TO-FULL-GRID``,
+    ``TRANSPLANT-WOUNDED``, ``INSTRUMENT-BLIND``,
+    ``CORE-USEFUL-NO-PASS``, ``ANCHOR-OFF-NOMINAL``), ``anchor_ridge``,
+    ``canary_pass`` (spec gates MC>=4, rails<=5%, ridge<0.6),
+    ``gate_zero_flip`` (core load-bearing without gate pass), and a
+    human-readable ``summary``.
+    """
+    lo, hi = CANARY_ANCHOR_BAND
+    canary_pass = (
+        canary.mc_total_washout_corrected >= CANARY_PASS_MC_ABOVE
+        and canary.ridge_nrmse < CANARY_PASS_RIDGE_BELOW
+        and canary.rail_frac <= RAIL_DISQUALIFY_ABOVE
+    )
+    gate_zero_flip = (
+        (canary.gate_zero_ridge_nrmse - canary.ridge_nrmse)
+        > CANARY_GZ_FLIP_DELTA
+        and canary.gate_zero_mc_total < canary.mc_total_washout_corrected
+    )
+    if anchor_ridge >= CANARY_BLIND_AT_OR_ABOVE:
+        outcome = "INSTRUMENT-BLIND"
+        summary = (
+            f"anchor ridge {anchor_ridge:.4f} >= {CANARY_BLIND_AT_OR_ABOVE}: "
+            f"instrument blind, all historical FAILs voided -- stop and "
+            f"fix the meter, do not expand."
+        )
+    elif lo <= anchor_ridge <= hi and canary_pass:
+        outcome = "EXPAND-TO-FULL-GRID"
+        summary = (
+            f"anchor {anchor_ridge:.4f} in [{lo}, {hi}] (calibrated) + "
+            f"canary passes (MC={canary.mc_total_washout_corrected:.2f}, "
+            f"ridge={canary.ridge_nrmse:.4f}, "
+            f"rail={100.0 * canary.rail_frac:.1f}%) -- expand to the full "
+            f"{transplant_corner_count()}-corner grid, then a short k=2 "
+            f"train from the winning init."
+        )
+    elif lo <= anchor_ridge <= hi and gate_zero_flip:
+        outcome = "CORE-USEFUL-NO-PASS"
+        summary = (
+            f"anchor {anchor_ridge:.4f} calibrated but canary fails the "
+            f"gates (MC={canary.mc_total_washout_corrected:.2f}, "
+            f"ridge={canary.ridge_nrmse:.4f}); gate-zero flip "
+            f"(gz ridge={canary.gate_zero_ridge_nrmse:.4f}) confirms the "
+            f"core is useful -- full grid with core-Isat as lead axis."
+        )
+    elif lo <= anchor_ridge <= hi:
+        outcome = "TRANSPLANT-WOUNDED"
+        summary = (
+            f"anchor {anchor_ridge:.4f} calibrated but canary fails "
+            f"(MC={canary.mc_total_washout_corrected:.2f}, "
+            f"ridge={canary.ridge_nrmse:.4f}, no gate-zero flip) -- "
+            f"transplant wounded; re-examine the ESN->fabric translation, "
+            f"do not burn GPU on the full grid."
+        )
+    else:
+        outcome = "ANCHOR-OFF-NOMINAL"
+        summary = (
+            f"anchor ridge {anchor_ridge:.4f} outside both the calibrated "
+            f"band [{lo}, {hi}] and the blind threshold "
+            f">={CANARY_BLIND_AT_OR_ABOVE}: unregistered zone -- inspect "
+            f"before any expand/stop decision."
+        )
+    return {
+        "outcome": outcome,
+        "summary": summary,
+        "anchor_ridge": float(anchor_ridge),
+        "anchor_band": [lo, hi],
+        "blind_at_or_above": CANARY_BLIND_AT_OR_ABOVE,
+        "canary_pass": bool(canary_pass),
+        "canary_gates": {
+            "mc_above_or_equal": CANARY_PASS_MC_ABOVE,
+            "ridge_below": CANARY_PASS_RIDGE_BELOW,
+            "rail_at_or_below": RAIL_DISQUALIFY_ABOVE,
+        },
+        "gate_zero_flip": bool(gate_zero_flip),
+        "gate_zero_flip_delta": CANARY_GZ_FLIP_DELTA,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1380,15 +1805,54 @@ def main(argv: list[str] | None = None) -> int:
     p_e0.add_argument("--num-steps", type=int, default=8)
     p_e0.add_argument("--hidden-dim", type=int, default=25)
     p_e0.add_argument("--gain-grid", type=str, default="-5,-2,0,1.5",
-                      help="Comma-separated gm_init values (default -5,-2,0,1.5)")
+                      help="Comma-separated gm_init values (default -5,-2,0,1.5). "
+                           "Use the --flag=value form when the value starts "
+                           "with '-' (argparse rejects a bare space-separated "
+                           "negative).")
     p_e0.add_argument(
         "--leak-grid", type=str, default="slow-fixed,randomized,0.15",
         help="Comma-separated leak modes; numeric -> fixed scalar leak. "
              "Step 4 hetero-leak token: 'hetero:1.0:40.0' (per-node "
              "log-uniform time constants; colons, never commas, so the "
-             "token survives grid splitting).",
+             "token survives grid splitting). Regime-transplant raw token: "
+             "'raw:-0.5' (programmable leak, raw_leak filled to scalar; "
+             "effective leak softplus(-0.5)~0.47 -- NOT the same as bare "
+             "'-0.5', which sets a negative leak_constant).",
     )
-    p_e0.add_argument("--drive-grid", type=str, default="0.25,0.5,1.0")
+    p_e0.add_argument("--drive-grid", type=str, default="0.25,0.5,1.0",
+                      help="Comma-separated input scales. Regime-transplant "
+                           "runs below the historical 0.25 floor "
+                           "(e.g. '0.1,0.2,0.3').")
+    p_e0.add_argument(
+        "--isat-grid", type=str, default=None,
+        help="Regime-transplant: comma-separated isat_init values, one per "
+             "gain-grid entry (length must match --gain-grid). Use 'nan' "
+             "or leave blank for a position to mean 'coupled (==gm_init)'. "
+             "Example: '--gain-grid -3.5,-3.5 --isat-grid -2,-6' decouples "
+             "Isat into both directions at moderate core gm.",
+    )
+    p_e0.add_argument(
+        "--per-lib-override", type=str, default=None,
+        help="Regime-transplant: per-cell-library override JSON, e.g. "
+             "'{\"boundary_cell_lib\":{\"gm\":-3.5,\"isat\":-2}}'. Libraries "
+             "not listed fall back to --gain-grid values. Mutually "
+             "compatible with --isat-grid (per-lib wins for listed libs).",
+    )
+    p_e0.add_argument(
+        "--anchor-ckpt", type=str, default=None,
+        help="Regime-transplant: exact-tensor anchor corner. Path to a "
+             "fabric .pt checkpoint whose dynamics tensors (gm_raw, "
+             "isat_raw, raw_leak) are copied into every freshly built "
+             "net BEFORE the gm/Isat/leak override pass is suppressed. "
+             "Used to calibrate the E0 instrument against a known-good "
+             "trained artifact. Mutually exclusive with --isat-grid and "
+             "--per-lib-override (the override pass is suppressed).",
+    )
+    p_e0.add_argument("--refresh", type=int, default=0,
+                      help="core_refresh_interval for every built stage "
+                           "(default 0 = legacy frozen). The exact-tensor "
+                           "anchor must use the checkpoint's own k "
+                           "(k2 ckpt -> --refresh 2).")
     p_e0.add_argument("--max-corners", type=int, default=0,
                       help="If >0, run exactly the first N corners in "
                            "drive/leak/gain traversal order (smoke).")
@@ -1410,6 +1874,46 @@ def main(argv: list[str] | None = None) -> int:
              "_fan<tgt>... config-tag suffix and a separate resume key, "
              "so the canonical progress file is untouched.",
     )
+    # --- regime-transplant canary: anchor + advisor priority corner ---
+    p_can = sub.add_parser(
+        "canary",
+        help="Regime-transplant canary leg: exact-tensor anchor corner + "
+             "advisor priority corner, then the pre-registered 4-outcome "
+             "verdict. CPU-runnable (2 corners).",
+    )
+    _add_common_args(p_can)
+    p_can.add_argument("--anchor-ckpt", type=str, required=True,
+                       help="Path to the k2 epoch-54 fabric .pt checkpoint "
+                            "whose dynamics tensors calibrate the E0 "
+                            "instrument (expect ridge 0.60-0.68).")
+    p_can.add_argument("--anchor-refresh", type=int, default=2,
+                       help="core_refresh_interval for the anchor build "
+                            "ONLY (must match the ckpt's own k; default 2).")
+    p_can.add_argument("--n-streams", type=int, default=4)
+    p_can.add_argument("--train-samples", type=int, default=2500)
+    p_can.add_argument("--jacobian-samples", type=int, default=3)
+    p_can.add_argument("--t-span", type=float, default=1.0)
+    p_can.add_argument("--num-steps", type=int, default=8)
+    p_can.add_argument("--hidden-dim", type=int, default=25)
+
+    # --- regime-transplant full grid (~54 corners, GPU-intended) ---
+    p_tr = sub.add_parser(
+        "transplant",
+        help="Regime-transplant full grid: 2 gm x 3 Isat x 3 raw-leak x "
+             "3 swing = 54 corners (spec regime-transplant-grid). "
+             "GPU-intended; per-corner progress flush + resume included.",
+    )
+    _add_common_args(p_tr)
+    p_tr.add_argument("--n-streams", type=int, default=4)
+    p_tr.add_argument("--train-samples", type=int, default=2500)
+    p_tr.add_argument("--jacobian-samples", type=int, default=3)
+    p_tr.add_argument("--t-span", type=float, default=1.0)
+    p_tr.add_argument("--num-steps", type=int, default=8)
+    p_tr.add_argument("--hidden-dim", type=int, default=25)
+    p_tr.add_argument("--refresh", type=int, default=0)
+    p_tr.add_argument("--max-corners", type=int, default=0,
+                      help="If >0, run exactly the first N corners in "
+                           "drive/leak/gain traversal order (smoke).")
 
     args = parser.parse_args(argv)
     # Pre-registered thresholds and locked grids are NARMA-10-specific.
@@ -1531,9 +2035,67 @@ def main(argv: list[str] | None = None) -> int:
             except ValueError:
                 leak_grid.append(tok)
         drive_grid = tuple(float(s) for s in args.drive_grid.split(",") if s.strip())
+        # Regime-transplant: parse --isat-grid (length must match gain_grid;
+        # 'nan' / empty / 'none' tokens mean "coupled (==gm_init)").
+        isat_grid: list[float | None] | None = None
+        if args.isat_grid is not None:
+            isat_grid = []
+            for tok in args.isat_grid.split(","):
+                tok = tok.strip()
+                if not tok or tok.lower() in ("nan", "none", "coupled"):
+                    isat_grid.append(None)
+                else:
+                    isat_grid.append(float(tok))
+            if len(isat_grid) != len(gain_grid):
+                raise SystemExit(
+                    f"--isat-grid length ({len(isat_grid)}) must match "
+                    f"--gain-grid length ({len(gain_grid)})"
+                )
+        # Regime-transplant: parse --per-lib-override (JSON dict).
+        per_lib_parsed: dict[str, dict[str, float | None]] | None = None
+        if args.per_lib_override is not None:
+            try:
+                pl_raw = json.loads(args.per_lib_override)
+            except json.JSONDecodeError as e:
+                raise SystemExit(f"--per-lib-override: invalid JSON: {e}")
+            if not isinstance(pl_raw, dict):
+                raise SystemExit(
+                    "--per-lib-override must be a JSON object, got "
+                    f"{type(pl_raw).__name__}"
+                )
+            valid_libs = {"cell_lib", "boundary_cell_lib", "output_ode_cell_lib"}
+            per_lib_parsed = {}
+            for lib_name, ov in pl_raw.items():
+                if lib_name not in valid_libs:
+                    raise SystemExit(
+                        f"--per-lib-override: unknown library {lib_name!r}; "
+                        f"valid: {sorted(valid_libs)}"
+                    )
+                if not isinstance(ov, dict):
+                    raise SystemExit(
+                        f"--per-lib-override[{lib_name!r}] must be a dict, "
+                        f"got {type(ov).__name__}"
+                    )
+                entry: dict[str, float | None] = {}
+                for k in ("gm", "isat"):
+                    if k in ov:
+                        v = ov[k]
+                        entry[k] = None if v is None else float(v)
+                per_lib_parsed[lib_name] = entry
+        # Regime-transplant: the anchor suppresses the override pass, so
+        # combining it with override flags is almost certainly a mistake.
+        if args.anchor_ckpt is not None and (
+            args.isat_grid is not None or args.per_lib_override is not None
+        ):
+            raise SystemExit(
+                "--anchor-ckpt is mutually exclusive with --isat-grid and "
+                "--per-lib-override (the anchor suppresses the gm/Isat/leak "
+                "override pass; exact tensors come from the checkpoint)."
+            )
         selected_corners = _select_corner_subset(
             drive_grid, leak_grid, gain_grid,
             args.max_corners if args.max_corners > 0 else None,
+            isat_grid=isat_grid,
         )
         # Round-2 §13.1 sparse-drive E0: parse the JSON boundary-fan-out
         # spec. ``None`` keeps the canonical full fan-out exactly (zero
@@ -1595,6 +2157,12 @@ def main(argv: list[str] | None = None) -> int:
             t_span=args.t_span, num_steps=args.num_steps,
             hidden_dim=args.hidden_dim,
             selected_corners=selected_corners,
+            isat_grid=isat_grid,
+            per_lib_overrides=per_lib_parsed,
+            pre_fill=_make_anchor_pre_fill(args.anchor_ckpt, args.device)
+                if args.anchor_ckpt else None,
+            pre_fill_overrides_after=False,
+            refresh=args.refresh,
             use_small_world=args.use_small_world,
             small_world_k=args.small_world_k,
             small_world_p=args.small_world_p,
@@ -1664,7 +2232,7 @@ def main(argv: list[str] | None = None) -> int:
             "canonical_net": {
                 "cell_library": "tanh_free",
                 "freeze_read": False,
-                "core_refresh_interval": 0,
+                "core_refresh_interval": args.refresh,
                 "t_span": args.t_span,
                 "num_steps": args.num_steps,
                 "hidden_dim": args.hidden_dim,
@@ -1685,6 +2253,180 @@ def main(argv: list[str] | None = None) -> int:
                 "gain": list(gain_grid),
                 "leak": [str(value) for value in leak_grid],
                 "drive": list(drive_grid),
+                # Regime-transplant: only present when caller actually
+                # decoupled. Keeps the JSON schema clean for legacy legs.
+                **({"isat": [v for v in (isat_grid or [])]}
+                   if isat_grid is not None else {}),
+                **({"per_lib_overrides": per_lib_parsed}
+                   if per_lib_parsed is not None else {}),
+            },
+            "corner_selection": (
+                f"first {args.max_corners}" if args.max_corners > 0 else "full grid"
+            ),
+            "n_corners": len(rows),
+            "complete": True,
+            "elapsed_s": elapsed,
+            "thresholds": {
+                "mc_above": E0_PASS_MC_ABOVE,
+                "ridge_below_or_equal": E0_PASS_RIDGE_BELOW,
+                "state_pr_min": E0_PASS_STATE_PR_MIN,
+                "rail_disqualify_above": RAIL_DISQUALIFY_ABOVE,
+            },
+            "rows": row_dicts,
+        }, indent=2))
+        return 0
+
+    if args.mode == "canary":
+        # Canary leg (plan narma-regime-transplant): exact-tensor anchor
+        # corner (instrument calibration) + advisor priority corner
+        # (high core Isat, moderate core gm, fast raw leak, swing 0.2),
+        # then the pre-registered 4-outcome verdict. Two corners,
+        # CPU-runnable.
+        t0 = time.time()
+        anchor_rows = e0_sweep(
+            order=args.order, seed=args.seed, device=args.device,
+            gain_grid=(0.0,), leak_grid=("slow-fixed",), drive_grid=(1.0,),
+            n_streams=args.n_streams,
+            train_samples_per_stream=args.train_samples,
+            jacobian_samples=args.jacobian_samples,
+            t_span=args.t_span, num_steps=args.num_steps,
+            hidden_dim=args.hidden_dim,
+            pre_fill=_make_anchor_pre_fill(args.anchor_ckpt, args.device),
+            pre_fill_overrides_after=False,
+            refresh=args.anchor_refresh,
+            progress_json=args.output / "canary_anchor_progress.json",
+        )
+        canary_rows = e0_sweep(
+            order=args.order, seed=args.seed, device=args.device,
+            gain_grid=(TRANSPLANT_CANARY_GM,),
+            leak_grid=(TRANSPLANT_CANARY_LEAK,),
+            drive_grid=(TRANSPLANT_CANARY_DRIVE,),
+            n_streams=args.n_streams,
+            train_samples_per_stream=args.train_samples,
+            jacobian_samples=args.jacobian_samples,
+            t_span=args.t_span, num_steps=args.num_steps,
+            hidden_dim=args.hidden_dim,
+            per_lib_overrides=TRANSPLANT_CANARY_PER_LIB,
+            refresh=0,
+            progress_json=args.output / "canary_priority_progress.json",
+        )
+        elapsed = time.time() - t0
+        anchor, canary = anchor_rows[0], canary_rows[0]
+        verdict = canary_verdict(anchor.ridge_nrmse, canary)
+        print(f"  ANCHOR (exact-tensor k2 ckpt, refresh={args.anchor_refresh}):")
+        print(f"    ridge={anchor.ridge_nrmse:.4f} R^2={anchor.ridge_r2:.4f} "
+              f"MC={anchor.mc_total_washout_corrected:.2f} PR={anchor.state_pr:.2f} "
+              f"rail={100.0 * anchor.rail_frac:.1f}% "
+              f"(expect ridge 0.60-0.68, MC ~2.6)")
+        print(f"  PRIORITY (core gm={TRANSPLANT_CANARY_GM}, core "
+              f"isat=-2.0, leak={TRANSPLANT_CANARY_LEAK}, "
+              f"drive={TRANSPLANT_CANARY_DRIVE}):")
+        print(f"    ridge={canary.ridge_nrmse:.4f} R^2={canary.ridge_r2:.4f} "
+              f"MC={canary.mc_total_washout_corrected:.2f} PR={canary.state_pr:.2f} "
+              f"rail={100.0 * canary.rail_frac:.1f}% "
+              f"gz_ridge={canary.gate_zero_ridge_nrmse:.4f} "
+              f"gz_MC={canary.gate_zero_mc_total:.2f}")
+        print(f"  VERDICT: {verdict['outcome']}")
+        print(f"  {verdict['summary']}")
+        (args.output / "canary.json").write_text(json.dumps({
+            "order": args.order,
+            "seed": args.seed,
+            "device": args.device,
+            "anchor_ckpt": args.anchor_ckpt,
+            "anchor_refresh": args.anchor_refresh,
+            "anchor": asdict(anchor),
+            "priority": asdict(canary),
+            "priority_spec": {
+                "gm": TRANSPLANT_CANARY_GM,
+                "leak": TRANSPLANT_CANARY_LEAK,
+                "drive": TRANSPLANT_CANARY_DRIVE,
+                "per_lib_overrides": TRANSPLANT_CANARY_PER_LIB,
+            },
+            "verdict": verdict,
+            "elapsed_s": elapsed,
+        }, indent=2))
+        write_probe_csv(
+            args.output / "canary.csv", [asdict(anchor), asdict(canary)],
+        )
+        return 0
+
+    if args.mode == "transplant":
+        # Full transplant grid (spec regime-transplant-grid): 2 gm x 3 Isat
+        # x 3 raw-leak x 3 swing = 54 corners. GPU-intended; per-corner
+        # progress flush + resume via transplant_progress.json (kept
+        # separate from the e0 progress file so legacy legs never match).
+        assert len(TRANSPLANT_GM_GRID) == len(TRANSPLANT_ISAT_GRID)
+        t0 = time.time()
+        rows = e0_sweep(
+            order=args.order, seed=args.seed, device=args.device,
+            gain_grid=TRANSPLANT_GM_GRID, leak_grid=TRANSPLANT_LEAK_GRID,
+            drive_grid=TRANSPLANT_DRIVE_GRID,
+            n_streams=args.n_streams,
+            train_samples_per_stream=args.train_samples,
+            jacobian_samples=args.jacobian_samples,
+            t_span=args.t_span, num_steps=args.num_steps,
+            hidden_dim=args.hidden_dim,
+            selected_corners=_select_corner_subset(
+                TRANSPLANT_DRIVE_GRID, TRANSPLANT_LEAK_GRID,
+                TRANSPLANT_GM_GRID,
+                args.max_corners if args.max_corners > 0 else None,
+                isat_grid=TRANSPLANT_ISAT_GRID,
+            ),
+            isat_grid=TRANSPLANT_ISAT_GRID,
+            refresh=args.refresh,
+            progress_json=args.output / "transplant_progress.json",
+        )
+        elapsed = time.time() - t0
+        row_dicts = [asdict(r) for r in rows]
+        write_probe_csv(args.output / "transplant_sweep.csv", row_dicts)
+        hdr = (f"Transplant sweep -- order={args.order} seed={args.seed} "
+               f"{len(rows)} corners in {elapsed:.1f}s")
+        lines = [
+            f"{'gm':>6} {'isat':>6} {'leak':>10} {'drive':>5} {'ridge':>7} "
+            f"{'mc':>6} {'sPR':>6} {'gzR':>7} {'gzMC':>6} "
+            f"{'rail%':>6} {'pass':>4}",
+        ]
+        for r in rows:
+            _isat = (f"{r.isat_init:.1f}" if r.isat_init == r.isat_init
+                     else "coup")
+            lines.append(
+                f"{r.gm_init:>6.2f} {_isat:>6} {r.leak_mode:>10} "
+                f"{r.drive:>5.2f} {r.ridge_nrmse:>7.4f} "
+                f"{r.mc_total_washout_corrected:>6.2f} {r.state_pr:>6.2f} "
+                f"{r.gate_zero_ridge_nrmse:>7.4f} "
+                f"{r.gate_zero_mc_total:>6.2f} "
+                f"{100.0 * r.rail_frac:>5.1f}% "
+                f"{'PASS' if r.pass_all else 'FAIL':>4}"
+            )
+        write_probe_txt(args.output / "transplant_sweep.txt", hdr, lines)
+        print("\n".join([hdr] + lines))
+        passing = [r for r in rows if r.pass_all]
+        print()
+        if passing:
+            best = min(passing, key=lambda r: r.ridge_nrmse)
+            print(
+                f"  DECISION: TRANSPLANT-LIVES. {len(passing)} corner(s) "
+                f"pass; best ridge={best.ridge_nrmse:.4f} at gm={best.gm_init}, "
+                f"isat={best.isat_init}, leak={best.leak_mode}, "
+                f"drive={best.drive}. Next: short k=2 train from the "
+                f"winning init."
+            )
+        else:
+            print(
+                f"  DECISION: TRANSPLANT-DEAD. No corner passes "
+                f"(MC>{E0_PASS_MC_ABOVE}, ridge<={E0_PASS_RIDGE_BELOW}, "
+                f"state-PR>={E0_PASS_STATE_PR_MIN}, rail<=5%). Next: "
+                f"re-examine the ESN->fabric translation."
+            )
+        (args.output / "transplant_sweep.json").write_text(json.dumps({
+            "order": args.order,
+            "seed": args.seed,
+            "device": args.device,
+            "grids": {
+                "gain": list(TRANSPLANT_GM_GRID),
+                "isat": list(TRANSPLANT_ISAT_GRID),
+                "leak": list(TRANSPLANT_LEAK_GRID),
+                "drive": list(TRANSPLANT_DRIVE_GRID),
             },
             "corner_selection": (
                 f"first {args.max_corners}" if args.max_corners > 0 else "full grid"

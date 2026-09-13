@@ -213,15 +213,17 @@ assert jac_rows[0]["transition_index"] == float(transition_index), "transition i
 print("AUDIT4B_JACOBIAN_TRANSITION_OK:", jac_rows[0])
 
 # --- 4c. Corner subsets and ESN decisions must match the locked protocol -
+# Corners are (drive, leak, gm, isat) 4-tuples since the regime-transplant
+# plan (isat=None = coupled); the traversal order is unchanged.
 subset = npr._select_corner_subset(
     (0.5, 1.0), ("slow-fixed", "randomized"), (-5.0, -2.0, 0.0), 5,
 )
 assert subset == [
-    (0.5, "slow-fixed", -5.0),
-    (0.5, "slow-fixed", -2.0),
-    (0.5, "slow-fixed", 0.0),
-    (0.5, "randomized", -5.0),
-    (0.5, "randomized", -2.0),
+    (0.5, "slow-fixed", -5.0, None),
+    (0.5, "slow-fixed", -2.0, None),
+    (0.5, "slow-fixed", 0.0, None),
+    (0.5, "randomized", -5.0, None),
+    (0.5, "randomized", -2.0, None),
 ], f"max-corners prefix is wrong: {subset}"
 assert npr._classify_esn(0.29, npr.ESN_HALT_ABOVE, npr.NARMA10_BAND) == "fabric-guilty"
 assert npr._classify_esn(0.5596, npr.ESN_HALT_ABOVE, npr.NARMA10_BAND) == "band-unknown"

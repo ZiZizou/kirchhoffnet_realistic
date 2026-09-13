@@ -540,16 +540,22 @@ def ridge_readout_diagnostic(
     y_train = y_train.to(device)
 
     T = u_train.shape[0]
-    # Use the direct stage-call path to capture states
-    stage = net.core.stages[0]
-    t_span = net.core.stage_times[0]
-    num_steps = net.core.stage_steps[0]
-    stage_width = net.hid_count + net.proj_count + net.output_ode_count
-
-    x0 = u_train.new_zeros(1, stage_width)
-    all_states = stage._forward_heun_sequence(
-        x0=x0, t_span=t_span, num_steps=num_steps, u_seq=u_train,
-    )
+    # Use the direct stage-call path to capture states. Multi-stage
+    # records last-stage states (equal widths for NARMA, so hid_count
+    # slices the hidden block either way).
+    if len(net.core.stages) > 1:
+        stage0_width = int(net.core.stages[0].num_nodes)
+        x0 = u_train.new_zeros(1, stage0_width)
+        all_states = net.core.forward_sequence(x0, u_train)
+    else:
+        stage = net.core.stages[0]
+        t_span = net.core.stage_times[0]
+        num_steps = net.core.stage_steps[0]
+        stage_width = net.hid_count + net.proj_count + net.output_ode_count
+        x0 = u_train.new_zeros(1, stage_width)
+        all_states = stage._forward_heun_sequence(
+            x0=x0, t_span=t_span, num_steps=num_steps, u_seq=u_train,
+        )
     # all_states: (T, 1, stage_width); take hidden nodes only
     states = all_states[:, 0, :net.hid_count]  # (T, hid_count)
 
@@ -845,26 +851,31 @@ def train_fabric(
     log_interval = max(1, epochs // 20)
     epoch_times: list[float] = []
 
-    state_width = net.hid_count + net.proj_count + net.output_ode_count
-
-    # Single-stage NARMA: hoist stage references and integrator config
-    # out of the chunk loop. The batched inner path uses
-    # stage._forward_heun_sequence to eliminate per-sample wrapper
-    # overhead (mirrors _evaluate_fabric_direct, but in train mode).
+    # Multi-stage NARMA (Phase-4 depth screen): the carried state is the
+    # stage-1 entry state; the recorded states are the LAST stage's end
+    # states (what the readout sees), so the loss/readout/rms/rail code
+    # below is width-agnostic. Single-stage keeps the legacy fused path
+    # byte-identical.
     if not hasattr(net, "core") or not hasattr(net.core, "stages"):
         raise ValueError(
             "train_fabric batched inner loop requires a KirchhoffNetWithIO "
             "wrapper exposing net.core.stages[0]. This net does not have it."
         )
-    if len(net.core.stages) != 1:
-        raise ValueError(
-            f"train_fabric batched inner loop currently supports single-stage "
-            f"topologies only, got {len(net.core.stages)} stages."
-        )
-    stage = net.core.stages[0]
-    t_span = float(net.core.stage_times[0])
-    num_steps = int(net.core.stage_steps[0])
-    stage_xmax = float(stage.x_max)
+    multi_stage = len(net.core.stages) > 1
+    if multi_stage:
+        stage0_width = int(net.core.stages[0].num_nodes)
+        state_width = stage0_width
+        stage = None
+        t_span = float("nan")
+        num_steps = -1
+        # Recorded states are last-stage: rail stats use its rail.
+        stage_xmax = float(net.core.stages[-1].x_max)
+    else:
+        state_width = net.hid_count + net.proj_count + net.output_ode_count
+        stage = net.core.stages[0]
+        t_span = float(net.core.stage_times[0])
+        num_steps = int(net.core.stage_steps[0])
+        stage_xmax = float(stage.x_max)
 
     # Initialise ``epoch`` so the post-loop return value is defined even
     # when the loop body never executes (e.g. resume from a checkpoint
@@ -911,12 +922,20 @@ def train_fabric(
             with autocast("cuda", enabled=amp_enabled):
                 # _forward_heun_sequence expects (B, K, 1) for multi-stream.
                 u_seq_batched = u_chunk.unsqueeze(-1)  # (B, K, 1)
-                all_states = stage._forward_heun_sequence(
-                    x0=state,
-                    t_span=t_span,
-                    num_steps=num_steps,
-                    u_seq=u_seq_batched,
-                )  # (K, B, N)
+                if multi_stage:
+                    # Depth-per-sample: stage pipeline per sample with
+                    # transfers; returns last-stage states (K, B, N_last)
+                    # plus the stage-1 end state for chunk carryover.
+                    all_states, stage0_end = net.core.forward_sequence(
+                        state, u_seq_batched, return_stage0=True,
+                    )
+                else:
+                    all_states = stage._forward_heun_sequence(
+                        x0=state,
+                        t_span=t_span,
+                        num_steps=num_steps,
+                        u_seq=u_seq_batched,
+                    )  # (K, B, N)
                 # Read slice (output_ode_count tail for temporal-readout).
                 x_read = all_states[:, :, net.read_slice]  # (K, B, R)
                 y_pred = net.output_mapper(x_read)  # (K, B, out_dim)
@@ -958,8 +977,11 @@ def train_fabric(
                         (_bnd.abs() > 0.9 * stage_xmax).float().mean().item()
                     )
 
-                # The new state for next chunk: the last sample's state.
-                state = all_states[-1]
+                # The new state for next chunk: the last sample's state
+                # (stage-1 end state for multi-stage: only stage 1 carries
+                # across samples; later stages restart from the transfer
+                # chain each sample per instantaneous-transfer semantics).
+                state = stage0_end if multi_stage else all_states[-1]
 
             # Backward
             scaler.scale(loss).backward()
@@ -1194,15 +1216,18 @@ def _evaluate_fabric_direct(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Direct evaluation bypassing KirchhoffNetWithIO / KirchhoffNet wrappers.
 
-    Calls ``DifferentialStage._forward_heun_sequence`` to process the entire
-    test sequence in a single call, eliminating per-sample Python overhead.
-    Only valid for the NARMA single-stage topology.
+    Single-stage calls ``DifferentialStage._forward_heun_sequence`` to
+    process the entire test sequence in a single call, eliminating
+    per-sample Python overhead. Multi-stage (Phase-4) dispatches to
+    ``KirchhoffNet.forward_sequence`` (stage pipeline with transfers per
+    sample); the recorded last-stage layout matches, so readout slicing
+    below is unchanged.
 
     If ``y_mean``/``y_std`` are provided, predictions are denormalized so
     they live on the same scale as ``y_test`` (needed for NRMSE/R²).
 
     ``carry_keep``: optional E2 carry mask, forwarded to the sequence
-    integrator (None = full carryover).
+    integrator (None = full carryover). Multi-stage supports None only.
     """
     net.eval()
     net.to(device)
@@ -1210,21 +1235,30 @@ def _evaluate_fabric_direct(
     y_test = y_test.to(device)
     T = u_seq.shape[0]
 
-    stage = net.core.stages[0]
     output_mapper = net.output_mapper
     read_slice = net.read_slice
-    t_span = net.core.stage_times[0]
-    num_steps = net.core.stage_steps[0]
-    stage_width = net.hid_count + net.proj_count + net.output_ode_count
-
-    x0 = u_seq.new_zeros(1, stage_width)
-    all_states = stage._forward_heun_sequence(
-        x0=x0,
-        t_span=t_span,
-        num_steps=num_steps,
-        u_seq=u_seq,
-        carry_keep=carry_keep,
-    )
+    if len(net.core.stages) > 1:
+        if carry_keep is not None:
+            raise ValueError(
+                "_evaluate_fabric_direct: carry_keep with multi-stage is "
+                "not supported (E2 ablations are single-stage)."
+            )
+        stage0_width = int(net.core.stages[0].num_nodes)
+        x0 = u_seq.new_zeros(1, stage0_width)
+        all_states = net.core.forward_sequence(x0, u_seq)
+    else:
+        stage = net.core.stages[0]
+        t_span = net.core.stage_times[0]
+        num_steps = net.core.stage_steps[0]
+        stage_width = net.hid_count + net.proj_count + net.output_ode_count
+        x0 = u_seq.new_zeros(1, stage_width)
+        all_states = stage._forward_heun_sequence(
+            x0=x0,
+            t_span=t_span,
+            num_steps=num_steps,
+            u_seq=u_seq,
+            carry_keep=carry_keep,
+        )
     x_read = all_states[:, :, read_slice]
     y_preds = output_mapper(x_read)
     preds = y_preds.view(T)
@@ -1244,10 +1278,12 @@ def collect_fabric_states(
     """Collect the per-sample fabric state (last layer only) for MC eval.
 
     Uses the direct-stage-call path to bypass wrapper overhead.
+    Multi-stage (Phase-4) records the LAST stage's end states (what the
+    readout sees), matching the single-stage layout.
 
     ``carry_keep``: optional E2 carry mask, forwarded to the sequence
     integrator (None = full carryover). MC is then measured on the
-    masked (actually-carried) states.
+    masked (actually-carried) states. Multi-stage supports None only.
 
     Returns:
         Tensor of shape ``(T, stage_width)`` — the final ODE state at
@@ -1257,6 +1293,17 @@ def collect_fabric_states(
     net.to(device)
     u = u.to(device)
     T = u.shape[0]
+
+    if len(net.core.stages) > 1:
+        if carry_keep is not None:
+            raise ValueError(
+                "collect_fabric_states: carry_keep with multi-stage is "
+                "not supported (E2 ablations are single-stage)."
+            )
+        stage0_width = int(net.core.stages[0].num_nodes)
+        x0 = u.new_zeros(1, stage0_width)
+        all_states = net.core.forward_sequence(x0, u)
+        return all_states[:, 0, :]  # (T, N_last)
 
     stage = net.core.stages[0]
     t_span = net.core.stage_times[0]
@@ -1548,6 +1595,9 @@ def _build_fabric_net(
     vca_core_enabled: bool = False,
     vca_use_hidden: bool = False,
     dynamic_leak: bool = False,
+    num_stages: int = 1,
+    interstage_activation: str = "none",
+    boundary_first_stage_only: bool = True,
 ) -> tuple[nn.Module, float, int]:
     """Build the NARMA fabric net (preset + topology + optional compile).
 
@@ -1606,6 +1656,16 @@ def _build_fabric_net(
     static leak. Compatible with ``leak_constant`` (non-programmable) and
     ``leak_init`` gain axis; the ``leak_init`` *leak* axis is superseded
     (warned, not applied to dyn params).
+
+    ``num_stages`` (Phase-4 depth screen): number of ODE stages stacked
+    per sample (1 = legacy single-stage, byte-identical path). With >1
+    the per-sample ``t_span`` window is SPLIT across stages (times split
+    evenly, steps split proportionally with each >= 1) and
+    ``interstage_activation`` selects the StageTransfer nonlinearity
+    (``residual-relu-tanh`` is identity at init). Fresh drive enters
+    stage 1 only (``boundary_first_stage_only``); readout reads the
+    LAST stage's accumulator. Training/eval/state-collection dispatch
+    to ``KirchhoffNet.forward_sequence`` when ``num_stages > 1``.
     """
     base = PRESET_NARMA20 if order == 20 else PRESET_NARMA10
     if t_span is None:
@@ -1614,14 +1674,37 @@ def _build_fabric_net(
         num_steps = base["stages"][0]["num_steps"]
     if hidden_dim is None:
         hidden_dim = base["stages"][0]["num_hidden"]
+    num_stages = int(num_stages)
+    if num_stages < 1:
+        raise ValueError(f"num_stages must be >= 1, got {num_stages}")
     preset = make_narma_preset(
         order=order,
         hidden_dim=hidden_dim,
+        num_stages=num_stages,
         t_span=t_span,
         num_steps_per_sample=num_steps,
         core_refresh_interval=core_refresh_interval,
         leak_constant=leak_constant,
     )
+    if num_stages > 1:
+        # Depth-per-sample (multistage-sequence spec): SPLIT the window.
+        # make_narma_preset replicates one stage dict (shared object) with
+        # the FULL t_span/num_steps per stage; rewrite with per-stage
+        # shares (times even, steps proportional, each >= 1).
+        if num_steps < num_stages:
+            raise ValueError(
+                f"num_stages={num_stages} needs num_steps >= stages "
+                f"(got num_steps={num_steps}); each stage needs >= 1 step."
+            )
+        base_steps, rem = divmod(num_steps, num_stages)
+        preset["stages"] = [
+            dict(
+                preset["stages"][0],
+                t_span=float(t_span) / num_stages,
+                num_steps=int(base_steps + (1 if i < rem else 0)),
+            )
+            for i in range(num_stages)
+        ]
     cell_lib = make_cell_library(cell_library)
     # knet-gated-memory: the hidden-conditioned gate has no other family
     # to live on, so requesting it without core VCA would silently build a
@@ -1679,6 +1762,8 @@ def _build_fabric_net(
             vca_core_enabled=vca_core_enabled,
             vca_use_hidden=vca_use_hidden,
             dynamic_leak=dynamic_leak,
+            interstage_activation=interstage_activation,
+            boundary_first_stage_only=boundary_first_stage_only,
         )
     elif readout == "temporal":
         net = build_net_from_config(
@@ -1693,6 +1778,8 @@ def _build_fabric_net(
             vca_core_enabled=vca_core_enabled,
             vca_use_hidden=vca_use_hidden,
             dynamic_leak=dynamic_leak,
+            interstage_activation=interstage_activation,
+            boundary_first_stage_only=boundary_first_stage_only,
         )
     else:
         raise ValueError(
@@ -1742,6 +1829,8 @@ def run_fabric_condition(
     vca_core_enabled: bool = False,
     vca_use_hidden: bool = False,
     dynamic_leak: bool = False,
+    num_stages: int = 1,
+    interstage_activation: str = "none",
     gain_init: float | None = None,
     leak_init: str | float | None = None,
 ) -> dict[str, Any]:
@@ -1819,6 +1908,7 @@ def run_fabric_condition(
         vca_enabled=vca_enabled, vca_rank=vca_rank, vca_bias=vca_bias,
         vca_core_enabled=vca_core_enabled, vca_use_hidden=vca_use_hidden,
         dynamic_leak=dynamic_leak,
+        num_stages=num_stages, interstage_activation=interstage_activation,
     )
     if dynamic_leak and leak_init is not None:
         print("[narma] WARNING: --dynamic-leak is on; --leak-init "
@@ -2004,6 +2094,9 @@ def run_fabric_condition(
         "vca_core_enabled": bool(vca_core_enabled),
         "vca_use_hidden": bool(vca_use_hidden),
         "dynamic_leak": bool(dynamic_leak),
+        # Phase-4 depth bookkeeping.
+        "num_stages": int(len(net.core.stages)),
+        "interstage_activation": str(interstage_activation),
         # Round-2 §13.3 VCA-leg init overrides. ``None`` means "default
         # cell-library init left in place" so the CSV column tells the
         # reader which legs were deliberately pinned to a starting point.
@@ -2126,7 +2219,7 @@ def run_eval_masks(
     u_test = _scale_drive(
         u_test_raw, bipolar=bipolar, order=order, input_scale=input_scale,
     )
-    xmax = float(net.core.stages[0].x_max)
+    xmax = float(net.core.stages[-1].x_max)
 
     rows: list[dict[str, Any]] = []
     for mask in masks:
@@ -2439,6 +2532,20 @@ def parse_args() -> argparse.Namespace:
                              "leak leak_eff = softplus(a*x + b*u + c) with "
                              "a=b=0, c=raw_leak_init at init. Epoch-0 "
                              "forward is bit-identical to the static leak.")
+    parser.add_argument("--num-stages", dest="num_stages", type=int, default=1,
+                        help="Phase-4 depth screen: ODE stages stacked per "
+                             "sample (default 1 = legacy single-stage). "
+                             "With >1 the per-sample t_span window is SPLIT "
+                             "across stages; fresh drive enters stage 1 "
+                             "only; readout reads the last stage. Requires "
+                             "equal stage widths (NARMA presets satisfy "
+                             "this). num_steps must be >= num_stages.")
+    parser.add_argument("--interstage-activation", dest="interstage_activation",
+                        type=str, default="none",
+                        help="StageTransfer nonlinearity between stages "
+                             "(default 'none'). 'residual-relu-tanh' is "
+                             "identity at init (w1=1, w2=w3=0) and is the "
+                             "Phase-4 candidate for depth mixing.")
     parser.add_argument("--gain-init", type=float, default=None,
                         dest="gain_init",
                         help="Round-2 §13.3 VCA-leg init: post-build gm/isat "
@@ -2485,7 +2592,7 @@ def _write_partial_tables(
         f"NARMA-{order} -- {len(seeds)} seeds -- final results",
         "=" * 60,
     ]
-    csv_lines = ["condition,seed,nrmse,r2,mc_total,trained_params,total_params,hidden_dim,cell_library,core_refresh_interval,cell_lib_evals_per_sample,readout,boundary_fan_out,vca_enabled,vca_rank,vca_bias,gain_init,leak_init,vca_core_enabled,vca_use_hidden,dynamic_leak"]
+    csv_lines = ["condition,seed,nrmse,r2,mc_total,trained_params,total_params,hidden_dim,cell_library,core_refresh_interval,cell_lib_evals_per_sample,readout,boundary_fan_out,vca_enabled,vca_rank,vca_bias,gain_init,leak_init,vca_core_enabled,vca_use_hidden,dynamic_leak,num_stages,interstage_activation"]
     for cond in sorted(by_cond):
         runs = by_cond[cond]
         nrmse_vals = [r["nrmse"] for r in runs]
@@ -2549,7 +2656,9 @@ def _write_partial_tables(
                 f"{r.get('leak_init', '')},"
                 f"{r.get('vca_core_enabled', False)},"
                 f"{r.get('vca_use_hidden', False)},"
-                f"{r.get('dynamic_leak', False)}"
+                f"{r.get('dynamic_leak', False)},"
+                f"{r.get('num_stages', 1)},"
+                f"{r.get('interstage_activation', 'none')}"
             )
 
     summary_text = "\n".join(summary_lines) + "\n"
@@ -2765,6 +2874,10 @@ def main() -> int:
                 cond_name = f"{cond_name}_vcaH"
             elif args.vca_core_enabled:
                 cond_name = f"{cond_name}_vcaC"
+            # Phase-4 depth marker (also keeps 1/2/3-stage checkpoints
+            # and CSV rows distinct).
+            if int(args.num_stages) > 1:
+                cond_name = f"{cond_name}_s{int(args.num_stages)}"
             print(f"  [{idx}/{len(fabric_jobs)}] {cond_name}  seed={seed}  "
                 f"core_refresh_interval={refresh_k}  "
                 f"cell_library={args.cell_library}  "
@@ -2805,6 +2918,8 @@ def main() -> int:
                 vca_core_enabled=args.vca_core_enabled,
                 vca_use_hidden=args.vca_use_hidden,
                 dynamic_leak=args.dynamic_leak,
+                num_stages=args.num_stages,
+                interstage_activation=args.interstage_activation,
                 gain_init=args.gain_init,
                 leak_init=args.leak_init,
             )
@@ -2841,6 +2956,8 @@ def main() -> int:
                 "vca_core_enabled": bool(res.get("vca_core_enabled", False)),
                 "vca_use_hidden": bool(res.get("vca_use_hidden", False)),
                 "dynamic_leak": bool(res.get("dynamic_leak", False)),
+                "num_stages": int(res.get("num_stages", 1)),
+                "interstage_activation": str(res.get("interstage_activation", "none")),
                 "gain_init": (
                     "" if res.get("gain_init") is None
                     else float(res["gain_init"])

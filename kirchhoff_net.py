@@ -179,6 +179,122 @@ class KirchhoffNet(nn.Module):
         self.last_solver = solver
         return x, all_trajs if store_trajectory else None
 
+    def forward_sequence(
+        self,
+        x0: torch.Tensor,
+        u_seq: torch.Tensor,
+        carry_keep: torch.Tensor | None = None,
+        return_stage0: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Integrate a per-sample input sequence through the stage pipeline.
+
+        Multi-stage generalization of
+        ``DifferentialStage._forward_heun_sequence`` (multistage-sequence
+        spec, depth-per-sample semantics): each sample's window is SPLIT
+        across stages (``stage_times[i]``/``stage_steps[i]``). Within one
+        sample, stage 1 integrates from the carried state, then
+        ``StageTransfer`` (instantaneous, no time evolution) maps to the
+        next stage, and so on. The LAST stage's end state is recorded per
+        sample, so the returned layout ``(T, B, N_last)`` matches the
+        single-stage path and existing readout slices apply unchanged.
+
+        Drive convention: the caller routes fresh external drive to stage
+        1 only (``boundary_first_stage_only`` at build); every stage still
+        receives ``u_t`` for its (input-conditioned) VCA readout taps, but
+        only stage 1 has boundary edges injecting current.
+
+        Args:
+            x0: Stage-1 entry state, shape ``(B, N0)``. Carried across
+                samples (the within-sample transfer chain fully determines
+                later stages' starts, per the instantaneous-transfer
+                semantics).
+            u_seq: Input sequence, same shape convention as the stage
+                version: ``(T, 1)``, ``(B, T)``, or ``(B, T, 1)``.
+            carry_keep: Optional ``(N0,)`` 0/1 mask applied to the carried
+                stage-1 state at every sample boundary. ``None`` (default)
+                = full carryover. Concatenated multi-stage masks are NOT
+                supported (E2 ablations are single-stage); pass ``None``.
+
+        Returns:
+            Last-stage end states, shape ``(T, B, N_last)``. With
+            ``return_stage0=True``, additionally the stage-1 end state
+            of the final sample, shape ``(B, N0)`` (the correct carry
+            for the next chunk/call -- grad preserved for BPTT; the
+            caller detaches at chunk boundaries).
+        """
+        if carry_keep is not None:
+            raise ValueError(
+                "KirchhoffNet.forward_sequence supports carry_keep=None only "
+                "(E2 carry-mask ablations are single-stage)."
+            )
+        B = x0.shape[0]
+        if u_seq.dim() == 3:
+            batched = (u_seq.shape[0] == B)
+            T = u_seq.shape[1] if batched else u_seq.shape[0]
+        elif u_seq.dim() == 2:
+            batched = (u_seq.shape[0] == B)
+            T = u_seq.shape[1] if batched else u_seq.shape[0]
+        else:
+            batched = False
+            T = u_seq.shape[0]
+
+        n_last = int(self.stages[-1].num_nodes)
+        states = torch.empty(
+            T, B, n_last, dtype=x0.dtype, device=x0.device,
+        )
+        x_carry = x0
+        n_stages = len(self.stages)
+        x_stage0_end: torch.Tensor | None = None
+        for t in range(T):
+            if not batched:
+                u_t = u_seq[t].view(1, 1)
+            elif u_seq.dim() == 2:
+                u_t = u_seq[:, t].unsqueeze(-1)
+            else:
+                u_t = u_seq[:, t, :]
+            x_in = x_carry
+            for i, stage in enumerate(self.stages):
+                dt = float(self.stage_times[i]) / float(self.stage_steps[i])
+                gate_core_cached = None
+                if (
+                    stage._vca_core_enabled and u_t is not None
+                    and stage.vca_v_core is not None
+                ):
+                    gate_core_cached = stage._compute_core_gate(
+                        u_t, x=x_in if stage.vca_use_hidden else None,
+                    )
+                stage._gate_core_cached = gate_core_cached
+                i_edge_const = None
+                if stage.freeze_read or stage.core_refresh_interval > 0:
+                    i_edge_const = stage._compute_i_edge_const(
+                        x_in, gate_core_cached,
+                    )
+                i_boundary_const = None
+                if stage.freeze_boundary:
+                    i_boundary_const = stage._compute_frozen_boundary(u_t, x_in)
+                i_readout_const = None
+                if stage.freeze_temporal_read:
+                    i_readout_const = stage._compute_frozen_readout(u_t, x_in)
+                x_new = stage._call_heun_steps(
+                    x_in, u_t, dt, int(self.stage_steps[i]),
+                    i_edge_const, i_boundary_const, i_readout_const,
+                    gate_core_cached,
+                )
+                if i == 0:
+                    # Stage-1 end state carries to the next sample (grad
+                    # preserved for BPTT; the chunk boundary detaches).
+                    x_carry = x_new
+                    x_stage0_end = x_new
+                x_in = (
+                    self.transfers[i](x_new)
+                    if i < n_stages - 1 else x_new
+                )
+            states[t] = x_in
+        if return_stage0:
+            assert x_stage0_end is not None
+            return states, x_stage0_end
+        return states
+
     def parameter_breakdown(self) -> dict:
         """Return parameter counts per component for the regularizer / loss."""
         out = {

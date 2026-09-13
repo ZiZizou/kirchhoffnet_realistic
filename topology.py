@@ -1944,6 +1944,7 @@ def build_net_from_config(
     vca_use_hidden: bool = False,
     dynamic_leak: bool = False,
     dynamic_leak_input_proj: bool = False,
+    boundary_first_stage_only: bool = False,
 ):
     """Build a KirchhoffNetWithIO from a full config dict.
 
@@ -2487,6 +2488,15 @@ def build_net_from_config(
     first_id_map: dict[int, int] = {}
 
     for stage_idx, topo in enumerate(multi.stages):
+        # Pipeline semantics (multistage-sequence spec): fresh external
+        # drive enters stage 1 only. Later stages are driven solely by
+        # the interstage transfer (their VCA readout taps stay
+        # input-conditioned via u_t, but no boundary current is injected).
+        _b_src = boundary_src
+        _b_dst = boundary_dst
+        _b_lib = boundary_cell_lib
+        if boundary_first_stage_only and stage_idx > 0:
+            _b_src, _b_dst, _b_lib = None, None, None
         stage, active_nodes, id_map = topology_to_stage(
             topo, cell_lib=cell_lib, write_idx=write_idx_arg if enable_drive else None,
             leak_mode=leak_mode, leak_constant=leak_constant,
@@ -2494,9 +2504,9 @@ def build_net_from_config(
             freeze_read=freeze_read,
             freeze_boundary=freeze_boundary,
             freeze_temporal_read=freeze_temporal_read,
-            boundary_src=boundary_src,
-            boundary_dst=boundary_dst,
-            boundary_cell_lib=boundary_cell_lib,
+            boundary_src=_b_src,
+            boundary_dst=_b_dst,
+            boundary_cell_lib=_b_lib,
             enable_ref_edges=enable_ref_edges,
             output_ode_src=output_ode_src,
             output_ode_dst=output_ode_dst,

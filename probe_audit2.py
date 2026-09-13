@@ -328,6 +328,53 @@ assert torch.equal(stage_c1br.boundary_cell_lib.isat_raw, orig_b_isat_c1br), \
     "C1b-real boundary isat not restored"
 print("AUDIT2_C1B_REAL_RESTORE_OK")
 
+# --- 4c2. Rung-1 install/restore roundtrip (knet-gated-memory) -----------
+# Leak mapping: esn_leak=1 -> -ln(1e-3)/t_span; esn_leak=0.3 -> -ln(0.7).
+assert_close(
+    nlc.rung1_leak_from_esn(1.0, 1.0), -math.log(1e-3),
+    "rung1 leak map esn_leak=1",
+)
+assert_close(
+    nlc.rung1_leak_from_esn(0.3, 1.0), -math.log(0.7),
+    "rung1 leak map esn_leak=0.3",
+)
+try:
+    nlc.rung1_leak_from_esn(0.0, 1.0)
+    raise AssertionError("rung1 leak map accepted esn_leak=0")
+except ValueError:
+    pass
+net_r1, _, _ = build_net(hidden_dim=9)
+stage_r1 = net_r1.core.stages[0]
+orig_gm_r1 = stage_r1.cell_lib.gm_raw.detach().clone()
+orig_gr_r1 = stage_r1.cell_lib.g_resistive_raw.detach().clone()
+orig_lm_r1 = str(stage_r1.leak_mode)
+saved_r1 = nlc.install_native_linear_rung1(
+    net_r1, gm_raw_fill=-8.0, isat_raw_fill=-2.0,
+    g_resistive_fill=-20.0, leak_value=0.36,
+)
+assert_close(float(stage_r1.cell_lib.gm_raw.mean().item()), -8.0, "rung1 gm_raw filled")
+assert_close(float(stage_r1.cell_lib.isat_raw.mean().item()), -2.0, "rung1 isat_raw filled")
+assert_close(
+    float(stage_r1.cell_lib.g_resistive_raw.mean().item()), -20.0,
+    "rung1 g_resistive_raw filled (shunt killed)",
+)
+assert_close(
+    float(stage_r1.boundary_cell_lib.gm_raw.mean().item()), -8.0,
+    "rung1 boundary gm_raw filled",
+)
+assert stage_r1.leak_mode == "non-programmable", "rung1 leak non-programmable"
+assert_close(float(stage_r1.leak_constant), 0.36, "rung1 leak_constant")
+print("AUDIT2_RUNG1_INSTALL_OK")
+
+nlc.restore_native_linear_rung1(net_r1, saved_r1)
+assert torch.equal(stage_r1.cell_lib.gm_raw, orig_gm_r1), \
+    "rung1 gm_raw not restored"
+assert torch.equal(stage_r1.cell_lib.g_resistive_raw, orig_gr_r1), \
+    "rung1 g_resistive_raw not restored"
+assert str(stage_r1.leak_mode) == orig_lm_r1, \
+    "rung1 leak_mode not restored"
+print("AUDIT2_RUNG1_RESTORE_OK")
+
 # --- 4d. C1b restore_tanh flag changes dynamics (C3 sweep contract) ----
 # Regression: the C3 sweep fills gm_raw on a C1b base, which is dead
 # unless the rhs honors _lin_restore_tanh.
@@ -483,7 +530,7 @@ res = subprocess.run(
     capture_output=True, text=True,
 )
 assert res.returncode == 0, res.stderr
-for mode in ("r0", "c0", "c1", "c2c3c4", "c1b", "c1b_real", "c3_sweep"):
+for mode in ("r0", "c0", "c1", "c2c3c4", "c1b", "c1b_real", "c3_sweep", "rung1"):
     assert mode in res.stdout, f"CLI mode {mode} missing"
 res = subprocess.run(
     [sys.executable, "-B", "narma_linear_controls.py", "c1", "--help"],
@@ -517,6 +564,14 @@ res = subprocess.run(
 )
 assert res.returncode == 0, res.stderr
 assert "--c1b-sidecar-dir" in res.stdout, "c3_sweep CLI arg missing"
+res = subprocess.run(
+    [sys.executable, "-B", "narma_linear_controls.py", "rung1", "--help"],
+    capture_output=True, text=True,
+)
+assert res.returncode == 0, res.stderr
+for arg in ("--esn-leak", "--esn-input-scaling", "--gm-raw-fill",
+            "--isat-raw-fill", "--g-resistive-fill", "--drive-scale"):
+    assert arg in res.stdout, f"rung1 CLI arg {arg} missing"
 print("AUDIT2_CLI_OK")
 
 # --- 10. Sidecar roundtrip (c1b-revision) --------------------------------

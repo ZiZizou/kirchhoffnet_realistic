@@ -1341,6 +1341,8 @@ def topology_to_stage(
     write_idx: list[int] | None = None,
     leak_mode: str = "programmable",
     leak_constant: float | None = None,
+    dynamic_leak: bool = False,
+    dynamic_leak_input_proj: bool = False,
     read_only_source: bool = False,
     freeze_read: bool = False,
     freeze_boundary: bool = False,
@@ -1365,6 +1367,7 @@ def topology_to_stage(
     vca_gate_shunt: bool = False,
     vca_separate_core_bus: bool = False,
     vca_bias: bool | None = None,
+    vca_use_hidden: bool = False,
     core_refresh_interval: int = 0,
 ) -> tuple[DifferentialStage, list[int], dict[int, int]]:
     """Convert a SparseTopology into a DifferentialStage.
@@ -1671,6 +1674,8 @@ def topology_to_stage(
         write_idx=write_idx,
         leak_mode=leak_mode,
         leak_constant=leak_constant,
+        dynamic_leak=dynamic_leak,
+        dynamic_leak_input_proj=dynamic_leak_input_proj,
         read_only_source=read_only_source,
         freeze_read=freeze_read,
         freeze_boundary=freeze_boundary,
@@ -1695,6 +1700,7 @@ def topology_to_stage(
         vca_gate_shunt=vca_gate_shunt,
         vca_separate_core_bus=vca_separate_core_bus,
         vca_bias=vca_bias,
+        vca_use_hidden=vca_use_hidden,
         core_refresh_interval=core_refresh_interval,
     )
     return stage, active_nodes, id_map
@@ -1935,6 +1941,9 @@ def build_net_from_config(
     gln_alpha_init: float = 1.0,
     gln_families: str | None = None,
     core_refresh_interval: int = 0,
+    vca_use_hidden: bool = False,
+    dynamic_leak: bool = False,
+    dynamic_leak_input_proj: bool = False,
 ):
     """Build a KirchhoffNetWithIO from a full config dict.
 
@@ -2035,6 +2044,10 @@ def build_net_from_config(
     # Resolve core_refresh_interval: cfg > explicit kwarg (matches the
     # freeze_read/freeze_boundary/freeze_temporal_read precedence above).
     core_refresh_interval = int(cfg.get("core_refresh_interval", core_refresh_interval))
+    # knet-gated-memory (plan): cfg dict > explicit kwarg.
+    vca_use_hidden_effective = bool(cfg.get("vca_use_hidden", vca_use_hidden))
+    dynamic_leak_effective = bool(cfg.get("dynamic_leak", dynamic_leak))
+    dynamic_leak_input_proj_effective = bool(cfg.get("dynamic_leak_input_proj", dynamic_leak_input_proj))
     if core_refresh_interval < 0:
         raise ValueError(
             f"core_refresh_interval must be >= 0, got {core_refresh_interval}"
@@ -2501,6 +2514,9 @@ def build_net_from_config(
             vca_gate_shunt=vca_gate_shunt,
             vca_separate_core_bus=vca_separate_core_bus,
             vca_bias=vca_bias_effective,
+            vca_use_hidden=vca_use_hidden_effective,
+            dynamic_leak=dynamic_leak_effective,
+            dynamic_leak_input_proj=dynamic_leak_input_proj_effective,
             x_max=x_max,
             c_eff=c_eff,
             learnable_clip_sharpness=learnable_clip_sharpness,

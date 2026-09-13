@@ -2573,8 +2573,354 @@ def c1b_real_resistive(
 
 
 # ---------------------------------------------------------------------------
-# C3 tanh-crossover sweep (c1b-revision amendment)
+# Rung-1 native-linear control (knet-gated-memory plan, Phase 2)
 # ---------------------------------------------------------------------------
+
+# Rung-1 PASS gates (ESN-parity screen, NARMA-10, single seed, eval-only).
+# MC>=10 ~= 0.7x the ESN-25 reference (MC=14.65 in the Alliance logs);
+# ridge<=0.45 matches the frozen-state readout-fix promotion threshold.
+RUNG1_PASS_MC_ABOVE: float = 10.0
+RUNG1_PASS_RIDGE_BELOW: float = 0.45
+RUNG1_PASS_RAIL_BELOW: float = 0.05
+# Default fills: gm_raw=-8 -> gm ~= 0.013 (tanh args ~1e-2, deep linear);
+# isat_raw=-2 -> Isat ~= 1.2 (currents measurable, not vanishing);
+# g_resistive_raw=-20 -> G ~= 2e-9 (shunt killed: tanh-core dominates,
+# the complement of the c1b-real resistive-core control).
+RUNG1_GM_RAW_FILL: float = -8.0
+RUNG1_ISAT_RAW_FILL: float = -2.0
+RUNG1_G_RESISTIVE_FILL: float = -20.0
+# ESN-winner defaults (seed-dependent in general; read the in-harness
+# run_baselines grid per seed and override via CLI when known).
+RUNG1_ESN_LEAK_DEFAULT: float = 1.0
+RUNG1_ESN_INPUT_SCALING_DEFAULT: float = 0.2
+
+
+def rung1_leak_from_esn(esn_leak: float, t_span: float) -> float:
+    """Map an ESN leak rate to a KNet uniform leak constant.
+
+    ESN state decay per step is ``(1 - leak)``; KNet per-sample decay
+    over ``t_span`` is ``exp(-L * t_span)``.  Equating them gives
+    ``L = -ln(1 - leak) / t_span``.  ``leak=1`` (full replacement)
+    maps to ``L = -ln(1e-3)/t_span`` (fast but finite decay).
+    """
+    if not (0.0 < float(esn_leak) <= 1.0):
+        raise ValueError(
+            f"rung1 esn_leak must be in (0, 1], got {esn_leak}"
+        )
+    if float(t_span) <= 0:
+        raise ValueError(f"rung1 t_span must be > 0, got {t_span}")
+    retention = max(1.0 - float(esn_leak), 1e-3)
+    return -math.log(retention) / float(t_span)
+
+
+def install_native_linear_rung1(
+    net: nn.Module, *,
+    gm_raw_fill: float = RUNG1_GM_RAW_FILL,
+    isat_raw_fill: float = RUNG1_ISAT_RAW_FILL,
+    g_resistive_fill: float = RUNG1_G_RESISTIVE_FILL,
+    leak_value: float = C1B_LEAK_VALUE,
+) -> dict:
+    """Install rung-1: tanh-core native-linear reservoir, no rhs override.
+
+    Post-build fills only (``cell_library.py`` init defaults untouched):
+
+    - core + boundary + readout libs: ``gm_raw``/``isat_raw`` fills put
+      every OTA in the small-signal regime (tanh(z) ~= z); the resistive
+      shunt is killed via ``g_resistive_raw`` fill so the tanh path (not
+      the shunt) carries the recurrence -- the complement of C1b-real.
+    - leak forced to non-programmable ``leak_constant=leak_value``
+      (uniform; caller maps it from the ESN winner via
+      :func:`rung1_leak_from_esn`).
+    - ``x_max``/clip/gates left canonical; rail_frac is reported, not
+      suppressed.
+
+    Returns a snapshot dict for :func:`restore_native_linear_rung1`.
+    """
+    if len(list(net.core.stages)) != 1:
+        raise NotImplementedError(
+            "rung-1 install supports single-stage nets only"
+        )
+    stage = net.core.stages[0]
+    snapshots: dict[str, Any] = {}
+    libs: dict[str, Any] = {}
+    for lib_name in ("cell_lib", "boundary_cell_lib", "output_ode_cell_lib"):
+        lib = getattr(stage, lib_name, None)
+        if lib is None:
+            continue
+        libs[lib_name] = lib
+        for pname in ("gm_raw", "isat_raw", "g_resistive_raw"):
+            if hasattr(lib, pname):
+                snapshots[f"{lib_name}.{pname}"] = getattr(lib, pname).detach().clone()
+    snapshots["leak_mode"] = str(stage.leak_mode)
+    snapshots["leak_constant"] = (
+        float(stage.leak_constant) if hasattr(stage, "leak_constant")
+        else float("nan")
+    )
+    snapshots["raw_leak"] = (
+        stage.raw_leak.detach().clone()
+        if hasattr(stage, "raw_leak") and stage.raw_leak is not None
+        else torch.empty(0)
+    )
+    with torch.no_grad():
+        for lib in libs.values():
+            if hasattr(lib, "gm_raw"):
+                lib.gm_raw.data.fill_(float(gm_raw_fill))
+            if hasattr(lib, "isat_raw"):
+                lib.isat_raw.data.fill_(float(isat_raw_fill))
+            if hasattr(lib, "g_resistive_raw"):
+                lib.g_resistive_raw.data.fill_(float(g_resistive_fill))
+    stage.leak_mode = "non-programmable"
+    stage.leak_constant = float(leak_value)
+    return snapshots
+
+
+def restore_native_linear_rung1(net: nn.Module, saved: dict) -> None:
+    """Restore pre-rung-1 tensors snapshotted by :func:`install_native_linear_rung1`."""
+    stage = net.core.stages[0]
+    with torch.no_grad():
+        for key, val in saved.items():
+            if key in ("leak_mode", "leak_constant", "raw_leak"):
+                continue
+            lib_name, pname = key.split(".", 1)
+            lib = getattr(stage, lib_name, None)
+            if lib is not None and hasattr(lib, pname):
+                getattr(lib, pname).data.copy_(val)
+    stage.leak_mode = str(saved["leak_mode"])
+    if isinstance(saved["leak_constant"], float) and math.isfinite(saved["leak_constant"]):
+        stage.leak_constant = float(saved["leak_constant"])
+    if (
+        hasattr(stage, "raw_leak") and stage.raw_leak is not None
+        and isinstance(saved["raw_leak"], torch.Tensor)
+        and saved["raw_leak"].numel() == stage.raw_leak.numel()
+    ):
+        with torch.no_grad():
+            stage.raw_leak.data.copy_(saved["raw_leak"])
+
+
+@dataclass
+class Rung1Report:
+    """Rung-1 native-linear (tanh-core) control report.
+
+    Complements C1 (monkey-patched linear KCL) and C1b-real
+    (resistive-core linear): this leg keeps the real tanh rhs and asks
+    whether the native OTA path holds linear memory at small signal.
+    """
+
+    order: int
+    seed: int
+    device: str
+    hidden_dim: int
+    n_streams: int
+    train_samples_per_stream: int
+    washout: int
+    n_params: int
+    instrument: InstrumentRow
+    matched_raw_delay_nrmse: float
+    matched_parity_tolerance: float
+    matched_parity_delta: float
+    gm_raw_fill: float
+    isat_raw_fill: float
+    g_resistive_fill: float
+    leak_value: float
+    esn_leak: float
+    esn_input_scaling: float
+    esn_nrmse: float
+    esn_mc_total: float
+    nrmse_hidden: float
+    r2_hidden: float
+    mc_total_hidden: float
+    state_pr_raw: float
+    state_pr_standardized: float
+    state_rms: float
+    pass_mc: bool
+    pass_ridge: bool
+    pass_rail: bool
+    pass_all: bool
+    note: str = ""
+
+
+def rung1_native_linear(
+    *, order: int = 10, seed: int = 0, device: str = "cpu",
+    hidden_dim: int = CANONICAL_HIDDEN,
+    n_streams: int = 1,     train_samples_per_stream: int = 300,
+    washout: int = PROBE_WASHOUT, max_delay: int = 20,
+    jacobian_samples: int = C1_SPECTRAL_TRANSITION_MIN,
+    t_span: float = CANONICAL_T_SPAN, num_steps: int = CANONICAL_NUM_STEPS,
+    drive_scale: float | None = None,
+    esn_leak: float = RUNG1_ESN_LEAK_DEFAULT,
+    esn_input_scaling: float = RUNG1_ESN_INPUT_SCALING_DEFAULT,
+    gm_raw_fill: float = RUNG1_GM_RAW_FILL,
+    isat_raw_fill: float = RUNG1_ISAT_RAW_FILL,
+    g_resistive_fill: float = RUNG1_G_RESISTIVE_FILL,
+    matched_parity_tol: float = R0_MATCHED_PARITY_TOL,
+) -> Rung1Report:
+    """Run the rung-1 native-linear (tanh-core) control.
+
+    Builds the canonical tanh_free fabric, installs small-signal fills
+    (tanh linear regime, shunt killed), maps the ESN winner's leak to a
+    uniform ``leak_constant``, drives at ``input_scale=esn_input_scaling``,
+    and measures ridge/MC/PR/Jacobian/rails with the shared instruments.
+    An in-harness ESN with the same (leak, input_scaling) is fit on the
+    identical stream as the parity reference (diagnostic, not a gate).
+    """
+    if order != 10:
+        raise ValueError("rung-1 is calibrated for NARMA-10 only")
+    leak_value = rung1_leak_from_esn(esn_leak, t_span)
+    if drive_scale is None:
+        # Default: match the ESN winner's input swing (the fabric sees
+        # rail-mapped V x input_scale; the ESN sees raw u x input_scaling).
+        drive_scale = float(esn_input_scaling)
+    u_raw, y_raw = ne._gen_narma_train_streams(
+        order=order, seed=seed, n_streams=n_streams,
+        n=train_samples_per_stream,
+    )
+    u_stream = u_raw[0]
+    y_stream = y_raw[0]
+    u_scaled = ne._scale_drive(
+        u_stream, bipolar=True, order=order, input_scale=drive_scale,
+    )
+    u_scaled = u_scaled.to(device)
+    y_stream = y_stream.to(device)
+
+    # Parity reference: in-harness ESN with the mapped (leak,
+    # input_scaling) on the identical raw stream.
+    esn = ne.ESN(
+        n_reservoir=hidden_dim, spectral_radius=0.9,
+        input_scaling=float(esn_input_scaling), leak=float(esn_leak),
+        ridge_l2=1e-2, seed=seed,
+    )
+    esn.fit(u_stream, y_stream)
+    esn_states = esn._run(u_stream).to(device)
+    esn_pred = esn_states @ esn.readout_W.to(device) + esn.readout_b.to(device)
+    esn_nrmse = float(ne.nrmse(esn_pred[washout:], y_stream[washout:]))
+    _, esn_mc = _per_delay_mc(
+        esn_states, u_stream.to(device), washout=washout,
+        max_delay=max_delay, use_svd_fallback=True,
+    )
+    esn_mc_total = float(esn_mc)
+
+    net, _, _ = ne._build_fabric_net(
+        order=order, seed=seed, freeze_read=False,
+        t_span=t_span, num_steps=num_steps, cell_library="tanh_free",
+        core_refresh_interval=0, leak_constant=None,
+        compile_sequence=False, hidden_dim=hidden_dim,
+    )
+    n_params = int(sum(p.numel() for p in net.parameters() if p.requires_grad))
+    saved = install_native_linear_rung1(
+        net,
+        gm_raw_fill=float(gm_raw_fill),
+        isat_raw_fill=float(isat_raw_fill),
+        g_resistive_fill=float(g_resistive_fill),
+        leak_value=float(leak_value),
+    )
+    try:
+        spec = measure_spectral_radius(
+            net, u_scaled, t_span=t_span, num_steps=num_steps,
+            washout=washout, n_samples=jacobian_samples, device=device,
+        )
+        states_full = spec["states_full"]
+        jac_rows = spec["jacobian_rows"]
+        abs_eigs: list[float] = []
+        for eigs in spec["abs_eigs_per_transition"]:
+            abs_eigs.extend([float(v) for v in eigs if math.isfinite(float(v))])
+        instrument = _instrument_trajectory(
+            stage=net.core.stages[0], states_full=states_full,
+            u_seq=u_scaled, y_seq=y_stream, washout=washout,
+            jacobian_samples=jacobian_samples,
+            t_span=t_span, num_steps=num_steps,
+        )
+        mc_per, mc_total = _per_delay_mc(
+            states_full, u_scaled, washout=washout, max_delay=max_delay,
+            use_svd_fallback=True,
+        )
+        x_max = float(net.core.stages[0].x_max)
+        sat_max = float(states_full.abs().max().item())
+        rail_frac = float(
+            (states_full.abs() > 0.9 * x_max).float().mean().item()
+        )
+        hidden = states_full[:, :hidden_dim].detach()
+        X_w = hidden[washout:]
+        y_w = y_stream[washout:]
+        W_h = _ridge_fit_predict(X_w, y_w)
+        X_aug = torch.cat(
+            [X_w, torch.ones(X_w.shape[0], 1, device=X_w.device)], dim=1,
+        )
+        h_pred = X_aug @ W_h
+        nrmse_hidden = float(ne.nrmse(h_pred, y_w))
+        r2_hidden = float(ne.r2(h_pred, y_w))
+        _, mc_total_hidden = _per_delay_mc(
+            hidden, u_scaled, washout=washout, max_delay=max_delay,
+            use_svd_fallback=True,
+        )
+        mc_total_hidden = float(mc_total_hidden)
+        state_pr_hidden = _safe_participation_ratio(hidden[washout:])
+        state_pr_std = _standardized_state_pr(states_full[washout:])
+        state_rms = float(states_full[washout:].pow(2).mean().sqrt().item())
+        raw = _raw_delay_ridge(
+            u_scaled, y_stream, n_taps=R0_RAW_DELAY_TAPS, washout=washout,
+        )
+        matched_delta = float(instrument["ridge_nrmse"] - raw["nrmse"])
+        pass_mc = bool(mc_total >= RUNG1_PASS_MC_ABOVE)
+        pass_ridge = bool(instrument["ridge_nrmse"] <= RUNG1_PASS_RIDGE_BELOW)
+        pass_rail = bool(rail_frac <= RUNG1_PASS_RAIL_BELOW)
+        pass_all = bool(pass_mc and pass_ridge and pass_rail)
+        row = InstrumentRow(
+            config_tag=(
+                f"rung1_seed{seed}_{device}_h{hidden_dim}"
+                f"_tspan{t_span:g}_steps{num_steps}"
+                f"_drive{drive_scale:g}_washout{washout}"
+                f"_esnleak{esn_leak:g}_esnscale{esn_input_scaling:g}"
+                f"_gm{gm_raw_fill:g}_is{isat_raw_fill:g}_gr{g_resistive_fill:g}"
+                f"_leak{leak_value:.4g}"
+            ),
+            nrmse=float(instrument["ridge_nrmse"]),
+            r2=float(instrument["ridge_r2"]),
+            mc_total=float(mc_total),
+            mc_per_delay=[float(v) for v in mc_per],
+            state_pr=float(instrument["state_pr"]),
+            jac_max_abs=float(instrument["jac_max_abs"]),
+            jac_min_abs=float(instrument["jac_min_abs"]),
+            jac_mean_abs=float(instrument["jac_mean_abs"]),
+            jac_rank_proxy=float(instrument["jac_rank_proxy"]),
+            jac_eig_abs=abs_eigs,
+            sat_max_ratio=float(sat_max / x_max) if x_max > 0 else float("nan"),
+            rail_frac=rail_frac,
+            n_params=n_params,
+            note="rung-1 native-linear tanh-core reservoir",
+            state_pr_standardized=float(state_pr_std),
+        )
+        return Rung1Report(
+            order=order, seed=seed, device=device, hidden_dim=hidden_dim,
+            n_streams=n_streams, train_samples_per_stream=train_samples_per_stream,
+            washout=washout, n_params=n_params,
+            instrument=row,
+            matched_raw_delay_nrmse=float(raw["nrmse"]),
+            matched_parity_tolerance=float(matched_parity_tol),
+            matched_parity_delta=matched_delta,
+            gm_raw_fill=float(gm_raw_fill),
+            isat_raw_fill=float(isat_raw_fill),
+            g_resistive_fill=float(g_resistive_fill),
+            leak_value=float(leak_value),
+            esn_leak=float(esn_leak),
+            esn_input_scaling=float(esn_input_scaling),
+            esn_nrmse=esn_nrmse,
+            esn_mc_total=esn_mc_total,
+            nrmse_hidden=nrmse_hidden,
+            r2_hidden=r2_hidden,
+            mc_total_hidden=mc_total_hidden,
+            state_pr_raw=float(state_pr_hidden),
+            state_pr_standardized=float(state_pr_std),
+            state_rms=state_rms,
+            pass_mc=pass_mc, pass_ridge=pass_ridge,
+            pass_rail=pass_rail, pass_all=pass_all,
+            note=(
+                "Rung-1 PASS gates: MC>=10, ridge<=0.45, rails<=5%. "
+                "ESN reference is diagnostic (same stream, mapped leak/scale). "
+                "nrmse_hidden/r2_hidden/mc_total_hidden available in JSON."
+            ),
+        )
+    finally:
+        restore_native_linear_rung1(net, saved)
 
 
 def c3_gm_grid_sweep(
@@ -3726,6 +4072,47 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_c1b_real.add_argument("--max-delay", type=int, default=20)
 
+    p_rung1 = sub.add_parser(
+        "rung1",
+        help="Rung-1 native-linear (tanh-core) control: small-signal OTA "
+             "fills, ESN-mapped leak/drive, MC~=14 parity screen.",
+    )
+    _add_common(p_rung1)
+    p_rung1.add_argument("--t-span", type=float, default=CANONICAL_T_SPAN)
+    p_rung1.add_argument("--num-steps", type=int, default=CANONICAL_NUM_STEPS)
+    p_rung1.add_argument(
+        "--jacobian-samples", type=int, default=C1_SPECTRAL_TRANSITION_MIN,
+    )
+    p_rung1.add_argument(
+        "--drive-scale", type=float, default=None,
+        help="Fabric input_scale. Default (None) follows --esn-input-scaling "
+             "so the fabric drive swing matches the ESN winner.",
+    )
+    p_rung1.add_argument("--max-delay", type=int, default=20)
+    p_rung1.add_argument(
+        "--esn-leak", type=float, default=RUNG1_ESN_LEAK_DEFAULT,
+        help="ESN-winner leak rate mapped to a uniform leak_constant via "
+             "-ln(1-leak)/t_span (default 1.0; read the in-harness "
+             "run_baselines grid per seed and override when known).",
+    )
+    p_rung1.add_argument(
+        "--esn-input-scaling", type=float, default=RUNG1_ESN_INPUT_SCALING_DEFAULT,
+        help="ESN-winner input scaling used as the fabric input_scale "
+             "(default 0.2).",
+    )
+    p_rung1.add_argument(
+        "--gm-raw-fill", type=float, default=RUNG1_GM_RAW_FILL,
+        help="Fill for core/boundary/readout gm_raw (default -8: gm~=0.013).",
+    )
+    p_rung1.add_argument(
+        "--isat-raw-fill", type=float, default=RUNG1_ISAT_RAW_FILL,
+        help="Fill for core/boundary/readout isat_raw (default -2: Isat~=1.2).",
+    )
+    p_rung1.add_argument(
+        "--g-resistive-fill", type=float, default=RUNG1_G_RESISTIVE_FILL,
+        help="Fill for g_resistive_raw (default -20: shunt killed).",
+    )
+
     p_c3 = sub.add_parser(
         "c3_sweep",
         help="C3 tanh-crossover sweep: install the tuned C1b base, sweep "
@@ -3839,6 +4226,84 @@ def main(argv: list[str] | None = None) -> int:
                 "pr_around_15_25": (15.0, 25.0),
             },
             "note": row.note,
+        }, indent=2))
+        return 0
+
+    if args.mode == "rung1":
+        report = rung1_native_linear(
+            order=args.order, seed=args.seed, device=args.device,
+            hidden_dim=args.hidden_dim,
+            n_streams=args.n_streams,
+            train_samples_per_stream=args.train_samples,
+            washout=args.washout, max_delay=args.max_delay,
+            jacobian_samples=args.jacobian_samples,
+            t_span=args.t_span, num_steps=args.num_steps,
+            drive_scale=args.drive_scale,
+            esn_leak=args.esn_leak,
+            esn_input_scaling=args.esn_input_scaling,
+            gm_raw_fill=args.gm_raw_fill,
+            isat_raw_fill=args.isat_raw_fill,
+            g_resistive_fill=args.g_resistive_fill,
+        )
+        rd = _serialize_rows([report.instrument])[0]
+        write_probe_csv(args.output / "rung1.csv", [rd])
+        hdr = (
+            f"Rung-1 native-linear -- order={args.order} seed={args.seed} "
+            f"h={args.hidden_dim} t_span={args.t_span:g} steps={args.num_steps} "
+            f"esn_leak={report.esn_leak:g} esn_scale={report.esn_input_scaling:g} "
+            f"gm={report.gm_raw_fill:g} isat={report.isat_raw_fill:g}"
+        )
+        lines = [
+            f"  config_tag={report.instrument.config_tag}",
+            f"  nrmse={report.instrument.nrmse:.4f}  r2={report.instrument.r2:.4f}",
+            f"  mc_total={report.instrument.mc_total:.3f}  "
+            f"state_pr={report.instrument.state_pr:.2f}  "
+            f"state_pr_std={report.state_pr_standardized:.2f}",
+            f"  state_rms={report.state_rms:.4e}",
+            f"  jac_max_abs={report.instrument.jac_max_abs:.4f}  "
+            f"jac_min_abs={report.instrument.jac_min_abs:.4f}  "
+            f"jac_mean_abs={report.instrument.jac_mean_abs:.4f}  "
+            f"jac_rank_proxy={report.instrument.jac_rank_proxy:.2f}",
+            f"  rail_frac={report.instrument.rail_frac:.4f}  "
+            f"sat_max_ratio={report.instrument.sat_max_ratio:.4f}",
+            f"  esn_ref: nrmse={report.esn_nrmse:.4f}  mc={report.esn_mc_total:.2f}",
+            f"  hidden ridge: nrmse={report.nrmse_hidden:.4f}  "
+            f"r2={report.r2_hidden:.4f}  mc={report.mc_total_hidden:.2f}",
+            f"  pass_mc={report.pass_mc} pass_ridge={report.pass_ridge} "
+            f"pass_rail={report.pass_rail} pass_all={report.pass_all}",
+        ]
+        write_probe_txt(args.output / "rung1.txt", hdr, lines)
+        print("\n".join([hdr] + lines))
+        (args.output / "rung1.json").write_text(json.dumps({
+            "order": report.order, "seed": report.seed,
+            "device": report.device, "hidden_dim": report.hidden_dim,
+            "n_streams": report.n_streams,
+            "train_samples_per_stream": report.train_samples_per_stream,
+            "washout": report.washout,
+            "n_params": report.n_params,
+            "instrument": rd,
+            "matched_raw_delay_nrmse": report.matched_raw_delay_nrmse,
+            "matched_parity_tolerance": report.matched_parity_tolerance,
+            "matched_parity_delta": report.matched_parity_delta,
+            "gm_raw_fill": report.gm_raw_fill,
+            "isat_raw_fill": report.isat_raw_fill,
+            "g_resistive_fill": report.g_resistive_fill,
+            "leak_value": report.leak_value,
+            "esn_leak": report.esn_leak,
+            "esn_input_scaling": report.esn_input_scaling,
+            "esn_nrmse": report.esn_nrmse,
+            "esn_mc_total": report.esn_mc_total,
+            "nrmse_hidden": report.nrmse_hidden,
+            "r2_hidden": report.r2_hidden,
+            "mc_total_hidden": report.mc_total_hidden,
+            "state_pr_raw": report.state_pr_raw,
+            "state_pr_standardized": report.state_pr_standardized,
+            "state_rms": report.state_rms,
+            "pass_mc": report.pass_mc,
+            "pass_ridge": report.pass_ridge,
+            "pass_rail": report.pass_rail,
+            "pass_all": report.pass_all,
+            "note": report.note,
         }, indent=2))
         return 0
 

@@ -97,6 +97,7 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -1544,6 +1545,9 @@ def _build_fabric_net(
     vca_enabled: bool = False,
     vca_rank: int | None = None,
     vca_bias: bool | None = None,
+    vca_core_enabled: bool = False,
+    vca_use_hidden: bool = False,
+    dynamic_leak: bool = False,
 ) -> tuple[nn.Module, float, int]:
     """Build the NARMA fabric net (preset + topology + optional compile).
 
@@ -1585,6 +1589,23 @@ def _build_fabric_net(
     explicitly empty ``{}`` disables boundary terminals and the
     differential-stage validator raises (the gate would have nothing to
     modulate).
+
+    ``vca_core_enabled`` (knet-gated-memory spike): additionally gates the
+    core edge family. Auto-enabled when ``vca_use_hidden=True`` (the
+    hidden-conditioned gate lives on the core family only; without it the
+    flag would be a silent no-op).
+
+    ``vca_use_hidden`` (knet-gated-memory spike 3b): the core VCA gate
+    becomes ``2*sigmoid(((u@W + x@W_h)@v_c.T) + b)`` with a zero-init
+    ``(num_nodes, rank)`` hidden projection. Epoch-0 forward is
+    bit-identical to the input-only gate.
+
+    ``dynamic_leak`` (knet-gated-memory spike 3a): per-node
+    ``leak_eff = softplus(a*x + b*u + c)`` with ``a=b=0``,
+    ``c=raw_leak_init`` at init. Epoch-0 forward is bit-identical to the
+    static leak. Compatible with ``leak_constant`` (non-programmable) and
+    ``leak_init`` gain axis; the ``leak_init`` *leak* axis is superseded
+    (warned, not applied to dyn params).
     """
     base = PRESET_NARMA20 if order == 20 else PRESET_NARMA10
     if t_span is None:
@@ -1602,6 +1623,12 @@ def _build_fabric_net(
         leak_constant=leak_constant,
     )
     cell_lib = make_cell_library(cell_library)
+    # knet-gated-memory: the hidden-conditioned gate has no other family
+    # to live on, so requesting it without core VCA would silently build a
+    # net where the flag does nothing. Auto-enable with a loud note.
+    if vca_use_hidden and not vca_core_enabled:
+        print("[narma] --vca-use-hidden implies --vca-core (auto-enabled).")
+        vca_core_enabled = True
     torch.manual_seed(seed)
     # Resolve effective boundary fan-out: explicit override wins over the
     # preset default. ``None`` keeps ``preset["boundary_fan_out"]`` (the
@@ -1649,6 +1676,9 @@ def _build_fabric_net(
             vca_enabled=vca_enabled,
             vca_rank=vca_rank,
             vca_bias=vca_bias,
+            vca_core_enabled=vca_core_enabled,
+            vca_use_hidden=vca_use_hidden,
+            dynamic_leak=dynamic_leak,
         )
     elif readout == "temporal":
         net = build_net_from_config(
@@ -1660,6 +1690,9 @@ def _build_fabric_net(
             vca_enabled=vca_enabled,
             vca_rank=vca_rank,
             vca_bias=vca_bias,
+            vca_core_enabled=vca_core_enabled,
+            vca_use_hidden=vca_use_hidden,
+            dynamic_leak=dynamic_leak,
         )
     else:
         raise ValueError(
@@ -1706,6 +1739,9 @@ def run_fabric_condition(
     vca_enabled: bool = False,
     vca_rank: int | None = None,
     vca_bias: bool | None = None,
+    vca_core_enabled: bool = False,
+    vca_use_hidden: bool = False,
+    dynamic_leak: bool = False,
     gain_init: float | None = None,
     leak_init: str | float | None = None,
 ) -> dict[str, Any]:
@@ -1781,7 +1817,13 @@ def run_fabric_condition(
         readout=readout,
         boundary_fan_out=boundary_fan_out,
         vca_enabled=vca_enabled, vca_rank=vca_rank, vca_bias=vca_bias,
+        vca_core_enabled=vca_core_enabled, vca_use_hidden=vca_use_hidden,
+        dynamic_leak=dynamic_leak,
     )
+    if dynamic_leak and leak_init is not None:
+        print("[narma] WARNING: --dynamic-leak is on; --leak-init "
+              f"({leak_init!r}) leak axis is superseded by the learned "
+              "dyn_leak_a/b/c (its gain axis still applies).")
     # Round-2 §13.3 VCA-leg init overrides: post-build apply the
     # ``--gain-init`` / ``--leak-init`` overrides if supplied. Each axis
     # is independent: ``None`` leaves that axis at the cell-library
@@ -1958,6 +2000,10 @@ def run_fabric_condition(
         "vca_bias": (
             None if vca_bias is None else bool(vca_bias)
         ),
+        # knet-gated-memory spike bookkeeping.
+        "vca_core_enabled": bool(vca_core_enabled),
+        "vca_use_hidden": bool(vca_use_hidden),
+        "dynamic_leak": bool(dynamic_leak),
         # Round-2 §13.3 VCA-leg init overrides. ``None`` means "default
         # cell-library init left in place" so the CSV column tells the
         # reader which legs were deliberately pinned to a starting point.
@@ -2166,8 +2212,15 @@ def _decide_refresh_ladder(by_cond, band):
         if not math.isfinite(m):
             diverged.append(c)
             continue
-        # rsplit on the LAST "k": condition names are fabric_refresh_k<N>.
-        k_num = c.rsplit("k", 1)[-1]
+        # Parse the ladder k from the head of the condition name
+        # (fabric_refresh_k<N>[...suffixes]). Suffixes added by later
+        # legs (_dense, _vca, _dynleak, _vcaH, _gi..., _fan...) trail
+        # after the k and must not break the parse (the old rsplit
+        # assumed a bare fabric_refresh_k<N> tail).
+        _m = re.match(r"fabric_refresh_k(\d+)", c)
+        if _m is None:
+            continue
+        k_num = _m.group(1)
         k_means.append((int(k_num), m))
         tag = " (some seeds diverged)" if was_filtered else ""
         lines.append(f"  k={k_num}: NRMSE={m:.4f}{tag}")
@@ -2366,6 +2419,26 @@ def parse_args() -> argparse.Namespace:
                              "(gate_e = 2*sigmoid(b_e + (u@W)@v_e); default "
                              "follows config.VCA['bias']). Prefer the "
                              "--no-vca-bias form for ablation clarity.")
+    parser.add_argument("--vca-core", dest="vca_core_enabled",
+                        action="store_true", default=False,
+                        help="knet-gated-memory: additionally gate the core "
+                             "edge family with VCA (run-C style). Required "
+                             "for --vca-use-hidden (auto-enabled there with "
+                             "a note if omitted).")
+    parser.add_argument("--vca-use-hidden", dest="vca_use_hidden",
+                        action="store_true", default=False,
+                        help="knet-gated-memory spike 3b: hidden-conditioned "
+                             "core VCA gate "
+                             "2*sigmoid(((u@W + x@W_h)@v_c.T) + b) with a "
+                             "zero-init (num_nodes, rank) hidden projection. "
+                             "Epoch-0 forward is bit-identical to the "
+                             "input-only gate. Implies --vca-core.")
+    parser.add_argument("--dynamic-leak", dest="dynamic_leak",
+                        action="store_true", default=False,
+                        help="knet-gated-memory spike 3a: per-node dynamic "
+                             "leak leak_eff = softplus(a*x + b*u + c) with "
+                             "a=b=0, c=raw_leak_init at init. Epoch-0 "
+                             "forward is bit-identical to the static leak.")
     parser.add_argument("--gain-init", type=float, default=None,
                         dest="gain_init",
                         help="Round-2 §13.3 VCA-leg init: post-build gm/isat "
@@ -2412,7 +2485,7 @@ def _write_partial_tables(
         f"NARMA-{order} -- {len(seeds)} seeds -- final results",
         "=" * 60,
     ]
-    csv_lines = ["condition,seed,nrmse,r2,mc_total,trained_params,total_params,hidden_dim,cell_library,core_refresh_interval,cell_lib_evals_per_sample,readout,boundary_fan_out,vca_enabled,vca_rank,vca_bias,gain_init,leak_init"]
+    csv_lines = ["condition,seed,nrmse,r2,mc_total,trained_params,total_params,hidden_dim,cell_library,core_refresh_interval,cell_lib_evals_per_sample,readout,boundary_fan_out,vca_enabled,vca_rank,vca_bias,gain_init,leak_init,vca_core_enabled,vca_use_hidden,dynamic_leak"]
     for cond in sorted(by_cond):
         runs = by_cond[cond]
         nrmse_vals = [r["nrmse"] for r in runs]
@@ -2473,7 +2546,10 @@ def _write_partial_tables(
                 f"{r.get('vca_rank', '')},"
                 f"{r.get('vca_bias', '')},"
                 f"{r.get('gain_init', '')},"
-                f"{r.get('leak_init', '')}"
+                f"{r.get('leak_init', '')},"
+                f"{r.get('vca_core_enabled', False)},"
+                f"{r.get('vca_use_hidden', False)},"
+                f"{r.get('dynamic_leak', False)}"
             )
 
     summary_text = "\n".join(summary_lines) + "\n"
@@ -2681,6 +2757,14 @@ def main() -> int:
                     if args.leak_init is not None else "leDFLT"
                 )
                 cond_name = f"{cond_name}_{_gi}_{_leak_token}"
+            # knet-gated-memory spike markers: keep spike legs distinct
+            # from default-init legs on disk and in tables.
+            if args.dynamic_leak:
+                cond_name = f"{cond_name}_dynleak"
+            if args.vca_use_hidden:
+                cond_name = f"{cond_name}_vcaH"
+            elif args.vca_core_enabled:
+                cond_name = f"{cond_name}_vcaC"
             print(f"  [{idx}/{len(fabric_jobs)}] {cond_name}  seed={seed}  "
                 f"core_refresh_interval={refresh_k}  "
                 f"cell_library={args.cell_library}  "
@@ -2718,6 +2802,9 @@ def main() -> int:
                 vca_enabled=args.vca_enabled,
                 vca_rank=args.vca_rank,
                 vca_bias=args.vca_bias,
+                vca_core_enabled=args.vca_core_enabled,
+                vca_use_hidden=args.vca_use_hidden,
+                dynamic_leak=args.dynamic_leak,
                 gain_init=args.gain_init,
                 leak_init=args.leak_init,
             )
@@ -2751,6 +2838,9 @@ def main() -> int:
                     "" if res.get("vca_bias") is None
                     else bool(res["vca_bias"])
                 ),
+                "vca_core_enabled": bool(res.get("vca_core_enabled", False)),
+                "vca_use_hidden": bool(res.get("vca_use_hidden", False)),
+                "dynamic_leak": bool(res.get("dynamic_leak", False)),
                 "gain_init": (
                     "" if res.get("gain_init") is None
                     else float(res["gain_init"])

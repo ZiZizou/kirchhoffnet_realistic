@@ -1182,6 +1182,8 @@ def make_narma_preset(
     t_span: float = 1.0,
     core_refresh_interval: int = 0,
     leak_constant: float | None = None,
+    dynamic_leak: bool = False,
+    vca_use_hidden: bool = False,
 ) -> dict:
     """Build the NARMA reservoir-task preset.
 
@@ -1294,6 +1296,9 @@ def make_narma_preset(
             )
         preset["leak_mode"] = "non-programmable"
         preset["leak_constant"] = float(leak_constant)
+    # knet-gated-memory (plan): forward the spike flags to the stage factory.
+    preset["dynamic_leak"] = bool(dynamic_leak)
+    preset["vca_use_hidden"] = bool(vca_use_hidden)
     return preset
 
 

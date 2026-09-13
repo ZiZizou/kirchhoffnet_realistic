@@ -1674,6 +1674,269 @@ def canary_verdict(
 
 
 # ---------------------------------------------------------------------------
+# Split leg: per-node diagnostics + shunt-vs-tanh arms (plan canary-core-split)
+# ---------------------------------------------------------------------------
+
+# Arm fills (spec core-decomp-legs). Boundary/output libraries are never
+# touched by the arms: the drive path stays identical across arms.
+SPLIT_ARM_SHUNT_FILL: float = -20.0  # g_resistive_raw -> G ~= 2e-9
+SPLIT_ARM_TANH_FILL: float = -20.0  # gm_raw/isat_raw -> tanh current ~= 0
+
+
+def _pearson(a: torch.Tensor, b: torch.Tensor) -> float:
+    """Pearson correlation of two 1-D tensors; NaN when either is constant."""
+    if a.numel() != b.numel() or a.numel() < 2:
+        return float("nan")
+    af = a.detach().float()
+    bf = b.detach().float()
+    af = af - af.mean()
+    bf = bf - bf.mean()
+    denom = torch.sqrt((af ** 2).sum() * (bf ** 2).sum())
+    if not torch.isfinite(denom) or float(denom) == 0.0:
+        return float("nan")
+    return float(((af * bf).sum() / denom).item())
+
+
+def _single_stage(net: nn.Module) -> nn.Module:
+    """Return the single stage of a fabric net (split legs are 1-stage)."""
+    stages = list(net.core.stages)
+    if len(stages) != 1:
+        raise NotImplementedError(
+            "split legs currently support single-stage nets only"
+        )
+    return stages[0]
+
+
+def apply_arm_fill(net: nn.Module, arm: str) -> dict[str, Any]:
+    """Apply a split-leg arm fill to the core cell library (post-build).
+
+    Arm ``"A"`` (shunt-only kill) fills core ``g_resistive_raw``; arm
+    ``"B"`` (tanh-only kill) fills core ``gm_raw``/``isat_raw``. Boundary
+    and output libraries are untouched. No-op parameters that a library
+    lacks are skipped (defensive; the ``tanh_free`` core has all three).
+    """
+    if arm not in ("A", "B"):
+        raise ValueError(f"split arm must be 'A' or 'B', got {arm!r}")
+    stage = _single_stage(net)
+    lib = stage.cell_lib
+    log: dict[str, Any] = {"arm": arm}
+    with torch.no_grad():
+        if arm == "A":
+            if hasattr(lib, "g_resistive_raw"):
+                lib.g_resistive_raw.data.fill_(SPLIT_ARM_SHUNT_FILL)
+                g_eff = torch.nn.functional.softplus(
+                    torch.tensor(SPLIT_ARM_SHUNT_FILL)).item()
+                log["g_resistive_fill"] = float(SPLIT_ARM_SHUNT_FILL)
+                log["g_effective"] = float(g_eff)
+        else:
+            if hasattr(lib, "gm_raw"):
+                lib.gm_raw.data.fill_(SPLIT_ARM_TANH_FILL)
+                log["gm_fill"] = float(SPLIT_ARM_TANH_FILL)
+            if hasattr(lib, "isat_raw"):
+                lib.isat_raw.data.fill_(SPLIT_ARM_TANH_FILL)
+                log["isat_fill"] = float(SPLIT_ARM_TANH_FILL)
+    return log
+
+
+def _forward_states(net: nn.Module, u_seq: torch.Tensor) -> torch.Tensor:
+    """Collect full states ``(T, N)`` on a 1-D drive stream (eval-only)."""
+    stage = _single_stage(net)
+    state_width = (int(net.hid_count) + int(net.proj_count)
+                   + int(net.output_ode_count))
+    x0 = u_seq.new_zeros(1, state_width)
+    with torch.no_grad():
+        all_states = stage._forward_heun_sequence(
+            x0=x0, t_span=float(net.core.stage_times[0]),
+            num_steps=int(net.core.stage_steps[0]), u_seq=u_seq,
+        )
+    return all_states[:, 0, :].detach()
+
+
+def node_diagnostics(
+    net: nn.Module, states_full: torch.Tensor, u_seq: torch.Tensor, *,
+    hidden_dim: int | None = None,
+) -> dict[str, Any]:
+    """Per-node decomposition of a collected trajectory (spec
+    per-node-diagnostics).
+
+    Returns per-hidden-node ``max_abs_ratio`` (the bimodality histogram),
+    ``shunt_G_sum`` (incident shunt conductance), ``sign_balance``
+    (incoming sign sum), ``boundary_current`` (per-node boundary OTA
+    current at the zero-state/first-sample operating point), the dumped
+    ``s_raw`` sign pattern, and Pearson correlations of the three
+    structural vectors against ``max_abs_ratio``. Eval-only; weights are
+    never mutated. All outputs are JSON-safe Python floats/lists.
+    """
+    stage = _single_stage(net)
+    hid = int(net.hid_count) if hidden_dim is None else int(hidden_dim)
+    if states_full.dim() != 2 or u_seq.dim() != 1:
+        raise ValueError(
+            "node_diagnostics requires (T, N) states and (T,) inputs, got "
+            f"{tuple(states_full.shape)} and {tuple(u_seq.shape)}"
+        )
+    if states_full.shape[0] != u_seq.shape[0]:
+        raise ValueError(
+            "states and inputs must have the same length, got "
+            f"{states_full.shape[0]} and {u_seq.shape[0]}"
+        )
+    hidden = states_full[:, :hid]
+    x_max = float(stage.x_max)
+    max_abs = hidden.abs().amax(dim=0).cpu()
+    max_abs_ratio = (max_abs / x_max).tolist()
+
+    src = stage.src.detach().cpu().long()
+    dst = stage.dst.detach().cpu().long()
+    n_edges = int(src.numel())
+    mask = (src < hid) | (dst < hid)
+
+    lib = stage.cell_lib
+    if hasattr(lib, "g_resistive_raw"):
+        g_all = torch.nn.functional.softplus(
+            lib.g_resistive_raw.detach().cpu().float())
+    else:
+        g_all = torch.zeros(n_edges)
+    shunt_sums = torch.zeros(hid)
+    shunt_sums.index_add_(0, dst[mask & (dst < hid)],
+                          g_all[mask & (dst < hid)])
+    shunt_sums.index_add_(0, src[mask & (src < hid)],
+                          g_all[mask & (src < hid)])
+    shunt_list = shunt_sums.tolist()
+
+    if hasattr(lib, "s_raw"):
+        s_all = torch.sign(lib.s_raw.detach().cpu().float())
+        s_dump = s_all.tolist()
+    else:
+        s_all = torch.zeros(n_edges)
+        s_dump = [0.0] * n_edges
+    sign_bal = torch.zeros(hid)
+    sign_bal.index_add_(0, dst[mask & (dst < hid)],
+                        s_all[mask & (dst < hid)])
+    sign_list = sign_bal.tolist()
+
+    n_nodes = int(stage.num_nodes)
+    with torch.no_grad():
+        u_first = u_seq[:1].reshape(1, 1).to(states_full.device)
+        x0 = u_seq.new_zeros(1, n_nodes)
+        acc_b = stage._compute_frozen_boundary(u_first, x0)
+    if acc_b is None:
+        bnd = [0.0] * hid
+    else:
+        bnd = acc_b[0, :hid].abs().detach().cpu().float().tolist()
+
+    max_t = torch.tensor(max_abs_ratio)
+    out: dict[str, Any] = {
+        "hidden_dim": hid,
+        "x_max": x_max,
+        "max_abs_ratio": [float(v) for v in max_abs_ratio],
+        "shunt_G_sum": [float(v) for v in shunt_list],
+        "sign_balance": [float(v) for v in sign_list],
+        "boundary_current": [float(v) for v in bnd],
+        "s_raw_sign": [float(v) for v in s_dump],
+        "corr_shunt_vs_max": _pearson(max_t, torch.tensor(shunt_list)),
+        "corr_sign_vs_max": _pearson(max_t, torch.tensor(sign_list)),
+        "corr_boundary_vs_max": _pearson(max_t, torch.tensor(bnd)),
+    }
+    return out
+
+
+def _build_split_base_net(
+    order: int, seed: int, t_span: float, num_steps: int, hidden_dim: int,
+) -> nn.Module:
+    """Rebuild the exact canary priority-corner net (base for all arms).
+
+    Same factory + seed + override as the ``canary`` priority leg
+    (``e0_sweep`` torus path with ``TRANSPLANT_CANARY_*``), so the base
+    row must reproduce ``output/canary/canary.json`` priority numbers.
+    """
+    net, _, _ = ne._build_fabric_net(
+        order=order, seed=seed, freeze_read=False,
+        t_span=t_span, num_steps=num_steps,
+        cell_library="tanh_free",
+        hidden_dim=hidden_dim,
+        core_refresh_interval=0,
+        leak_constant=None,
+        compile_sequence=False,
+        boundary_fan_out=None,
+    )
+    apply_gain_override(
+        net, gm_init=TRANSPLANT_CANARY_GM, isat_init=None,
+        leak_mode=TRANSPLANT_CANARY_LEAK,
+        raw_leak_init_seed=int(seed),
+        per_lib_overrides=TRANSPLANT_CANARY_PER_LIB,
+    )
+    return net
+
+
+def run_split_leg(
+    order: int = 10, seed: int = 0, device: str = "cpu",
+    t_span: float = 1.0, num_steps: int = 8, hidden_dim: int = 25,
+    n_streams: int = 4, train_samples: int = 2500,
+    jacobian_samples: int = 3,
+) -> dict[str, Any]:
+    """Run the split leg: base corner + arms A/B/C with node diagnostics.
+
+    The base build reuses stream zero and the ``canary`` priority override,
+    so ``base.score`` must match the recorded canary priority row. Each arm
+    rebuilds the identical net (same seed), applies its fill, and re-scores
+    the full E0 instrument set plus per-node diagnostics. Returns a
+    JSON-safe dict with ``base``/``arm_A``/``arm_B``/``arm_C`` entries.
+    """
+    u_raw, y_raw = ne._gen_narma_train_streams(
+        order, seed, n_streams, train_samples)
+    drive = TRANSPLANT_CANARY_DRIVE
+    u = ne._scale_drive(u_raw[0], bipolar=True, order=order,
+                        input_scale=drive).to(device)
+    y = y_raw[0].to(device)
+    washout = PROBE_WASHOUT
+
+    def _score(net: nn.Module, states: torch.Tensor) -> dict[str, float]:
+        stage = _single_stage(net)
+        return _score_state_trajectory(
+            stage=stage, states_full=states,
+            u_seq=u, y_seq=y,
+            washout=washout, jacobian_samples=jacobian_samples,
+            t_span=float(net.core.stage_times[0]),
+            num_steps=int(net.core.stage_steps[0]),
+        )
+
+    result: dict[str, Any] = {
+        "order": order, "seed": seed, "device": device,
+        "t_span": t_span, "num_steps": num_steps,
+        "hidden_dim": hidden_dim, "drive": drive,
+        "leak": TRANSPLANT_CANARY_LEAK,
+        "per_lib_overrides": TRANSPLANT_CANARY_PER_LIB,
+    }
+    base_net = _build_split_base_net(order, seed, t_span, num_steps,
+                                     hidden_dim)
+    base_net.to(device)
+    base_states = _forward_states(base_net, u)
+    result["base"] = {
+        "score": _score(base_net, base_states),
+        "node": node_diagnostics(base_net, base_states, u,
+                                 hidden_dim=hidden_dim),
+    }
+    for arm in ("A", "B"):
+        arm_net = _build_split_base_net(order, seed, t_span, num_steps,
+                                        hidden_dim)
+        arm_net.to(device)
+        fill_log = apply_arm_fill(arm_net, arm)
+        arm_states = _forward_states(arm_net, u)
+        result[f"arm_{arm}"] = {
+            "fill": fill_log,
+            "score": _score(arm_net, arm_states),
+            "node": node_diagnostics(arm_net, arm_states, u,
+                                     hidden_dim=hidden_dim),
+        }
+    gz_states = _gate_zero_eval_forward(base_net, u)[:, 0, :].detach()
+    result["arm_C"] = {
+        "score": _score(base_net, gz_states),
+        "node": node_diagnostics(base_net, gz_states, u,
+                                 hidden_dim=hidden_dim),
+    }
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Baselines calibration
 # ---------------------------------------------------------------------------
 
@@ -1914,6 +2177,22 @@ def main(argv: list[str] | None = None) -> int:
     p_tr.add_argument("--max-corners", type=int, default=0,
                       help="If >0, run exactly the first N corners in "
                            "drive/leak/gain traversal order (smoke).")
+
+    # --- split leg: per-node diagnostics + shunt-vs-tanh arms ---
+    p_sp = sub.add_parser(
+        "split",
+        help="Split leg (plan canary-core-split): rebuild the canary "
+             "priority corner, run per-node diagnostics, then arms A/B/C "
+             "with the full E0 instrument set. GPU-intended; writes "
+             "split.json.",
+    )
+    _add_common_args(p_sp)
+    p_sp.add_argument("--n-streams", type=int, default=4)
+    p_sp.add_argument("--train-samples", type=int, default=2500)
+    p_sp.add_argument("--jacobian-samples", type=int, default=3)
+    p_sp.add_argument("--t-span", type=float, default=1.0)
+    p_sp.add_argument("--num-steps", type=int, default=8)
+    p_sp.add_argument("--hidden-dim", type=int, default=25)
 
     args = parser.parse_args(argv)
     # Pre-registered thresholds and locked grids are NARMA-10-specific.
@@ -2442,6 +2721,37 @@ def main(argv: list[str] | None = None) -> int:
             },
             "rows": row_dicts,
         }, indent=2))
+        return 0
+
+    if args.mode == "split":
+        # Split leg (plan canary-core-split): base corner + arms A/B/C.
+        t0 = time.time()
+        split = run_split_leg(
+            order=args.order, seed=args.seed, device=args.device,
+            t_span=args.t_span, num_steps=args.num_steps,
+            hidden_dim=args.hidden_dim,
+            n_streams=args.n_streams,
+            train_samples=args.train_samples,
+            jacobian_samples=args.jacobian_samples,
+        )
+        split["elapsed_s"] = time.time() - t0
+        b = split["base"]["score"]
+        print(f"  BASE (priority corner rebuild):")
+        print(f"    ridge={b['ridge_nrmse']:.4f} MC={b['mc_total']:.2f} "
+              f"PR={b['state_pr']:.2f} rail={100.0 * b['rail_frac']:.1f}% "
+              f"(expect 0.7611 / 1.68 / 15.2%)")
+        bn = split["base"]["node"]
+        print(f"    corr shunt/max={bn['corr_shunt_vs_max']:.3f} "
+              f"sign/max={bn['corr_sign_vs_max']:.3f} "
+              f"bnd/max={bn['corr_boundary_vs_max']:.3f}")
+        for arm in ("A", "B", "C"):
+            s = split[f"arm_{arm}"]["score"]
+            n = split[f"arm_{arm}"]["node"]
+            hot = sum(1 for v in n["max_abs_ratio"] if v > 0.9)
+            print(f"  ARM {arm}: ridge={s['ridge_nrmse']:.4f} "
+                  f"MC={s['mc_total']:.2f} PR={s['state_pr']:.2f} "
+                  f"rail={100.0 * s['rail_frac']:.1f}% hot_nodes={hot}")
+        (args.output / "split.json").write_text(json.dumps(split, indent=2))
         return 0
 
     parser.error(f"unknown mode {args.mode}")

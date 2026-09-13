@@ -30,7 +30,7 @@ check_optuna_versions.py
 probe_study_db.py
 test_bo_guard.py
 *test*
-*audit*
+
 *db*
 Paper
 docs/gln-learned-sharpness.md

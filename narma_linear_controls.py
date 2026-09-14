@@ -2780,10 +2780,14 @@ def rung1_native_linear(
         u_stream, bipolar=True, order=order, input_scale=drive_scale,
     )
     u_scaled = u_scaled.to(device)
-    y_stream = y_stream.to(device)
+    # Device copy for the fabric path. The ESN parity reference below
+    # runs on CPU (ne.ESN has no device handling), so y_stream stays on
+    # CPU -- fitting it against a CUDA target raised a device-mismatch
+    # RuntimeError (Alliance rung-1 preflight).
+    y_dev = y_stream.to(device)
 
     # Parity reference: in-harness ESN with the mapped (leak,
-    # input_scaling) on the identical raw stream.
+    # input_scaling) on the identical raw stream (CPU tensors).
     esn = ne.ESN(
         n_reservoir=hidden_dim, spectral_radius=0.9,
         input_scaling=float(esn_input_scaling), leak=float(esn_leak),
@@ -2792,7 +2796,7 @@ def rung1_native_linear(
     esn.fit(u_stream, y_stream)
     esn_states = esn._run(u_stream).to(device)
     esn_pred = esn_states @ esn.readout_W.to(device) + esn.readout_b.to(device)
-    esn_nrmse = float(ne.nrmse(esn_pred[washout:], y_stream[washout:]))
+    esn_nrmse = float(ne.nrmse(esn_pred[washout:], y_dev[washout:]))
     _, esn_mc = _per_delay_mc(
         esn_states, u_stream.to(device), washout=washout,
         max_delay=max_delay, use_svd_fallback=True,
@@ -2825,7 +2829,7 @@ def rung1_native_linear(
             abs_eigs.extend([float(v) for v in eigs if math.isfinite(float(v))])
         instrument = _instrument_trajectory(
             stage=net.core.stages[0], states_full=states_full,
-            u_seq=u_scaled, y_seq=y_stream, washout=washout,
+            u_seq=u_scaled, y_seq=y_dev, washout=washout,
             jacobian_samples=jacobian_samples,
             t_span=t_span, num_steps=num_steps,
         )
@@ -2840,7 +2844,7 @@ def rung1_native_linear(
         )
         hidden = states_full[:, :hidden_dim].detach()
         X_w = hidden[washout:]
-        y_w = y_stream[washout:]
+        y_w = y_dev[washout:]
         W_h = _ridge_fit_predict(X_w, y_w)
         X_aug = torch.cat(
             [X_w, torch.ones(X_w.shape[0], 1, device=X_w.device)], dim=1,
@@ -2857,7 +2861,7 @@ def rung1_native_linear(
         state_pr_std = _standardized_state_pr(states_full[washout:])
         state_rms = float(states_full[washout:].pow(2).mean().sqrt().item())
         raw = _raw_delay_ridge(
-            u_scaled, y_stream, n_taps=R0_RAW_DELAY_TAPS, washout=washout,
+            u_scaled, y_dev, n_taps=R0_RAW_DELAY_TAPS, washout=washout,
         )
         matched_delta = float(instrument["ridge_nrmse"] - raw["nrmse"])
         pass_mc = bool(mc_total >= RUNG1_PASS_MC_ABOVE)

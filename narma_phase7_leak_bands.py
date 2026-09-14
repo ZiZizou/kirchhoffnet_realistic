@@ -9,7 +9,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-from collections import defaultdict
 from pathlib import Path
 
 import torch
@@ -115,13 +114,46 @@ def ridge_metrics(features: torch.Tensor, target: torch.Tensor, washout: int) ->
 
 def boundary_net_currents(stage, states: torch.Tensor, taps: torch.Tensor) -> torch.Tensor:
     """Per-node net boundary-current vector, recomputed on recorded states."""
-    x, u = states.to(next(stage.parameters()).device), taps.to(next(stage.parameters()).device)
-    dst_x = stage._node_broadcast(x)[:, stage.boundary_dst] if stage.node_activation == "tanh" else x[:, stage.boundary_dst]
-    current = stage.boundary_cell_lib(u[:, stage.boundary_src], dst_x, x_max=stage.x_max)
-    current = current * torch.sigmoid(stage.boundary_z_logits).unsqueeze(0)
-    out = torch.zeros(x.shape[0], HIDDEN_DIM, device=x.device, dtype=current.dtype)
-    out.index_add_(1, stage.boundary_dst, current)
-    return out.cpu()
+    with torch.no_grad():
+        device = next(stage.parameters()).device
+        x, u = states.to(device), taps.to(device)
+        dst_x = stage._node_broadcast(x)[:, stage.boundary_dst] if stage.node_activation == "tanh" else x[:, stage.boundary_dst]
+        current = stage.boundary_cell_lib(u[:, stage.boundary_src], dst_x, x_max=stage.x_max)
+        current = current * torch.sigmoid(stage.boundary_z_logits).unsqueeze(0)
+        out = torch.zeros(x.shape[0], HIDDEN_DIM, device=x.device, dtype=current.dtype)
+        out.index_add_(1, stage.boundary_dst, current)
+        return out.cpu()
+
+
+def causal_delay_augmented_map(j: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the tangent map for hidden state plus seven causal registers.
+
+    The augmented state is ``[x, u[t], ..., u[t-6]]``.  A scalar innovation
+    supplies the new ``u[t+1]``; it affects the first input-tap column of
+    ``b``, while the existing registers shift by one place.  Shapes are
+    checked here so an implementation change fails clearly instead of inside
+    an opaque tensor slice assignment.
+    """
+    n_registers = N_TAPS - 1
+    expected_j, expected_b = (HIDDEN_DIM, HIDDEN_DIM), (HIDDEN_DIM, N_TAPS)
+    if tuple(j.shape) != expected_j or tuple(b.shape) != expected_b:
+        raise ValueError(
+            "unexpected one-sample tangent shapes: "
+            f"J={tuple(j.shape)} (expected {expected_j}), "
+            f"B={tuple(b.shape)} (expected {expected_b})"
+        )
+    n_aug = HIDDEN_DIM + n_registers
+    a = torch.zeros(n_aug, n_aug, dtype=j.dtype, device=j.device)
+    a[:HIDDEN_DIM, :HIDDEN_DIM] = j
+    a[:HIDDEN_DIM, HIDDEN_DIM:] = b[:, 1:]
+    # r_next[0] is supplied by the innovation; r_next[1:] = r_old[:-1].
+    if n_registers > 1:
+        a[HIDDEN_DIM + 1:, HIDDEN_DIM:HIDDEN_DIM + n_registers - 1] = torch.eye(
+            n_registers - 1, dtype=j.dtype, device=j.device,
+        )
+    g = torch.cat((b[:, 0], torch.ones(1, dtype=j.dtype, device=j.device),
+                   torch.zeros(n_registers - 1, dtype=j.dtype, device=j.device)))
+    return a, g
 
 
 def local_linear_metrics(stage, states: torch.Tensor, taps: torch.Tensor, washout: int, n_local: int) -> dict:
@@ -137,18 +169,15 @@ def local_linear_metrics(stage, states: torch.Tensor, taps: torch.Tensor, washou
         rows.append({"rho": float(vals.max()), "eig_pr": float(vals.sum().square() / vals.square().sum().clamp_min(1e-30)), "b_all_pr": eig_pr(torch.linalg.eigvalsh(b @ b.T)), "b_new_scalar_norm": float(torch.linalg.vector_norm(b[:, 0]))})
         # Actual scalar innovation: q_next=[w,q0,...q6].  Build finite-time
         # augmented tangent Gramian and retain only its hidden-state block.
-        w = torch.zeros(32, 32, device=dev); w[:25, :25] = j
-        w[:25, 25:] = b[:, 1:]; w[26:, 25:-1] = torch.eye(7, device=dev)
-        g = torch.cat((b[:, 0], torch.ones(1, device=dev), torch.zeros(6, device=dev)))
-        gram = torch.zeros(32, 32, device=dev)
+        gram = torch.zeros(HIDDEN_DIM + N_TAPS - 1, HIDDEN_DIM + N_TAPS - 1,
+                           dtype=j.dtype, device=dev)
         for k in range(i, min(i + GRAMIAN_HORIZON, states.shape[0] - 1)):
             def fk(xx, qq): return _one_sample_transition(stage, xx.view(1, -1), qq.view(1, -1), dt, N_STEPS)
             xx, qq = states[k].to(dev).detach(), taps[k + 1].to(dev).detach()
             jk, bk = torch.autograd.functional.jacobian(fk, (xx, qq), create_graph=False)
-            a = torch.zeros(32, 32, device=dev); a[:25, :25] = jk; a[:25, 25:] = bk[:, 1:]; a[26:, 25:-1] = torch.eye(7, device=dev)
-            gg = torch.cat((bk[:, 0], torch.ones(1, device=dev), torch.zeros(6, device=dev)))
+            a, gg = causal_delay_augmented_map(jk, bk)
             gram = a @ gram @ a.T + torch.outer(gg, gg)
-        hidden = (gram[:25, :25] + gram[:25, :25].T) * .5
+        hidden = (gram[:HIDDEN_DIM, :HIDDEN_DIM] + gram[:HIDDEN_DIM, :HIDDEN_DIM].T) * .5
         causal.append((eig_pr(torch.linalg.eigvalsh(hidden)), float(torch.trace(hidden))))
     return {"n_local_jacobians": len(rows), "driven_jac_spectral_radius_mean": float(torch.tensor([r["rho"] for r in rows]).mean()), "driven_jac_eig_pr_mean": float(torch.tensor([r["eig_pr"] for r in rows]).mean()), "trajectory_input_jacobian_all_taps_pr_mean": float(torch.tensor([r["b_all_pr"] for r in rows]).mean()), "trajectory_input_jacobian_new_scalar_norm_mean": float(torch.tensor([r["b_new_scalar_norm"] for r in rows]).mean()), "causal_trajectory_controllability_hidden_pr_mean": float(torch.tensor([x[0] for x in causal]).mean()), "causal_trajectory_controllability_hidden_trace_mean": float(torch.tensor([x[1] for x in causal]).mean())}
 
@@ -190,14 +219,15 @@ def main() -> None:
     a = p.parse_args(); a.out.mkdir(parents=True, exist_ok=True)
     seeds = [int(v) for v in a.core_seeds.split(",") if v.strip()]; grid = [float(v) for v in a.uniform_leak_grid.split(",") if v.strip()]
     if not seeds or any(v <= 0 for v in grid): raise ValueError("need core seeds and positive uniform leak candidates")
+    if a.samples <= a.washout + max(20, GRAMIAN_HORIZON) + 1:
+        raise ValueError("samples must exceed washout by at least 21 for MC and local tangent diagnostics")
     # Calibration is a separate, target-free NARMA input realization.  Its
     # scores never choose a band assignment or alter the fixed boundary.
     cal_u, _ = ne.narma(a.samples, order=10, seed=77); cal_taps = delay_bank(ne._scale_drive(cal_u, bipolar=True, order=10, input_scale=1.0))
     u, y = ne.narma(a.samples, order=10, seed=0); taps = delay_bank(ne._scale_drive(u, bipolar=True, order=10, input_scale=1.0))
     rows, calibrations = [], []
     for seed in seeds:
-        base = build_base(seed).to(a.device); stage = base.core.stages[0]
-        baseline_leaks = stage._effective_leak().detach().cpu().clone()
+        base = build_base(seed).to(a.device)
         # Primary condition: replace leaks only, and explicitly do not normalize.
         banded = build_base(seed).to(a.device); band_vals = torch.empty(HIDDEN_DIM)
         for name, nodes in BAND_GROUPS.items(): band_vals[nodes] = BAND_LEAKS[name]

@@ -503,6 +503,7 @@ def memory_capacity(states: torch.Tensor, targets: torch.Tensor,
     return r2_list, mc_total
 
 
+@torch.inference_mode()
 def ridge_readout_diagnostic(
     net: nn.Module,
     u_train: torch.Tensor,
@@ -530,6 +531,11 @@ def ridge_readout_diagnostic(
         washout: Number of initial samples to discard (reservoir convention).
         ridge_l2: Ridge regularization.
         device: 'cpu' or 'cuda'.
+
+    This diagnostic is intentionally inference-only: wrapping both the
+    state rollout and the ridge solve in ``torch.inference_mode()`` prevents
+    inference tensors from entering the differentiable Heun scatter path
+    (``index_add_``) when the diagnostic follows an inference-mode rollout.
 
     Returns:
         Dict with ``ridge_nrmse``, ``ridge_r2``.

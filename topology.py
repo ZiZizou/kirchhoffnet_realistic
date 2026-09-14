@@ -28,6 +28,7 @@ from differential_stage import DifferentialStage
 from cell_library import (
     AntiParallelFreeTanhLibrary,
     FreeTanhLibrary,
+    LinearOTALibrary,
     RealisticTanhLibrary,
     RealisticTanhUpgradeLibrary,
     SimpleEdgeLibrary,
@@ -945,11 +946,12 @@ def prune_stage(
         new_write_idx = [node_remap[int(idx)] for idx in stage._drive_idx.tolist()
                          if int(idx) in node_remap] if drive_surviving else None
 
-    is_simple = isinstance(stage.cell_lib, (SimpleEdgeLibrary, RealisticTanhLibrary, RealisticTanhUpgradeLibrary, FreeTanhLibrary, AntiParallelFreeTanhLibrary))
+    is_simple = isinstance(stage.cell_lib, (SimpleEdgeLibrary, RealisticTanhLibrary, RealisticTanhUpgradeLibrary, FreeTanhLibrary, LinearOTALibrary, AntiParallelFreeTanhLibrary))
     is_simple_classic = isinstance(stage.cell_lib, SimpleEdgeLibrary)
     is_realistic = isinstance(stage.cell_lib, RealisticTanhLibrary)
     is_realistic_upgrade = isinstance(stage.cell_lib, RealisticTanhUpgradeLibrary)
     is_free_tanh = isinstance(stage.cell_lib, FreeTanhLibrary)
+    is_linear_ota = isinstance(stage.cell_lib, LinearOTALibrary)
     is_anti_parallel = isinstance(stage.cell_lib, AntiParallelFreeTanhLibrary)
     if is_simple_classic:
         new_lib = SimpleEdgeLibrary(num_edges=len(new_src), mode=stage.cell_lib._mode)
@@ -979,6 +981,10 @@ def prune_stage(
             bias_enabled=old._bias_enabled,
             parallel_tanh_mult_enabled=old._parallel_tanh_mult_enabled,
         )
+    elif is_linear_ota:
+        old = stage.cell_lib
+        new_lib = LinearOTALibrary(num_edges=len(new_src), gm_min=old.gm_min,
+            gm_max=old.gm_max, isat_min=old.isat_min, isat_max=old.isat_max)
     elif is_anti_parallel:
         old = stage.cell_lib
         new_lib = AntiParallelFreeTanhLibrary(
@@ -1019,6 +1025,9 @@ def prune_stage(
                 isat_min=old_ref.isat_min, isat_max=old_ref.isat_max,
                 bias_enabled=old_ref._bias_enabled,
             )
+        elif isinstance(old_ref, LinearOTALibrary):
+            new_ref_lib = LinearOTALibrary(num_edges=num_nodes_new, gm_min=old_ref.gm_min,
+                gm_max=old_ref.gm_max, isat_min=old_ref.isat_min, isat_max=old_ref.isat_max)
         elif isinstance(old_ref, AntiParallelFreeTanhLibrary):
             new_ref_lib = AntiParallelFreeTanhLibrary(
                 num_edges=num_nodes_new, kappa_min=old_ref.kappa_min, kappa_max=old_ref.kappa_max,
@@ -1329,7 +1338,7 @@ def validate_topology(topo: SparseTopology, max_hidden_density: float = 0.5) -> 
 
 def topology_to_stage(
     topo: SparseTopology,
-    cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | AntiParallelFreeTanhLibrary,
+    cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | LinearOTALibrary | AntiParallelFreeTanhLibrary,
     c_eff: float | None = None,
     x_max: float | None = None,
     clip_current: float | None = None,
@@ -1350,15 +1359,15 @@ def topology_to_stage(
     freeze_temporal_read: bool = False,
     boundary_src: list[int] | None = None,
     boundary_dst: list[int] | None = None,
-    boundary_cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | AntiParallelFreeTanhLibrary | None = None,
+    boundary_cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | LinearOTALibrary | AntiParallelFreeTanhLibrary | None = None,
     enable_ref_edges: bool = False,
     output_ode_src: list[int] | None = None,
     output_ode_dst: list[int] | None = None,
-    output_ode_cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | AntiParallelFreeTanhLibrary | None = None,
+    output_ode_cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | LinearOTALibrary | AntiParallelFreeTanhLibrary | None = None,
     readout_mode: str = "ota_mesh",
     readout_senses_per_node: int = 1,
     readout_sense_src: list[int] | None = None,
-    readout_sense_cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | AntiParallelFreeTanhLibrary | None = None,
+    readout_sense_cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | LinearOTALibrary | AntiParallelFreeTanhLibrary | None = None,
     readout_crossbar_shape: tuple[int, int] | None = None,
     output_ode_node_count: int = 0,
     vca_enabled: bool = False,
@@ -1487,6 +1496,9 @@ def topology_to_stage(
             bias_enabled=cell_lib._bias_enabled,
             parallel_tanh_mult_enabled=cell_lib._parallel_tanh_mult_enabled,
         )
+    elif isinstance(cell_lib, LinearOTALibrary):
+        cell_lib = LinearOTALibrary(num_edges=len(remapped_src), gm_min=cell_lib.gm_min,
+            gm_max=cell_lib.gm_max, isat_min=cell_lib.isat_min, isat_max=cell_lib.isat_max)
     elif isinstance(cell_lib, AntiParallelFreeTanhLibrary):
         cell_lib = AntiParallelFreeTanhLibrary(
             num_edges=len(remapped_src),
@@ -1534,6 +1546,9 @@ def topology_to_stage(
                 bias_enabled=cell_lib._bias_enabled,
                 parallel_tanh_mult_enabled=cell_lib._parallel_tanh_mult_enabled,
             )
+        elif isinstance(cell_lib, LinearOTALibrary):
+            ref_cell_lib = LinearOTALibrary(num_edges=n_ref, gm_min=cell_lib.gm_min,
+                gm_max=cell_lib.gm_max, isat_min=cell_lib.isat_min, isat_max=cell_lib.isat_max)
         elif isinstance(cell_lib, AntiParallelFreeTanhLibrary):
             ref_cell_lib = AntiParallelFreeTanhLibrary(
                 num_edges=n_ref,
@@ -1594,6 +1609,10 @@ def topology_to_stage(
                 # contributes one default-init and one shifted-init sense.
                 with torch.no_grad():
                     readout_sense_cell_lib.gm_raw.data[1::2] += 0.5
+        elif isinstance(readout_sense_cell_lib, LinearOTALibrary):
+            readout_sense_cell_lib = LinearOTALibrary(num_edges=n_sense_clone,
+                gm_min=readout_sense_cell_lib.gm_min, gm_max=readout_sense_cell_lib.gm_max,
+                isat_min=readout_sense_cell_lib.isat_min, isat_max=readout_sense_cell_lib.isat_max)
         elif isinstance(readout_sense_cell_lib, AntiParallelFreeTanhLibrary):
             readout_sense_cell_lib = AntiParallelFreeTanhLibrary(
                 num_edges=n_sense_clone,
@@ -1645,6 +1664,9 @@ def topology_to_stage(
                 bias_enabled=cell_lib._bias_enabled,
                 parallel_tanh_mult_enabled=cell_lib._parallel_tanh_mult_enabled,
             )
+        elif isinstance(cell_lib, LinearOTALibrary):
+            output_ode_cell_lib = LinearOTALibrary(num_edges=n_out_ode, gm_min=cell_lib.gm_min,
+                gm_max=cell_lib.gm_max, isat_min=cell_lib.isat_min, isat_max=cell_lib.isat_max)
         elif isinstance(cell_lib, AntiParallelFreeTanhLibrary):
             output_ode_cell_lib = AntiParallelFreeTanhLibrary(
                 num_edges=n_out_ode,
@@ -2231,6 +2253,10 @@ def build_net_from_config(
                 bias_enabled=cell_lib._bias_enabled,
                 parallel_tanh_mult_enabled=cell_lib._parallel_tanh_mult_enabled,
             )
+        elif isinstance(cell_lib, LinearOTALibrary):
+            boundary_cell_lib = LinearOTALibrary(num_edges=n_boundary,
+                gm_min=cell_lib.gm_min, gm_max=cell_lib.gm_max,
+                isat_min=cell_lib.isat_min, isat_max=cell_lib.isat_max)
         elif isinstance(cell_lib, AntiParallelFreeTanhLibrary):
             boundary_cell_lib = AntiParallelFreeTanhLibrary(
                 num_edges=n_boundary,
@@ -2307,6 +2333,10 @@ def build_net_from_config(
                 bias_enabled=cell_lib._bias_enabled,
                 parallel_tanh_mult_enabled=cell_lib._parallel_tanh_mult_enabled,
             )
+        if isinstance(cell_lib, LinearOTALibrary):
+            return LinearOTALibrary(num_edges=n, gm_min=cell_lib.gm_min,
+                gm_max=cell_lib.gm_max, isat_min=cell_lib.isat_min,
+                isat_max=cell_lib.isat_max)
         if isinstance(cell_lib, AntiParallelFreeTanhLibrary):
             return AntiParallelFreeTanhLibrary(
                 num_edges=n,

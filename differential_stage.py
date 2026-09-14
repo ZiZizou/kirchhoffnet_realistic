@@ -35,6 +35,7 @@ from config import (
 from cell_library import (
     AntiParallelFreeTanhLibrary,
     FreeTanhLibrary,
+    LinearOTALibrary,
     RealisticTanhLibrary,
     RealisticTanhUpgradeLibrary,
     SimpleEdgeLibrary,
@@ -193,7 +194,7 @@ class DifferentialStage(nn.Module):
         num_nodes: int,
         src: list[int],
         dst: list[int],
-        cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | AntiParallelFreeTanhLibrary,
+        cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | LinearOTALibrary | AntiParallelFreeTanhLibrary,
         c_eff: float | None = None,
         x_max: float | None = None,
         clip_current: float | None = None,
@@ -215,16 +216,16 @@ class DifferentialStage(nn.Module):
         freeze_temporal_read: bool = False,
         boundary_src: list[int] | None = None,
         boundary_dst: list[int] | None = None,
-        boundary_cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | AntiParallelFreeTanhLibrary | None = None,
+        boundary_cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | LinearOTALibrary | AntiParallelFreeTanhLibrary | None = None,
         enable_ref_edges: bool = False,
-        ref_cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | AntiParallelFreeTanhLibrary | None = None,
+        ref_cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | LinearOTALibrary | AntiParallelFreeTanhLibrary | None = None,
 output_ode_src: list[int] | None = None,
         output_ode_dst: list[int] | None = None,
-        output_ode_cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | AntiParallelFreeTanhLibrary | None = None,
+        output_ode_cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | LinearOTALibrary | AntiParallelFreeTanhLibrary | None = None,
         readout_mode: str = "ota_mesh",
         readout_senses_per_node: int = 1,
         readout_sense_src: list[int] | None = None,
-        readout_sense_cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | AntiParallelFreeTanhLibrary | None = None,
+        readout_sense_cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | LinearOTALibrary | AntiParallelFreeTanhLibrary | None = None,
         readout_crossbar_shape: tuple[int, int] | None = None,
         vca_enabled: bool = False,
         vca_rank: int = 2,
@@ -2330,7 +2331,7 @@ output_ode_src: list[int] | None = None,
             )
             if hasattr(self.cell_lib, "bias_raw"):
                 device_n += int(self.cell_lib.bias_raw.numel())
-        elif isinstance(self.cell_lib, FreeTanhLibrary):
+        elif isinstance(self.cell_lib, (FreeTanhLibrary, LinearOTALibrary)):
             device_n = (
                 int(self.cell_lib.a_raw.numel())
                 + int(self.cell_lib.b_raw.numel())
@@ -2381,7 +2382,7 @@ output_ode_src: list[int] | None = None,
                 )
                 if hasattr(self.boundary_cell_lib, "bias_raw"):
                     bdev += int(self.boundary_cell_lib.bias_raw.numel())
-            elif isinstance(self.boundary_cell_lib, FreeTanhLibrary):
+            elif isinstance(self.boundary_cell_lib, (FreeTanhLibrary, LinearOTALibrary)):
                 bdev = (
                     int(self.boundary_cell_lib.a_raw.numel())
                     + int(self.boundary_cell_lib.b_raw.numel())

@@ -1948,8 +1948,8 @@ def run_fabric_condition(
         val_y_test: Optional pre-generated validation target.
         cell_library: Name of the cell library to use for this fabric
             condition. One of ``config.CELL_LIBRARIES`` keys (e.g. ``tanh``,
-            ``tanh_free``, ``tanh_realistic``, ``tanh_realistic_upgrade``,
-            ``tanh_anti``, ``relu``). Defaults to ``tanh`` for backward
+            ``tanh_free``, ``linear_ota``, ``tanh_realistic``,
+            ``tanh_realistic_upgrade``, ``tanh_anti``, ``relu``). Defaults to ``tanh`` for backward
             compatibility.
         mapper_lr_scale: LR multiplier for the readout params (E4
             two-timescale screen; 1.0 = legacy single LR).
@@ -2563,10 +2563,11 @@ def parse_args() -> argparse.Namespace:
                         help="Evaluate test-set NRMSE/R^2 every N epochs (default 5). "
                              "Set to 0 to disable.")
     parser.add_argument("--cell-library", type=str, default="tanh",
-                        choices=["tanh", "tanh_free", "tanh_realistic",
+                        choices=["tanh", "tanh_free", "linear_ota", "tanh_realistic",
                                  "tanh_realistic_upgrade", "tanh_anti", "relu"],
                         help="Cell library for fabric conditions (default 'tanh'). "
-                             "'tanh_free' uses FreeTanhLibrary; 'tanh_realistic' uses "
+                             "'tanh_free' uses FreeTanhLibrary; 'linear_ota' uses the "
+                             "linear ESN-form OTA; 'tanh_realistic' uses "
                              "RealisticTanhLibrary; etc. See config.CELL_LIBRARIES.")
     parser.add_argument("--mapper-lr-scale", type=float, default=1.0,
                         help="LR multiplier for the readout params (E4 "

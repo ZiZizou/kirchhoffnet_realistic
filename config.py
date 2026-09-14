@@ -259,6 +259,7 @@ CELL_LIBRARIES = {
     "tanh_realistic": {"cells": {}, "cell_order": ["S"], "device": "tanh_realistic", "BIAS_ENABLED": False},
     "tanh_realistic_upgrade": {"cells": {}, "cell_order": ["S"], "device": "tanh_realistic_upgrade", "BIAS_ENABLED": False},
     "tanh_free": {"cells": {}, "cell_order": ["S"], "device": "tanh_free", "BIAS_ENABLED": True, "PARALLEL_TANH_MULT_ENABLED": False},
+    "linear_ota": {"cells": {}, "cell_order": ["S"], "device": "linear_ota"},
     "tanh_anti": {"cells": {}, "cell_order": ["S"], "device": "tanh_anti", "THETA_ENABLED": False},
 }
 

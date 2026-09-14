@@ -42,6 +42,7 @@ __all__ = [
     "RealisticTanhLibrary",
     "RealisticTanhUpgradeLibrary",
     "FreeTanhLibrary",
+    "LinearOTALibrary",
     "AntiParallelFreeTanhLibrary",
     "make_cell_library",
 ]
@@ -434,6 +435,48 @@ class FreeTanhLibrary(nn.Module):
         pass
 
 
+class LinearOTALibrary(nn.Module):
+    """Strictly linear per-edge OTA for the ESN-form control.
+
+    ``I = Isat * gm * s * (A * Vsrc - B * Vdst)``.  ``Isat`` is retained
+    only as a bounded current-scale parameter; this cell has no per-edge
+    saturation or resistive shunt.  Combined with node activation, KCL is a
+    linear mix of bounded node signals.
+    """
+
+    def __init__(self, num_edges: int, gm_min: float | None = None,
+                 gm_max: float | None = None, isat_min: float | None = None,
+                 isat_max: float | None = None) -> None:
+        super().__init__()
+        self.gm_min = float(gm_min if gm_min is not None else TANH_REALISTIC_GM_MIN)
+        self.gm_max = float(gm_max if gm_max is not None else TANH_REALISTIC_GM_MAX)
+        self.isat_min = float(isat_min if isat_min is not None else TANH_REALISTIC_ISAT_MIN)
+        self.isat_max = float(isat_max if isat_max is not None else TANH_REALISTIC_ISAT_MAX)
+        if self.gm_max <= self.gm_min or self.isat_max <= self.isat_min:
+            raise ValueError("LinearOTALibrary requires gm_max > gm_min and isat_max > isat_min")
+        self.a_raw = nn.Parameter(torch.zeros(num_edges))
+        self.b_raw = nn.Parameter(torch.zeros(num_edges))
+        self.s_raw = nn.Parameter(torch.randn(num_edges) * 0.1)
+        self.gm_raw = nn.Parameter(torch.full((num_edges,), -5.0))
+        self.isat_raw = nn.Parameter(torch.full((num_edges,), -5.0))
+        self._beta_softness = float(PHYS["beta_softness"])
+
+    def forward(self, x_src: torch.Tensor, x_dst: torch.Tensor, x_max: float) -> torch.Tensor:
+        A = F.softplus(self.a_raw).unsqueeze(0)
+        B = F.softplus(self.b_raw).unsqueeze(0)
+        s = torch.sign(self.s_raw)
+        s_ste = s + self.s_raw - self.s_raw.detach()
+        gm = self.gm_min + (self.gm_max - self.gm_min) * torch.sigmoid(self.gm_raw)
+        isat = self.isat_min + (self.isat_max - self.isat_min) * torch.sigmoid(self.isat_raw)
+        current = isat.unsqueeze(0) * gm.unsqueeze(0) * s_ste.unsqueeze(0) * (A * x_src - B * x_dst)
+        gate_src = torch.sigmoid((x_max - x_src.abs()) / self._beta_softness)
+        gate_dst = torch.sigmoid((x_max - x_dst.abs()) / self._beta_softness)
+        return gate_src * gate_dst * current
+
+    def compile_forward(self, backend: str = "inductor"):
+        pass
+
+
 class AntiParallelFreeTanhLibrary(nn.Module):
     """Per-edge rectified differential OTA slice for antiparallel edge fabrics.
 
@@ -555,7 +598,7 @@ def make_cell_library(
     gm_max: float | None = None,
     isat_min: float | None = None,
     isat_max: float | None = None,
-) -> SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | AntiParallelFreeTanhLibrary:
+) -> SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | LinearOTALibrary | AntiParallelFreeTanhLibrary:
     """Factory: returns the appropriate edge-library class.
 
     ``relu`` / ``tanh`` → ``SimpleEdgeLibrary``.
@@ -607,6 +650,9 @@ def make_cell_library(
             gm_min=gm_min, gm_max=gm_max,
             isat_min=isat_min, isat_max=isat_max,
         )
+    if library_name == "linear_ota":
+        return LinearOTALibrary(num_edges=n, gm_min=gm_min, gm_max=gm_max,
+                                isat_min=isat_min, isat_max=isat_max)
     if library_name == "tanh_anti":
         theta_enabled = bool(CELL_LIBRARIES[library_name].get("THETA_ENABLED", False))
         return AntiParallelFreeTanhLibrary(
@@ -616,5 +662,5 @@ def make_cell_library(
     raise ValueError(
         f"Unknown cell library: {library_name!r}. "
         f"Available: 'relu', 'tanh', 'tanh_realistic', "
-        f"'tanh_realistic_upgrade', 'tanh_free', 'tanh_anti'."
+        f"'tanh_realistic_upgrade', 'tanh_free', 'linear_ota', 'tanh_anti'."
     )

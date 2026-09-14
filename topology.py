@@ -1756,6 +1756,7 @@ def build_net_from_preset(
     freeze_temporal_read: bool = False,
     enable_skip_linear: bool = False,
     boundary_fan_out: dict[int, list[int]] | None = None,
+    allow_boundary_target_overlap: bool = False,
     enable_ref_edges: bool = False,
     enable_temporal_readout: bool = False,
     readout_mode: str = "ota_mesh",
@@ -1904,6 +1905,7 @@ def build_net_from_preset(
         freeze_temporal_read=freeze_temporal_read,
         enable_skip_linear=enable_skip_linear,
         boundary_fan_out=boundary_fan_out,
+        allow_boundary_target_overlap=allow_boundary_target_overlap,
         enable_ref_edges=enable_ref_edges,
         enable_temporal_readout=enable_temporal_readout,
         readout_mode=readout_mode,
@@ -1944,6 +1946,7 @@ def build_net_from_config(
     freeze_temporal_read: bool = False,
     enable_skip_linear: bool = False,
     boundary_fan_out: dict[int, list[int]] | None = None,
+    allow_boundary_target_overlap: bool = False,
     enable_ref_edges: bool = False,
     enable_temporal_readout: bool = False,
     readout_mode: str = "ota_mesh",
@@ -2008,6 +2011,12 @@ def build_net_from_config(
     ``freeze_boundary`` can be specified either explicitly or via
     ``cfg['freeze_boundary']``. Explicit kwargs take precedence. No-op when
     boundary fan-out is not configured.
+
+    ``allow_boundary_target_overlap`` (``False`` default) permits more than
+    one boundary terminal to inject into the same hidden node. Each terminal
+    remains a distinct boundary OTA and its current sums through KCL. The
+    legacy duplicate-target guard remains the default; opt in for multi-tap
+    input banks where several delayed voltage terminals drive every node.
 
     ``freeze_temporal_read`` can be specified either explicitly or via
     ``cfg['freeze_temporal_read']``. Explicit kwargs take precedence.
@@ -2192,7 +2201,9 @@ def build_net_from_config(
                 f"boundary_fan_out: missing input indices {missing_b}; "
                 f"must cover [0, {in_dim})"
             )
-        # Validate target indices are in [0, n_first_hid) and unique across inputs.
+        # Validate target indices are in [0, n_first_hid). Legacy boundary
+        # maps require unique targets; multi-tap boundary banks may opt in to
+        # overlapping terminals whose currents add through KCL.
         all_b_targets: list[int] = []
         for i, targets in boundary_fan_out.items():
             if i < 0 or i >= in_dim:
@@ -2206,7 +2217,7 @@ def build_net_from_config(
                         f"range [0, {n_first_hid})"
                     )
                 all_b_targets.append(t)
-        if len(all_b_targets) != len(set(all_b_targets)):
+        if not allow_boundary_target_overlap and len(all_b_targets) != len(set(all_b_targets)):
             dupes = sorted(
                 {t for t in all_b_targets if all_b_targets.count(t) > 1}
             )

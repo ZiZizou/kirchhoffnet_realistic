@@ -1941,9 +1941,11 @@ output_ode_src: list[int] | None = None,
             t_span: Integration window duration per sample.
             num_steps: Heun steps per sample.
             u_seq: Input sequence. Accepted shapes:
-                - ``(T, 1)`` — eval mode, single stream (B=1)
-                - ``(B, T)`` — batched, no explicit input-dim axis
-                - ``(B, T, 1)`` — batched with explicit input-dim axis
+                - ``(T,)`` or ``(T, D)`` — eval mode, single stream
+                  (``B=1``), with ``D`` boundary terminals per sample.
+                - ``(B, T)`` — batched scalar-input sequence.
+                - ``(B, T, D)`` — batched sequence with ``D`` boundary
+                  terminals per sample.
 
         Returns:
             Final states at each sample boundary, shape ``(T, B, N)``
@@ -1952,13 +1954,26 @@ output_ode_src: list[int] | None = None,
         dt = t_span / float(num_steps)
         B = x0.shape[0]
 
-        # Determine (batched, T) from u_seq shape.
+        # Determine (batched, T) from u_seq shape.  For a single stream, a
+        # rank-2 tensor is ``(T, D)`` rather than a degenerate batched
+        # ``(1, T)`` tensor when it has the configured multi-terminal width.
+        # This lets a physical delay bank drive distinct boundary terminals
+        # without changing the scalar-input path.
+        n_input_terms = (
+            int(self.boundary_src.max().item()) + 1
+            if self._has_boundary and self.boundary_src.numel() > 0
+            else 1
+        )
         # ``batched`` is True when the first axis is the batch dim.
         if u_seq.dim() == 3:
             batched = (u_seq.shape[0] == B)
             T = u_seq.shape[1] if batched else u_seq.shape[0]
         elif u_seq.dim() == 2:
-            batched = (u_seq.shape[0] == B)
+            is_single_stream_bank = (
+                B == 1 and n_input_terms > 1
+                and u_seq.shape[1] == n_input_terms
+            )
+            batched = (u_seq.shape[0] == B) and not is_single_stream_bank
             T = u_seq.shape[1] if batched else u_seq.shape[0]
         else:
             # 1D: assume (T,) — single-stream eval, B=1
@@ -1973,7 +1988,7 @@ output_ode_src: list[int] | None = None,
                 if u_seq.dim() == 1:
                     u_t = u_seq[t].view(1, 1)
                 else:
-                    u_t = u_seq[t].view(1, 1)
+                    u_t = u_seq[t].unsqueeze(0)  # (1, D)
             else:
                 # u_seq is (B, T) or (B, T, 1)
                 if u_seq.dim() == 2:

@@ -52,7 +52,17 @@ def _jacobian_at_zero(
 
     n_nodes = int(stage.num_nodes)
     x0 = torch.zeros(n_nodes, device=device, dtype=torch.float32)
-    u_next = torch.zeros(1, 1, device=device, dtype=torch.float32)
+    # A boundary bank has one ideal input voltage per terminal.  The
+    # Jacobian is still evaluated at the all-zero operating point, but the
+    # probe must preserve that terminal width: indexing boundary_src into a
+    # legacy ``(1, 1)`` input fails as soon as a delay bank uses tap 1+.
+    boundary_src = getattr(stage, "boundary_src", None)
+    n_input_terms = (
+        int(boundary_src.max().item()) + 1
+        if boundary_src is not None and boundary_src.numel() > 0
+        else 1
+    )
+    u_next = torch.zeros(1, n_input_terms, device=device, dtype=torch.float32)
     dt = float(t_span) / float(num_steps)
 
     def transition_map(x_flat: torch.Tensor) -> torch.Tensor:

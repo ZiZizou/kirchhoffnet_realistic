@@ -1058,6 +1058,7 @@ def prune_stage(
         vca_rank=VCA["rank"],
         vca_in_dim=0,
         core_refresh_interval=int(getattr(stage, "core_refresh_interval", 0)),
+        node_activation=str(getattr(stage, "node_activation", "none")),
     )
 
     if transfer_params:
@@ -1369,6 +1370,7 @@ def topology_to_stage(
     vca_bias: bool | None = None,
     vca_use_hidden: bool = False,
     core_refresh_interval: int = 0,
+    node_activation: str = "none",
 ) -> tuple[DifferentialStage, list[int], dict[int, int]]:
     """Convert a SparseTopology into a DifferentialStage.
 
@@ -1702,6 +1704,7 @@ def topology_to_stage(
         vca_bias=vca_bias,
         vca_use_hidden=vca_use_hidden,
         core_refresh_interval=core_refresh_interval,
+        node_activation=node_activation,
     )
     return stage, active_nodes, id_map
 
@@ -1945,6 +1948,9 @@ def build_net_from_config(
     dynamic_leak: bool = False,
     dynamic_leak_input_proj: bool = False,
     boundary_first_stage_only: bool = False,
+    node_activation: str | None = None,
+    allow_experimental_cells: bool = False,
+    no_clip: bool = False,
 ):
     """Build a KirchhoffNetWithIO from a full config dict.
 
@@ -2016,6 +2022,15 @@ def build_net_from_config(
     ``OutputMapper`` projection. Requires all stages to have the same
     width. Mutually exclusive with ``decoder_type='residual_tanh'`` and
     ``grouped_readout``.
+
+    ``node_activation`` (narma-node-activation plan, default ``"none"``):
+    per-node bounding of the voltages the edges mix (``"tanh"`` broadcasts
+    ``Y = x_max * tanh(x / x_max)``). ``"none"`` is byte-identical legacy;
+    ``"identity"`` is a named no-op for ablations. Resolved cfg dict >
+    explicit kwarg. Any non-``"none"`` value additionally requires
+    ``allow_experimental_cells=True`` (narma-cell-isolation spec) —
+    otherwise ``ValueError`` — so the static train path cannot opt in.
+    Only the NARMA ``_build_fabric_net`` path passes the guard.
     """
     if leak_mode is None:
         leak_mode = cfg.get("leak_mode", "programmable")
@@ -2049,6 +2064,24 @@ def build_net_from_config(
     vca_use_hidden_effective = bool(cfg.get("vca_use_hidden", vca_use_hidden))
     dynamic_leak_effective = bool(cfg.get("dynamic_leak", dynamic_leak))
     dynamic_leak_input_proj_effective = bool(cfg.get("dynamic_leak_input_proj", dynamic_leak_input_proj))
+    # narma-node-activation (plan + narma-cell-isolation spec): cfg dict >
+    # explicit kwarg. Any non-"none" value requires allow_experimental_cells
+    # (only the NARMA _build_fabric_net path passes it); the static
+    # train_script path can never opt in, so its builds stay byte-identical.
+    _node_act_raw = cfg.get("node_activation", node_activation)
+    node_activation_effective = str(_node_act_raw) if _node_act_raw is not None else "none"
+    if node_activation_effective not in ("none", "tanh", "identity"):
+        raise ValueError(
+            f"node_activation must be 'none', 'tanh', or 'identity', "
+            f"got {node_activation_effective!r}"
+        )
+    if node_activation_effective != "none" and not bool(allow_experimental_cells):
+        raise ValueError(
+            "node_activation='tanh'/'identity' is NARMA-experimental "
+            "(narma-cell-isolation spec): pass allow_experimental_cells=True "
+            "from the NARMA _build_fabric_net path. The static train path "
+            "must stay on node_activation='none'."
+        )
     if core_refresh_interval < 0:
         raise ValueError(
             f"core_refresh_interval must be >= 0, got {core_refresh_interval}"
@@ -2527,6 +2560,8 @@ def build_net_from_config(
             vca_use_hidden=vca_use_hidden_effective,
             dynamic_leak=dynamic_leak_effective,
             dynamic_leak_input_proj=dynamic_leak_input_proj_effective,
+            node_activation=node_activation_effective,
+            clip_current=(0.0 if no_clip else None),
             x_max=x_max,
             c_eff=c_eff,
             learnable_clip_sharpness=learnable_clip_sharpness,

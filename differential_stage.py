@@ -235,6 +235,7 @@ output_ode_src: list[int] | None = None,
         vca_bias: bool | None = None,
         vca_use_hidden: bool = False,
         core_refresh_interval: int = 0,
+        node_activation: str = "none",
     ) -> None:
         super().__init__()
         self.num_nodes = int(num_nodes)
@@ -254,6 +255,28 @@ output_ode_src: list[int] | None = None,
         #          ``freeze_boundary`` / ``freeze_temporal_read`` /
         #          resistive-shunt paths which keep their own dynamic /
         #          frozen semantics.
+        # Node activation (narma-node-activation plan): per-node bounding
+        # applied to the voltages the edges MIX, before edge-current
+        # computation. ``"none"`` (default) is byte-identical legacy
+        # behavior; ``"tanh"`` broadcasts ``Y = x_max * tanh(x / x_max)``
+        # (Hopfield/ESN structure: edges always see bounded inputs, and the
+        # growing pre-activation self-regulates effective gain via sech^2);
+        # ``"identity"`` is a named no-op for the ablation matrix (forward
+        # matches ``"none"`` exactly; the config tag distinguishes them).
+        # Stored as a plain attribute: no parameter, no state_dict change.
+        # NOTE: when enabled, the cell-library compliance gates see the
+        # bounded broadcast (|Y| < x_max strictly), so they evaluate to ~1
+        # — node activation SUPERSEDES compliance gating by construction.
+        # Leak, clip, and drive terms in rhs intentionally keep reading the
+        # raw pre-activation ``x``. Boundary ``u`` terminals and the Vref
+        # rails are ideal voltage sources, never state nodes: they are NOT
+        # transformed.
+        if node_activation not in ("none", "tanh", "identity"):
+            raise ValueError(
+                f"node_activation must be 'none', 'tanh', or 'identity', "
+                f"got {node_activation!r}"
+            )
+        self.node_activation = str(node_activation)
         if core_refresh_interval < 0:
             raise ValueError(
                 f"core_refresh_interval must be >= 0, got {core_refresh_interval}"
@@ -1118,6 +1141,10 @@ output_ode_src: list[int] | None = None,
             return None
         u_src0 = u[:, self.boundary_src]
         x_dst0 = x0[:, self.boundary_dst]
+        # Node activation: the state-side input reads the bounded broadcast;
+        # the boundary terminal ``u`` is an ideal source, never transformed.
+        if self.node_activation == "tanh":
+            x_dst0 = self._node_broadcast(x0)[:, self.boundary_dst]
         cell_lib = self.boundary_cell_lib
         gln_rails = getattr(self, "gln_rails", None)
         if gln_rails is not None and "boundary" in gln_rails.families:
@@ -1177,6 +1204,11 @@ output_ode_src: list[int] | None = None,
             return None
         x_src0 = x0[:, self.output_ode_src]
         x_dst0 = x0[:, self.output_ode_dst]
+        # Node activation: both readout endpoints are state nodes.
+        if self.node_activation == "tanh":
+            _xb = self._node_broadcast(x0)
+            x_src0 = _xb[:, self.output_ode_src]
+            x_dst0 = _xb[:, self.output_ode_dst]
         cell_lib = self.output_ode_cell_lib
         if hasattr(cell_lib, "forward_tanh"):
             i_edge = cell_lib.forward_tanh(
@@ -1216,6 +1248,10 @@ output_ode_src: list[int] | None = None,
         if not self._has_shared_readout or self.readout_sense_src.numel() == 0:
             return None
         x_src0 = x0[:, self.readout_sense_src]            # [B, n_sense]
+        # Node activation: the sense source is a state node; the Vref dst
+        # below is an ideal rail, never transformed.
+        if self.node_activation == "tanh":
+            x_src0 = self._node_broadcast(x0)[:, self.readout_sense_src]
         cell_lib = self.readout_sense_cell_lib
         # Sense destination is the private Vref rail (an ideal voltage
         # source held constant during integration). Pass it as the
@@ -1278,6 +1314,12 @@ output_ode_src: list[int] | None = None,
         """
         x_src0 = x_src_state[:, self.src]
         x_dst0 = x_src_state[:, self.dst]
+        # Node activation: frozen core precompute reads the bounded
+        # broadcast, matching the dynamic rhs path exactly.
+        if self.node_activation == "tanh":
+            _xb = self._node_broadcast(x_src_state)
+            x_src0 = _xb[:, self.src]
+            x_dst0 = _xb[:, self.dst]
         if self._has_resistive and hasattr(self.cell_lib, "forward_tanh"):
             i_edge = self.cell_lib.forward_tanh(
                 x_src=x_src0, x_dst=x_dst0, x_max=self.x_max,
@@ -1298,6 +1340,19 @@ output_ode_src: list[int] | None = None,
         if not self.read_only_source:
             acc_const.index_add_(1, self.src, -i_edge_f32)
         return acc_const.to(dtype=x_src_state.dtype)
+
+    def _node_broadcast(self, x: torch.Tensor) -> torch.Tensor:
+        """Bounded node broadcast for edge mixing (narma-node-activation).
+
+        ``"tanh"`` returns ``Y = x_max * tanh(x / x_max)`` — the voltages
+        the edges mix. ``"none"`` and ``"identity"`` return ``x`` unchanged
+        (the latter is a named no-op for ablation tagging). Callers gather
+        ``Y[:, idx]`` for every cell-library input that reads a STATE node;
+        boundary ``u`` terminals and Vref rails bypass this helper.
+        """
+        if self.node_activation == "tanh":
+            return self.x_max * torch.tanh(x / self.x_max)
+        return x
 
     def clip_sharpness(self) -> float | torch.Tensor:
         """Live soft-rail clip sharpness ``s`` (denominator of the sigmoid rails).
@@ -1394,6 +1449,15 @@ output_ode_src: list[int] | None = None,
         """
         x_src = x[:, self.src]
         x_dst = x[:, self.dst]
+        # Node activation (narma-node-activation): every cell-library input
+        # below that reads a STATE node uses the bounded broadcast ``xb``.
+        # Leak, clip, and drive keep the raw pre-activation ``x``; boundary
+        # ``u`` and Vref rails are ideal sources and bypass the transform.
+        # When ``node_activation="none"`` (default) ``xb is x``: byte-identical.
+        xb = self._node_broadcast(x)
+        if self.node_activation == "tanh":
+            x_src = xb[:, self.src]
+            x_dst = xb[:, self.dst]
 
         # GLN rails (F2): compute the rail activations once per stage entry
         # (u is constant per sample during the ODE integration) and reuse
@@ -1480,6 +1544,8 @@ output_ode_src: list[int] | None = None,
         if self._has_boundary and u is not None and self.boundary_src.numel() > 0:
             u_src = u[:, self.boundary_src]
             x_dst_b = x[:, self.boundary_dst]
+            if self.node_activation == "tanh":
+                x_dst_b = xb[:, self.boundary_dst]
             boundary_mask = torch.sigmoid(self.boundary_z_logits)  # [Eb]
             if i_boundary_const is None:
                 # Dynamic path: full cell forward (tanh + resistive shunt).
@@ -1545,8 +1611,11 @@ output_ode_src: list[int] | None = None,
         if self._has_ref:
             vref = torch.sigmoid(self.raw_vref) * self.x_max  # [1], in [0, x_max]
             vref_expanded = vref.view(1, 1).expand(x.size(0), self.num_nodes)  # [B, N]
+            # Node activation: the state-side dst reads the broadcast; the
+            # Vref src is an ideal rail, never transformed.
+            x_ref_dst = xb if self.node_activation == "tanh" else x
             i_ref = self.ref_cell_lib(
-                x_src=vref_expanded, x_dst=x, x_max=self.x_max,
+                x_src=vref_expanded, x_dst=x_ref_dst, x_max=self.x_max,
             )  # [B, N]
             ref_mask = torch.sigmoid(self.ref_z_logits)  # [N]
             i_ref = i_ref * ref_mask.unsqueeze(0)  # [B, N]
@@ -1567,6 +1636,9 @@ output_ode_src: list[int] | None = None,
         if self._has_output_ode and self.output_ode_src.numel() > 0:
             x_src_o = x[:, self.output_ode_src]  # hidden (read-only)
             x_dst_o = x[:, self.output_ode_dst]  # output ODE (writable)
+            if self.node_activation == "tanh":
+                x_src_o = xb[:, self.output_ode_src]
+                x_dst_o = xb[:, self.output_ode_dst]
             out_mask = torch.sigmoid(self.output_ode_z_logits)  # [Eo]
             if i_readout_const is None:
                 # Dynamic path: full cell forward (tanh + resistive shunt).
@@ -1621,6 +1693,8 @@ output_ode_src: list[int] | None = None,
             W = self.readout_crossbar_W                    # [d_out, n_sense]
             sense_mask = torch.sigmoid(self.readout_sense_z_logits)  # [n_sense]
             x_j = x[:, self.readout_sense_src]             # [B, n_sense]
+            if self.node_activation == "tanh":
+                x_j = xb[:, self.readout_sense_src]
             vref = (torch.sigmoid(self.raw_vref_sense) * self.x_max).to(x.dtype)
             x_dst_s = vref.view(1, 1).expand_as(x_j)
             if i_readout_const is None:
@@ -2132,6 +2206,11 @@ output_ode_src: list[int] | None = None,
         if self.freeze_read:
             x_src0 = x0[:, self.src]
             x_dst0 = x0[:, self.dst]
+            # Node activation: frozen DEQ precompute matches the rhs path.
+            if self.node_activation == "tanh":
+                _xb0 = self._node_broadcast(x0)
+                x_src0 = _xb0[:, self.src]
+                x_dst0 = _xb0[:, self.dst]
             i_edge = self.cell_lib(x_src=x_src0, x_dst=x_dst0, x_max=self.x_max)
             edge_mask = torch.sigmoid(self.z_logits)
             if self.budget_enabled:

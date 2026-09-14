@@ -1598,6 +1598,10 @@ def _build_fabric_net(
     num_stages: int = 1,
     interstage_activation: str = "none",
     boundary_first_stage_only: bool = True,
+    node_activation: str = "none",
+    spectral_radius_target: float | None = None,
+    spectral_norm_passes: int = 15,
+    no_clip: bool = False,
 ) -> tuple[nn.Module, float, int]:
     """Build the NARMA fabric net (preset + topology + optional compile).
 
@@ -1666,6 +1670,20 @@ def _build_fabric_net(
     stage 1 only (``boundary_first_stage_only``); readout reads the
     LAST stage's accumulator. Training/eval/state-collection dispatch
     to ``KirchhoffNet.forward_sequence`` when ``num_stages > 1``.
+
+    ``node_activation`` (narma-node-activation Step 1): per-node bounding
+    of the voltages the edges mix (``"tanh"`` broadcasts
+    ``Y = x_max * tanh(x / x_max)``). ``"none"`` (default) is legacy;
+    ``"identity"`` is a named no-op for ablations. Threaded with
+    ``allow_experimental_cells=True`` (this IS the NARMA path, the sole
+    holder of the guard); the static train path can never reach it.
+
+    ``spectral_radius_target`` (narma-node-activation Step 2): when not
+    ``None``, runs the ``normalize_spectral_radius`` init hook post-build
+    (shifts ``gm_raw`` so each stage's Heun-map Jacobian at ``x=0``
+    approaches the target, up to ``spectral_norm_passes`` passes with
+    early-stop on tol). The per-stage report is stashed as
+    ``net.spectral_norm_report`` (``None`` when the hook is off).
     """
     base = PRESET_NARMA20 if order == 20 else PRESET_NARMA10
     if t_span is None:
@@ -1712,6 +1730,13 @@ def _build_fabric_net(
     if vca_use_hidden and not vca_core_enabled:
         print("[narma] --vca-use-hidden implies --vca-core (auto-enabled).")
         vca_core_enabled = True
+    # narma-node-activation: validate early so a typo fails before the
+    # (expensive) build; the builder re-validates under its own guard.
+    if node_activation not in ("none", "tanh", "identity"):
+        raise ValueError(
+            f"node_activation must be 'none', 'tanh', or 'identity', "
+            f"got {node_activation!r}"
+        )
     torch.manual_seed(seed)
     # Resolve effective boundary fan-out: explicit override wins over the
     # preset default. ``None`` keeps ``preset["boundary_fan_out"]`` (the
@@ -1764,6 +1789,9 @@ def _build_fabric_net(
             dynamic_leak=dynamic_leak,
             interstage_activation=interstage_activation,
             boundary_first_stage_only=boundary_first_stage_only,
+            node_activation=node_activation,
+            allow_experimental_cells=True,
+            no_clip=no_clip,
         )
     elif readout == "temporal":
         net = build_net_from_config(
@@ -1780,16 +1808,62 @@ def _build_fabric_net(
             dynamic_leak=dynamic_leak,
             interstage_activation=interstage_activation,
             boundary_first_stage_only=boundary_first_stage_only,
+            node_activation=node_activation,
+            allow_experimental_cells=True,
+            no_clip=no_clip,
         )
     else:
         raise ValueError(
             f"_build_fabric_net: readout must be 'temporal' or 'dense', "
             f"got {readout!r}"
         )
+    # narma-node-activation Step 2: single-shot spectral normalization,
+    # post-build, pre-training. Stashed on the net for results bookkeeping.
+    # run_fabric_condition re-applies it AFTER the gain/leak fills (which
+    # overwrite gm_raw/isat_raw/leak), so this builder-level pass is the
+    # final word only when no fills follow (eval path, direct callers).
+    net.spectral_norm_report = None
+    if spectral_radius_target is not None:
+        _apply_spectral_norm(
+            net, float(spectral_radius_target), t_span, num_steps,
+            tag="post-build", max_passes=int(spectral_norm_passes),
+        )
     if compile_sequence:
         for stage in net.core.stages:
             stage.enable_sequence_compile()
     return net, t_span, num_steps
+
+
+def _apply_spectral_norm(
+    net: nn.Module,
+    target: float,
+    t_span: float,
+    num_steps: int,
+    *,
+    tag: str,
+    max_passes: int = 15,
+) -> None:
+    """Run the spectral hook (up to ``max_passes``), stash + log the report.
+
+    Shared by the ``_build_fabric_net`` post-build pass (``tag="post-build"``)
+    and the ``run_fabric_condition`` post-fill re-application
+    (``tag="post-fill"``). The report lands on ``net.spectral_norm_report``
+    so results bookkeeping always reads the LAST application.
+    """
+    from narma_spectral_norm import normalize_spectral_radius as _nsr
+    net.spectral_norm_report = _nsr(
+        net, target_sr=float(target),
+        t_span=t_span, num_steps=num_steps,
+        max_passes=int(max_passes),
+    )
+    for _row in net.spectral_norm_report["stages"]:
+        print(
+            f"[narma] spectral-norm({tag}) stage{_row['stage_index']}: "
+            f"rho {_row['sr_before']:.4f} -> {_row['sr_after']:.4f} "
+            f"(target {net.spectral_norm_report['target_sr']:.2f}, "
+            f"passes {_row['passes']}/{net.spectral_norm_report['max_passes']}"
+            f"{'; ' + _row['note'] if _row['note'] else ''})"
+        )
 
 
 def run_fabric_condition(
@@ -1833,6 +1907,11 @@ def run_fabric_condition(
     interstage_activation: str = "none",
     gain_init: float | None = None,
     leak_init: str | float | None = None,
+    node_activation: str = "none",
+    spectral_radius_target: float | None = None,
+    spectral_norm_passes: int = 15,
+    isat_init: float | None = None,
+    no_clip: bool = False,
 ) -> dict[str, Any]:
     """Train one fabric condition and return its results.
 
@@ -1909,6 +1988,10 @@ def run_fabric_condition(
         vca_core_enabled=vca_core_enabled, vca_use_hidden=vca_use_hidden,
         dynamic_leak=dynamic_leak,
         num_stages=num_stages, interstage_activation=interstage_activation,
+        node_activation=node_activation,
+        spectral_radius_target=spectral_radius_target,
+        spectral_norm_passes=spectral_norm_passes,
+        no_clip=no_clip,
     )
     if dynamic_leak and leak_init is not None:
         print("[narma] WARNING: --dynamic-leak is on; --leak-init "
@@ -1959,6 +2042,31 @@ def run_fabric_condition(
             net, gm_init=_cur_gm, isat_init=_cur_gm,
             leak_mode=leak_init,
             raw_leak_init_seed=int(seed),
+        )
+    # narma-node-activation Step 3: asymmetric isat fill. Applied AFTER
+    # --gain-init (which fills gm+isat symmetrically) so the proposal's
+    # gate config (gm_raw=-1, isat_raw=-5) is expressible. None = untouched.
+    if isat_init is not None:
+        _is = float(isat_init)
+        for _stage in net.core.stages:
+            for _lib_name in (
+                "cell_lib", "boundary_cell_lib", "output_ode_cell_lib",
+            ):
+                _lib = getattr(_stage, _lib_name, None)
+                if _lib is None or not hasattr(_lib, "isat_raw"):
+                    continue
+                with torch.no_grad():
+                    _lib.isat_raw.data.fill_(_is)
+    # narma-node-activation Step 2 ordering: the fills above overwrite
+    # gm_raw/isat_raw/leak, so a builder-level spectral pass is stale
+    # whenever any fill ran. Re-apply LAST so sr_after reflects the true
+    # training start point (report overwritten on the net).
+    if spectral_radius_target is not None and (
+        gain_init is not None or isat_init is not None or leak_init is not None
+    ):
+        _apply_spectral_norm(
+            net, float(spectral_radius_target), t_span, num_steps,
+            tag="post-fill", max_passes=int(spectral_norm_passes),
         )
 
     # ---- (Optional) Ridge-on-frozen-states diagnostic BEFORE training ----
@@ -2094,6 +2202,22 @@ def run_fabric_condition(
         "vca_core_enabled": bool(vca_core_enabled),
         "vca_use_hidden": bool(vca_use_hidden),
         "dynamic_leak": bool(dynamic_leak),
+        # narma-node-activation bookkeeping (None/absent = hook off).
+        "node_activation": str(node_activation),
+        "no_clip": bool(no_clip),
+        "spectral_radius_target": (
+            None if spectral_radius_target is None
+            else float(spectral_radius_target)
+        ),
+        "spectral_norm_passes": int(spectral_norm_passes),
+        "sr_before": (
+            None if getattr(net, "spectral_norm_report", None) is None
+            else float(net.spectral_norm_report["stages"][0]["sr_before"])
+        ),
+        "sr_after": (
+            None if getattr(net, "spectral_norm_report", None) is None
+            else float(net.spectral_norm_report["stages"][0]["sr_after"])
+        ),
         # Phase-4 depth bookkeeping.
         "num_stages": int(len(net.core.stages)),
         "interstage_activation": str(interstage_activation),
@@ -2102,6 +2226,9 @@ def run_fabric_condition(
         # reader which legs were deliberately pinned to a starting point.
         "gain_init": (
             None if gain_init is None else float(gain_init)
+        ),
+        "isat_init": (
+            None if isat_init is None else float(isat_init)
         ),
         "leak_init": (
             None if leak_init is None else str(leak_init)
@@ -2532,6 +2659,40 @@ def parse_args() -> argparse.Namespace:
                              "leak leak_eff = softplus(a*x + b*u + c) with "
                              "a=b=0, c=raw_leak_init at init. Epoch-0 "
                              "forward is bit-identical to the static leak.")
+    parser.add_argument("--node-activation", dest="node_activation",
+                        type=str, default="none",
+                        choices=("none", "tanh", "identity"),
+                        help="narma-node-activation Step 1: per-node bound "
+                             "on the voltages the edges mix ('tanh': "
+                             "Y = x_max*tanh(x/x_max), Hopfield/ESN "
+                             "structure). 'none' (default) is legacy; "
+                             "'identity' is a named no-op for ablations. "
+                             "NARMA-only; train_script cannot reach it.")
+    parser.add_argument("--spectral-radius-target", dest="spectral_radius_target",
+                        type=float, default=None,
+                        help="narma-node-activation Step 2: single-shot "
+                             "init rescaling of gm_raw so each stage's "
+                             "Heun-map Jacobian at x=0 approaches this "
+                             "spectral radius (e.g. 0.95). None (default) "
+                             "disables the hook (legacy behavior).")
+    parser.add_argument("--spectral-norm-passes", dest="spectral_norm_passes",
+                        type=int, default=15,
+                        help="narma-node-activation Step 2: max "
+                             "linearize-plus-shift passes per stage "
+                             "(default 15, early-stop on tol 0.02). "
+                             "Re-application converges through the sigmoid "
+                             "compression a single shot cannot cross.")
+    parser.add_argument("--isat-init", type=float, default=None,
+                        dest="isat_init",
+                        help="narma-node-activation Step 3: post-build "
+                             "isat_raw fill (applied AFTER --gain-init, so "
+                             "the gate config gm_raw=-1/isat_raw=-5 is "
+                             "expressible as --gain-init -1 --isat-init -5). "
+                             "None (default) leaves isat untouched.")
+    parser.add_argument("--no-clip", action="store_true",
+                        help="narma-node-activation Phase-4 fallback: disable "
+                             "the DifferentialStage soft rail clip. Default "
+                             "keeps the legacy clip unchanged.")
     parser.add_argument("--num-stages", dest="num_stages", type=int, default=1,
                         help="Phase-4 depth screen: ODE stages stacked per "
                              "sample (default 1 = legacy single-stage). "
@@ -2592,7 +2753,7 @@ def _write_partial_tables(
         f"NARMA-{order} -- {len(seeds)} seeds -- final results",
         "=" * 60,
     ]
-    csv_lines = ["condition,seed,nrmse,r2,mc_total,trained_params,total_params,hidden_dim,cell_library,core_refresh_interval,cell_lib_evals_per_sample,readout,boundary_fan_out,vca_enabled,vca_rank,vca_bias,gain_init,leak_init,vca_core_enabled,vca_use_hidden,dynamic_leak,num_stages,interstage_activation"]
+    csv_lines = ["condition,seed,nrmse,r2,mc_total,trained_params,total_params,hidden_dim,cell_library,core_refresh_interval,cell_lib_evals_per_sample,readout,boundary_fan_out,vca_enabled,vca_rank,vca_bias,gain_init,isat_init,leak_init,vca_core_enabled,vca_use_hidden,dynamic_leak,node_activation,no_clip,spectral_radius_target,spectral_norm_passes,sr_before,sr_after,num_stages,interstage_activation"]
     for cond in sorted(by_cond):
         runs = by_cond[cond]
         nrmse_vals = [r["nrmse"] for r in runs]
@@ -2653,10 +2814,17 @@ def _write_partial_tables(
                 f"{r.get('vca_rank', '')},"
                 f"{r.get('vca_bias', '')},"
                 f"{r.get('gain_init', '')},"
+                f"{r.get('isat_init', '')},"
                 f"{r.get('leak_init', '')},"
                 f"{r.get('vca_core_enabled', False)},"
                 f"{r.get('vca_use_hidden', False)},"
                 f"{r.get('dynamic_leak', False)},"
+                f"{r.get('node_activation', 'none')},"
+                f"{r.get('no_clip', False)},"
+                f"{r.get('spectral_radius_target', '')},"
+                f"{r.get('spectral_norm_passes', '')},"
+                f"{r.get('sr_before', '')},"
+                f"{r.get('sr_after', '')},"
                 f"{r.get('num_stages', 1)},"
                 f"{r.get('interstage_activation', 'none')}"
             )
@@ -2866,10 +3034,22 @@ def main() -> int:
                     if args.leak_init is not None else "leDFLT"
                 )
                 cond_name = f"{cond_name}_{_gi}_{_leak_token}"
+            # narma-node-activation asymmetric-isat marker (appended after
+            # the symmetric _gi marker so legacy legs never collide).
+            if args.isat_init is not None:
+                cond_name = f"{cond_name}_is{args.isat_init:g}"
             # knet-gated-memory spike markers: keep spike legs distinct
             # from default-init legs on disk and in tables.
             if args.dynamic_leak:
                 cond_name = f"{cond_name}_dynleak"
+            # narma-node-activation markers: activation + spectral target
+            # keep Step-3 legs distinct from legacy legs on disk/tables.
+            if args.node_activation != "none":
+                cond_name = f"{cond_name}_na{args.node_activation}"
+            if args.spectral_radius_target is not None:
+                cond_name = f"{cond_name}_sr{float(args.spectral_radius_target):g}"
+            if args.no_clip:
+                cond_name = f"{cond_name}_noclip"
             if args.vca_use_hidden:
                 cond_name = f"{cond_name}_vcaH"
             elif args.vca_core_enabled:
@@ -2883,7 +3063,10 @@ def main() -> int:
                 f"cell_library={args.cell_library}  "
                 f"readout={args.readout}  "
                 f"vca={args.vca_enabled}  "
-                f"gain_init={args.gain_init}  leak_init={args.leak_init}  "
+                f"gain_init={args.gain_init}  isat_init={args.isat_init}  "
+                f"leak_init={args.leak_init}  nodeact={args.node_activation}  "
+                f"sr_target={args.spectral_radius_target}  "
+                f"no_clip={args.no_clip}  "
                 f"freeze_read=False (evolving core)")
             ckpt_path = out_dir / f"{cond_name}_seed{seed}.pt"
             res = run_fabric_condition(
@@ -2922,6 +3105,11 @@ def main() -> int:
                 interstage_activation=args.interstage_activation,
                 gain_init=args.gain_init,
                 leak_init=args.leak_init,
+                node_activation=args.node_activation,
+                spectral_radius_target=args.spectral_radius_target,
+                spectral_norm_passes=args.spectral_norm_passes,
+                isat_init=args.isat_init,
+                no_clip=args.no_clip,
             )
             result_row = {
                 "seed": seed,
@@ -2956,11 +3144,30 @@ def main() -> int:
                 "vca_core_enabled": bool(res.get("vca_core_enabled", False)),
                 "vca_use_hidden": bool(res.get("vca_use_hidden", False)),
                 "dynamic_leak": bool(res.get("dynamic_leak", False)),
+                "node_activation": str(res.get("node_activation", "none")),
+                "no_clip": bool(res.get("no_clip", False)),
+                "spectral_radius_target": (
+                    "" if res.get("spectral_radius_target") is None
+                    else float(res["spectral_radius_target"])
+                ),
+                "spectral_norm_passes": int(res.get("spectral_norm_passes", 15)),
+                "sr_before": (
+                    "" if res.get("sr_before") is None
+                    else float(res["sr_before"])
+                ),
+                "sr_after": (
+                    "" if res.get("sr_after") is None
+                    else float(res["sr_after"])
+                ),
                 "num_stages": int(res.get("num_stages", 1)),
                 "interstage_activation": str(res.get("interstage_activation", "none")),
                 "gain_init": (
                     "" if res.get("gain_init") is None
                     else float(res["gain_init"])
+                ),
+                "isat_init": (
+                    "" if res.get("isat_init") is None
+                    else float(res["isat_init"])
                 ),
                 "leak_init": res.get("leak_init") or "",
             }

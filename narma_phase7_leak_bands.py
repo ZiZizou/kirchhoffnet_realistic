@@ -303,7 +303,6 @@ def main() -> None:
             ordered = sorted(band_candidates, key=lambda r: r["alpha"])
             brackets = [(left, right) for left, right in zip(ordered, ordered[1:])
                         if left["finite_states"] and right["finite_states"]
-                        and left["rail_frac"] <= a.rail_max and right["rail_frac"] <= a.rail_max
                         and left["spectrum"]["zero_jacobian_spectral_radius"] <= a.zero_rho_max
                         and right["spectrum"]["zero_jacobian_spectral_radius"] <= a.zero_rho_max
                         and left["spectrum"]["realized_spectrum_bands_distinguishable"]
@@ -333,9 +332,12 @@ def main() -> None:
         # initial supplied grid was too coarse near the requested activity.
         for _ in range(8):
             ordered = sorted(candidates, key=lambda r: r["leak"])
+            # A bracket endpoint can be over rail while the target crossing
+            # itself is safe (as happened between 0.08 and 0.12).  It is
+            # calibration evidence only: the final selection below still
+            # requires rails <= rail_max and is the only reported condition.
             brackets = [(left, right) for left, right in zip(ordered, ordered[1:])
                         if left["finite_states"] and right["finite_states"]
-                        and left["rail_frac"] <= a.rail_max and right["rail_frac"] <= a.rail_max
                         and left["spectrum"]["zero_jacobian_spectral_radius"] <= a.zero_rho_max
                         and right["spectrum"]["zero_jacobian_spectral_radius"] <= a.zero_rho_max
                         and (left["mean_abs_over_rail"] - a.activity_target) * (right["mean_abs_over_rail"] - a.activity_target) <= 0]

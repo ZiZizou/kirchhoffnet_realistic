@@ -358,6 +358,9 @@ output_ode_src: list[int] | None = None,
         # so stage.parameters()/state_dict() do not duplicate the shared
         # tensors across stages. ``None`` disables GLN (default).
         object.__setattr__(self, "gln_rails", gln_rails)
+        # Phase-8 tied tap rails are attached explicitly by the NARMA probe.
+        # Keeping the default ``None`` makes legacy models byte-identical.
+        self.tap_rails = None
 
         if len(src) != len(dst):
             raise ValueError(f"src/dst length mismatch: {len(src)} vs {len(dst)}")
@@ -1389,7 +1392,8 @@ output_ode_src: list[int] | None = None,
             i_edge_const: torch.Tensor | None = None,
             i_boundary_const: torch.Tensor | None = None,
             i_readout_const: torch.Tensor | None = None,
-            vca_gate_core: torch.Tensor | None = None) -> torch.Tensor:
+            vca_gate_core: torch.Tensor | None = None,
+            tied_gate_multiplier: torch.Tensor | None = None) -> torch.Tensor:
         """Compute dx/dt at state x. x: [batch, num_nodes].
 
         Gate application:
@@ -1764,7 +1768,15 @@ output_ode_src: list[int] | None = None,
         clip_term = self.soft_clip(x)
 
         i_drive = self.drive_current(x, x_drive, drive_scale)
-        return (acc + i_drive - leak_term - clip_term) / self.c_eff
+        # A tied gate is a sample/hold: it controls *all* candidate KCL
+        # current and leakage together.  Clip remains outside as a safety.
+        # The multiplier is cached once per sample by the Heun callers.
+        write_retain = acc + i_drive - leak_term
+        if tied_gate_multiplier is not None:
+            write_retain = write_retain * tied_gate_multiplier.to(
+                dtype=x.dtype, device=x.device
+            )
+        return (write_retain - clip_term) / self.c_eff
 
     def compile_rhs(self, backend: str = "inductor"):
         """Compile `rhs` with `torch.compile` for kernel fusion.
@@ -1850,6 +1862,7 @@ output_ode_src: list[int] | None = None,
         gate_core_cached = None
         if self._vca_core_enabled and u is not None and self.vca_v_core is not None:
             gate_core_cached = self._compute_core_gate(u, x=x0 if self.vca_use_hidden else None)
+        tied_gate_cached = self.tap_rails(u) if self.tap_rails is not None and u is not None else None
         # Diagnostic attribute (not read inside compiled rhs — rhs
         # receives the gate via the explicit kwarg below).
         self._gate_core_cached = gate_core_cached
@@ -1897,13 +1910,13 @@ output_ode_src: list[int] | None = None,
                           i_edge_const=i_edge_const,
                           i_boundary_const=i_boundary_const,
                           i_readout_const=i_readout_const,
-                          vca_gate_core=gate_core_cached)
+                          vca_gate_core=gate_core_cached, tied_gate_multiplier=tied_gate_cached)
             x_pred = x + dt * k1
             k2 = self.rhs(x_pred, u=u, x_drive=x_drive, drive_scale=drive_scale,
                           i_edge_const=i_edge_const,
                           i_boundary_const=i_boundary_const,
                           i_readout_const=i_readout_const,
-                          vca_gate_core=gate_core_cached)
+                          vca_gate_core=gate_core_cached, tied_gate_multiplier=tied_gate_cached)
             x = x + 0.5 * dt * (k1 + k2)
             if store_trajectory:
                 traj_chunks.append(x)
@@ -2002,6 +2015,7 @@ output_ode_src: list[int] | None = None,
             if self._vca_core_enabled and u_t is not None and self.vca_v_core is not None:
                 gate_core_cached = self._compute_core_gate(u_t, x=x if self.vca_use_hidden else None)
             self._gate_core_cached = gate_core_cached
+            tied_gate_cached = self.tap_rails(u_t) if self.tap_rails is not None else None
 
             # freeze_read / core_refresh_interval: precompute edge currents
             # from the current state (each sample window freezes from its own
@@ -2028,7 +2042,7 @@ output_ode_src: list[int] | None = None,
 
             x = self._call_heun_steps(x, u_t, dt, num_steps, i_edge_const,
                                       i_boundary_const, i_readout_const,
-                                      gate_core_cached)
+                                      gate_core_cached, tied_gate_cached)
             if carry_keep is not None:
                 x = x * carry_keep.to(dtype=x.dtype, device=x.device)
             states[t] = x
@@ -2045,6 +2059,7 @@ output_ode_src: list[int] | None = None,
         i_boundary_const: torch.Tensor | None = None,
         i_readout_const: torch.Tensor | None = None,
         vca_gate_core: torch.Tensor | None = None,
+        tied_gate_multiplier: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Dispatch to compiled or uncompiled Heun steps with fallback.
 
@@ -2065,7 +2080,7 @@ output_ode_src: list[int] | None = None,
                 return self._heun_steps_compiled_fn(
                     x, u_t, dt, num_steps,
                     i_edge_const, i_boundary_const, i_readout_const,
-                    vca_gate_core,
+                    vca_gate_core, tied_gate_multiplier,
                 )
             except Exception as e:
                 print(
@@ -2076,7 +2091,7 @@ output_ode_src: list[int] | None = None,
         return self._heun_steps(
             x, u_t, dt, num_steps,
             i_edge_const, i_boundary_const, i_readout_const,
-            vca_gate_core,
+            vca_gate_core, tied_gate_multiplier,
         )
 
     def _heun_steps(
@@ -2089,6 +2104,7 @@ output_ode_src: list[int] | None = None,
         i_boundary_const: torch.Tensor | None = None,
         i_readout_const: torch.Tensor | None = None,
         vca_gate_core: torch.Tensor | None = None,
+        tied_gate_multiplier: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run ``num_steps`` Heun integration steps (predictor-corrector).
 
@@ -2113,13 +2129,13 @@ output_ode_src: list[int] | None = None,
                               i_edge_const=i_edge_const,
                               i_boundary_const=i_boundary_const,
                               i_readout_const=i_readout_const,
-                              vca_gate_core=vca_gate_core)
+                              vca_gate_core=vca_gate_core, tied_gate_multiplier=tied_gate_multiplier)
                 x_pred = x + dt * k1
                 k2 = self.rhs(x_pred, u=u_t, x_drive=None, drive_scale=0.0,
                               i_edge_const=i_edge_const,
                               i_boundary_const=i_boundary_const,
                               i_readout_const=i_readout_const,
-                              vca_gate_core=vca_gate_core)
+                              vca_gate_core=vca_gate_core, tied_gate_multiplier=tied_gate_multiplier)
                 x = x + 0.5 * dt * (k1 + k2)
             return x
         # Refresh path: recompute ``i_edge_const`` every k Heun steps.
@@ -2131,13 +2147,13 @@ output_ode_src: list[int] | None = None,
                           i_edge_const=i_edge_const,
                           i_boundary_const=i_boundary_const,
                           i_readout_const=i_readout_const,
-                          vca_gate_core=vca_gate_core)
+                          vca_gate_core=vca_gate_core, tied_gate_multiplier=tied_gate_multiplier)
             x_pred = x + dt * k1
             k2 = self.rhs(x_pred, u=u_t, x_drive=None, drive_scale=0.0,
                           i_edge_const=i_edge_const,
                           i_boundary_const=i_boundary_const,
                           i_readout_const=i_readout_const,
-                          vca_gate_core=vca_gate_core)
+                          vca_gate_core=vca_gate_core, tied_gate_multiplier=tied_gate_multiplier)
             x = x + 0.5 * dt * (k1 + k2)
         return x
 

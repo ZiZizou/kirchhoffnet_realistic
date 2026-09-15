@@ -693,6 +693,13 @@ def _one_sample_transition(
     gate_core_cached = None
     if stage._vca_core_enabled and u_next is not None and stage.vca_v_core is not None:
         gate_core_cached = stage._compute_core_gate(u_next)
+    # Phase-8 tied tap gate: same once-per-sample convention as the stage
+    # sequence path — without this, driven/input Jacobians silently ignore
+    # the gates and gate conditions compare identically on those metrics.
+    tied_gate_cached = None
+    tap_rails = getattr(stage, "tap_rails", None)
+    if tap_rails is not None and u_next is not None:
+        tied_gate_cached = tap_rails(u_next)
     i_edge_const = None
     if stage.freeze_read or stage.core_refresh_interval > 0:
         i_edge_const = stage._compute_i_edge_const(x_from, gate_core_cached)
@@ -707,7 +714,7 @@ def _one_sample_transition(
     x_next = stage._heun_steps(
         x_from, u_next, dt, num_steps,
         i_edge_const, i_boundary_const, i_readout_const,
-        gate_core_cached,
+        gate_core_cached, tied_gate_cached,
     )
     return x_next.view(-1)
 

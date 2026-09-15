@@ -7,6 +7,7 @@ does not apply the legacy global-gain normalizer after those tensors change.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 from pathlib import Path
@@ -281,28 +282,67 @@ def main() -> None:
     rows, calibrations = [], []
     for seed in seeds:
         base = build_base(seed).to(a.device)
+        # Every calibration candidate starts from this exact normalized core.
+        # Cloning makes leak the sole intervention and avoids redoing the same
+        # 30-pass normalization (and its noisy log) for every candidate.
+        def clone_base(): return copy.deepcopy(base)
         # The alpha calibration changes all three bands by one scalar only.
         # It cannot alter the core graph, boundary, band ratios, or global gain.
         band_vals = torch.empty(HIDDEN_DIM)
         for name, nodes in BAND_GROUPS.items(): band_vals[nodes] = BAND_LEAKS[name]
-        banded = build_base(seed).to(a.device); set_leaks(banded.core.stages[0], band_vals)
+        banded = clone_base(); set_leaks(banded.core.stages[0], band_vals)
         band_candidates = []
         for alpha in alpha_grid:
-            candidate = build_base(seed).to(a.device); set_leaks(candidate.core.stages[0], alpha * band_vals)
+            candidate = clone_base(); set_leaks(candidate.core.stages[0], alpha * band_vals)
             x = ne.collect_fabric_states(candidate, cal_taps, device=a.device).cpu()[a.washout:, :HIDDEN_DIM]
             spec = spectrum_metrics(candidate.core.stages[0])
             band_candidates.append({"alpha": alpha, "mean_abs_over_rail": float(x.abs().mean() / candidate.core.stages[0].x_max), "rail_frac": float((x.abs() > .9 * candidate.core.stages[0].x_max).float().mean()), "finite_states": bool(torch.isfinite(x).all()), "spectrum": spec})
+        # A coarse grid finds a measured bracket; bisection then calibrates
+        # alpha rather than treating the grid itself as the operating point.
+        for _ in range(8):
+            ordered = sorted(band_candidates, key=lambda r: r["alpha"])
+            brackets = [(left, right) for left, right in zip(ordered, ordered[1:])
+                        if left["finite_states"] and right["finite_states"]
+                        and left["rail_frac"] <= a.rail_max and right["rail_frac"] <= a.rail_max
+                        and left["spectrum"]["zero_jacobian_spectral_radius"] <= a.zero_rho_max
+                        and right["spectrum"]["zero_jacobian_spectral_radius"] <= a.zero_rho_max
+                        and left["spectrum"]["realized_spectrum_bands_distinguishable"]
+                        and right["spectrum"]["realized_spectrum_bands_distinguishable"]
+                        and (left["mean_abs_over_rail"] - a.activity_target) * (right["mean_abs_over_rail"] - a.activity_target) <= 0]
+            if not brackets: break
+            left, right = min(brackets, key=lambda pair: pair[1]["alpha"] - pair[0]["alpha"])
+            alpha = (left["alpha"] + right["alpha"]) / 2
+            candidate = clone_base(); set_leaks(candidate.core.stages[0], alpha * band_vals)
+            x = ne.collect_fabric_states(candidate, cal_taps, device=a.device).cpu()[a.washout:, :HIDDEN_DIM]
+            band_candidates.append({"alpha": alpha, "mean_abs_over_rail": float(x.abs().mean() / candidate.core.stages[0].x_max), "rail_frac": float((x.abs() > .9 * candidate.core.stages[0].x_max).float().mean()), "finite_states": bool(torch.isfinite(x).all()), "spectrum": spectrum_metrics(candidate.core.stages[0])})
         acceptable_bands = [r for r in band_candidates if r["finite_states"] and r["rail_frac"] <= a.rail_max and r["spectrum"]["zero_jacobian_spectral_radius"] <= a.zero_rho_max and r["spectrum"]["realized_spectrum_bands_distinguishable"] and abs(r["mean_abs_over_rail"] - a.activity_target) <= a.activity_tolerance]
         if not acceptable_bands:
             (a.out / "calibration_failure.json").write_text(json.dumps({"core_seed": seed, "condition": "banded_leaks_activity_restored", "reason": "no acceptable one-dimensional band-preserving alpha", "candidates": band_candidates}, indent=2))
             raise RuntimeError(f"no stable band-preserving alpha reaches {a.activity_target:.3f} +/- {a.activity_tolerance:.3f} for seed {seed}; refusing to broaden the intervention")
         selected_band = min(acceptable_bands, key=lambda r: abs(r["mean_abs_over_rail"] - a.activity_target))
-        restored = build_base(seed).to(a.device); set_leaks(restored.core.stages[0], selected_band["alpha"] * band_vals)
+        restored = clone_base(); set_leaks(restored.core.stages[0], selected_band["alpha"] * band_vals)
         # Independent uniform calibration targets the requested activity, not
         # Phase-7's old 0.401 banded amplitude or a pre-assumed leak bracket.
         candidates = []
         for leak in grid:
-            candidate = build_base(seed).to(a.device); set_leaks(candidate.core.stages[0], torch.full((HIDDEN_DIM,), leak))
+            candidate = clone_base(); set_leaks(candidate.core.stages[0], torch.full((HIDDEN_DIM,), leak))
+            x = ne.collect_fabric_states(candidate, cal_taps, device=a.device).cpu()[a.washout:, :HIDDEN_DIM]
+            candidates.append({"leak": leak, "mean_abs_over_rail": float(x.abs().mean() / candidate.core.stages[0].x_max), "rail_frac": float((x.abs() > .9 * candidate.core.stages[0].x_max).float().mean()), "finite_states": bool(torch.isfinite(x).all()), "spectrum": spectrum_metrics(candidate.core.stages[0])})
+        # Use exactly the same measured, input-only calibration procedure for
+        # uniform leaks.  This avoids declaring failure merely because the
+        # initial supplied grid was too coarse near the requested activity.
+        for _ in range(8):
+            ordered = sorted(candidates, key=lambda r: r["leak"])
+            brackets = [(left, right) for left, right in zip(ordered, ordered[1:])
+                        if left["finite_states"] and right["finite_states"]
+                        and left["rail_frac"] <= a.rail_max and right["rail_frac"] <= a.rail_max
+                        and left["spectrum"]["zero_jacobian_spectral_radius"] <= a.zero_rho_max
+                        and right["spectrum"]["zero_jacobian_spectral_radius"] <= a.zero_rho_max
+                        and (left["mean_abs_over_rail"] - a.activity_target) * (right["mean_abs_over_rail"] - a.activity_target) <= 0]
+            if not brackets: break
+            left, right = min(brackets, key=lambda pair: pair[1]["leak"] - pair[0]["leak"])
+            leak = (left["leak"] + right["leak"]) / 2
+            candidate = clone_base(); set_leaks(candidate.core.stages[0], torch.full((HIDDEN_DIM,), leak))
             x = ne.collect_fabric_states(candidate, cal_taps, device=a.device).cpu()[a.washout:, :HIDDEN_DIM]
             candidates.append({"leak": leak, "mean_abs_over_rail": float(x.abs().mean() / candidate.core.stages[0].x_max), "rail_frac": float((x.abs() > .9 * candidate.core.stages[0].x_max).float().mean()), "finite_states": bool(torch.isfinite(x).all()), "spectrum": spectrum_metrics(candidate.core.stages[0])})
         acceptable_uniform = [r for r in candidates if r["finite_states"] and r["rail_frac"] <= a.rail_max and r["spectrum"]["zero_jacobian_spectral_radius"] <= a.zero_rho_max and abs(r["mean_abs_over_rail"] - a.activity_target) <= a.activity_tolerance]
@@ -310,7 +350,7 @@ def main() -> None:
             (a.out / "calibration_failure.json").write_text(json.dumps({"core_seed": seed, "condition": "uniform_activity_matched", "reason": "no acceptable scalar uniform leak", "candidates": candidates}, indent=2))
             raise RuntimeError(f"no stable uniform leak reaches {a.activity_target:.3f} +/- {a.activity_tolerance:.3f} for seed {seed}")
         selected = min(acceptable_uniform, key=lambda r: abs(r["mean_abs_over_rail"] - a.activity_target))
-        uniform = build_base(seed).to(a.device); set_leaks(uniform.core.stages[0], torch.full((HIDDEN_DIM,), selected["leak"]))
+        uniform = clone_base(); set_leaks(uniform.core.stages[0], torch.full((HIDDEN_DIM,), selected["leak"]))
         calibrations.append({"core_seed": seed, "method": "input_only; no NARMA targets or scores", "activity_target": a.activity_target, "activity_tolerance": a.activity_tolerance, "rail_max": a.rail_max, "zero_rho_max": a.zero_rho_max, "band_alpha_candidates": band_candidates, "band_alpha_selected": selected_band, "uniform_candidates": candidates, "uniform_selected": selected, "activity_mismatch_uniform_minus_banded": selected["mean_abs_over_rail"] - selected_band["mean_abs_over_rail"]})
         for tag, net in (("baseline", base), ("banded_leaks_alpha1_banked", banded), ("banded_leaks_activity_restored", restored), ("uniform_activity_matched", uniform)):
             row = evaluate(net, tag, seed, taps, u, y, a.washout, a.n_local_jac)

@@ -1,4 +1,4 @@
-"""Tree-based & gradient-boosting benchmark for housing + Friedman 1/2/3.
+"""Tree-based & gradient-boosting benchmark for housing + Friedman 1/2/3 + Franke.
 
 Mirrors the existing ``mlp_benchmark_{housing,friedman{1,2,3}}.py`` and the
 (now-deprecated ``xgb_benchmark_housing.py``) so that tree/boosting results are
@@ -19,6 +19,7 @@ Datasets (select with --dataset):
     friedman1  - Friedman #1 synthetic (10 features, 5 relevant + 5 noise)
     friedman2  - Friedman #2 synthetic (4 features, ranges per-dim)
     friedman3  - Friedman #3 synthetic (4 features, ranges per-dim)
+    franke    - Franke's function synthetic (2 features, smooth 2-D surface)
 
 Data pipeline:
   - housing:    reuses ``train_script._load_california_housing_data`` and
@@ -90,6 +91,7 @@ from train_script import (
     make_data_friedman1,
     make_data_friedman2,
     make_data_friedman3,
+    make_data_smooth2d,
 )
 
 
@@ -442,11 +444,54 @@ def _load_friedman(make_data_fn, name: str, target_noise_std: float):
     )
 
 
+def _load_franke():
+    """Returns (X_train, y_train_orig, X_val, y_val_orig, ...) for Franke.
+
+    Uses ``train_script.make_data_smooth2d`` (20k LHS train + 4k uniform
+    val, seed=42, noise_std=0.01 on train only) so the split is
+    byte-identical to the MLP/KNet Franke runs. Inputs are already in
+    [0,1]^2. Targets are denormalized back to RAW units for tree training.
+    """
+    train_loader, val_loader, _, inverse_stats = make_data_smooth2d(
+        batch_size=int(OPTIM["batch_size"]),
+    )
+    X_train, y_train_norm = _to_array(train_loader)
+    X_val, y_val_norm = _to_array(val_loader)
+
+    y_mean_f = float(inverse_stats["y_mean"])
+    y_std_f = float(inverse_stats["y_std"])
+    y_train_orig = (y_train_norm * y_std_f + y_mean_f).astype(np.float32).ravel()
+    y_val_orig = (y_val_norm * y_std_f + y_mean_f).astype(np.float32).ravel()
+
+    meta = dict(
+        name="Franke",
+        n_train=int(X_train.shape[0]),
+        n_val=int(X_val.shape[0]),
+        n_features=int(X_train.shape[1]),
+        target_units="raw Franke target units",
+        split="20k LHS train / 4k uniform val (seed=42)",
+        target_normalization_for_huber="z-score (mean="
+        + f"{y_mean_f:.6f}, std={y_std_f:.6f})",
+        target_noise_std=0.01,
+        input_normalization="none (already [0,1]^2)",
+    )
+    return (
+        X_train,
+        y_train_orig,
+        X_val,
+        y_val_orig,
+        y_mean_f,
+        y_std_f,
+        meta,
+    )
+
+
 DATASET_LOADERS = {
     "housing": _load_housing,
     "friedman1": lambda: _load_friedman(make_data_friedman1, "Friedman #1", 1.0),
     "friedman2": lambda: _load_friedman(make_data_friedman2, "Friedman #2", 1.0),
     "friedman3": lambda: _load_friedman(make_data_friedman3, "Friedman #3", 1.0),
+    "franke": _load_franke,
 }
 
 
@@ -1170,7 +1215,7 @@ TRAINERS["extra_trees"] = _train_extra_trees
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Tree / gradient-boosting benchmark across housing + Friedman 1/2/3. "
+            "Tree / gradient-boosting benchmark across housing + Friedman 1/2/3 + Franke. "
             "Same data splits, preprocessing, and metrics as the MLP / KNet baselines."
         ),
     )

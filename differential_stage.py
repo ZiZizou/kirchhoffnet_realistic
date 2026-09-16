@@ -2230,6 +2230,11 @@ output_ode_src: list[int] | None = None,
         if self._vca_core_enabled and u is not None and self.vca_v_core is not None:
             gate_core_cached = self._compute_core_gate(u, x=x0 if self.vca_use_hidden else None)
         self._gate_core_cached = gate_core_cached
+        # Phase-8 tied tap gate on the DEQ path: u is constant per solve,
+        # so compute once and hold across fixed-point iterations (mirrors
+        # the once-per-sample Heun convention). NARMA probes use Heun,
+        # but rhs(x*) = 0 must see the same gate for consistency.
+        tied_gate_cached = self.tap_rails(u) if self.tap_rails is not None and u is not None else None
 
         # freeze_read: precompute edge currents (cell_lib + edge gate + budget
         # gate + core VCA gate + KCL scatter-add) once from x0 and hold them
@@ -2277,7 +2282,8 @@ output_ode_src: list[int] | None = None,
                                         i_edge_const=i_edge_const,
                                         i_boundary_const=i_boundary_const,
                                         i_readout_const=i_readout_const,
-                                        vca_gate_core=gate_core_cached)
+                                        vca_gate_core=gate_core_cached,
+                                        tied_gate_multiplier=tied_gate_cached)
 
             x_star, info = solve_equilibrium(phi, x0, cfg)
             self.last_deq_info = {

@@ -3881,6 +3881,383 @@ def config_default_xmax() -> float:
         return 3.0
 
 
+# ---------------------------------------------------------------------------
+# Twin probe (plan twin-node-tanh, feature spec twin-probe-spec).
+# Digital node-tanh twin: x_{t+1} = (1-a)*x_t + a*tanh(W_mix @ x_t + W_in @ d_t).
+# Standalone discrete map (NO stage/cell-library mutation, NO rhs override).
+# Two drive harnesses, both run: 25x8 eight-tap delay bank and 25x1 scalar.
+# ---------------------------------------------------------------------------
+
+
+TWIN_HARNESSES: tuple[str, ...] = ("taps8", "scalar")
+TWIN_DEFAULT_N_TAPS: int = 8
+# Tanh-engagement guard: reject corner if measured |pre| stats show the
+# tanh args collapsed into the ~1e-2 linear regime (the rung-1 trap).
+# Threshold is on the median absolute pre-tanh value.
+TWIN_PRE_LINEAR_REGIME_MEDIAN: float = 0.05
+# Tanh-units activity screen matched to ESN parity ref's mean |x| (ESN
+# states live in [-1,1]; twin states live in [-1,1]).
+TWIN_ACTIVITY_LOW: float = 0.20
+TWIN_ACTIVITY_HIGH: float = 0.80
+
+
+def twin_delay_bank(u: torch.Tensor, n_taps: int) -> torch.Tensor:
+    """Build ``(T, n_taps)`` causal tap matrix. Tap 0 is current input."""
+    if u.dim() != 1:
+        raise ValueError(f"delay_bank wants (T,) input, got {tuple(u.shape)}")
+    T = u.shape[0]
+    if T < n_taps:
+        raise ValueError(f"need at least {n_taps} samples, got {T}")
+    cols = []
+    for lag in range(n_taps):
+        if lag == 0:
+            cols.append(u)
+        else:
+            pad = u.new_zeros(lag)
+            cols.append(torch.cat([pad, u[:-lag]]))
+    return torch.stack(cols, dim=1)
+
+
+def _twin_build_weights(
+    *, n_nodes: int, n_in: int, w_seed: int, win_seed: int,
+    target_radius: float, dtype: torch.dtype, device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build ``W_mix`` (Gaussian, spectral-radius normalized) and ``W_in`` (Gaussian)."""
+    g_w = torch.Generator(device="cpu").manual_seed(int(w_seed))
+    W_raw = torch.randn(n_nodes, n_nodes, generator=g_w, dtype=torch.float32)
+    eigs = torch.linalg.eigvals(W_raw.to(torch.float64))
+    rho = float(eigs.abs().max().item())
+    if not math.isfinite(rho) or rho <= 0:
+        raise ValueError(f"W_mix spectral radius invalid: {rho}")
+    W = (W_raw * (float(target_radius) / rho)).to(dtype=dtype, device=device)
+    g_in = torch.Generator(device="cpu").manual_seed(int(win_seed))
+    W_in = torch.randn(n_nodes, n_in, generator=g_in, dtype=torch.float32).to(
+        dtype=dtype, device=device
+    )
+    return W, W_in
+
+
+def _twin_drive(
+    u_stream: torch.Tensor, harness: str, *,
+    n_taps: int, input_scale: float,
+) -> torch.Tensor:
+    """Build the ``(T, n_in)`` drive signal for the chosen harness.
+
+    ``taps8``: 8-tap causal delay bank, columns scaled to drive RMS = ``input_scale``.
+    ``scalar``: scalar rail-mapped drive, replicated to a 1-column matrix.
+    """
+    if harness == "taps8":
+        taps = twin_delay_bank(u_stream, n_taps=n_taps)
+        rms = float(taps.pow(2).mean().sqrt().item())
+        if rms > 0 and input_scale > 0:
+            taps = taps * (float(input_scale) / rms)
+        return taps
+    if harness == "scalar":
+        scaled = u_stream * float(input_scale)
+        return scaled.unsqueeze(-1)
+    raise ValueError(f"unknown twin harness: {harness}")
+
+
+def _twin_run(
+    *, W: torch.Tensor, W_in: torch.Tensor, drive: torch.Tensor,
+    a: float, x0: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run the discrete twin map and return ``(T, n_nodes)`` states."""
+    T = drive.shape[0]
+    n = W.shape[0]
+    dev = W.device
+    dtype = W.dtype
+    states = []
+    x = x0 if x0 is not None else torch.zeros(n, dtype=dtype, device=dev)
+    for t in range(T):
+        pre = W @ x + W_in @ drive[t]
+        x = (1.0 - a) * x + a * torch.tanh(pre)
+        states.append(x.detach().clone())
+    return torch.stack(states, dim=0)
+
+
+def _twin_jacobian_at(
+    *, W: torch.Tensor, W_in: torch.Tensor, x: torch.Tensor,
+    drive_row: torch.Tensor, a: float,
+) -> torch.Tensor:
+    """Analytic per-step Jacobian at ``(x, d_t)``.
+
+    ``J = (1-a)*I + a*diag(sech^2(W@x + W_in@d)) * W``.
+    """
+    pre = W @ x + W_in @ drive_row
+    gain = 1.0 - torch.tanh(pre).pow(2)
+    eye = torch.eye(W.shape[0], dtype=W.dtype, device=W.device)
+    return (1.0 - a) * eye + a * (gain.unsqueeze(1) * W)
+
+
+def _twin_eigs_per_transition(
+    *, W: torch.Tensor, W_in: torch.Tensor, states: torch.Tensor,
+    drive: torch.Tensor, washout: int, n_samples: int, a: float,
+) -> tuple[list[dict[str, float]], list[list[float]]]:
+    """Eigenvalue spectra at observed transitions, twin map."""
+    n_nodes = W.shape[0]
+    T = states.shape[0]
+    if T - washout - 1 <= 0:
+        raise ValueError(
+            f"need T > washout+1, got T={T}, washout={washout}"
+        )
+    n = min(n_samples, T - washout - 1)
+    indices = torch.linspace(
+        washout, T - 2, steps=n,
+    ).round().to(torch.long).unique().tolist()
+    rows: list[dict[str, float]] = []
+    eig_per: list[list[float]] = []
+    a_val = float(a)
+    for t in indices:
+        x = states[t].detach()
+        d = drive[t + 1]
+        J = _twin_jacobian_at(
+            W=W, W_in=W_in, x=x, drive_row=d, a=a_val,
+        )
+        try:
+            eig = torch.linalg.eigvals(J)
+            abs_e = eig.abs()
+            if not torch.isfinite(abs_e).all():
+                raise RuntimeError("non-finite twin eigenvalues")
+        except Exception:
+            m = J.detach().to(dtype=torch.float64, device="cpu")
+            try:
+                eig = torch.linalg.eigvals(m)
+                abs_e = eig.abs().to(dtype=torch.float32)
+                if not torch.isfinite(abs_e).all():
+                    raise RuntimeError("non-finite after fallback")
+            except Exception:
+                rows.append({
+                    "transition_index": float(t),
+                    "state_dim": float(n_nodes),
+                    "max_abs": float("nan"),
+                    "min_abs": float("nan"),
+                    "mean_abs": float("nan"),
+                    "rank_proxy": float("nan"),
+                })
+                eig_per.append([])
+                continue
+        rows.append({
+            "transition_index": float(t),
+            "state_dim": float(n_nodes),
+            "max_abs": float(abs_e.max().item()),
+            "min_abs": float(abs_e.min().item()),
+            "mean_abs": float(abs_e.mean().item()),
+            "rank_proxy": float(npr.participation_ratio(abs_e)),
+        })
+        eig_per.append([float(v) for v in abs_e.tolist()])
+    return rows, eig_per
+
+
+def _twin_pre_stats(
+    *, W: torch.Tensor, W_in: torch.Tensor, states: torch.Tensor,
+    drive: torch.Tensor,
+) -> dict[str, float]:
+    """Stats on ``|W@x + W_in@d|`` over the trajectory (tanh-engagement guard)."""
+    T = states.shape[0]
+    pre_vals = []
+    for t in range(T):
+        pre_vals.append((W @ states[t].detach() + W_in @ drive[t]).abs())
+    all_pre = torch.stack(pre_vals)
+    return {
+        "median_abs_pre": float(all_pre.median().item()),
+        "p90_abs_pre": float(torch.quantile(all_pre.flatten(), 0.9).item()),
+        "mean_abs_pre": float(all_pre.mean().item()),
+    }
+
+
+def twin_node_tanh(
+    *, order: int = 10, seed: int = 0, device: str = "cpu",
+    hidden_dim: int = 25, n_taps: int = TWIN_DEFAULT_N_TAPS,
+    harness: str = "taps8", radius: float = 0.9, leak_a: float = 1.0,
+    input_scale: float = 1.0, w_seed: int = 0, win_seed: int = 0,
+    n_streams: int = 1, train_samples_per_stream: int = 300,
+    washout: int = 200, max_delay: int = 20,
+    jacobian_samples: int = C1_SPECTRAL_TRANSITION_MIN,
+    matched_parity_tol: float = R0_MATCHED_PARITY_TOL,
+) -> dict:
+    """Run the digital node-tanh twin probe (standalone discrete map).
+
+    Returns a dict with ``config_tag``, instrument row, ESN parity row,
+    pre-tanh engagement stats, pass flags, and serialized metadata.
+    """
+    if order != 10:
+        raise ValueError("twin is calibrated for NARMA-10 only")
+    if harness not in TWIN_HARNESSES:
+        raise ValueError(
+            f"twin harness must be one of {TWIN_HARNESSES}, got {harness!r}"
+        )
+    if not (0.0 < float(radius) < 2.0):
+        raise ValueError(f"twin radius must be in (0, 2), got {radius}")
+    if not (0.0 < float(leak_a) <= 1.0):
+        raise ValueError(f"twin leak_a must be in (0, 1], got {leak_a}")
+    u_raw, y_raw = ne._gen_narma_train_streams(
+        order=order, seed=seed, n_streams=n_streams,
+        n=train_samples_per_stream,
+    )
+    u_stream = u_raw[0]
+    y_stream = y_raw[0]
+    u_scaled = ne._scale_drive(
+        u_stream, bipolar=True, order=order, input_scale=1.0,
+    )
+    drive = _twin_drive(
+        u_scaled, harness, n_taps=n_taps, input_scale=input_scale,
+    )
+    drive = drive.to(device)
+    y_dev = y_stream.to(device)
+    dev = torch.device(device)
+    dtype = torch.float32
+    n_in = drive.shape[1]
+    W, W_in = _twin_build_weights(
+        n_nodes=hidden_dim, n_in=n_in, w_seed=w_seed, win_seed=win_seed,
+        target_radius=radius, dtype=dtype, device=dev,
+    )
+    states = _twin_run(W=W, W_in=W_in, drive=drive, a=float(leak_a))
+    pre_stats = _twin_pre_stats(
+        W=W, W_in=W_in, states=states, drive=drive,
+    )
+    tanh_engaged = pre_stats["median_abs_pre"] >= TWIN_PRE_LINEAR_REGIME_MEDIAN
+    # MC, ridge from full state.
+    mc_per, mc_total = _per_delay_mc(
+        states, drive[:, 0] if harness == "scalar" else u_scaled.to(device),
+        washout=washout, max_delay=max_delay, use_svd_fallback=True,
+    )
+    X_w = states[washout:]
+    y_w = y_dev[washout:]
+    W_r = _ridge_fit_predict(X_w, y_w)
+    X_aug = torch.cat(
+        [X_w, torch.ones(X_w.shape[0], 1, device=X_w.device)], dim=1,
+    )
+    pred = X_aug @ W_r
+    ridge_nrmse = float(ne.nrmse(pred, y_w))
+    ridge_r2 = float(ne.r2(pred, y_w))
+    jac_rows, eig_per = _twin_eigs_per_transition(
+        W=W, W_in=W_in, states=states, drive=drive,
+        washout=washout, n_samples=jacobian_samples, a=float(leak_a),
+    )
+    abs_eigs = _flatten_abs_eigs([{"eig_abs": eigs} for eigs in eig_per])
+    state_pr = _safe_participation_ratio(states[washout:])
+    state_pr_std = _standardized_state_pr(states[washout:])
+    state_rms = float(states[washout:].pow(2).mean().sqrt().item())
+    sat_max = float(states.abs().max().item())
+    # Tanh states live in [-1, 1]; rail fraction is N/A per c0 convention.
+    # Activity defined in tanh units.
+    activity = float(states[washout:].abs().mean().item())
+    # ESN parity ref on identical streams.  For the scalar harness the
+    # ESN sees EXACTLY the twin's drive column (u_scaled * input_scale)
+    # with input_scaling=1.0, so drive statistics match bit-for-bit and
+    # the parity comparison is apples-to-apples.  For the taps8 harness
+    # the ESN still sees the scalar drive (ne.ESN takes a 1-D input), so
+    # that parity row is approximate by construction (documented, not gated).
+    esn_in = (u_scaled * float(input_scale)).to("cpu")
+    esn = ne.ESN(
+        n_reservoir=hidden_dim, spectral_radius=0.9,
+        input_scaling=1.0, leak=1.0,
+        ridge_l2=1e-2, seed=int(seed),
+    )
+    esn.fit(esn_in, y_stream.to("cpu"))
+    esn_states = esn._run(esn_in).to(device)
+    _, esn_mc = _per_delay_mc(
+        esn_states, esn_in.squeeze(-1).to(device),
+        washout=washout, max_delay=max_delay, use_svd_fallback=True,
+    )
+    esn_pred = esn_states @ esn.readout_W.to(device) + esn.readout_b.to(device)
+    esn_nrmse = float(ne.nrmse(esn_pred[washout:], y_dev[washout:]))
+    # Raw-delay parity diagnostic.
+    raw = _raw_delay_ridge(
+        u_scaled.to(device), y_dev,
+        n_taps=R0_RAW_DELAY_TAPS, washout=washout,
+    )
+    matched_delta = float(ridge_nrmse - raw["nrmse"])
+    # Pass gates (twin-probe-spec):
+    # - PASS_ARCH: NRMSE <= 0.50 AND MC >= 5 (near-ESN numbers, architecture
+    #   inversion confirmed).
+    # - PASS_FAIL_FABRIC: NRMSE >= 0.60 AND MC <= 3 (C1b-like; fabric
+    #   exonerated, harness/task-mapping suspect).
+    # - VOID: tanh not engaged (linear regime) or non-finite states.
+    states_finite = bool(torch.isfinite(states).all().item())
+    activity_in_band = bool(
+        TWIN_ACTIVITY_LOW <= activity <= TWIN_ACTIVITY_HIGH
+    )
+    pass_arch = bool(
+        tanh_engaged and states_finite
+        and ridge_nrmse <= 0.50 and mc_total >= 5.0
+    )
+    fail_fabric = bool(
+        tanh_engaged and states_finite
+        and ridge_nrmse >= 0.60 and mc_total <= 3.0
+    )
+    void = bool(
+        (not tanh_engaged) or (not states_finite)
+    )
+    row = InstrumentRow(
+        config_tag=(
+            f"twin_{harness}_seed{seed}_{device}_h{hidden_dim}"
+            f"_n{n_in}_r{radius:g}_a{leak_a:g}_is{input_scale:g}"
+            f"_ws{w_seed}_wis{win_seed}_washout{washout}"
+        ),
+        nrmse=ridge_nrmse,
+        r2=ridge_r2,
+        mc_total=float(mc_total),
+        mc_per_delay=[float(v) for v in mc_per],
+        state_pr=float(state_pr),
+        jac_max_abs=float(max(r["max_abs"] for r in jac_rows)),
+        jac_min_abs=float(min(r["min_abs"] for r in jac_rows)),
+        jac_mean_abs=float(
+            sum(r["mean_abs"] for r in jac_rows) / max(len(jac_rows), 1)
+        ),
+        jac_rank_proxy=float(max(r["rank_proxy"] for r in jac_rows)),
+        jac_eig_abs=abs_eigs,
+        # NOTE: twin states live in [-1, 1], so this field holds the
+        # ABSOLUTE max |x| (tanh bound = 1.0), NOT a ratio vs x_max.
+        # Do NOT compare against C1/C1b sat_max_ratio (vs x_max=20).
+        sat_max_ratio=float(sat_max),
+        rail_frac=float("nan"),
+        n_params=int(hidden_dim * hidden_dim + hidden_dim * n_in),
+        note=(
+            f"Twin node-tanh, harness={harness}, radius={radius}, "
+            f"leak_a={leak_a}, input_scale={input_scale}; "
+            f"tanh_states[-1,1] rail_frac=N/A; "
+            f"pre_median={pre_stats['median_abs_pre']:.4f}, "
+            f"engaged={tanh_engaged}"
+        ),
+        state_pr_standardized=float(state_pr_std),
+    )
+    return {
+        "order": order, "seed": seed, "device": device,
+        "hidden_dim": hidden_dim, "n_taps": n_taps, "harness": harness,
+        "radius": float(radius), "leak_a": float(leak_a),
+        "input_scale": float(input_scale),
+        "w_seed": int(w_seed), "win_seed": int(win_seed),
+        "n_streams": n_streams,
+        "train_samples_per_stream": train_samples_per_stream,
+        "washout": washout, "max_delay": max_delay,
+        "jacobian_samples": jacobian_samples,
+        "n_in": int(n_in),
+        "instrument": row,
+        "activity": activity,
+        "activity_in_band": bool(activity_in_band),
+        "activity_band": [TWIN_ACTIVITY_LOW, TWIN_ACTIVITY_HIGH],
+        "tanh_engaged": bool(tanh_engaged),
+        "states_finite": bool(states_finite),
+        "pass_arch": bool(pass_arch),
+        "fail_fabric": bool(fail_fabric),
+        "void": bool(void),
+        "pre_stats": pre_stats,
+        "esn_nrmse": esn_nrmse,
+        "esn_mc_total": float(esn_mc),
+        "matched_raw_delay_nrmse": float(raw["nrmse"]),
+        "matched_parity_tolerance": float(matched_parity_tol),
+        "matched_parity_delta": float(matched_delta),
+        "note": (
+            f"twin_node_tanh: harness={harness}, radius={radius}, "
+            f"leak_a={leak_a}, input_scale={input_scale}. "
+            f"States live in [-1,1]; rail fraction N/A. "
+            f"Activity (tanh units)={activity:.4f}."
+        ),
+    }
+
+
 def _serialize_rows(rows: list[Any]) -> list[dict]:
     out = []
     for r in rows:
@@ -4136,6 +4513,42 @@ def main(argv: list[str] | None = None) -> int:
         "--c1b-sidecar-dir", type=Path, required=True,
         help="Directory containing the tuned C1b sidecar "
              f"({C1B_SIDECAR_NAME} + {C1B_SIDECAR_JSON}).",
+    )
+
+    p_twin = sub.add_parser(
+        "twin",
+        help="Twin node-tanh digital probe: standalone discrete map "
+             "x=(1-a)*x + a*tanh(W_mix@x + W_in@drive). "
+             "Tests the bottom-right cell of the linear-vs-nonlinear 2x2 "
+             "(plan twin-node-tanh, feature spec twin-probe-spec).",
+    )
+    _add_common(p_twin)
+    p_twin.add_argument(
+        "--harness", choices=TWIN_HARNESSES, default="taps8",
+        help="Drive harness: 'taps8' (8-tap delay bank, 25x8 W_in) or "
+             "'scalar' (rail-mapped scalar, 25x1 W_in, C1-style).",
+    )
+    p_twin.add_argument(
+        "--n-taps", type=int, default=TWIN_DEFAULT_N_TAPS,
+        help="Number of causal delay-bank taps (taps8 harness only).",
+    )
+    p_twin.add_argument(
+        "--radius", type=float, default=0.9,
+        help="Target spectral radius for W_mix (Gaussian, normalized).",
+    )
+    p_twin.add_argument(
+        "--leak-a", type=float, default=1.0,
+        help="Per-step leak a in (0, 1]; x_{t+1} = (1-a)*x + a*tanh(...).",
+    )
+    p_twin.add_argument(
+        "--input-scale", type=float, default=1.0,
+        help="RMS scale applied to the chosen drive harness.",
+    )
+    p_twin.add_argument("--w-seed", type=int, default=0)
+    p_twin.add_argument("--win-seed", type=int, default=0)
+    p_twin.add_argument("--max-delay", type=int, default=20)
+    p_twin.add_argument(
+        "--jacobian-samples", type=int, default=C1_SPECTRAL_TRANSITION_MIN,
     )
 
     args = parser.parse_args(argv)
@@ -4654,14 +5067,103 @@ def main(argv: list[str] | None = None) -> int:
         write_probe_txt(args.output / "c3_sweep.txt", hdr, lines)
         print("\n".join([hdr] + lines))
         (args.output / "c3_sweep.json").write_text(json.dumps({
-            "order": report.order, "seed": report.seed,
-            "device": report.device, "hidden_dim": report.hidden_dim,
+            "order": args.order, "seed": args.seed,
+            "device": args.device, "hidden_dim": args.hidden_dim,
             "c1b_path": report.c1b_path,
             "c1b_mc_total": report.c1b_mc_total,
             "gm_grid": report.gm_grid,
             "rows": rows,
             "crossover_gm_raw_fill": report.crossover_gm_raw_fill,
             "note": report.note,
+        }, indent=2))
+        return 0
+
+    if args.mode == "twin":
+        report = twin_node_tanh(
+            order=args.order, seed=args.seed, device=args.device,
+            hidden_dim=args.hidden_dim,
+            n_taps=args.n_taps, harness=args.harness,
+            radius=args.radius, leak_a=args.leak_a,
+            input_scale=args.input_scale,
+            w_seed=args.w_seed, win_seed=args.win_seed,
+            n_streams=args.n_streams,
+            train_samples_per_stream=args.train_samples,
+            washout=args.washout, max_delay=args.max_delay,
+            jacobian_samples=args.jacobian_samples,
+        )
+        rd = _serialize_rows([report["instrument"]])[0]
+        write_probe_csv(args.output / "twin.csv", [rd])
+        hdr = (
+            f"Twin node-tanh -- order={args.order} seed={args.seed} "
+            f"h={args.hidden_dim} harness={args.harness} n_in={report['n_in']} "
+            f"radius={args.radius:g} leak_a={args.leak_a:g} "
+            f"input_scale={args.input_scale:g}"
+        )
+        verdict = (
+            "PASS_ARCH" if report["pass_arch"]
+            else "FAIL_FABRIC" if report["fail_fabric"]
+            else "VOID" if report["void"]
+            else "INCONCLUSIVE"
+        )
+        lines = [
+            f"  config_tag={report['instrument'].config_tag}",
+            f"  nrmse={report['instrument'].nrmse:.4f}  "
+            f"r2={report['instrument'].r2:.4f}",
+            f"  mc_total={report['instrument'].mc_total:.3f}  "
+            f"state_pr={report['instrument'].state_pr:.2f}  "
+            f"state_pr_std={report['instrument'].state_pr_standardized:.2f}",
+            f"  activity(tanh units)={report['activity']:.4f}  "
+            f"(band=[{TWIN_ACTIVITY_LOW:g},{TWIN_ACTIVITY_HIGH:g}] "
+            f"in_band={report['activity_in_band']})  "
+            f"sat_max={report['instrument'].sat_max_ratio:.4f}",
+            f"  jac_max_abs={report['instrument'].jac_max_abs:.4f}  "
+            f"jac_min_abs={report['instrument'].jac_min_abs:.4f}  "
+            f"jac_rank_proxy={report['instrument'].jac_rank_proxy:.2f}",
+            f"  pre_tanh: median={report['pre_stats']['median_abs_pre']:.4f}  "
+            f"p90={report['pre_stats']['p90_abs_pre']:.4f}  "
+            f"mean={report['pre_stats']['mean_abs_pre']:.4f}  "
+            f"engaged={report['tanh_engaged']}",
+            f"  esn_ref: nrmse={report['esn_nrmse']:.4f}  "
+            f"mc={report['esn_mc_total']:.2f}",
+            f"  matched_parity_delta={report['matched_parity_delta']:+.4f}  "
+            f"(raw_delay={report['matched_raw_delay_nrmse']:.4f}, "
+            f"tol={report['matched_parity_tolerance']:.3f})",
+            f"  pass_arch={report['pass_arch']}  "
+            f"fail_fabric={report['fail_fabric']}  "
+            f"void={report['void']}",
+            f"  verdict={verdict}",
+        ]
+        write_probe_txt(args.output / "twin.txt", hdr, lines)
+        print("\n".join([hdr] + lines))
+        (args.output / "twin.json").write_text(json.dumps({
+            "order": report["order"], "seed": report["seed"],
+            "device": report["device"], "hidden_dim": report["hidden_dim"],
+            "n_taps": report["n_taps"], "harness": report["harness"],
+            "radius": report["radius"], "leak_a": report["leak_a"],
+            "input_scale": report["input_scale"],
+            "w_seed": report["w_seed"], "win_seed": report["win_seed"],
+            "n_streams": report["n_streams"],
+            "train_samples_per_stream": report["train_samples_per_stream"],
+            "washout": report["washout"], "max_delay": report["max_delay"],
+            "jacobian_samples": report["jacobian_samples"],
+            "n_in": report["n_in"],
+            "instrument": rd,
+            "activity": report["activity"],
+            "activity_in_band": report["activity_in_band"],
+            "activity_band": report["activity_band"],
+            "tanh_engaged": report["tanh_engaged"],
+            "states_finite": report["states_finite"],
+            "pass_arch": report["pass_arch"],
+            "fail_fabric": report["fail_fabric"],
+            "void": report["void"],
+            "verdict": verdict,
+            "pre_stats": report["pre_stats"],
+            "esn_nrmse": report["esn_nrmse"],
+            "esn_mc_total": report["esn_mc_total"],
+            "matched_raw_delay_nrmse": report["matched_raw_delay_nrmse"],
+            "matched_parity_tolerance": report["matched_parity_tolerance"],
+            "matched_parity_delta": report["matched_parity_delta"],
+            "note": report["note"],
         }, indent=2))
         return 0
 

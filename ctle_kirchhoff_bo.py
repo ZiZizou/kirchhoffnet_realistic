@@ -14,10 +14,12 @@ and optimiser choices, not MLP architectures.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import random
 import shutil
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -84,8 +86,13 @@ class KirchhoffCircuit(nn.Module):
         self.raw_leak = nn.Parameter(torch.full((self.num_nodes,), raw_leak))
         self.x_max, self.clip_current = float(x_max), float(clip_current)
         self.clip_softness, self.c_eff = float(clip_softness), float(c_eff)
+        self.nfe = 0
+
+    def reset_nfe(self) -> None:
+        self.nfe = 0
 
     def forward(self, _t: torch.Tensor, voltage: torch.Tensor) -> torch.Tensor:
+        self.nfe += 1
         # Ground is fixed to zero. Device activation is selected per BO trial.
         bounded = self.x_max * torch.tanh(voltage / self.x_max)
         with_ground = torch.cat((torch.zeros_like(bounded[:, :1]), bounded), dim=1)
@@ -191,6 +198,24 @@ def evaluate(model: nn.Module, data: dict[str, Any], split: str, device: torch.d
         return float(loss_fn(model(x), y, teacher, args, data["power_norm"]).item())
 
 
+TRIAL_SUMMARY_FIELDS = [
+    "trial", "state", "objective_validation_loss", "best_validation_loss", "test_loss",
+    "failure_rate", "nodes", "edges", "parameter_count", "activation", "t_end", "rtol",
+    "lr", "weight_decay", "epochs_completed", "pruned_epoch", "elapsed_seconds", "error",
+]
+
+
+def append_trial_summary(output: Path, row: dict[str, Any]) -> None:
+    """Append a human-readable trial index; Optuna's SQLite DB remains authoritative."""
+    path = output / "trial_summary.csv"
+    new_file = not path.exists()
+    with path.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=TRIAL_SUMMARY_FIELDS)
+        if new_file:
+            writer.writeheader()
+        writer.writerow({field: row.get(field, "") for field in TRIAL_SUMMARY_FIELDS})
+
+
 def trial_train(trial: optuna.Trial, data: dict[str, Any], args: argparse.Namespace, device: torch.device,
                 candidates: list[tuple[int, int]], output: Path) -> float:
     nodes, edges = candidates[trial.suggest_int("circuit_architecture", 0, len(candidates) - 1)]
@@ -199,37 +224,86 @@ def trial_train(trial: optuna.Trial, data: dict[str, Any], args: argparse.Namesp
     rtol = trial.suggest_categorical("rtol", [1e-3, 3e-4])
     lr = trial.suggest_float("lr", 1e-4, 3e-3, log=True)
     wd = trial.suggest_float("weight_decay", 1e-7, 1e-3, log=True)
+    trial_dir = output / f"trial_{trial.number:04d}"
+    trial_dir.mkdir(parents=True, exist_ok=True)
     model = CTLEKirchhoffNet(nodes, edges, activation, args.seed + trial.number, t_end, rtol,
                              x_max=args.x_max, clip_current=args.clip_current,
                              clip_softness=args.clip_softness, leak_init=args.leak_init,
                              c_eff=args.c_eff).to(device)
     trial.set_user_attr("nodes", nodes); trial.set_user_attr("edges", edges)
     trial.set_user_attr("parameter_count", parameter_count(nodes, edges))
+    metadata = {
+        "trial": trial.number, "state": "RUNNING", "dataset_fingerprint": data["fingerprint"],
+        "architecture": {"nodes": nodes, "edges": edges, "parameter_count": parameter_count(nodes, edges),
+                         "topology_seed": args.seed + trial.number, "device_activation": activation},
+        "bo_parameters": dict(trial.params), "ode": {"solver": "odeint_adjoint", "method": "dopri5", "t_end": t_end, "rtol": rtol, "atol": rtol * .1},
+        "constraints": {"x_max": args.x_max, "clip_current": args.clip_current, "clip_softness": args.clip_softness, "leak_init": args.leak_init, "c_eff": args.c_eff},
+        "metrics_note": "failure_rate is null: this compact baseline does not run the external ZIG/forward-surrogate evaluator.",
+    }
+    (trial_dir / "trial_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
     idx = data["train"]
     tensors = [torch.from_numpy(data["x"][idx]), torch.from_numpy(data["y"][idx])]
     if data["teacher"] is not None: tensors.append(torch.from_numpy(data["teacher"][idx]))
     loader = DataLoader(TensorDataset(*tensors), batch_size=args.batch_size, shuffle=True)
     best, state = float("inf"), None
-    for epoch in range(args.epochs):
-        model.train()
-        ramp = min(1., max(0., (epoch + 2 - args.ctle_phase_a_validity_ramp_start) / max(1, args.ctle_phase_a_validity_ramp_epochs)))
-        for batch in loader:
-            opt.zero_grad(set_to_none=True); x, y = batch[0].to(device), batch[1].to(device)
-            teacher = batch[2].to(device) if len(batch) == 3 else None
-            loss_fn(model(x), y, teacher, args, data["power_norm"], ramp).backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.); opt.step()
-        value = evaluate(model, data, "val", device, args)
-        if value < best:
-            best, state = value, {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-        trial.report(value, epoch)
-        if trial.should_prune(): raise optuna.TrialPruned()
-    torch.save({"state_dict": state, "nodes": nodes, "edges": edges, "activation": activation, "t_end": t_end,
-                "rtol": rtol, "x_max": args.x_max, "clip_current": args.clip_current,
-                "clip_softness": args.clip_softness, "leak_init": args.leak_init,
-                "c_eff": args.c_eff, "validation_loss": best,
-                "parameter_count": parameter_count(nodes, edges)},
-               output / f"trial_{trial.number:04d}.pt")
+    started = time.perf_counter()
+    history_path, log_path = trial_dir / "history.csv", trial_dir / "log.txt"
+    checkpoint_payload: dict[str, Any] | None = None
+    with history_path.open("w", newline="", encoding="utf-8") as history, log_path.open("w", encoding="utf-8") as log:
+        history_writer = csv.DictWriter(history, fieldnames=["epoch", "train_loss", "validation_loss", "validity_ramp", "train_nfe", "validation_nfe", "mean_grad_norm", "elapsed_seconds"])
+        history_writer.writeheader()
+        log.write("# CTLE KirchhoffNet BO trial\n" + json.dumps(metadata, indent=2) + "\n\n# epoch descent\n")
+        log.write("epoch train_loss validation_loss ramp train_nfe validation_nfe mean_grad_norm elapsed_seconds\n")
+        try:
+            for epoch in range(args.epochs):
+                epoch_start = time.perf_counter(); model.train(); model.circuit.reset_nfe()
+                ramp = min(1., max(0., (epoch + 2 - args.ctle_phase_a_validity_ramp_start) / max(1, args.ctle_phase_a_validity_ramp_epochs)))
+                loss_sum = grad_sum = 0.0
+                for batch in loader:
+                    opt.zero_grad(set_to_none=True); x, y = batch[0].to(device), batch[1].to(device)
+                    teacher = batch[2].to(device) if len(batch) == 3 else None
+                    train_loss = loss_fn(model(x), y, teacher, args, data["power_norm"], ramp)
+                    train_loss.backward()
+                    grad_sum += float(torch.nn.utils.clip_grad_norm_(model.parameters(), 1.).item())
+                    opt.step(); loss_sum += float(train_loss.detach().item())
+                train_nfe = model.circuit.nfe; model.circuit.reset_nfe()
+                value = evaluate(model, data, "val", device, args); validation_nfe = model.circuit.nfe
+                row = {"epoch": epoch + 1, "train_loss": loss_sum / max(1, len(loader)), "validation_loss": value,
+                       "validity_ramp": ramp, "train_nfe": train_nfe, "validation_nfe": validation_nfe,
+                       "mean_grad_norm": grad_sum / max(1, len(loader)), "elapsed_seconds": time.perf_counter() - epoch_start}
+                history_writer.writerow(row); history.flush()
+                log.write("{epoch} {train_loss:.8g} {validation_loss:.8g} {validity_ramp:.6g} {train_nfe} {validation_nfe} {mean_grad_norm:.8g} {elapsed_seconds:.3f}\n".format(**row)); log.flush()
+                if value < best:
+                    best, state = value, {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                trial.report(value, epoch)
+                if trial.should_prune():
+                    metadata.update({"state": "PRUNED", "pruned_epoch": epoch + 1, "best_validation_loss": best, "elapsed_seconds": time.perf_counter() - started})
+                    if state is not None:
+                        torch.save({"state_dict": state, "validation_loss": best, "pruned": True}, trial_dir / "pruned_best_model.pt")
+                    (trial_dir / "trial_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+                    append_trial_summary(output, {"trial": trial.number, "state": "PRUNED", "best_validation_loss": best, "failure_rate": None, "nodes": nodes, "edges": edges, "parameter_count": parameter_count(nodes, edges), "activation": activation, "t_end": t_end, "rtol": rtol, "lr": lr, "weight_decay": wd, "epochs_completed": epoch + 1, "pruned_epoch": epoch + 1, "elapsed_seconds": metadata["elapsed_seconds"]})
+                    log.write(f"# PRUNED after epoch {epoch + 1}; best_validation_loss={best:.8g}\n")
+                    raise optuna.TrialPruned()
+            assert state is not None
+            checkpoint_payload = {"state_dict": state, "nodes": nodes, "edges": edges, "activation": activation, "t_end": t_end,
+                                  "rtol": rtol, "x_max": args.x_max, "clip_current": args.clip_current,
+                                  "clip_softness": args.clip_softness, "leak_init": args.leak_init, "c_eff": args.c_eff,
+                                  "validation_loss": best, "parameter_count": parameter_count(nodes, edges)}
+            torch.save(checkpoint_payload, trial_dir / "best_model.pt")
+            model.load_state_dict(state); model.circuit.reset_nfe(); test_loss = evaluate(model, data, "test", device, args)
+            metadata.update({"state": "COMPLETE", "best_validation_loss": best, "test_loss": test_loss, "test_nfe": model.circuit.nfe, "elapsed_seconds": time.perf_counter() - started})
+            (trial_dir / "trial_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+            append_trial_summary(output, {"trial": trial.number, "state": "COMPLETE", "objective_validation_loss": best, "best_validation_loss": best, "test_loss": test_loss, "failure_rate": None, "nodes": nodes, "edges": edges, "parameter_count": parameter_count(nodes, edges), "activation": activation, "t_end": t_end, "rtol": rtol, "lr": lr, "weight_decay": wd, "epochs_completed": args.epochs, "elapsed_seconds": metadata["elapsed_seconds"]})
+            log.write(f"# COMPLETE best_validation_loss={best:.8g} test_loss={test_loss:.8g} test_nfe={model.circuit.nfe}\n")
+        except Exception as exc:
+            if isinstance(exc, optuna.TrialPruned):
+                raise
+            metadata.update({"state": "FAIL", "error": repr(exc), "elapsed_seconds": time.perf_counter() - started})
+            (trial_dir / "trial_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+            append_trial_summary(output, {"trial": trial.number, "state": "FAIL", "failure_rate": None, "nodes": nodes, "edges": edges, "parameter_count": parameter_count(nodes, edges), "activation": activation, "t_end": t_end, "rtol": rtol, "lr": lr, "weight_decay": wd, "elapsed_seconds": metadata["elapsed_seconds"], "error": repr(exc)})
+            log.write(f"# FAIL {exc!r}\n")
+            raise
     return best
 
 
@@ -247,7 +321,7 @@ def run(args: argparse.Namespace) -> None:
         pruner=optuna.pruners.MedianPruner(n_startup_trials=min(5, args.n_trials), n_warmup_steps=max(1, args.epochs // 5)))
     done = sum(t.state == optuna.trial.TrialState.COMPLETE for t in study.trials)
     study.optimize(lambda t: trial_train(t, data, args, device, candidates, output), n_trials=max(0, args.n_trials - done))
-    best = study.best_trial; ckpt = output / f"trial_{best.number:04d}.pt"; payload = torch.load(ckpt, map_location="cpu", weights_only=False)
+    best = study.best_trial; ckpt = output / f"trial_{best.number:04d}" / "best_model.pt"; payload = torch.load(ckpt, map_location="cpu", weights_only=False)
     model = CTLEKirchhoffNet(payload["nodes"], payload["edges"], payload["activation"], args.seed + best.number,
                              payload["t_end"], payload["rtol"], x_max=payload["x_max"],
                              clip_current=payload["clip_current"], clip_softness=payload["clip_softness"],
@@ -265,6 +339,9 @@ def smoke_test() -> None:
         params = 10 ** rng.uniform(PARAM_LOG_BOUNDS[:, 0], PARAM_LOG_BOUNDS[:, 1], (32, 7)).astype(np.float32); logs = np.log10(specs)
         np.savez_compressed(root / "data.npz", specs=specs, params=params, train_idx=np.arange(20), val_idx=np.arange(20, 26), test_idx=np.arange(26, 32), input_log_min=logs.min(0)-.1, input_log_max=logs.max(0)+.1, fingerprint=np.array("smoke"))
         run(parse_args(["--dataset", "ctle", "--ctle-phase-a", "--ctle-canonical-dataset", str(root / "data.npz"), "--param-budget", "300", "--param-tolerance", ".4", "--epochs", "1", "--n-trials", "1", "--batch-size", "10", "--device", "cpu", "--ctle-phase-a-mlp-weight", "0", "--output", str(root / "out")]))
+        trial_dir = root / "out" / "trial_0000"
+        assert (trial_dir / "log.txt").is_file() and (trial_dir / "history.csv").is_file()
+        assert (trial_dir / "trial_metadata.json").is_file() and (root / "out" / "trial_summary.csv").is_file()
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

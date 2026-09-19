@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import logging
 import random
 import shutil
 import tempfile
@@ -116,20 +117,43 @@ class CTLEKirchhoffNet(nn.Module):
                  clip_softness: float, leak_init: float, c_eff: float) -> None:
         super().__init__()
         src, dst = make_topology(nodes, edge_count, topology_seed)
-        self.encoder = nn.Linear(4, nodes)
+        # Names intentionally match the existing Phase-A differential-LR
+        # grouping and OutputAffine-bias initialisation conventions.
+        self.input_mapper = nn.Linear(4, nodes)
         self.circuit = KirchhoffCircuit(src, dst, num_nodes=nodes, activation=activation, x_max=x_max, clip_current=clip_current,
                                         clip_softness=clip_softness, leak_init=leak_init, c_eff=c_eff)
-        self.readout = nn.Linear(nodes, 7)
+        self.output_mapper = nn.Linear(nodes, 7)
         self.t_end, self.rtol = float(t_end), float(rtol)
         self.x_max = float(x_max)
+        lo = torch.as_tensor(PARAM_LOG_BOUNDS[:, 0], dtype=torch.float32)
+        hi = torch.as_tensor(PARAM_LOG_BOUNDS[:, 1], dtype=torch.float32)
+        self.register_buffer("log_lo", lo)
+        self.register_buffer("log_hi", hi)
+        self.input_log_min: torch.Tensor | None = None
+        self.input_log_max: torch.Tensor | None = None
+
+    def attach_scaler(self, *, input_log_min, input_log_max, **_unused: Any) -> None:
+        """Use the canonical Phase-A four-log-feature input contract."""
+        if input_log_min is None or input_log_max is None:
+            raise ValueError("Canonical Phase-A input_log_min/max are required")
+        self.input_log_min = torch.as_tensor(input_log_min, dtype=torch.float32)
+        self.input_log_max = torch.as_tensor(input_log_max, dtype=torch.float32)
+
+    def scale_input(self, specs: torch.Tensor) -> torch.Tensor:
+        if self.input_log_min is None or self.input_log_max is None:
+            raise RuntimeError("Call attach_scaler before the first forward pass")
+        lo = self.input_log_min.to(specs.device, specs.dtype)
+        hi = self.input_log_max.to(specs.device, specs.dtype)
+        logs = torch.log10(specs.clamp(min=1e-12))
+        return (2.0 * (logs - lo) / (hi - lo).clamp(min=1e-8) - 1.0).clamp(-4.0, 4.0)
 
     def forward(self, specs: torch.Tensor) -> torch.Tensor:
-        initial_voltage = self.x_max * torch.tanh(self.encoder(specs) / self.x_max)
+        initial_voltage = self.x_max * torch.tanh(self.input_mapper(self.scale_input(specs)) / self.x_max)
         times = torch.tensor((0., self.t_end), device=specs.device, dtype=specs.dtype)
         # Explicitly adjoint + adaptive Dormand-Prince. No fixed-step/Heun path.
         final_voltage = odeint_adjoint(self.circuit, initial_voltage, times,
                                        rtol=self.rtol, atol=self.rtol * .1, method="dopri5")[-1]
-        return self.readout(self.x_max * torch.tanh(final_voltage / self.x_max))
+        return self.output_mapper(self.x_max * torch.tanh(final_voltage / self.x_max))
 
 
 def make_topology(nodes: int, edge_count: int, seed: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -161,43 +185,6 @@ def circuit_candidates(budget: int, tolerance: float) -> list[tuple[int, int]]:
     return result
 
 
-def load_dataset(path: Path) -> dict[str, Any]:
-    if not path.is_file(): raise FileNotFoundError(path)
-    with np.load(path, allow_pickle=False) as z:
-        needed = {"specs", "params", "train_idx", "val_idx", "test_idx", "input_log_min", "input_log_max"}
-        if missing := needed - set(z.files): raise ValueError(f"Canonical dataset missing {sorted(missing)}")
-        specs, params = np.asarray(z["specs"], np.float32), np.asarray(z["params"], np.float32)
-        lo, hi = np.asarray(z["input_log_min"], np.float32), np.asarray(z["input_log_max"], np.float32)
-        x = np.clip(2 * (np.log10(np.clip(specs, 1e-30, None)) - lo) / (hi - lo) - 1, -4, 4).astype(np.float32)
-        teacher = np.asarray(z["mlp_logits_trial0019"], np.float32) if "mlp_logits_trial0019" in z.files else None
-        power_norm = float(np.asarray(z["power_norm_const"]).item()) if "power_norm_const" in z.files else float(np.mean(4 * params[:, 6] * params[:, 1]))
-        return {"x": x, "y": target_logits(params), "teacher": teacher, "power_norm": power_norm,
-                "train": np.asarray(z["train_idx"], np.int64), "val": np.asarray(z["val_idx"], np.int64),
-                "test": np.asarray(z["test_idx"], np.int64), "fingerprint": str(np.asarray(z["fingerprint"]).item())}
-
-
-def loss_fn(logits: torch.Tensor, labels: torch.Tensor, teacher: torch.Tensor | None,
-            args: argparse.Namespace, power_norm: float, validity_scale: float = 1.) -> torch.Tensor:
-    flow_loss = F.smooth_l1_loss(logits, labels)
-    loss = flow_loss * (1. + args.ctle_phase_a_fwd_weight)
-    if teacher is not None: loss = loss + args.ctle_phase_a_mlp_weight * F.mse_loss(logits, teacher)
-    logs = bounded_logs(logits)
-    power = 4 * torch.pow(10., logs[:, 6]) * torch.pow(10., logs[:, 1])
-    loss = loss + args.ctle_phase_a_power_weight * power.mean() / power_norm
-    # A ZIG model is intentionally not imported into this compact ODE trainer;
-    # this is an explicit rail-confidence regularizer, not claimed ZIG validity.
-    loss = loss + args.ctle_phase_a_validity_weight * validity_scale * torch.relu(logits.abs() - 8).square().mean()
-    return loss
-
-
-def evaluate(model: nn.Module, data: dict[str, Any], split: str, device: torch.device, args: argparse.Namespace) -> float:
-    model.eval(); idx = data[split]
-    with torch.no_grad():
-        x, y = torch.from_numpy(data["x"][idx]).to(device), torch.from_numpy(data["y"][idx]).to(device)
-        teacher = torch.from_numpy(data["teacher"][idx]).to(device) if data["teacher"] is not None else None
-        return float(loss_fn(model(x), y, teacher, args, data["power_norm"]).item())
-
-
 TRIAL_SUMMARY_FIELDS = [
     "trial", "state", "objective_validation_loss", "best_validation_loss", "test_loss",
     "failure_rate", "nodes", "edges", "parameter_count", "activation", "t_end", "rtol",
@@ -216,14 +203,22 @@ def append_trial_summary(output: Path, row: dict[str, Any]) -> None:
         writer.writerow({field: row.get(field, "") for field in TRIAL_SUMMARY_FIELDS})
 
 
+def batch_size_choices(value: str) -> list[int]:
+    choices = [int(v.strip()) for v in value.split(",") if v.strip()]
+    if not choices or min(choices) < 1:
+        raise ValueError("--batch-size-choices must be a nonempty comma-separated list of positive integers")
+    return choices
+
+
 def trial_train(trial: optuna.Trial, data: dict[str, Any], args: argparse.Namespace, device: torch.device,
                 candidates: list[tuple[int, int]], output: Path) -> float:
     nodes, edges = candidates[trial.suggest_int("circuit_architecture", 0, len(candidates) - 1)]
     activation = trial.suggest_categorical("device_activation", ["tanh", "relu"])
     t_end = trial.suggest_categorical("t_end", [.25, .5, 1.])
     rtol = trial.suggest_categorical("rtol", [1e-3, 3e-4])
-    lr = trial.suggest_float("lr", 1e-4, 3e-3, log=True)
+    lr = trial.suggest_float("lr", args.lr_min, args.lr_max, log=True)
     wd = trial.suggest_float("weight_decay", 1e-7, 1e-3, log=True)
+    batch_size = trial.suggest_categorical("batch_size", batch_size_choices(args.batch_size_choices))
     trial_dir = output / f"trial_{trial.number:04d}"
     trial_dir.mkdir(parents=True, exist_ok=True)
     model = CTLEKirchhoffNet(nodes, edges, activation, args.seed + trial.number, t_end, rtol,
@@ -245,7 +240,7 @@ def trial_train(trial: optuna.Trial, data: dict[str, Any], args: argparse.Namesp
     idx = data["train"]
     tensors = [torch.from_numpy(data["x"][idx]), torch.from_numpy(data["y"][idx])]
     if data["teacher"] is not None: tensors.append(torch.from_numpy(data["teacher"][idx]))
-    loader = DataLoader(TensorDataset(*tensors), batch_size=args.batch_size, shuffle=True)
+    loader = DataLoader(TensorDataset(*tensors), batch_size=batch_size, shuffle=True)
     best, state = float("inf"), None
     started = time.perf_counter()
     history_path, log_path = trial_dir / "history.csv", trial_dir / "log.txt"
@@ -307,52 +302,172 @@ def trial_train(trial: optuna.Trial, data: dict[str, Any], args: argparse.Namesp
     return best
 
 
+def build_phase_a_context(args: argparse.Namespace, output: Path) -> tuple[Any, dict[str, Any], dict[str, Any]]:
+    """Load the exact shared CTLE evaluator/scalers used by KNet Phase A."""
+    import ctle_dagger_common as phase
+
+    canonical = phase.load_canonical_flow_dataset(args.ctle_canonical_dataset)
+    setup_args = argparse.Namespace(
+        teacher_dir=args.teacher_dir or phase.DEFAULT_TEACHER_DIR,
+        data_dir=args.data_dir or phase.DEFAULT_DATA_DIR,
+        output=str(output / "_phase_a_shared_assets"), device=args.device, seed=args.seed,
+        input_preprocessing="knet", param_budget=args.param_budget,
+    )
+    base = phase.setup(setup_args)
+    # Canonical bounds, not the historical-frame bounds setup() derived, are
+    # the shared Phase-A preprocessing contract.
+    base.update({"canonical_dataset": canonical, "input_log_min": None, "input_log_max": None})
+    return phase, base, canonical
+
+
+def phase_a_trial(trial: optuna.Trial, phase: Any, base_ctx: dict[str, Any], canonical: dict[str, Any],
+                  args: argparse.Namespace, candidates: list[tuple[int, int]], output: Path) -> float:
+    """Run the existing Phase-A loop unchanged, substituting only the student."""
+    nodes, edges = candidates[trial.suggest_int("circuit_architecture", 0, len(candidates) - 1)]
+    activation = trial.suggest_categorical("device_activation", ["tanh", "relu"])
+    t_end = trial.suggest_categorical("t_end", [.25, .5, 1.])
+    rtol = trial.suggest_categorical("rtol", [1e-3, 3e-4])
+    lr = trial.suggest_float("lr", args.lr_min, args.lr_max, log=True)
+    wd = trial.suggest_float("weight_decay", 1e-7, 1e-3, log=True)
+    batch_size = trial.suggest_categorical("batch_size", batch_size_choices(args.batch_size_choices))
+    trial_dir = output / f"trial_{trial.number:04d}"
+    trial_dir.mkdir(parents=True, exist_ok=True)
+    student = CTLEKirchhoffNet(nodes, edges, activation, args.seed + trial.number, t_end, rtol,
+                               x_max=args.x_max, clip_current=args.clip_current,
+                               clip_softness=args.clip_softness, leak_init=args.leak_init,
+                               c_eff=args.c_eff)
+    # Align this wrapper's fixed physical decode bounds with the shared phase
+    # harness, rather than relying on a duplicated local constant.
+    bounds = list(phase.PARAM_LOG_BOUNDS.values())
+    with torch.no_grad():
+        student.log_lo.copy_(torch.tensor([b[0] for b in bounds], dtype=torch.float32))
+        student.log_hi.copy_(torch.tensor([b[1] for b in bounds], dtype=torch.float32))
+    phase.init_output_affine_bias_from_labels(
+        student, canonical["params"][np.asarray(canonical["train_idx"], dtype=np.int64)], phase.PARAM_LOG_BOUNDS)
+    trial.set_user_attr("nodes", nodes); trial.set_user_attr("edges", edges)
+    trial.set_user_attr("parameter_count", parameter_count(nodes, edges))
+    trial.set_user_attr("phase_a_framework", "ctle_dagger_common.run_phase_a_training")
+    ctx = dict(base_ctx)
+    ctx.update({
+        "canonical_dataset": canonical, "epochs": args.epochs, "batch_size": batch_size,
+        "lr": lr, "weight_decay": wd, "output_dir": str(trial_dir), "grad_clip": 1.0,
+        "val_eval_every": args.ctle_eval_every, "earlystop_patience": args.ctle_earlystop_patience,
+        "error_threshold": 0.10, "validity_weight": args.ctle_phase_a_validity_weight,
+        "validity_ramp_start": args.ctle_phase_a_validity_ramp_start,
+        "validity_ramp_epochs": args.ctle_phase_a_validity_ramp_epochs,
+        "mlp_weight": args.ctle_phase_a_mlp_weight, "fwd_weight": args.ctle_phase_a_fwd_weight,
+        "power_weight": args.ctle_phase_a_power_weight, "mapper_lr_scale": args.mapper_lr_scale,
+        "struct_lr_scale": args.struct_lr_scale, "dyn_lr_scale": args.dyn_lr_scale,
+        "input_log_min": None, "input_log_max": None,
+    })
+    log_path = trial_dir / "log.txt"
+    log_path.write_text("# Original KirchhoffNet transplanted into the shared CTLE Phase-A framework\n"
+                        f"# BO params: {json.dumps(trial.params, sort_keys=True)}\n", encoding="utf-8")
+    handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"))
+    phase._logger.addHandler(handler)
+    try:
+        result = phase.run_phase_a_training(student, ctx, model_name="original_kirchhoffnet")
+    except Exception as exc:
+        trial.set_user_attr("error", repr(exc))
+        append_trial_summary(output, {"trial": trial.number, "state": "FAIL", "nodes": nodes, "edges": edges,
+            "parameter_count": parameter_count(nodes, edges), "activation": activation, "t_end": t_end, "rtol": rtol,
+            "lr": lr, "weight_decay": wd, "error": repr(exc)})
+        raise
+    finally:
+        phase._logger.removeHandler(handler)
+        handler.close()
+    final = result["final"]
+    val_failure = float(final["val"]["failure_rate"])
+    test_failure = float(final["test"]["failure_rate"])
+    # Same Phase-A lexicographic tie-break as kn_bayes_opt: among equal
+    # failure rates, prefer lower valid-design power and then lower teacher
+    # logit MSE.  It is deliberately tiny and never replaces the failure
+    # metric as the primary objective.
+    valid_power = float(final["val"].get("valid_mean_power", float("nan")))
+    val_mlp_mse = float(final["val"].get("mlp_mse", float("nan")))
+    power_ref = float(np.asarray(canonical["power_norm_const"]).item())
+    lex_offset = 0.0
+    if np.isfinite(valid_power) and valid_power > 0:
+        lex_offset += 1e-4 * (valid_power / power_ref - 1.0)
+    if np.isfinite(val_mlp_mse):
+        lex_offset += 1e-6 * val_mlp_mse
+    objective = val_failure + lex_offset
+    trial.set_user_attr("validation_failure_rate", val_failure)
+    trial.set_user_attr("test_failure_rate", test_failure)
+    trial.set_user_attr("best_validation_failure_rate", float(result["best_val_failure_rate"]))
+    trial.set_user_attr("phase_a_valid_mean_power", valid_power if np.isfinite(valid_power) else None)
+    trial.set_user_attr("phase_a_val_mlp_mse", val_mlp_mse if np.isfinite(val_mlp_mse) else None)
+    trial.set_user_attr("lexicographic_offset", lex_offset)
+    # This is the exact Phase-A BO metric.  Test is recorded strictly for
+    # diagnostics and never participates in the Optuna objective.
+    append_trial_summary(output, {"trial": trial.number, "state": "COMPLETE", "objective_validation_loss": objective,
+        "best_validation_loss": float(result["best_val_failure_rate"]), "test_loss": test_failure,
+        "failure_rate": val_failure, "nodes": nodes, "edges": edges, "parameter_count": parameter_count(nodes, edges),
+        "activation": activation, "t_end": t_end, "rtol": rtol, "lr": lr, "weight_decay": wd,
+        "epochs_completed": len(result["history"]["epoch"])})
+    trial.report(objective, step=len(result["history"]["epoch"]))
+    return objective
+
+
 def run(args: argparse.Namespace) -> None:
     if args.dataset != "ctle" or not args.ctle_phase_a: raise ValueError("Use --dataset ctle --ctle-phase-a")
     if args.ctle_canonical_dataset is None or args.output is None or args.param_budget is None: raise ValueError("canonical dataset, output, and parameter budget are required")
     if args.device == "cuda" and not torch.cuda.is_available(): raise ValueError("CUDA requested but unavailable")
-    seed_everything(args.seed); device = torch.device(args.device); data = load_dataset(args.ctle_canonical_dataset)
-    if args.ctle_phase_a_mlp_weight > 0 and data["teacher"] is None: raise ValueError("Teacher distillation needs schema-2 data with mlp_logits_trial0019")
+    seed_everything(args.seed)
     output = args.output.resolve(); output.mkdir(parents=True, exist_ok=True); candidates = circuit_candidates(args.param_budget, args.param_tolerance)
-    (output / "run_config.json").write_text(json.dumps({**vars(args), "fingerprint": data["fingerprint"], "candidate_count": len(candidates), "solver": "odeint_adjoint/dopri5", "device_activation_choices": ["tanh", "relu"], "node_constraint": "bounded tanh broadcast + soft rail + positive leak"}, indent=2, default=str))
+    phase, base_ctx, canonical = build_phase_a_context(args, output)
+    if args.ctle_phase_a_mlp_weight > 0 and "mlp_logits_trial0019" not in canonical:
+        raise ValueError("Teacher distillation needs schema-2 data with mlp_logits_trial0019")
+    (output / "run_config.json").write_text(json.dumps({**vars(args), "fingerprint": str(np.asarray(canonical["fingerprint"]).item()), "candidate_count": len(candidates), "solver": "odeint_adjoint/dopri5", "device_activation_choices": ["tanh", "relu"], "node_constraint": "bounded tanh broadcast + soft rail + positive leak", "training_framework": "ctle_dagger_common.run_phase_a_training"}, indent=2, default=str))
     storage = f"sqlite:///{(output / 'study.db').as_posix()}"
     study = optuna.create_study(study_name="ctle_kirchhoff_bo", storage=storage, load_if_exists=args.resume,
         direction="minimize", sampler=optuna.samplers.TPESampler(seed=args.seed, multivariate=True),
         pruner=optuna.pruners.MedianPruner(n_startup_trials=min(5, args.n_trials), n_warmup_steps=max(1, args.epochs // 5)))
     done = sum(t.state == optuna.trial.TrialState.COMPLETE for t in study.trials)
-    study.optimize(lambda t: trial_train(t, data, args, device, candidates, output), n_trials=max(0, args.n_trials - done))
-    best = study.best_trial; ckpt = output / f"trial_{best.number:04d}" / "best_model.pt"; payload = torch.load(ckpt, map_location="cpu", weights_only=False)
-    model = CTLEKirchhoffNet(payload["nodes"], payload["edges"], payload["activation"], args.seed + best.number,
-                             payload["t_end"], payload["rtol"], x_max=payload["x_max"],
-                             clip_current=payload["clip_current"], clip_softness=payload["clip_softness"],
-                             leak_init=payload["leak_init"], c_eff=payload["c_eff"]).to(device)
-    model.load_state_dict(payload["state_dict"]); summary = {"best_trial": best.number, "validation_loss": best.value,
-        "test_loss": evaluate(model, data, "test", device, args), "parameter_count": payload["parameter_count"], "params": best.params}
-    shutil.copy2(ckpt, output / "best_model.pt"); (output / "summary.json").write_text(json.dumps(summary, indent=2)); print(json.dumps(summary, indent=2))
+    study.optimize(lambda t: phase_a_trial(t, phase, base_ctx, canonical, args, candidates, output), n_trials=max(0, args.n_trials - done))
+    best = study.best_trial
+    history_path = output / f"trial_{best.number:04d}" / "phase_a_history.json"
+    with history_path.open(encoding="utf-8") as handle:
+        best_history = json.load(handle)
+    summary = {"best_trial": best.number, "validation_failure_rate": best.value,
+        "test_failure_rate": best_history["final"]["test"]["failure_rate"],
+        "parameter_count": best.user_attrs["parameter_count"], "params": best.params}
+    shutil.copy2(output / f"trial_{best.number:04d}" / "phase_a_best.pt", output / "best_model.pt")
+    (output / "summary.json").write_text(json.dumps(summary, indent=2)); print(json.dumps(summary, indent=2))
     engine = getattr(getattr(study._storage, "_backend", study._storage), "engine", None)
     if engine is not None: engine.dispose()
 
 
 def smoke_test() -> None:
-    with tempfile.TemporaryDirectory(prefix="ctle_kirchhoff_bo_") as temp:
-        root = Path(temp); rng = np.random.default_rng(7); specs = 10 ** rng.uniform(-2, 2, (32, 4)).astype(np.float32)
-        params = 10 ** rng.uniform(PARAM_LOG_BOUNDS[:, 0], PARAM_LOG_BOUNDS[:, 1], (32, 7)).astype(np.float32); logs = np.log10(specs)
-        np.savez_compressed(root / "data.npz", specs=specs, params=params, train_idx=np.arange(20), val_idx=np.arange(20, 26), test_idx=np.arange(26, 32), input_log_min=logs.min(0)-.1, input_log_max=logs.max(0)+.1, fingerprint=np.array("smoke"))
-        run(parse_args(["--dataset", "ctle", "--ctle-phase-a", "--ctle-canonical-dataset", str(root / "data.npz"), "--param-budget", "300", "--param-tolerance", ".4", "--epochs", "1", "--n-trials", "1", "--batch-size", "10", "--device", "cpu", "--ctle-phase-a-mlp-weight", "0", "--output", str(root / "out")]))
-        trial_dir = root / "out" / "trial_0000"
-        assert (trial_dir / "log.txt").is_file() and (trial_dir / "history.csv").is_file()
-        assert (trial_dir / "trial_metadata.json").is_file() and (root / "out" / "trial_summary.csv").is_file()
+    """Small adjoint/backward check; full tests require the external CTLE assets."""
+    model = CTLEKirchhoffNet(16, 80, "tanh", 7, .25, 1e-3, x_max=3.,
+                             clip_current=.05, clip_softness=.02, leak_init=.0486, c_eff=1.)
+    model.attach_scaler(input_log_min=np.full(4, -2., dtype=np.float32),
+                        input_log_max=np.full(4, 2., dtype=np.float32))
+    x = torch.full((4, 4), .1, dtype=torch.float32)
+    loss = model(x).square().mean(); loss.backward()
+    assert model.circuit.edge.grad is not None and torch.isfinite(model.circuit.edge.grad).all()
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--dataset", default="ctle", choices=["ctle"]); p.add_argument("--ctle-phase-a", action="store_true")
     p.add_argument("--ctle-canonical-dataset", type=Path); p.add_argument("--ctle-phase-a-mlp-teacher-ckpt", type=Path, help="Recorded with run provenance; teacher logits are frozen in schema-2 canonical data.")
+    p.add_argument("--teacher-dir", type=str, default=None, help="ZIG/scaler artifact directory; defaults to the existing Phase-A harness path.")
+    p.add_argument("--data-dir", type=str, default=None, help="Historical CTLE CSV directory; defaults to the existing Phase-A harness path.")
     p.add_argument("--ctle-phase-a-mlp-weight", type=float, default=1.); p.add_argument("--ctle-phase-a-fwd-weight", type=float, default=0.)
     p.add_argument("--ctle-phase-a-power-weight", type=float, default=0.); p.add_argument("--ctle-phase-a-validity-weight", type=float, default=0.)
     p.add_argument("--ctle-phase-a-validity-ramp-start", type=int, default=10); p.add_argument("--ctle-phase-a-validity-ramp-epochs", type=int, default=30)
     p.add_argument("--ctle-objective", choices=["validation"], default="validation"); p.add_argument("--param-budget", type=int); p.add_argument("--param-tolerance", type=float, default=.15)
-    p.add_argument("--epochs", type=int, default=300); p.add_argument("--n-trials", type=int, default=30); p.add_argument("--batch-size", type=int, default=256); p.add_argument("--seed", type=int, default=100)
+    p.add_argument("--epochs", type=int, default=300); p.add_argument("--n-trials", type=int, default=30); p.add_argument("--seed", type=int, default=100)
+    p.add_argument("--batch-size-choices", default="512,1024,2048,4096", help="BO batch-size choices; matches kn_bayes_opt by default.")
+    p.add_argument("--lr-min", type=float, default=1e-4); p.add_argument("--lr-max", type=float, default=1e-2)
+    p.add_argument("--ctle-eval-every", type=int, default=10, help="ZIG failure-rate evaluation cadence, matching Phase-A.")
+    p.add_argument("--ctle-earlystop-patience", type=int, default=200, help="Phase-A no-improvement patience measured in evaluation cycles.")
+    p.add_argument("--mapper-lr-scale", type=float, default=1.0)
+    p.add_argument("--struct-lr-scale", type=float, default=4.0)
+    p.add_argument("--dyn-lr-scale", type=float, default=1.0)
     p.add_argument("--x-max", type=float, default=3.0, help="Fixed differential node-voltage rail.")
     p.add_argument("--clip-current", type=float, default=0.05, help="Fixed soft-rail restoring-current magnitude.")
     p.add_argument("--clip-softness", type=float, default=0.02, help="Fixed soft-rail transition width.")

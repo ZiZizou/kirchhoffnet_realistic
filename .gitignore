@@ -34,3 +34,6 @@ test_bo_guard.py
 *db*
 Paper
 docs/gln-learned-sharpness.md
+plot_bo_descent.py
+plot_bo_descent_4pane.py
+plot_phase_a_ctle_descent.py

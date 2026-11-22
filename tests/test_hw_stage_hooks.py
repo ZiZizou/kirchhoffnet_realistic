@@ -421,3 +421,106 @@ def test_c_node_vector_is_not_in_the_state_dict():
     with torch.no_grad():
         mg.model_forward(hw_net, xin)
     assert set(hw_net.state_dict()) == set(plain.state_dict())
+
+
+# ---------------------------------------------------------------------------
+# 3.9 power penalty
+# ---------------------------------------------------------------------------
+def test_hw_power_penalty_is_lambda_p_avg_over_p_ref():
+    from hw.constraints import POWER_REF_W, hw_power_penalty, model_power_penalty
+    hw = hw_of(hw_power_lambda=0.5)
+    net = build_toy(hw)
+    u = mg.make_inputs(dict(mg.TOY_NET))
+    pen = hw_power_penalty(net, hw, u=u)
+    p_avg = model_power_penalty(net, u, hw.units)
+    assert 1e-9 < float(p_avg) < 1e-3                       # a physical power [W]
+    torch.testing.assert_close(pen, 0.5 * p_avg / POWER_REF_W)
+    torch.testing.assert_close(hw_power_penalty(net, u=u), pen)   # hw found on the stages
+    # the gradient pushes every Isat down
+    g, = torch.autograd.grad(pen, net.core.stages[0].cell_lib.isat_raw)
+    assert bool((g > 0).all())
+    # off: an exact zero without a graph
+    for h in (None, hw_of()):
+        z = hw_power_penalty(build_toy(h), h, u=u)
+        assert float(z) == 0.0 and not z.requires_grad
+
+
+def test_compute_loss_adds_the_power_term_only_when_on():
+    from hw.constraints import hw_power_penalty
+    from train import compute_loss
+    u = mg.make_inputs(dict(mg.TOY_NET))
+    target = torch.zeros(u.shape[0], 3, dtype=D)
+    mse = torch.nn.functional.mse_loss
+    plain = build_toy(None)
+    hw = hw_of(hw_power_lambda=2.0)
+    on = build_toy(hw)
+    on.load_state_dict(plain.state_dict())
+    plain.eval(), on.eval()
+    t0, s0, p0 = compute_loss(plain, u, target, mse, return_parts=True)
+    t1, s1, p1 = compute_loss(on, u, target, mse, return_parts=True)
+    assert "hw_power" not in p0
+    torch.testing.assert_close(t1, t0)
+    pen = hw_power_penalty(on, hw, u=u)
+    torch.testing.assert_close(s1 - s0, pen, rtol=1e-9, atol=1e-12)
+    assert p1["hw_power"] == pytest.approx(float(pen))
+    (t1 + s1).backward()
+    assert torch.isfinite(on.core.stages[0].cell_lib.isat_raw.grad).all()
+
+
+# ---------------------------------------------------------------------------
+# 3.3 stiffness diagnostic
+# ---------------------------------------------------------------------------
+def test_stiffness_lambda_matches_the_small_signal_conductance():
+    from hw.constraints import stage_small_signal_lambda
+    hw = hw_of(hw_check_stiffness=True)
+    st = _stage(hw, freeze_read=False)
+    lib = st.cell_lib
+    with torch.no_grad():
+        lib.g_resistive_raw.fill_(-1.0)
+        if getattr(lib, "theta_raw", None) is not None:
+            lib.theta_raw.zero_()
+    lam = stage_small_signal_lambda(st)
+    z = torch.sigmoid(st.z_logits)
+    k = lib.isat_values() * lib.gm_eff_values() * z
+    A, B = lib.ab_values()
+    G = torch.nn.functional.softplus(lib.g_resistive_raw) * z
+    torch.testing.assert_close(lam, torch.cat([k * A + G, k * B + G]), rtol=1e-12, atol=1e-12)
+    # against the Jacobian of rhs at the steepest point (x = 0, theta = 0): the
+    # OTA part of |d rhs_n / d x_n| is Isat*gm*A^ (* (1 + ALPHA) for the legacy
+    # leaky tanh); the shunt is taken out because the legacy dynamic core path
+    # counts it twice (see the W2c report)
+    with torch.no_grad():
+        lib.g_resistive_raw.fill_(-40.0)
+    lam = stage_small_signal_lambda(st)
+    x = torch.zeros(1, 2, dtype=D)
+    J = torch.autograd.functional.jacobian(lambda v: st.rhs(v).squeeze(0), x).squeeze(1)
+    torch.testing.assert_close(J.diagonal().abs(), lam * (1.0 + lib.ALPHA), rtol=1e-6, atol=1e-12)
+
+
+def test_stiffness_check_warns_above_two_and_is_quiet_below():
+    hw = hw_of(hw_check_stiffness=True)
+    st = _stage(hw, freeze_read=False)
+    x0 = torch.zeros(1, 2, dtype=D)
+    import warnings as _w
+    with _w.catch_warnings():
+        _w.simplefilter("error")
+        st(x0, t_span=0.1, num_steps=10)                  # default cell: tiny dt*lambda
+    assert 0.0 < st.last_dt_lambda < 2.0
+    _make_strong(st.cell_lib)
+    with pytest.warns(RuntimeWarning, match="hw_check_stiffness"):
+        st(x0, t_span=1.0, num_steps=2)
+    assert st.last_dt_lambda > 2.0
+    # no check without the flag
+    plain = _stage(None, freeze_read=False)
+    plain(x0, t_span=0.1, num_steps=10)
+    assert not hasattr(plain, "last_dt_lambda")
+
+
+def test_stiffness_report_on_the_toy_net():
+    from hw.constraints import stiffness_report
+    net = build_toy(hw_of(hw_check_stiffness=True))
+    u = mg.make_inputs(dict(mg.TOY_NET))
+    rep = stiffness_report(net, u=u, warn=False)
+    assert len(rep) == len(net.core.stages)
+    assert all(math.isfinite(v) and v > 0 for v in rep)
+

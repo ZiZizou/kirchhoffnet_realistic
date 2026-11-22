@@ -32,9 +32,12 @@ from cell_library import (
 from gating.gln import gln_gm_override
 from gating.vca import isat_eff_scale, vca_edge_gain
 from hw.constraints import (
+    STIFFNESS_LIMIT,
     acc_compliance,
     c_node_vector,
     compliance_legs,
+    stage_small_signal_lambda,
+    stiffness_dt_lambda,
     vref_map,
     xbar_map,
 )
@@ -751,6 +754,28 @@ output_ode_src: list[int] | None = None,
             cache = (key, vec.to(device=x.device, dtype=x.dtype))
             object.__setattr__(self, "_c_node_cache", cache)
         return cache[1]
+
+    def check_stiffness(self, t_span=None, num_steps=None, u=None, warn: bool = True) -> float:
+        """3.3 diagnostic (``hw_check_stiffness``): ``max_n dt * lambda_n`` of this stage.
+
+        ``lambda_n`` is the small-signal bound of
+        ``hw.constraints.stage_small_signal_lambda``.  Stored in
+        ``self.last_dt_lambda``; a ``RuntimeWarning`` is issued (once per
+        stage, and again whenever the value grows) when it exceeds 2.
+        """
+        t_span = float(t_span if t_span is not None else SOLVER["t_span"])
+        num_steps = int(num_steps if num_steps is not None else SOLVER["num_steps"])
+        dt = t_span / float(num_steps)
+        with torch.no_grad():
+            v = float(stiffness_dt_lambda(dt, stage_small_signal_lambda(self, u)).max())
+        object.__setattr__(self, "last_dt_lambda", v)
+        worst = self.__dict__.get("_stiffness_warned_at", STIFFNESS_LIMIT)
+        if warn and v > worst:
+            object.__setattr__(self, "_stiffness_warned_at", v)
+            warnings.warn(f"hw_check_stiffness: max(dt*lambda) = {v:.3f} > {STIFFNESS_LIMIT} "
+                          f"(dt = {dt:.4g}); Heun is unstable, raise num_steps",
+                          RuntimeWarning, stacklevel=2)
+        return v
 
     def _hw_vca_bits(self) -> int | None:
         """3.10: the width of the VCA logit DAC (``None`` = no quantisation)."""
@@ -1620,6 +1645,9 @@ output_ode_src: list[int] | None = None,
         traj : torch.Tensor or None
             ``[batch, num_nodes, num_steps+1]`` when ``store_trajectory``.
         """
+        c = self.hw_constraints
+        if c is not None and c.hw_check_stiffness:
+            self.check_stiffness(t_span, num_steps, u)
         return self._forward_heun(
             x0=x0, t_span=t_span, num_steps=num_steps,
             store_trajectory=store_trajectory,

@@ -31,12 +31,32 @@ from cell_library import (
 )
 from gating.gln import gln_gm_override
 from gating.vca import isat_eff_scale, vca_edge_gain
+from hw.constraints import (
+    acc_compliance,
+    compliance_legs,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle
     from hw import HWConfig
 
 
 __all__ = ["DifferentialStage"]
+
+
+class FrozenLegs:
+    """Frozen pre-compliance leg currents ``(i_pos, i_neg)`` of one edge family.
+
+    The 3.4 compliance path freezes the *leg currents* (i.e. the frozen
+    quantity is ``u``, equivalently ``I_+`` / ``I_-``) while the rail factors
+    ``c_top`` / ``c_bot`` are evaluated LIVE on the current node voltage at
+    every rhs call (3a 3.4, "freeze_read interaction").
+    """
+
+    __slots__ = ("i_pos", "i_neg")
+
+    def __init__(self, i_pos: torch.Tensor, i_neg: torch.Tensor) -> None:
+        self.i_pos = i_pos
+        self.i_neg = i_neg
 
 
 class DifferentialStage(nn.Module):
@@ -639,10 +659,32 @@ output_ode_src: list[int] | None = None,
         hw = getattr(self, "hw", None)
         return None if hw is None else hw.constraints
 
+    def _hw_units(self):
+        """The ``HWUnits`` of the hardware configuration (``None`` when off)."""
+        hw = getattr(self, "hw", None)
+        return None if hw is None else hw.units
+
+    def _hw_compliance_on(self) -> bool:
+        """True when the 3.4 leg-wise output compliance is active."""
+        c = self.hw_constraints
+        return c is not None and c.hw_compliance
+
     def _hw_vca_bits(self) -> int | None:
         """3.10: the width of the VCA logit DAC (``None`` = no quantisation)."""
         c = self.hw_constraints
         return None if c is None else c.hw_vca_bits
+
+    def _isat_eff_scale(self, cell_lib, mask: torch.Tensor,
+                        gain: torch.Tensor | None) -> torch.Tensor | None:
+        """3.10: the ``Isat_eff`` ceiling scale (``None`` when the flag is off).
+
+        The scale is multiplicative, so it can be applied to the two leg
+        currents of the 3.4 compliance path as well.
+        """
+        c = self.hw_constraints
+        if c is None or not c.hw_isat_eff_clamp:
+            return None
+        return isat_eff_scale(cell_lib.isat_values(), mask, gain)
 
     def _clamp_isat_eff(self, i_edge: torch.Tensor, cell_lib, mask: torch.Tensor,
                         gain: torch.Tensor | None) -> torch.Tensor:
@@ -650,10 +692,8 @@ output_ode_src: list[int] | None = None,
 
         No-op when ``hw_isat_eff_clamp`` is off.
         """
-        c = self.hw_constraints
-        if c is None or not c.hw_isat_eff_clamp:
-            return i_edge
-        return i_edge * isat_eff_scale(cell_lib.isat_values(), mask, gain)
+        scale = self._isat_eff_scale(cell_lib, mask, gain)
+        return i_edge if scale is None else i_edge * scale
 
     def edge_gain(self, family: str, u: torch.Tensor | None) -> torch.Tensor | None:
         """VCA interface: per-edge gain ``2*sigmoid((u @ W) @ v_e.T [+ b])`` ``[B, E]``.
@@ -732,6 +772,25 @@ output_ode_src: list[int] | None = None,
         u_src0 = u[:, self.boundary_src]
         x_dst0 = x0[:, self.boundary_dst]
         cell_lib = self.boundary_cell_lib
+        if self._hw_compliance_on():
+            # 3.4 + freeze_boundary: freeze the leg currents, roll the rails
+            # off live in rhs().
+            gm_b = self.edge_gm_scale("boundary", cell_lib, self._gln_rails_z(u))
+            i_pos, i_neg = cell_lib.forward_legs(
+                x_src=u_src0, x_dst=x_dst0, gm_override=gm_b,
+            )
+            b_mask = torch.sigmoid(self.boundary_z_logits)  # [Eb]
+            i_pos = i_pos * b_mask.unsqueeze(0)
+            i_neg = i_neg * b_mask.unsqueeze(0)
+            _g = self.edge_gain("boundary", u)
+            if _g is not None:
+                i_pos = i_pos * _g
+                i_neg = i_neg * _g
+            scale = self._isat_eff_scale(cell_lib, b_mask, _g)
+            if scale is not None:
+                i_pos = i_pos * scale
+                i_neg = i_neg * scale
+            return FrozenLegs(i_pos, i_neg)
         # GLN (F2): fold the input-conditioned gm modulation into the frozen
         # tensor exactly like the dynamic path (tanh with modulated gm;
         # resistive shunt stays dynamic in rhs).
@@ -789,6 +848,22 @@ output_ode_src: list[int] | None = None,
         x_src0 = x0[:, self.output_ode_src]
         x_dst0 = x0[:, self.output_ode_dst]
         cell_lib = self.output_ode_cell_lib
+        if self._hw_compliance_on():
+            # 3.4 + freeze_temporal_read: freeze the leg currents, roll the
+            # rails off live in rhs().
+            i_pos, i_neg = cell_lib.forward_legs(x_src=x_src0, x_dst=x_dst0)
+            o_mask = torch.sigmoid(self.output_ode_z_logits)
+            i_pos = i_pos * o_mask.unsqueeze(0)
+            i_neg = i_neg * o_mask.unsqueeze(0)
+            _g = self.edge_gain("readout", u)
+            if _g is not None:
+                i_pos = i_pos * _g
+                i_neg = i_neg * _g
+            scale = self._isat_eff_scale(cell_lib, o_mask, _g)
+            if scale is not None:
+                i_pos = i_pos * scale
+                i_neg = i_neg * scale
+            return FrozenLegs(i_pos, i_neg)
         if hasattr(cell_lib, "forward_tanh"):
             i_edge = cell_lib.forward_tanh(
                 x_src=x_src0, x_dst=x_dst0, x_max=self.x_max,
@@ -835,6 +910,25 @@ output_ode_src: list[int] | None = None,
         # FreeTanh ``x_dst`` argument so the cell is reused exactly.
         vref = torch.sigmoid(self.raw_vref_sense) * self.x_max
         x_dst0 = vref.to(x0.dtype).view(1, 1).expand_as(x_src0)
+        if self._hw_compliance_on():
+            # 3.4 + freeze_temporal_read: freeze the leg currents of the sense
+            # OTAs; the rail factors are applied live in rhs().
+            gm_s = self.edge_gm_scale("readout", cell_lib, self._gln_rails_z(u))
+            i_pos, i_neg = cell_lib.forward_legs(
+                x_src=x_src0, x_dst=x_dst0, gm_override=gm_s,
+            )
+            sense_mask = torch.sigmoid(self.readout_sense_z_logits)
+            i_pos = i_pos * sense_mask.unsqueeze(0)
+            i_neg = i_neg * sense_mask.unsqueeze(0)
+            _g = self.edge_gain("readout", u)
+            if _g is not None:
+                i_pos = i_pos * _g
+                i_neg = i_neg * _g
+            scale = self._isat_eff_scale(cell_lib, sense_mask, _g)
+            if scale is not None:
+                i_pos = i_pos * scale
+                i_neg = i_neg * scale
+            return FrozenLegs(i_pos, i_neg)
         # GLN (F2): fold the input-conditioned sense-gm modulation into the
         # frozen per-sense currents (crossbar W stays untouched).
         gm_s = self.edge_gm_scale("readout", cell_lib, self._gln_rails_z(u))
@@ -882,6 +976,22 @@ output_ode_src: list[int] | None = None,
         """
         x_src0 = x_src_state[:, self.src]
         x_dst0 = x_src_state[:, self.dst]
+        if self._hw_compliance_on():
+            # 3.4 + freeze_read: the frozen quantity is the leg current
+            # (equivalently tanh u); the rail factors c_top / c_bot are
+            # applied live in rhs() on the current node voltage.
+            i_pos, i_neg = self.cell_lib.forward_legs(x_src=x_src0, x_dst=x_dst0)
+            edge_mask = torch.sigmoid(self.z_logits)
+            i_pos = i_pos * edge_mask.unsqueeze(0)
+            i_neg = i_neg * edge_mask.unsqueeze(0)
+            if gate_core_cached is not None:
+                i_pos = i_pos * gate_core_cached
+                i_neg = i_neg * gate_core_cached
+            scale = self._isat_eff_scale(self.cell_lib, edge_mask, gate_core_cached)
+            if scale is not None:
+                i_pos = i_pos * scale
+                i_neg = i_neg * scale
+            return FrozenLegs(i_pos, i_neg)
         if self._has_resistive and hasattr(self.cell_lib, "forward_tanh"):
             i_edge = self.cell_lib.forward_tanh(
                 x_src=x_src0, x_dst=x_dst0, x_max=self.x_max,
@@ -928,6 +1038,17 @@ output_ode_src: list[int] | None = None,
         clip = torch.sigmoid((x - self.x_max) / s)
         clip = clip - torch.sigmoid((-x - self.x_max) / s)
         return self.clip_current * clip
+
+    def clip_term(self, x: torch.Tensor) -> torch.Tensor:
+        """The rail current subtracted in ``rhs``.
+
+        Zero when the 3.4 leg-wise output compliance is on: the hard rails are
+        then enforced by the OTA legs themselves (the soft clip would fight the
+        legs and switch them off).
+        """
+        if self._hw_compliance_on():
+            return torch.zeros_like(x)
+        return self.soft_clip(x)
 
     def rhs(self, x: torch.Tensor,
             u: torch.Tensor | None = None,
@@ -999,7 +1120,32 @@ output_ode_src: list[int] | None = None,
         # here and reused for both the tanh current and the resistive shunt
         # (when applicable), avoiding a redundant sigmoid call.
         edge_mask = torch.sigmoid(self.z_logits)  # [E]
-        if i_edge_const is None:
+        if i_edge_const is None and self._hw_compliance_on():
+            # 3.4: leg-wise output compliance.  The tanh part of the cell
+            # current is split into its two leg currents; the destination node
+            # gets the P leg and the source node the N leg, each rolled off by
+            # the LIVE node voltage.
+            i_pos, i_neg = self.cell_lib.forward_legs(x_src=x_src, x_dst=x_dst)
+            i_pos = i_pos * edge_mask.unsqueeze(0)          # [B, E]
+            i_neg = i_neg * edge_mask.unsqueeze(0)          # [B, E]
+            if vca_gate_core is not None:
+                i_pos = i_pos * vca_gate_core               # [B, E]
+                i_neg = i_neg * vca_gate_core               # [B, E]
+            scale = self._isat_eff_scale(self.cell_lib, edge_mask, vca_gate_core)
+            if scale is not None:
+                i_pos = i_pos * scale
+                i_neg = i_neg * scale
+            into_dst, into_src = compliance_legs(
+                i_pos, i_neg, x_dst,
+                None if self.read_only_source else x_src,
+                self._hw_units(),
+            )
+            acc = torch.zeros_like(x, dtype=torch.float32)
+            acc.index_add_(1, self.dst, into_dst.float())
+            if not self.read_only_source:
+                acc.index_add_(1, self.src, into_src.float())
+            acc = acc.to(dtype=x.dtype)
+        elif i_edge_const is None:
             i_edge = self.cell_lib(
                 x_src=x_src,
                 x_dst=x_dst,
@@ -1032,7 +1178,21 @@ output_ode_src: list[int] | None = None,
             # the core VCA gate already folded in at precompute time) was
             # computed from x0 and held constant. The resistive shunt (if
             # any) is added below from evolving voltages.
-            acc = i_edge_const
+            if isinstance(i_edge_const, FrozenLegs):
+                # 3.4 + freeze_read: the leg currents are frozen, the rail
+                # factors are evaluated live on the current x.
+                into_dst, into_src = compliance_legs(
+                    i_edge_const.i_pos, i_edge_const.i_neg, x_dst,
+                    None if self.read_only_source else x_src,
+                    self._hw_units(),
+                )
+                acc = torch.zeros_like(x, dtype=torch.float32)
+                acc.index_add_(1, self.dst, into_dst.float())
+                if not self.read_only_source:
+                    acc.index_add_(1, self.src, into_src.float())
+                acc = acc.to(dtype=x.dtype)
+            else:
+                acc = i_edge_const
 
         # Parallel resistive shunt (FreeTanhLibrary): always uses evolving
         # voltages, bypassing ``freeze_read``. Gated by the same edge_mask /
@@ -1063,7 +1223,39 @@ output_ode_src: list[int] | None = None,
             u_src = u[:, self.boundary_src]
             x_dst_b = x[:, self.boundary_dst]
             boundary_mask = torch.sigmoid(self.boundary_z_logits)  # [Eb]
-            if i_boundary_const is None:
+            if i_boundary_const is None and self._hw_compliance_on():
+                # 3.4: leg-wise output compliance at the destination node.
+                # The boundary terminal is an ideal voltage source: it is
+                # never drained, so only the destination rolls off.
+                gm_b = self.edge_gm_scale("boundary", self.boundary_cell_lib, gln_z)
+                i_pos, i_neg = self.boundary_cell_lib.forward_legs(
+                    x_src=u_src, x_dst=x_dst_b, gm_override=gm_b,
+                )
+                i_pos = i_pos * boundary_mask.unsqueeze(0)      # [B, Eb]
+                i_neg = i_neg * boundary_mask.unsqueeze(0)      # [B, Eb]
+                _g = self.edge_gain("boundary", u)
+                if _g is not None:
+                    i_pos = i_pos * _g
+                    i_neg = i_neg * _g
+                scale = self._isat_eff_scale(
+                    self.boundary_cell_lib, boundary_mask, _g)
+                if scale is not None:
+                    i_pos = i_pos * scale
+                    i_neg = i_neg * scale
+                into_dst, _ = compliance_legs(
+                    i_pos, i_neg, x_dst_b, None, self._hw_units())
+                i_boundary_f32 = into_dst.float()
+                # The parallel resistive shunt is a conductor, not an OTA leg:
+                # it is not rolled off by the rails.
+                if hasattr(self.boundary_cell_lib, "resistive_current"):
+                    i_res_b = self.boundary_cell_lib.resistive_current(
+                        u_src, x_dst_b,
+                    )  # [B, Eb]
+                    i_res_b = i_res_b * boundary_mask.unsqueeze(0)
+                    if _g is not None:
+                        i_res_b = i_res_b * _g
+                    i_boundary_f32 = i_boundary_f32 + i_res_b.float()
+            elif i_boundary_const is None:
                 # Dynamic path: full cell forward (tanh + resistive shunt).
                 # GLN (F2): modulate the family's gm with the shared rails
                 # (gm inside tanh arg); the resistive shunt is never gated.
@@ -1094,7 +1286,17 @@ output_ode_src: list[int] | None = None,
                 # shunt, if present, is recomputed per-step from evolving
                 # voltages so it remains dynamic — mirrors the Heun-path
                 # freeze_read behavior for the core family.
-                acc = (acc.float() + i_boundary_const.float()).to(dtype=x.dtype)
+                if isinstance(i_boundary_const, FrozenLegs):
+                    # 3.4 + freeze_boundary: the leg currents are frozen, the
+                    # rail factors are evaluated live on the current x.
+                    into_dst, _ = compliance_legs(
+                        i_boundary_const.i_pos, i_boundary_const.i_neg,
+                        x_dst_b, None, self._hw_units())
+                    acc_b_c = torch.zeros_like(x, dtype=torch.float32)
+                    acc_b_c.index_add_(1, self.boundary_dst, into_dst.float())
+                    acc = (acc.float() + acc_b_c).to(dtype=x.dtype)
+                else:
+                    acc = (acc.float() + i_boundary_const.float()).to(dtype=x.dtype)
                 if hasattr(self.boundary_cell_lib, "resistive_current"):
                     i_res_b = self.boundary_cell_lib.resistive_current(
                         u_src, x_dst_b,
@@ -1118,7 +1320,36 @@ output_ode_src: list[int] | None = None,
             x_src_o = x[:, self.output_ode_src]  # hidden (read-only)
             x_dst_o = x[:, self.output_ode_dst]  # output ODE (writable)
             out_mask = torch.sigmoid(self.output_ode_z_logits)  # [Eo]
-            if i_readout_const is None:
+            if i_readout_const is None and self._hw_compliance_on():
+                # 3.4: leg-wise output compliance at the accumulator node (the
+                # read-only source is never drained).
+                i_pos, i_neg = self.output_ode_cell_lib.forward_legs(
+                    x_src=x_src_o, x_dst=x_dst_o,
+                )
+                i_pos = i_pos * out_mask.unsqueeze(0)      # [B, Eo]
+                i_neg = i_neg * out_mask.unsqueeze(0)      # [B, Eo]
+                _g = self.edge_gain("readout", u)
+                if _g is not None:
+                    i_pos = i_pos * _g
+                    i_neg = i_neg * _g
+                scale = self._isat_eff_scale(
+                    self.output_ode_cell_lib, out_mask, _g)
+                if scale is not None:
+                    i_pos = i_pos * scale
+                    i_neg = i_neg * scale
+                into_dst, _ = compliance_legs(
+                    i_pos, i_neg, x_dst_o, None, self._hw_units())
+                i_out_f32 = into_dst.float()
+                # The parallel resistive shunt is a conductor, not an OTA leg.
+                if hasattr(self.output_ode_cell_lib, "resistive_current"):
+                    i_res_o = self.output_ode_cell_lib.resistive_current(
+                        x_src_o, x_dst_o,
+                    )  # [B, Eo]
+                    i_res_o = i_res_o * out_mask.unsqueeze(0)
+                    if _g is not None:
+                        i_res_o = i_res_o * _g
+                    i_out_f32 = i_out_f32 + i_res_o.float()
+            elif i_readout_const is None:
                 # Dynamic path: full cell forward (tanh + resistive shunt).
                 i_out = self.output_ode_cell_lib(
                     x_src=x_src_o, x_dst=x_dst_o, x_max=self.x_max,
@@ -1144,7 +1375,17 @@ output_ode_src: list[int] | None = None,
                 # shunt, if present, is recomputed per-step from evolving
                 # voltages — mirrors the Heun-path freeze_read behavior for
                 # the core family.
-                acc = (acc.float() + i_readout_const.float()).to(dtype=x.dtype)
+                if isinstance(i_readout_const, FrozenLegs):
+                    # 3.4 + freeze_temporal_read: the leg currents are frozen,
+                    # the rail factors are evaluated live on the current x.
+                    into_dst, _ = compliance_legs(
+                        i_readout_const.i_pos, i_readout_const.i_neg,
+                        x_dst_o, None, self._hw_units())
+                    acc_out_c = torch.zeros_like(x, dtype=torch.float32)
+                    acc_out_c.index_add_(1, self.output_ode_dst, into_dst.float())
+                    acc = (acc.float() + acc_out_c).to(dtype=x.dtype)
+                else:
+                    acc = (acc.float() + i_readout_const.float()).to(dtype=x.dtype)
                 if hasattr(self.output_ode_cell_lib, "resistive_current"):
                     i_res_o = self.output_ode_cell_lib.resistive_current(
                         x_src_o, x_dst_o,
@@ -1173,7 +1414,35 @@ output_ode_src: list[int] | None = None,
             x_j = x[:, self.readout_sense_src]             # [B, n_sense]
             vref = (torch.sigmoid(self.raw_vref_sense) * self.x_max).to(x.dtype)
             x_dst_s = vref.view(1, 1).expand_as(x_j)
-            if i_readout_const is None:
+            if i_readout_const is None and self._hw_compliance_on():
+                # 3.4: the sense OTA drives the Vref rail (an ideal voltage
+                # source), so its legs roll off at the rail voltage; the
+                # crossbar accumulator is the node that has rails.
+                gm_s = self.edge_gm_scale("readout", self.readout_sense_cell_lib, gln_z)
+                i_pos, i_neg = self.readout_sense_cell_lib.forward_legs(
+                    x_src=x_j, x_dst=x_dst_s, gm_override=gm_s,
+                )
+                i_pos = i_pos * sense_mask.unsqueeze(0)    # [B, n_sense]
+                i_neg = i_neg * sense_mask.unsqueeze(0)    # [B, n_sense]
+                _g = self.edge_gain("readout", u)
+                if _g is not None:
+                    i_pos = i_pos * _g
+                    i_neg = i_neg * _g
+                scale = self._isat_eff_scale(
+                    self.readout_sense_cell_lib, sense_mask, _g)
+                if scale is not None:
+                    i_pos = i_pos * scale
+                    i_neg = i_neg * scale
+                i_s, _ = compliance_legs(
+                    i_pos, i_neg, x_dst_s, None, self._hw_units())
+                # The parallel resistive shunt is a conductor, not an OTA leg.
+                if hasattr(self.readout_sense_cell_lib, "resistive_current"):
+                    i_res_s = self.readout_sense_cell_lib.resistive_current(x_j, x_dst_s)
+                    i_res_s = i_res_s * sense_mask.unsqueeze(0)
+                    if _g is not None:
+                        i_res_s = i_res_s * _g
+                    i_s = i_s + i_res_s
+            elif i_readout_const is None:
                 # Dynamic path: full cell forward (tanh + resistive shunt).
                 # GLN (F2): modulate the sense OTA gm with the shared rails
                 # (one gm per sense; the crossbar W is never touched by GLN).
@@ -1187,6 +1456,12 @@ output_ode_src: list[int] | None = None,
                     i_s = i_s * _g
                 i_s = self._clamp_isat_eff(
                     i_s, self.readout_sense_cell_lib, sense_mask, _g)
+            elif isinstance(i_readout_const, FrozenLegs):
+                # 3.4 + freeze_temporal_read: the leg currents are frozen, the
+                # rail factors are evaluated live on the current x.
+                i_s, _ = compliance_legs(
+                    i_readout_const.i_pos, i_readout_const.i_neg,
+                    x_dst_s, None, self._hw_units())
             else:
                 # Frozen-tanh path (freeze_temporal_read=True): the tanh cell
                 # contribution (sense gate + VCA gate already folded in at
@@ -1194,6 +1469,13 @@ output_ode_src: list[int] | None = None,
                 # resistive shunt is recomputed below from evolving voltages.
                 i_s = i_readout_const
             i_acc = (i_s.float() @ W.float().T)            # [B, d_out]
+            if self._hw_compliance_on():
+                # 3.4: the crossbar accumulator is a real node with rails:
+                # the net current is delivered by the P leg (positive) or the
+                # N leg (negative), each rolled off at the node voltage.
+                acc_slice = slice(self._readout_dst_start, self.num_nodes)
+                i_acc = acc_compliance(
+                    i_acc, x[:, acc_slice].to(i_acc.dtype), self._hw_units())
             if i_edge_const is not None:
                 acc = acc.clone()
             acc_f32 = acc.float()
@@ -1221,7 +1503,7 @@ output_ode_src: list[int] | None = None,
         leak = self._effective_leak().unsqueeze(0).to(x.device)  # [1, N]
         leak_term = leak * x
 
-        clip_term = self.soft_clip(x)
+        clip_term = self.clip_term(x)
 
         return (acc - leak_term - clip_term) / self.c_eff
 

@@ -276,16 +276,17 @@ class FreeTanhLibrary(nn.Module):
             gm = gm * f_ic
         return gm
 
-    def _tanh_core(
+    def _tanh_terms(
         self,
         x_src: torch.Tensor,
         x_dst: torch.Tensor,
         gm_override: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Internal: leaky-tanh current (no compliance gating).
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Internal: the terms of the leaky-tanh current: ``(isat_f, t, u)``.
 
-        Returns ``I_sat * (tanh(u) + ALPHA * u)`` with shape ``[B, E]`` —
-        broadcastable against ``x_src``/``x_dst`` which are ``[B, E]``.
+        ``isat_f * t`` is ``I_sat * (tanh(u) + ALPHA * u)`` with shape
+        ``[B, E]`` — broadcastable against ``x_src``/``x_dst`` which are
+        ``[B, E]``.
 
         ``gm_override`` (GLN path): caller-supplied modulated gm, shape
         ``[B, E]`` (or ``[1, E]``), used instead of the static sigmoid map.
@@ -351,7 +352,47 @@ class FreeTanhLibrary(nn.Module):
         isat_f = isat.unsqueeze(0)                                       # [1, E]
         if isat_scale is not None:
             isat_f = isat_f * isat_scale                                 # [B, E] / [1, E]
+        return isat_f, t, u
+
+    def _tanh_core(
+        self,
+        x_src: torch.Tensor,
+        x_dst: torch.Tensor,
+        gm_override: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Internal: leaky-tanh current (no compliance gating).
+
+        ``I_sat * (tanh(u) + ALPHA * u)`` — see :meth:`_tanh_terms`.
+        """
+        isat_f, t, _u = self._tanh_terms(x_src, x_dst, gm_override)
         return isat_f * t
+
+    def forward_legs(
+        self,
+        x_src: torch.Tensor,
+        x_dst: torch.Tensor,
+        gm_override: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pre-compliance leg currents ``(I_pos, I_neg)`` of the OTA (3a 3.4).
+
+        ``I_pos = Isat * (1 + tanh u)/2`` is the current of the P leg (it
+        sources the output node) and ``I_neg = Isat * (1 - tanh u)/2`` the one
+        of the N leg (it sinks the output node); both have shape ``[B, E]``.
+
+        The legacy ``ALPHA * u`` floor is NOT part of the legs (the 3a 3.4
+        formula has no such term); ``hw_alpha_bwd`` still floors the backward
+        pass.  The input compliance gate is skipped as well: the rails are
+        enforced by the leg-wise output compliance when the stage scatters the
+        legs (the node voltage is not known here).
+        """
+        isat_f, _t, u = self._tanh_terms(x_src, x_dst, gm_override)
+        c = self.hw_constraints
+        alpha_bwd = 0.0 if c is None else float(c.hw_alpha_bwd)
+        t_leg = tanh_ste(u, alpha_bwd) if alpha_bwd > 0.0 else torch.tanh(u)
+        i_pos = isat_f * (0.5 * (1.0 + t_leg))
+        i_neg = isat_f * (0.5 * (1.0 - t_leg))
+        b = int(x_src.shape[0])
+        return i_pos.expand(b, -1), i_neg.expand(b, -1)
 
     def forward_tanh(
         self,
@@ -364,7 +405,9 @@ class FreeTanhLibrary(nn.Module):
 
         Use this when the resistive term must be excluded (e.g. ``--freeze-read``
         wants to freeze only the tanh contribution at ``x0``).
-        Returns ``[batch, E]`` gated by ``gate_src * gate_dst``.
+        Returns ``[batch, E]`` gated by ``gate_src * gate_dst``.  With
+        ``hw_compliance`` the gate is skipped (the 3.4 leg-wise output
+        compliance replaces it).
 
         ``gm_override`` (GLN path): modulated gm ``[B, E]`` from
         :meth:`GLNRails.modulate_gm_z`, used instead of the static sigmoid
@@ -372,6 +415,13 @@ class FreeTanhLibrary(nn.Module):
         """
         i_cell = self._tanh_core(x_src, x_dst, gm_override=gm_override)  # [1, E] or [B, E]
         i_cell = i_cell.expand(x_src.shape[0], -1)                      # [B, E]
+        c = self.hw_constraints
+        if c is not None and c.hw_compliance:
+            # 3.4: the input compliance gate is replaced by the leg-wise output
+            # compliance.  The gate would switch the OTA off once a node is
+            # outside the rail and leave that node stuck there; the legs are
+            # rolled off by the node voltage instead.
+            return i_cell
         gate_src = torch.sigmoid((x_max - x_src.abs()) / self._beta_softness)
         gate_dst = torch.sigmoid((x_max - x_dst.abs()) / self._beta_softness)
         return (gate_src * gate_dst) * i_cell

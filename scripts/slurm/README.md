@@ -14,6 +14,24 @@ Reference: `kn_hwdocs/phase3b_fabric_impl_retrain.md` sections 3.1-3.5.
 
 ---
 
+## Local pre-flight (CPU)
+
+Before submitting, run a one-epoch smoke from the repository root. Set the
+same input paths as section 1 (`CANONICAL`, `TEACHER_CKPT`, `ZIG_DIR`, and
+`DATA_DIR`) and use the CPU virtualenv:
+
+```bash
+PY=~/Documents/kirchhoffnet_refactor/venv/bin/python
+COMMON=(--canonical-dataset "$CANONICAL" --phase-a-epochs 1 --kn-num-stages 7 --kn-num-hidden 11 --kn-small-world-k 2 --kn-small-world-p 0.2 --kn-vca-rank 3 --kn-x-max 4 --kn-gm-max 4.241970 --kn-isat-max 28.68855 --kn-readout shared-x2 --kn-learnable-clip-sharpness --kn-gln-rails --kn-gln-B 4 --kn-gln-rank 2 --kn-gln-families boundary,readout --t-span 4.660583 --boundary-fan-out '{"0": [0, 4], "1": [1, 5], "2": [2, 6], "3": [3, 7]}' --phase-a-mlp-teacher-ckpt "$TEACHER_CKPT" --teacher-dir "$ZIG_DIR" --data-dir "$DATA_DIR" --device cpu --seed 100)
+"$PY" dagger-nuance-distillation-kirchhoffnet.py "${COMMON[@]}" --output /tmp/w6_smoke/hw --hw-preset phase3a_core
+"$PY" dagger-nuance-distillation-kirchhoffnet.py "${COMMON[@]}" --output /tmp/w6_smoke/base
+```
+
+On ssr0 the CPU smoke took about **50 seconds per epoch**. At one epoch,
+expect a high failure rate (roughly **45-47%**); this is a plumbing check, not
+an accuracy result. The phase3a_core `hw.audit` Isat range FAILs are expected
+at one epoch and do not indicate a smoke-test failure.
+
 ## 1. Prerequisites
 
 | Input | Default in the scripts | Notes |

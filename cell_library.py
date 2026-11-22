@@ -27,6 +27,16 @@ from config import (
     TANH_REALISTIC_ISAT_MAX,
     TANH_REALISTIC_ISAT_MIN,
 )
+from hw.constraints import (
+    G_MIN,
+    THETA_MAX,
+    attenuation,
+    ic_factor,
+    ratio_ab,
+    slope_bound,
+    tanh_ste,
+    theta_bound,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle
     from hw import HWConfig
@@ -113,6 +123,13 @@ class FreeTanhLibrary(nn.Module):
         # instead of randn() which can cause huge A,B and gradient explosion.
         self.a_raw = nn.Parameter(torch.zeros(num_edges))
         self.b_raw = nn.Parameter(torch.zeros(num_edges))
+        # 3.1 (hw_ratio_ab): the edge then uses ONE ratio parameter (``r_raw``)
+        # instead of the two independent ``a_raw`` / ``b_raw`` (which stay in
+        # the module but are unused).  ``r_raw = 0`` -> ``A = B = 1``.  The
+        # parameter exists ONLY when the flag is on, so the flags-off
+        # state_dict stays byte-identical to the pre-constraint one.
+        if hw is not None and hw.constraints.hw_ratio_ab:
+            self.r_raw = nn.Parameter(torch.zeros(num_edges))
         # Initialize s_raw to small random values so sign() gives ±1, not 0.
         # STE allows gradients to flow; forward needs non-zero sign for tanh path.
         self.s_raw = nn.Parameter(torch.randn(num_edges) * 0.1)
@@ -162,6 +179,80 @@ class FreeTanhLibrary(nn.Module):
         sig_isat = torch.sigmoid(self.isat_raw)
         return (self.isat_min + (self.isat_max - self.isat_min) * sig_isat).clamp_min(1e-6)  # [E]
 
+    # ------------------------------------------------------------------
+    # hardware-constraint views (Phase 3a 3.1 / 3.2 / 3.3 / 3.6)
+    # ------------------------------------------------------------------
+    def ratio_ab_values(self) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """The 3.1 ratio form ``(A, B)`` with ``A + B == 2``, or ``None`` when the flag is off.
+
+        ``r = exp(ln(r_max) tanh(r_raw))``, ``A = 2r/(1+r)``, ``B = 2/(1+r)``.
+        """
+        c = self.hw_constraints
+        if c is None or not c.hw_ratio_ab:
+            return None
+        return ratio_ab(self.r_raw)
+
+    def ab_values(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """The ``(A, B)`` input attenuations the device uses, ``[E]`` each.
+
+        Legacy: ``softplus(a_raw)`` / ``softplus(b_raw)`` (unbounded).
+        3.1 (``hw_ratio_ab``): the ratio form (``A + B = 2``).
+        3.1 + 3.2: the pair is normalised to ``max = 1`` (the common gain is
+        folded into the slope factor of 3.2, so the per-input slope stays
+        bounded by ``slope_max``).
+        """
+        c = self.hw_constraints
+        if c is None or not c.hw_ratio_ab:
+            return (torch.nn.functional.softplus(self.a_raw),
+                    torch.nn.functional.softplus(self.b_raw))
+        A, B = ratio_ab(self.r_raw)
+        if c.hw_slope_bound:
+            m = torch.maximum(A, B)
+            A, B = A / m, B / m
+        return A, B
+
+    def gm_eff_values(self) -> torch.Tensor:
+        """The slope the device uses, ``[E]`` (the GLN override is not included).
+
+        Legacy: ``gm_min + (gm_max - gm_min) sigmoid(gm_raw)``.
+        3.2 / 3.3: ``s_max * f_IC(Isat) * g`` with ``g = g_min + (1-g_min) sigmoid(gm_raw)``.
+        """
+        c = self.hw_constraints
+        if c is None or not (c.hw_slope_bound or c.hw_ic_coupling):
+            return self.current_gm()
+        return self._gm_hw(c, None)
+
+    def theta_values(self) -> torch.Tensor | None:
+        """The input-referred offset ``theta`` ``[E]`` (``None`` when the cell has no bias)."""
+        if not self._bias_enabled:
+            return None
+        c = self.hw_constraints
+        if c is not None and c.hw_theta_bound:
+            return theta_bound(self.theta_raw, THETA_MAX)
+        return self.theta_raw
+
+    def _gm_hw(self, c, gm_override: torch.Tensor | None) -> torch.Tensor:
+        """The hardware slope of 3.2 / 3.3: ``gm_eff = s_max * f_IC(Isat) * g``.
+
+        ``g = g_min + (1 - g_min) sigmoid(gm_raw)`` is the attenuation of the
+        input pair.  When the GLN modulates the slope (legacy ``gm_override``,
+        a gm tensor), its *relative* modulation is applied to ``g`` and
+        re-clamped to ``[g_min, 1]``, so the bound ``gm_eff <= slope_max``
+        still holds for the GLN-gated families too.
+        """
+        units = self.hw.units
+        g = attenuation(self.gm_raw, G_MIN)                       # [E]
+        if gm_override is not None:
+            rel = gm_override / self.current_gm()                 # [B, E] or [1, E]
+            g = torch.clamp(g.unsqueeze(0) * rel, G_MIN, 1.0)
+        f_ic = None
+        if c.hw_ic_coupling:
+            f_ic = ic_factor(self.isat_values(), units)
+        gm = units.slope_max * g
+        if f_ic is not None:
+            gm = gm * f_ic
+        return gm
+
     def _tanh_core(
         self,
         x_src: torch.Tensor,
@@ -178,12 +269,24 @@ class FreeTanhLibrary(nn.Module):
         The stage calls this with the GLN-modulated gm for boundary /
         readout-sense families only; the core family always uses the static
         map (GLN never touches core edges in v1).
+
+        Every hardware constraint is a flag-gated branch: with the flag off
+        (or with no ``hw`` at all) the legacy expressions are used unchanged,
+        so the forward stays bit-identical to the pre-constraint model.
         """
-        A = torch.nn.functional.softplus(self.a_raw).unsqueeze(0)        # [1, E]
-        B = torch.nn.functional.softplus(self.b_raw).unsqueeze(0)        # [1, E]
+        c = self.hw_constraints
+        if c is not None and c.hw_ratio_ab:                          # 3.1
+            A, B = self.ab_values()                                 # [E]
+            A = A.unsqueeze(0)                                      # [1, E]
+            B = B.unsqueeze(0)                                      # [1, E]
+        else:
+            A = torch.nn.functional.softplus(self.a_raw).unsqueeze(0)        # [1, E]
+            B = torch.nn.functional.softplus(self.b_raw).unsqueeze(0)        # [1, E]
         s = torch.sign(self.s_raw)                                       # [E]
         s_ste = s + self.s_raw - self.s_raw.detach()                     # STE: [E]
-        if gm_override is not None:
+        if c is not None and (c.hw_slope_bound or c.hw_ic_coupling):      # 3.2 / 3.3
+            gm = self._gm_hw(c, gm_override)                              # [E] / [B, E]
+        elif gm_override is not None:
             gm = gm_override                                             # [B, E] or [1, E]
         else:
             sig_gm = torch.sigmoid(self.gm_raw)
@@ -191,9 +294,16 @@ class FreeTanhLibrary(nn.Module):
             gm = gm.unsqueeze(0)                                         # [1, E]
         sig_isat = torch.sigmoid(self.isat_raw)
         isat = (self.isat_min + (self.isat_max - self.isat_min) * sig_isat).clamp_min(1e-6)  # [E]
-        theta = self.theta_raw.unsqueeze(0) if self._bias_enabled else 0.0
+        if c is not None and c.hw_theta_bound and self._bias_enabled:     # 3.6
+            theta = theta_bound(self.theta_raw, THETA_MAX).unsqueeze(0)
+        else:
+            theta = self.theta_raw.unsqueeze(0) if self._bias_enabled else 0.0
         u = (s_ste.unsqueeze(0) * (A * x_src - B * x_dst) + theta) * gm
-        return isat.unsqueeze(0) * (torch.tanh(u) + self.ALPHA * u)
+        if c is not None and (c.hw_no_alpha or c.hw_alpha_bwd > 0.0):      # 3.5
+            t = tanh_ste(u, c.hw_alpha_bwd)                              # forward: tanh(u)
+        else:
+            t = torch.tanh(u) + self.ALPHA * u
+        return isat.unsqueeze(0) * t
 
     def forward_tanh(
         self,

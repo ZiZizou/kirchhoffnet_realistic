@@ -1999,7 +1999,7 @@ class LocalKirchhoffStudentWrapper(nn.Module):
         total = bd.get("total", 0)
         per_stage = bd.get("per_stage", {})
         encoder = int(groups.get("input_mapper", 0))
-        projector = int(groups.get("output_mapper", 0)) + int(groups.get("skip_linear", 0))
+        projector = int(groups.get("output_mapper", 0))
         circuit = int(total) - encoder - projector
         return {
             "encoder": encoder,

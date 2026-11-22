@@ -669,27 +669,11 @@ def _save_config_snapshot(out_dir: Path, problem: str, args, lambdas: dict,
             f.write(f"  retrain_stage_lr_scale: {args.retrain_stage_lr_scale}\n")
             f.write(f"  retrain_mapper_lr_scale: {args.retrain_mapper_lr_scale}\n")
             f.write(f"  freeze_mappers: {args.freeze_mappers}\n")
-            if getattr(net, "skip_linear_enabled", False):
-                f.write("\nSKIP-LINEAR CONNECTION (enabled):\n")
-                f.write(f"  in_dim: {net.skip_linear_in_dim}\n")
-                f.write(f"  out_dim: {net.skip_linear_out_dim}\n")
-                f.write(f"  weight shape: {tuple(net.skip_linear.weight.shape)}\n")
-                f.write(f"  bias shape: {tuple(net.skip_linear.bias.shape)}\n")
-                f.write(
-                    f"  l2_lambda (effective): "
-                    f"{lambdas.get('skip_linear_l2', 0.0)}\n"
-                )
         else:
             f.write(f"  write_mode: {args.write_mode}\n")
             f.write(f"  read_mode: {args.read_mode}\n")
             f.write(f"  write_idx: {args.write_idx}\n")
             f.write(f"  read_idx: {args.read_idx}\n")
-            if getattr(args, "skip_linear", False):
-                f.write("\nSKIP-LINEAR CONNECTION (enabled):\n")
-                f.write(
-                    f"  l2_lambda: "
-                    f"{lambdas.get('skip_linear_l2', 0.0)}\n"
-                )
 
 def make_data_sinx(batch_size: int, val_size: int = 1024):
     train_size = 8192
@@ -1691,18 +1675,6 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
         "--decoder-hidden-dim", type=int, default=64, dest="decoder_hidden_dim",
         help="Hidden width of the residual tanh branch in the output decoder "
              "(default: 64). Only used when --decoder-type='residual_tanh'.")
-    parser.add_argument(
-        "--skip-linear", action="store_true", default=False,
-        dest="skip_linear",
-        help="Add a pure-linear skip connection y = W₁·u + b₁ + f(x), where "
-             "W₁ is an nn.Linear from raw input (in_dim) to the output "
-             "dimension and f(x) is the KirchhoffNet ODE transformation. "
-             "Offloads the linear mixing part from the KirchhoffNet so the "
-             "ODE core can specialize on non-linear structure only. Adds "
-             "(in_dim * out_dim + out_dim) parameters and is regularized "
-             "with an L2 penalty (lambda = config.LAMBDAS['skip_linear_l2']) "
-             "so the skip projection is incentivized to be small. Default: "
-             "off (no skip connection).")
     parser.add_argument(
         "--device-l2-lambda", type=float, default=0.0,
         dest="device_l2_lambda",
@@ -2796,7 +2768,6 @@ def main():
         freeze_temporal_read=args.freeze_temporal_read,
         interstage_activation=args.interstage_activation,
         interstage_residual_rank=args.interstage_residual_rank,
-        enable_skip_linear=args.skip_linear,
         boundary_fan_out=boundary_fan_out_parsed,
         enable_temporal_readout=enable_temporal_readout,
         readout_mode=readout_mode,
@@ -2892,14 +2863,6 @@ def main():
         return
     breakdown = net.parameter_breakdown()
     print(f"[train] param breakdown:\n{format_parameter_breakdown(breakdown)}")
-    if getattr(net, "skip_linear_enabled", False):
-        skip_l2_lambda = _resolve_lambdas(args.problem).get("skip_linear_l2", 0.0)
-        print(
-            f"[train] skip_linear ENABLED: "
-            f"y = W₁·u + b₁ + f(x), "
-            f"shape={net.skip_linear_in_dim}->{net.skip_linear_out_dim}, "
-            f"L2 lambda={skip_l2_lambda}"
-        )
     if args.device_l2_lambda > 0.0:
         from cell_library import FreeTanhLibrary as _FreeTanhLibrary
         n_tanh_free = sum(
@@ -3683,9 +3646,6 @@ def main():
             torch.cuda.empty_cache()
         _log_gpu_mem("pre_pruned_net_build")
 
-        skip_linear_enabled = bool(getattr(raw_net, "skip_linear_enabled", False))
-        skip_in_dim = in_dim
-        skip_out_dim = out_dim
         pruned_net = KirchhoffNetWithIO(
             input_mapper_pruned,
             pruned_core,
@@ -3695,19 +3655,7 @@ def main():
             final_hid_count=pruned_last_n,
             final_proj_count=0,
             write_idx=pruned_write_idx if effective_write_mode in ("one_to_one", "sparse_proj") else None,
-            read_idx=pruned_read_idx if effective_read_mode == "sparse" else None,
-            enable_skip_linear=skip_linear_enabled,
-            skip_linear_in_dim=skip_in_dim if skip_linear_enabled else None,
-            skip_linear_out_dim=skip_out_dim if skip_linear_enabled else None)
-        if skip_linear_enabled and getattr(raw_net, "skip_linear", None) is not None:
-            with torch.no_grad():
-                pruned_net.skip_linear.weight.data.copy_(raw_net.skip_linear.weight.data)
-                if pruned_net.skip_linear.bias is not None and raw_net.skip_linear.bias is not None:
-                    pruned_net.skip_linear.bias.data.copy_(raw_net.skip_linear.bias.data)
-            print(
-                f"[prune] copied skip_linear ({skip_in_dim}->{skip_out_dim}) "
-                "weights from raw_net to pruned_net"
-            )
+            read_idx=pruned_read_idx if effective_read_mode == "sparse" else None)
         pruned_net.to(device)
         # Re-apply --no-resistive-shunt: prune_stage constructs fresh
         # DifferentialStage + FreeTanhLibrary objects (topology.py:1288),

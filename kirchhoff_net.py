@@ -56,7 +56,7 @@ def format_parameter_breakdown(breakdown: dict) -> str:
     stage_label_w = max(stage_label_w, 8)
     width = max(label_w + 18, stage_label_w + 18, 30)
     lines: list[str] = []
-    for name in ("input_mapper", "output_mapper", "skip_linear", "gln_rails"):
+    for name in ("input_mapper", "output_mapper", "gln_rails"):
         if groups.get(name, 0) or name in ("input_mapper", "output_mapper"):
             lines.append(f"  {name:<{label_w}}: {groups.get(name, 0):>{width - label_w - 4}}")
     for stage_key in sorted(per_stage.keys()):
@@ -203,9 +203,6 @@ class KirchhoffNetWithIO(nn.Module):
         final_proj_count: int | None = None,
         write_idx: list[int] | None = None,
         read_idx: list[int] | None = None,
-        enable_skip_linear: bool = False,
-        skip_linear_in_dim: int | None = None,
-        skip_linear_out_dim: int | None = None,
         enable_boundary: bool = False,
         boundary_fan_out: dict[int, list[int]] | None = None,
         enable_temporal_readout: bool = False,
@@ -295,7 +292,6 @@ class KirchhoffNetWithIO(nn.Module):
             self.read_dim = self.final_proj_count
         self.read_slice = slice(self.read_start, self.read_start + self.read_dim)
 
-        self.skip_linear_enabled = bool(enable_skip_linear)
         self.enable_boundary = bool(enable_boundary)
         self.boundary_fan_out = (
             None if boundary_fan_out is None
@@ -337,25 +333,6 @@ class KirchhoffNetWithIO(nn.Module):
                     f"enable_boundary=True requires all stages to have the same width, "
                     f"got {stage_widths}"
                 )
-        if self.skip_linear_enabled:
-            if skip_linear_in_dim is None or skip_linear_out_dim is None:
-                raise ValueError(
-                    "enable_skip_linear=True requires skip_linear_in_dim and "
-                    "skip_linear_out_dim"
-                )
-            self.skip_linear_in_dim = int(skip_linear_in_dim)
-            self.skip_linear_out_dim = int(skip_linear_out_dim)
-            self.skip_linear = nn.Linear(
-                self.skip_linear_in_dim, self.skip_linear_out_dim, bias=True,
-            )
-            nn.init.xavier_uniform_(self.skip_linear.weight)
-            with torch.no_grad():
-                self.skip_linear.bias.zero_()
-        else:
-            self.skip_linear = None
-            self.skip_linear_in_dim = None
-            self.skip_linear_out_dim = None
-
     def forward(
         self,
         u: torch.Tensor,
@@ -435,13 +412,6 @@ class KirchhoffNetWithIO(nn.Module):
                     f"{x_read.size(1)} dims; expected {self.read_dim}"
                 )
         y = self.output_mapper(x_read)
-        if self.skip_linear_enabled and self.skip_linear is not None:
-            if u.size(-1) != self.skip_linear_in_dim:
-                raise ValueError(
-                    f"SkipLinear: input has {u.size(-1)} features, "
-                    f"expected {self.skip_linear_in_dim}"
-                )
-            y = y + self.skip_linear(u)
         y = self.post_readout_transfer(y)
         if return_final_state:
             return y, None, x_final
@@ -456,7 +426,6 @@ class KirchhoffNetWithIO(nn.Module):
           - ``input_mapper.*``
           - ``output_mapper.*``
           - ``post_readout_transfer.*``  (post-OutputMapper residual-relu-tanh)
-          - ``skip_linear.*``  (skip connection, enabled via enable_skip_linear)
           - ``core.stages.N.z_logits``  (structural)
           - ``core.stages.N.u_logits``  (structural, deprecated)
           - ``core.stages.N.raw_leak``  (dynamical)
@@ -470,7 +439,6 @@ class KirchhoffNetWithIO(nn.Module):
             "input_mapper": 0,
             "output_mapper": 0,
             "post_readout_transfer": 0,
-            "skip_linear": 0,
             "gln_rails": 0,
         }
         per_stage: dict[str, dict[str, int]] = {}
@@ -486,8 +454,6 @@ class KirchhoffNetWithIO(nn.Module):
                 groups["post_readout_transfer"] += n
             elif name.startswith("output_mapper"):
                 groups["output_mapper"] += n
-            elif name.startswith("skip_linear"):
-                groups["skip_linear"] += n
             elif name.startswith("gln_rails"):
                 groups["gln_rails"] += n
             elif name.startswith("core.stages."):
@@ -552,12 +518,8 @@ class KirchhoffNetWithIO(nn.Module):
         }
 
     def extra_repr(self) -> str:
-        skip = (
-            f", skip_linear={self.skip_linear_in_dim}->{self.skip_linear_out_dim}"
-            if self.skip_linear_enabled else ""
-        )
         return (
             f"hid_count={self.hid_count}, proj_count={self.proj_count}, "
             f"final_hid_count={self.final_hid_count}, final_proj_count={self.final_proj_count}, "
-            f"write_idx={self.write_idx}, read_idx={self.read_idx}{skip}"
+            f"write_idx={self.write_idx}, read_idx={self.read_idx}"
         )

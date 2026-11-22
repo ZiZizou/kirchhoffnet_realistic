@@ -17,6 +17,7 @@ Run locally (no optuna required for the offline path):
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -24,6 +25,10 @@ from pathlib import Path
 
 PENALTY = (1.0, 1e6)
 N_EXPECTED = 2
+
+
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+FDBO_PATH = os.path.join(REPO_ROOT, "fixed-distillation-bayes-opt.py")
 
 
 def fake_trial(number: int, state: str, values, user_attrs=None):
@@ -150,7 +155,7 @@ def test_metrics_parse_failures_yield_penalty_not_fail() -> None:
     import importlib.util as _importlib
     # Load fixed-distillation-bayes-opt as a module without executing main()
     spec = _importlib.spec_from_file_location(
-        "fdbo_under_test", r"C:\Users\Atharva\Documents\kirchhoffnet_realistic\fixed-distillation-bayes-opt.py")
+        "fdbo_under_test", FDBO_PATH)
     mod = _importlib.module_from_spec(spec)
     # Stub out heavy imports so we can call metrics() without optuna/torch.
     import sys as _sys
@@ -326,12 +331,12 @@ def test_budget_aware_sampler_feasibility() -> None:
     import sys as _sys
     import types as _types
     spec = _importlib.spec_from_file_location(
-        "fdbo_budget_test", r"C:\Users\Atharva\Documents\kirchhoffnet_realistic\fixed-distillation-bayes-opt.py")
+        "fdbo_budget_test", FDBO_PATH)
     mod = _importlib.module_from_spec(spec)
     # Reuse the same optuna stub as the metrics test so import succeeds
     # without a real optuna install, but here optuna IS installed so we
     # actually want the real module. Temporarily ensure sys.path has ROOT.
-    _sys.path.insert(0, r"C:\Users\Atharva\Documents\kirchhoffnet_realistic")
+    _sys.path.insert(0, REPO_ROOT)
     try:
         spec.loader.exec_module(mod)
     except Exception as exc:
@@ -397,9 +402,9 @@ def test_knet_prior_biased_feasible() -> None:
     import importlib.util as _importlib
     import sys as _sys
     spec = _importlib.spec_from_file_location(
-        "fdbo_prior_test", r"C:\Users\Atharva\Documents\kirchhoffnet_realistic\fixed-distillation-bayes-opt.py")
+        "fdbo_prior_test", FDBO_PATH)
     mod = _importlib.module_from_spec(spec)
-    _sys.path.insert(0, r"C:\Users\Atharva\Documents\kirchhoffnet_realistic")
+    _sys.path.insert(0, REPO_ROOT)
     try:
         spec.loader.exec_module(mod)
     except Exception as exc:
@@ -430,9 +435,9 @@ def test_fanout_consistent_and_buildable() -> None:
     import sys as _sys
     from pathlib import Path as _P
     spec = _importlib.spec_from_file_location(
-        "fdbo_fanout_test", r"C:\Users\Atharva\Documents\kirchhoffnet_realistic\fixed-distillation-bayes-opt.py")
+        "fdbo_fanout_test", FDBO_PATH)
     mod = _importlib.module_from_spec(spec)
-    _sys.path.insert(0, r"C:\Users\Atharva\Documents\kirchhoffnet_realistic")
+    _sys.path.insert(0, REPO_ROOT)
     try:
         spec.loader.exec_module(mod)
     except Exception as exc:
@@ -445,8 +450,7 @@ def test_fanout_consistent_and_buildable() -> None:
         assert len(targets) == 8, (hs, fanout)
         assert len(set(targets)) == 8, (hs, fanout)  # cross-input uniqueness
         assert all(0 <= t < hs for t in targets), (hs, fanout)
-    src = (_P(r"C:\Users\Atharva\Documents\kirchhoffnet_realistic")
-           / "fixed-distillation-bayes-opt.py").read_text(encoding="utf-8")
+    src = (_P(FDBO_PATH)).read_text(encoding="utf-8")
     assert "[i, i + 4]" not in src or src.count("knet_fanout") >= 3, \
         "fanout rule duplicated instead of shared via knet_fanout()"
     print("OK: single knet_fanout() rule, 8 unique in-range targets for hs 8-24.")
@@ -455,11 +459,13 @@ def test_fanout_consistent_and_buildable() -> None:
 def test_sampler_rev_bumped() -> None:
     """knet-bo-repair: fingerprint carries sampler_rev so stale studies fail fast."""
     from pathlib import Path as _P
-    fdbo = (_P(r"C:\Users\Atharva\Documents\kirchhoffnet_realistic")
-            / "fixed-distillation-bayes-opt.py").read_text(encoding="utf-8")
-    assert "SAMPLER_REV = 2" in fdbo
-    assert '"sampler_rev": SAMPLER_REV' in fdbo or "'sampler_rev'" in fdbo or '"sampler_rev"' in fdbo
-    print("OK: sampler_rev=2 is part of the study fingerprint.")
+    import re as _re
+    fdbo = _P(FDBO_PATH).read_text(encoding="utf-8")
+    m = _re.search(r"^SAMPLER_REV\s*=\s*(\d+)\s*$", fdbo, _re.M)
+    assert m, "SAMPLER_REV constant missing from fixed-distillation-bayes-opt.py"
+    assert int(m.group(1)) >= 2, f"SAMPLER_REV={m.group(1)} (must stay >= 2 so stale studies fail fast)"
+    assert '"sampler_rev": SAMPLER_REV' in fdbo
+    print(f"OK: sampler_rev={m.group(1)} is part of the study fingerprint.")
 
 
 def main() -> int:

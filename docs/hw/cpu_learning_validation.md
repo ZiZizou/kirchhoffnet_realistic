@@ -220,6 +220,19 @@ mean MSE by about 25% and reduces seed spread, but 1/64 is worse than the
 baseline. Thus a lower floor partly recovers the loss, non-monotonically; the
 three-seed results do not justify choosing 1/64 as a default.
 
+> **Lead audit caveat (statistical power).** Every ablation row has only 3
+> seeds, and the max:min held-out spreads range from 1.7× to 12.3×. Even the
+> unconstrained Friedman2 baseline at its best lr has an 11.1× spread. Most
+> between-row differences above (including the 60% / 37% / 25% figures) are
+> therefore within seed-to-seed variation. Treat the ranking as a set of
+> hypotheses to re-test, with ≥10 seeds or a lower/decayed lr that brings the
+> baseline spread under ~2×, before using it to choose which constraints to
+> enable for the CTLE retrain. The robust findings are: (i) no single core
+> constraint makes Friedman2 unlearnable; (ii) phase3b_tm and the Toy
+> constrained presets carry a real 2-4× cost; (iii) fixed-weight step
+> refinement leaves outputs unchanged, but a rail check needs enough Heun
+> steps to be meaningful.
+
 ### Conclusion
 
 The fair LR sweep selects `lr=0.1` for both unconstrained tasks and nearly all

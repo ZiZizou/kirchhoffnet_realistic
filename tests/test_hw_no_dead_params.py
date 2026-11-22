@@ -77,7 +77,7 @@ SINGLE_FLAGS = [
 
 # The legitimately grad-free parameters (see the module docstring).
 ALLOWLIST = (
-    re.compile(r"^core\.stages\.0\.cell_lib\.(a_raw|b_raw|r_raw|s_raw)$"),
+    re.compile(r"^core\.stages\.0\.cell_lib\.(a_raw|b_raw|r_raw|cap_a_raw|cap_b_raw|s_raw)$"),
 )
 
 
@@ -124,7 +124,7 @@ def _allowed(dead):
 # ---------------------------------------------------------------------------
 # the check
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("preset", ["phase3a_core", "phase3a_full", "phase3b_tm"])
+@pytest.mark.parametrize("preset", ["phase3a_core", "phase3a_full", "phase3b_tm", "phase3a_core_diff"])
 @pytest.mark.parametrize("spec_name", ["TOY_NET", "PAPER_NET"])
 def test_no_dead_params_under_the_presets(preset, spec_name):
     """Every trainable parameter learns under every hardware preset."""

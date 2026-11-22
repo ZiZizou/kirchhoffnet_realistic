@@ -532,6 +532,9 @@ PRESET_DIR = os.path.join(REPO_ROOT, "hw", "presets")
 # The flag names of Phase 3a section 3.11 - a preset may not use anything else.
 ALLOWED_CONSTRAINT_FLAGS = {
     "hw_ratio_ab",
+    "hw_ab_mode",
+    "hw_ab_bits",
+    "hw_ab_rmax",
     "hw_slope_bound",
     "hw_ic_coupling",
     "hw_compliance",
@@ -556,7 +559,7 @@ ALLOWED_CONSTRAINT_FLAGS = {
 }
 
 
-@pytest.mark.parametrize("name", ["phase3a_core", "phase3a_full", "phase3b_tm"])
+@pytest.mark.parametrize("name", ["phase3a_core", "phase3a_full", "phase3b_tm", "phase3a_core_diff"])
 def test_presets_have_the_expected_shape(name):
     path = os.path.join(PRESET_DIR, f"{name}.json")
     assert os.path.isfile(path), path
@@ -580,10 +583,15 @@ def test_preset_contents():
             return json.load(fh)
 
     core = load("phase3a_core")["constraints"]
-    assert core["hw_ratio_ab"] is True
+    assert core["hw_ab_mode"] == "cap_divider"
+    assert core["hw_ab_bits"] == 3 and core["hw_ab_rmax"] == 2.0
     assert core["hw_slope_bound"] is True
     assert core["hw_ic_coupling"] is True
     assert core["hw_no_alpha"] is True
+    diff = load("phase3a_core_diff")["constraints"]
+    assert diff["hw_ab_mode"] == "differential"
+    assert diff["hw_slope_bound"] is True
+    assert "hw_ab_bits" not in diff and "hw_ab_rmax" not in diff
 
     full = load("phase3a_full")["constraints"]
     for key, value in core.items():

@@ -282,9 +282,19 @@ Common rules:
   A = 2r/(1+r),   B = 2/(1+r)            →  A + B = 2,  A/B = r,  A,B ∈ [0.4, 1.6]
   ```
   `r_raw` initialises at 0 (A = B = 1). The old init (0.693) is not reproduced; it is a different model, so this flag is a retrain flag, not an epoch-0 identity.
-- **Mapping:** A and B are the input attenuations of the two pair inputs. A passive capacitor divider cannot exceed 1. Realised as `Â = A/max(A,B)`, `B̂ = B/max(A,B)` (so max = 1), with the common gain folded into the overall slope factor of §3.2: `u = s_max·g·(sgn·(Â·x_s − B̂·x_d) + θ)`. Â, B̂ are set by a 3-4-bit capacitor-ratio bank per input, or by a W-ratio / degeneration ratio. In Verilog-A: `V(pin_p) = Vcm + Â·(V(s)−Vcm)`; `V(pin_n) = Vcm + B̂·(V(d)−Vcm)`.
+- **Mapping:** A and B are input attenuations of the two pair inputs. In this historical ratio mode, realised as `Â = A/max(A,B)`, `B̂ = B/max(A,B)` (max = 1), with the common gain folded into the slope factor of §3.2. For a physically realistic unequal pair-input gain use the passive switched-cap divider in the A/B modes subsection below; do not emulate it with asymmetric W/L, which creates offset rather than gain.
 - **Effect:** removes the unbounded slope `gm·A`. A ≠ B gives a common-mode term `(A−B)·x_cm` that a real pair does not have; the ratio form bounds A−B = 2(r−1)/(r+1) to ±1.2 rather than unbounded. Trained readout edges with r outside [1/4, 4] (e.g. A = 2.65 against B = 0.43 is r ≈ 6) are clipped to the bound. Expect a small accuracy cost; measure it before enabling other flags.
 - Flag: `hw_ratio_ab`. Code site: `_tanh_core` (`cell_library.py:344-345`).
+
+#### Realistic A/B modes (Task A)
+
+The OTA pair current is `I = σ(z)·Isat·tanh(gm·(s·(A·x_src − B·x_dst) + θ))`. A and B are input-voltage gains, not transistor W/L: a native single-ended 22FDX differential pair shares gm and therefore has A=B=1. Any asymmetric W/L produces offset, not independent input gain. Unequal A/B requires a passive, switch-reset capacitive divider on each input, with gains no greater than one. The mode resolver treats legacy `hw_ratio_ab=True` as exactly `hw_ab_mode="ratio"`; setting both to ratio is accepted, while setting the boolean with `differential` or `cap_divider` raises a conflict error. `None` retains the legacy unconstrained A/B.
+
+- `ratio`: backward-compatible `r_raw`, A/B ratio parameterisation and optional max-normalisation under the slope bound.
+- `differential`: no A/B trainables; exactly A=B=1. The independent slope attenuation `g` sets the gain; requires `hw_slope_bound`.
+- `cap_divider`: two trainable raw codes per edge, STE-quantised independently; requires `hw_slope_bound`. For N bits, integer code `k=round(sigmoid(raw)·(2^N−1))`, `k∈{0,…,2^N−1}`, maps linearly as `gain=1/r_max+(1−1/r_max)·k/(2^N−1)`. Thus with defaults N=3, r_max=2 the eight gains are `{0.5, 0.5714, 0.6429, 0.7143, 0.7857, 0.8571, 0.9286, 1}`. Forward is quantised; backward uses the sigmoid's smooth derivative (STE).
+
+With 3 bits and r_max=2, the gain LSB is (1−1/r_max)/(2^N−1) = 0.0714. **[ASSUMPTION, not a PDK fact]** Take a MOM/MIM matching coefficient A_C ≈ 0.5–1 %·µm and a 5–10 fF unit cap; at an illustrative 1–2 fF/µm² density, W·L ≈ 2.5–10 µm², giving σ(ΔC/C) ≈ A_C/√(W·L) ≈ 0.16–0.63%, well below one LSB. The paper config has 22 core edges in the shared fabric (§1.0); 2^N unit caps per input × 2 inputs × 22 edges is about 350 unit caps total (plus switches), an O(10²) bank. Tap parasitic C_p adds to the divider denominator, lowering gain systematically; trim or calibrate it in the code. Since the divider is switch-reset and its input pair loads only through gates, this tap does not load a fabric state node and does not change `hw_c_node`. It must settle within the S&H/transfer phase budget (§1 of `phase3b_fabric_impl_retrain.md`). More bits increase bank area and matching burden; larger r_max both increases range/area and attenuates the signal more, making pair input-referred noise/offset larger relative to signal. Verilog-A mapping is `V(pin)=Vcm+gain·(V(source)−Vcm)`; `effective_ab_values(lib)` exposes tensors for export. The paper checkpoint has A/B as high as roughly 11–13, so clipping to r_max=2 requires retraining.
 
 ### 3.2 gm·A bound from the subthreshold slope
 
@@ -468,7 +478,8 @@ Common rules:
 
 | Flag | Default | Section | Replaces / touches |
 |---|---|---|---|
-| `hw_ratio_ab` | False | 3.1 | `cell_library.py:344-345` |
+| `hw_ratio_ab` | False | 3.1 | legacy alias for `hw_ab_mode="ratio"` |
+| `hw_ab_mode`, `hw_ab_bits`, `hw_ab_rmax` | None, 3, 2.0 | 3.1 | ratio / differential / cap-divider input gain |
 | `hw_slope_bound` | False | 3.2 | `cell_library.py:351-352`, `:357` |
 | `hw_ic_coupling` | False | 3.3 | `cell_library.py:351-355` |
 | `hw_compliance` | False | 3.4 | `cell_library.py:399-401`, `differential_stage.py:1376-1386`, `:1508-1514`, `:1768` |

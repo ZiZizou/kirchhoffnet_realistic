@@ -16,8 +16,10 @@ assertion set from those fresh results after fixing the rail-check bug; the
 cache schema is now versioned so stale JSONs from an older harness cannot be
 silently reused. Corrected run summary: Friedman2 25 passed / 5 failed; Toy 17
 passed / 10 failed (42 passed, 15 failed of 57 selected tests; the two
-Friedman2 physical-build checks are included). The default suite then passed
+Friedman2 physical-build checks are included). The W7 default suite passed
 **682 tests** with 57 slow tests deselected (`python -m pytest -q`; 15 warnings).
+After the W8a refactor, the final default suite passed **683 tests** with 57 slow
+tests deselected (15 warnings; 170.87 s).
 
 Table fields: `MSE / none` is the held-out MSE divided by the *same-seed*
 unconstrained MSE (diagnostic; acceptance uses the ratio of the mean MSEs over
@@ -218,20 +220,49 @@ mean MSE by about 25% and reduces seed spread, but 1/64 is worse than the
 baseline. Thus a lower floor partly recovers the loss, non-monotonically; the
 three-seed results do not justify choosing 1/64 as a default.
 
-### Conclusion (pending CTLE recommendations)
+### Conclusion
 
-The fair LR sweep shows that `lr=0.1` is best tested for both unconstrained
-tasks and nearly every constrained task/preset; Friedman2 phase3b_tm selects
-0.03. Friedman2 core/full match or slightly outperform the best unconstrained
-mean in this small held-out sample, while phase3b_tm and all Toy constrained
-presets retain a sizable relative-MSE cost. Refinement shows tiny fixed-weight
-output changes but one rail excursion resolves at ×4; the small-signal
-`stiffness_report` does not capture the larger trajectory-Jacobian metric.
-Friedman2 ablation suggests `hw_no_alpha` and `hw_ratio_ab` are the clearest
-cost contributors within the core, while `hw_ic_coupling` is beneficial in this
-sample; `g_min=1/32` modestly helps and `1/64` does not. Seed variability
-remains large. These CPU toys do not establish CTLE performance; a controlled
-CTLE retrain is still required.
+The fair LR sweep selects `lr=0.1` for both unconstrained tasks and nearly all
+constrained task/presets; Friedman2 phase3b_tm selects `0.03`. Friedman2
+phase3a_core/full match or slightly outperform the best unconstrained mean in
+this small held-out sample, while phase3b_tm and all Toy constrained presets
+retain a relative-MSE cost. Fixed-weight step refinement produces negligible
+output changes, although the full/seed-1 rail excursion resolves at ×4. The
+trajectory Jacobian and small-signal `stiffness_report` disagree materially,
+so both need checking. Friedman2 ablation implicates `hw_no_alpha` and
+`hw_ratio_ab` as the clearest quality costs inside the core; `hw_ic_coupling`
+helps in this sample. `g_min=1/32` modestly improves the mean, but the result is
+non-monotonic and seed spreads remain large. This CPU study informs a CTLE
+retrain plan; it does not replace validating the actual CTLE workload.
+
+## Recommendations for the CTLE retrain
+
+1. **Learning rate:** use `0.03` as the conservative starting point and include
+   `0.1` (the best tested setting for most toy task/presets) and `0.01` in a
+   short validation sweep. Do not transfer the toy `0.1` optimum blindly to
+   CTLE; select on a validation split and preserve a separate final test set.
+2. **Integration resolution:** measure `hw.constraints.stiffness_report` on the
+   built CTLE and choose per-stage `num_steps` so max `dt·λ ≤ 1`; also run the
+   trajectory-Jacobian audit on representative inputs. In this Toy study the
+   static report was below 0.25 even when the trajectory metric was 2.07–5.37,
+   so use the stricter of the two diagnostics and investigate any disagreement.
+   Six steps per stage was insufficient for the measured trajectory metric;
+   48 steps per stage is a conservative Toy trial, not a universal CTLE constant.
+   Recheck after training because learned conductances change stiffness.
+3. **Slope floor:** keep the configurable default `hw_slope_g_min=1/16` for the
+   first CTLE run. Include `1/32` as a sensitivity run if the MSE cost suggests
+   an attenuation-floor limitation; it improved the toy mean by about 25%.
+   Do not default to `1/64`: its toy mean was worse than `1/16`, and these
+   three-seed results are non-monotonic.
+4. **Constraint order:** establish the unconstrained reference, then enable
+   `hw_slope_bound` first and `hw_ratio_ab` next. Add `hw_ic_coupling` with the
+   slope bound (the coupling requires it and helped in the Friedman2 ablation).
+   Add `hw_no_alpha` last in the core ladder because removing it reduced the
+   ablated mean MSE by about 60%. For a physically rail-limited CTLE, introduce
+   `hw_compliance`/`hw_clamp_transfer` during the constrained training schedule,
+   not as a post-hoc patch; check rail peaks at the chosen integration step size.
+   Track held-out MSE, seed spread, slope/rail invariants, and both stiffness
+   diagnostics at every rung before advancing to the full CTLE retrain.
 
 ## Pruning investigation
 

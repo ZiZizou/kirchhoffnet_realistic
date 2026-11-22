@@ -69,7 +69,7 @@ def main() -> int:
         run_dir.mkdir(parents=True, exist_ok=True)
         deck = write_deck(module, run_dir)
         command = (
-            f"source {SETUP} >& /dev/null; cd {run_dir}; "
+            f"cd {run_dir}; source {SETUP} >& /dev/null; "
             f"spectre -format psfascii {deck.name} +log {module}.log"
         )
         result = subprocess.run(["tcsh", "-c", command], cwd=run_dir, text=True,

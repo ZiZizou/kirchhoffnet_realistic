@@ -625,27 +625,6 @@ INIT = {
     "u_logit_init": 0.0,
 }
 
-# Variation context defaults
-# (RR-C: temp_c sampling is deprecated. The dataclass field is kept for
-# backward compatibility but no longer randomized; ``temp_c_choices`` is
-# only read by external code that explicitly opts in via the
-# ``sample_random_context(..., legacy_temp=True)`` path.)
-VARIATION = {
-    "temp_c_default": 27.0,
-    "temp_c_choices": [0.0, 27.0, 75.0],
-    # Legacy-library variation is sampled in the log domain so positive
-    # physical parameters remain positive after perturbation:
-    #   gm   -> gm   * exp(delta_gm)
-    #   isat -> isat * exp(delta_isat)
-    #
-    # edge_mismatch_std is the legacy name for per-edge/per-cell gm log-std.
-    "global_gain_shift_std": 0.05,
-    "edge_mismatch_std": 0.05,
-    "global_isat_shift_std": 0.02,
-    "edge_isat_mismatch_std": 0.03,
-}
-
-
 def cells_to_tensor_dict(library_name: str = "legacy"):
     """Stack a named library into a dict of 1-D tensors ordered by cell_order.
 

@@ -89,11 +89,6 @@ class KirchhoffNet(nn.Module):
     Each stage integrates its internal state for stage_times[i] over
     stage_steps[i] Heun steps. Between stages, StageTransfer truncates
     or zero-pads the state vector to match the next stage's width.
-
-    Handles multi-stage edge_mismatch slicing internally: when ``ctx``
-    carries an ``edge_mismatch`` tensor sized for the *sum* of all stages,
-    ``forward()`` slices it into per-stage chunks so each stage receives
-    mismatch matching its own edge count.
     """
 
     def __init__(
@@ -131,8 +126,6 @@ class KirchhoffNet(nn.Module):
         store_trajectory: bool = False,
         drive_targets: list[torch.Tensor] | None = None,
         drive_scales: list[float] | None = None,
-        stage_noise_std: float = 0.0,
-        stage_noise_generator: torch.Generator | None = None,
         u: torch.Tensor | None = None,
         initial_state: torch.Tensor | None = None,
     ):
@@ -154,16 +147,6 @@ class KirchhoffNet(nn.Module):
             stage_outputs.append(x.detach())
             if store_trajectory and traj is not None:
                 all_trajs.append(traj)
-            # kirchhoff-noise: per-stage additive Gaussian noise on the state
-            # vector (thermal/IR-drop modeling on the analog voltage rails).
-            if stage_noise_std > 0.0:
-                if stage_noise_generator is not None:
-                    noise = torch.empty_like(x)
-                    noise.normal_(mean=0.0, std=stage_noise_std,
-                                  generator=stage_noise_generator)
-                    x = x + noise
-                else:
-                    x = x + torch.randn_like(x) * stage_noise_std
             if i < len(self.transfers):
                 x = self.transfers[i](x)
         self.last_stage_outputs = stage_outputs
@@ -548,8 +531,6 @@ class KirchhoffNetWithIO(nn.Module):
         self,
         u: torch.Tensor,
         store_trajectory: bool = False,
-        stage_noise_std: float = 0.0,
-        stage_noise_generator: torch.Generator | None = None,
         initial_state: torch.Tensor | None = None,
         return_final_state: bool = False,
     ):
@@ -623,8 +604,6 @@ class KirchhoffNetWithIO(nn.Module):
                 x0_full, store_trajectory=store_trajectory and not return_final_state,
                 drive_targets=drive_targets,
                 drive_scales=self.drive_scales if (self.enable_drive and not self.enable_boundary) else None,
-                stage_noise_std=stage_noise_std,
-                stage_noise_generator=stage_noise_generator,
                 u=u if (
                     self.enable_boundary or self.enable_vca
                     or self.gln_rails is not None

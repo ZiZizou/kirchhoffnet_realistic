@@ -26,9 +26,7 @@ from config import (
     SCHEDULE_THREE_PHASE,
     SOLVER,
     TAU,
-    VARIATION,
 )
-from sim_context import SimContext, sample_random_context
 from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
 from cell_library import (
     AntiParallelFreeTanhLibrary,
@@ -258,14 +256,12 @@ def _device_l2_penalty(net) -> torch.Tensor:
     Returns the *mean* of ``p.pow(2)`` over the union of penalized tensors
     (so the pressure per parameter is independent of how many params the
     active configuration has). Returns 0 when no penalized params exist.
-    Unwraps ``DataParallel`` and the ``KirchhoffNetNoiseWrapper`` so the
-    same call site works with or without multi-GPU / noise-aware training.
+    Unwraps ``DataParallel`` so the same call site works with or without
+    multi-GPU training.
     """
     raw = net
     if isinstance(raw, torch.nn.DataParallel):
         raw = raw.module
-    if hasattr(raw, "base") and hasattr(raw, "_stage_noise_std"):
-        raw = raw.base
 
     sum_sq = None
     num = 0
@@ -774,7 +770,6 @@ def compute_loss(
     net: KirchhoffNetWithIO | KirchhoffNet,
     x0: torch.Tensor,
     target: torch.Tensor,
-    ctx: SimContext,
     task_fn,
     lambdas: dict | None = None,
     return_parts: bool = False,
@@ -835,8 +830,6 @@ def compute_loss(
             net_skip = net
             if hasattr(net_skip, "module") and isinstance(net_skip, torch.nn.DataParallel):
                 net_skip = net_skip.module
-            if hasattr(net_skip, "base") and hasattr(net_skip, "_stage_noise_std"):
-                net_skip = net_skip.base
             if getattr(net_skip, "skip_linear_enabled", False):
                 p = net_skip.skip_linear
                 loss_skip_l2 = skip_l2_lambda * (
@@ -915,7 +908,6 @@ def compute_solver_loss(
     b: torch.Tensor,
     x_star: torch.Tensor,
     A: torch.Tensor,
-    ctx: SimContext,
     lambdas: dict | None = None,
     return_parts: bool = False,
     amp: bool = False,
@@ -1359,7 +1351,6 @@ def train_epoch(
     loader,
     optimizer,
     task_fn,
-    ctx_factory,
     epoch: int,
     total_epochs: int | None = None,
     lambdas: dict | None = None,
@@ -1368,7 +1359,7 @@ def train_epoch(
     scaler: torch.amp.GradScaler | None = None,
     amp: bool = False,
 ):
-    """Run one training epoch. ctx_factory(batch_size, num_edges_total, device) -> SimContext.
+    """Run one training epoch.
 
     `loader` is an iterable of (u, target) batches. For our DifferentialStage
     the relevant edge count is the sum across all stages.
@@ -1390,10 +1381,9 @@ def train_epoch(
     total_loss = 0.0
     n_batches = 0
     for i, (u, target) in enumerate(loader):
-        ctx = ctx_factory(u.size(0), device=u.device)
         optimizer.zero_grad()
         loss_task, loss_structural, parts = compute_loss(
-            net, u, target, ctx, task_fn, lambdas=lambdas,
+            net, u, target, task_fn, lambdas=lambdas,
             return_parts=True, amp=amp, reg_scale=reg_scale,
         )
         if scaler is not None:
@@ -1411,31 +1401,3 @@ def train_epoch(
         if log_every and (i % log_every == 0):
             print(f"  epoch {epoch} batch {i} loss={parts['total']:.4f} task={parts['task']:.4f} reg_scale={reg_scale:.2f}")
     return {"avg_loss": total_loss / max(1, n_batches), "tau": tau, "reg_scale": reg_scale}
-
-
-# ---------- convenience ctx factory ----------
-
-def default_ctx_factory(net: KirchhoffNetWithIO):
-    """Build a ctx_factory closure tied to a specific net and device.
-
-    Usage:
-        factory = default_ctx_factory(net)
-        ctx = factory(batch_size=128, device=u.device)
-
-    Note (RR-C): ``temp_choices`` is no longer passed — ``temp_c`` is
-    deprecated and ``sample_random_context`` always returns
-    ``VARIATION["temp_c_default"]``.
-    """
-    def _factory(batch_size: int, device: torch.device | str = "cpu", **kwargs):
-        total_edges = sum(s.num_edges() for s in net.core.stages)
-        return sample_random_context(
-            num_edges=total_edges,
-            device=device,
-            **{
-                "gain_shift_std": VARIATION["global_gain_shift_std"],
-                "mismatch_std": VARIATION["edge_mismatch_std"],
-                "global_isat_shift_std": VARIATION.get("global_isat_shift_std", 0.0),
-                "isat_mismatch_std": VARIATION.get("edge_isat_mismatch_std", 0.0),
-            },
-        )
-    return _factory

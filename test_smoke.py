@@ -95,135 +95,8 @@ def test_config_loads():
     check("cells_to_tensor_dict: P theta == 0.0", abs(float(t["theta"][2]) - 0.0) < 1e-5)
 
 
-def test_sim_context():
-    print("\nTest 2: SimContext construction and variation sampling (RR-C: temp_c deprecated)")
-    import warnings
-    from sim_context import SimContext, sample_random_context
-    ctx = SimContext()
-    check("SimContext defaults temp_c=27.0", ctx.temp_c == 27.0)
-    check("SimContext defaults gain_shift=0.0", ctx.global_gain_shift == 0.0)
-    check("SimContext defaults mismatch=None", ctx.edge_mismatch is None)
-    check("isat-variation: defaults global_isat_shift=0.0", ctx.global_isat_shift == 0.0)
-    check("isat-variation: defaults edge_isat_mismatch=None",
-          ctx.edge_isat_mismatch is None)
-
-    sampled = sample_random_context(num_edges=8, seed=0)
-    check("Sampled mismatch shape (8,)", sampled.edge_mismatch.shape == (8,))
-    check("Sampled mismatch finite", torch.isfinite(sampled.edge_mismatch).all().item())
-    check("Sampled temp_c is now the default 27.0 (RR-C: not randomized)",
-          sampled.temp_c == 27.0,
-          f"got {sampled.temp_c}")
-    check("isat-variation: sampled edge_isat_mismatch shape (8,)",
-          sampled.edge_isat_mismatch is not None
-          and sampled.edge_isat_mismatch.shape == (8,),
-          f"got {sampled.edge_isat_mismatch.shape if sampled.edge_isat_mismatch is not None else None}")
-    check("isat-variation: sampled edge_isat_mismatch finite",
-          sampled.edge_isat_mismatch is not None
-          and torch.isfinite(sampled.edge_isat_mismatch).all().item())
-
-    # slice_edges propagates both gm and isat tensors
-    sliced = sampled.slice_edges(2, 6)
-    check("isat-variation: slice_edges slices edge_mismatch",
-          sliced.edge_mismatch.shape == (4,),
-          f"got {sliced.edge_mismatch.shape}")
-    check("isat-variation: slice_edges slices edge_isat_mismatch",
-          sliced.edge_isat_mismatch is not None
-          and sliced.edge_isat_mismatch.shape == (4,),
-          f"got {sliced.edge_isat_mismatch.shape if sliced.edge_isat_mismatch is not None else None}")
-    check("isat-variation: slice_edges propagates global_gain_shift",
-          sliced.global_gain_shift == sampled.global_gain_shift)
-    check("isat-variation: slice_edges propagates global_isat_shift",
-          sliced.global_isat_shift == sampled.global_isat_shift)
-
-    # Zero isat variation -> None tensor
-    zero_isat = sample_random_context(
-        num_edges=4, seed=0,
-        isat_mismatch_std=0.0, global_isat_shift_std=0.0,
-    )
-    check("isat-variation: isat_mismatch_std=0 -> edge_isat_mismatch=None",
-          zero_isat.edge_isat_mismatch is None)
-    check("isat-variation: global_isat_shift_std=0 -> global_isat_shift=0.0",
-          zero_isat.global_isat_shift == 0.0)
-
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        legacy = sample_random_context(num_edges=4, seed=1, legacy_temp=True)
-    check("legacy_temp=True emits a DeprecationWarning",
-          any(issubclass(w.category, DeprecationWarning) for w in caught),
-          f"warnings: {[w.category.__name__ for w in caught]}")
-    check("legacy_temp=True samples from temp_choices [0,27,75]",
-          legacy.temp_c in (0.0, 27.0, 75.0),
-          f"got {legacy.temp_c}")
-
-    with warnings.catch_warnings(record=True) as caught2:
-        warnings.simplefilter("always")
-        SimContext(temp_c=75.0)
-    check("Explicit non-default temp_c emits DeprecationWarning",
-          any(issubclass(w.category, DeprecationWarning) for w in caught2),
-          f"warnings: {[w.category.__name__ for w in caught2]}")
 
 
-def test_isat_variation_pipeline():
-    print("\nTest 2b: isat variation through cell_library and KirchhoffNet")
-    from sim_context import SimContext, sample_random_context
-    from cell_library import make_cell_library
-    from topology import line_graph, topology_to_stage
-    from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
-    from io_mapper import InputMapper, OutputMapper
-    from stage_transfer import StageTransfer
-
-    # 2-stage legacy library pipeline
-    B, in_dim, hid_count = 4, 1, 4
-    g1 = make_cell_library('tanh')
-    g2 = make_cell_library('tanh')
-    topo = line_graph(hid_count, radius=1)
-    stage1, _, _ = topology_to_stage(topo, g1)
-    stage2, _, _ = topology_to_stage(topo, g2)
-    core = KirchhoffNet(
-        stages=[stage1, stage2],
-        transfers=[StageTransfer(hid_count, hid_count)],
-        stage_times=[1.0, 1.0],
-        stage_steps=[10, 10],
-    )
-    inp = InputMapper(in_dim=in_dim, out_dim=hid_count)
-    out = OutputMapper(node_dim=hid_count, out_dim=1)
-    net = KirchhoffNetWithIO(inp, core, out, hid_count=hid_count, proj_count=0)
-    u = torch.randn(B, in_dim)
-
-    # 1. ctx=None baseline
-    y_none, _ = net(u)
-    check("isat-variation: ctx=None output finite",
-          torch.isfinite(y_none).all().item())
-
-    # 2. Zero ALL variation (including gm) -> exact match to ctx=None
-    total_edges = sum(s.num_edges() for s in core.stages)
-    zero_ctx = sample_random_context(
-        num_edges=total_edges, seed=0,
-        gain_shift_std=0.0, mismatch_std=0.0,
-        global_isat_shift_std=0.0, isat_mismatch_std=0.0,
-    )
-    y_zero, _ = net(u)
-    check("isat-variation: all-zero ctx gives exact match to ctx=None",
-          torch.allclose(y_zero, y_none),
-          f"max diff = {(y_zero - y_none).abs().max().item():.3e}")
-
-    # 3. isat-only variation produces different output than no-var
-    isat_only = sample_random_context(
-        num_edges=total_edges, seed=1,
-        gain_shift_std=0.0, mismatch_std=0.0,
-        global_isat_shift_std=0.02, isat_mismatch_std=0.03,
-    )
-    y_isat, _ = net(u)
-    check("isat-variation: isat-only ctx finite",
-          torch.isfinite(y_isat).all().item())
-    check("isat-variation: isat-only ctx changes output",
-          not torch.allclose(y_isat, y_none),
-          f"max diff = {(y_isat - y_none).abs().max().item():.3e}")
-
-    # 4. Same ctx frozen for whole forward -> deterministic
-    y_again, _ = net(u)
-    check("isat-variation: same ctx produces same output (frozen-per-forward)",
-          torch.allclose(y_isat, y_again))
 
 
 def test_topology_primitives():
@@ -385,7 +258,6 @@ def test_heun_converges():
     from cell_library import make_cell_library
     from topology import StageTopologyBuilder, topology_to_stage
     from kirchhoff_net import KirchhoffNet
-    from sim_context import SimContext
 
     cell_lib = make_cell_library('tanh')
     hid = ring_graph(4, edge_prob=0.5, seed=0)
@@ -395,7 +267,6 @@ def test_heun_converges():
     stage, active, _ = topology_to_stage(topo, cell_lib=cell_lib)
     net = KirchhoffNet(stages=[stage], transfers=[], stage_times=[0.5], stage_steps=[20])
 
-    ctx = SimContext()
     x0 = torch.zeros(1, 4)
     x_final, trajs = net(x0, store_trajectory=True)
     check("x_final is finite", torch.isfinite(x_final).all().item())
@@ -409,7 +280,6 @@ def test_gradient_flow():
     from cell_library import make_cell_library
     from topology import StageTopologyBuilder, topology_to_stage
     from kirchhoff_net import KirchhoffNet
-    from sim_context import SimContext
 
     cell_lib = make_cell_library('tanh')
     hid = ring_graph(3, edge_prob=0.5, seed=0)
@@ -419,7 +289,6 @@ def test_gradient_flow():
     stage, active, _ = topology_to_stage(topo, cell_lib=cell_lib)
     net = KirchhoffNet(stages=[stage], transfers=[], stage_times=[0.3], stage_steps=[10])
 
-    ctx = SimContext()
     x0 = torch.ones(2, 3) * 0.05
     x_final, _ = net(x0, store_trajectory=False)
     loss = x_final.pow(2).sum()
@@ -445,7 +314,6 @@ def test_compute_loss_finite():
     from topology import StageTopologyBuilder, topology_to_stage
     from kirchhoff_net import KirchhoffNetWithIO
     from io_mapper import InputMapper, OutputMapper
-    from sim_context import SimContext
     from train import compute_loss
 
     cell_lib = make_cell_library('tanh')
@@ -463,8 +331,7 @@ def test_compute_loss_finite():
 
     u = torch.randn(8, 2) * 0.5
     target = torch.zeros(8, 1)
-    ctx = SimContext()
-    loss_task, loss_structural, parts = compute_loss(net, u, target, ctx, F.mse_loss, return_parts=True)
+    loss_task, loss_structural, parts = compute_loss(net, u, target, F.mse_loss, return_parts=True)
     check("total loss finite", math.isfinite(parts["total"]))
     check("task loss finite", math.isfinite(parts["task"]))
     check("sparsity loss finite", math.isfinite(parts["sparsity"]))
@@ -506,7 +373,6 @@ def test_housing_preset_robust():
     from topology import build_net_from_preset
     from cell_library import make_cell_library
     from io_mapper import RobustInputMapper, SparseInputMapper
-    from sim_context import SimContext
 
     net_dense = build_net_from_preset(
         "housing", cell_lib=make_cell_library('tanh'),
@@ -521,7 +387,6 @@ def test_housing_preset_robust():
 
     u = torch.randn(8, 8)
     target = torch.randn(8, 1)
-    ctx = SimContext()
     y, _ = net_dense(u, store_trajectory=False)
     check("housing dense: forward shape (8,1)", y.shape == (8, 1))
     check("housing dense: output finite", torch.isfinite(y).all().item())
@@ -622,7 +487,6 @@ def test_visualize_trajectories():
     from cell_library import make_cell_library
     from topology import StageTopologyBuilder, topology_to_stage
     from kirchhoff_net import KirchhoffNet
-    from sim_context import SimContext
     from visualize import plot_trajectories
 
     cell_lib = make_cell_library('tanh')
@@ -632,7 +496,6 @@ def test_visualize_trajectories():
                          proj_pattern="all_to_all")
     stage, _, _ = topology_to_stage(topo, cell_lib=cell_lib)
     net = KirchhoffNet(stages=[stage], transfers=[], stage_times=[0.5], stage_steps=[10])
-    ctx = SimContext()
     x0 = torch.zeros(2, 4)
     x_final, trajs = net(x0, store_trajectory=True)
     traj_tensor = trajs[0] if isinstance(trajs, list) else trajs
@@ -693,41 +556,6 @@ def test_union_topology():
           all(s < d for s, d in hidden_edges))
 
 
-def test_solver_loss_finite():
-    print("\nTest 21: compute_solver_loss returns finite values with all regularizers")
-    from sparse_solver_data import SparseLinearSystemDataset
-    from sparse_solver_topology import build_union_topology
-    from topology import topology_to_stage
-    from cell_library import make_cell_library
-    from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
-    from io_mapper import InputMapper, OutputMapper
-    from sim_context import SimContext
-    from train import compute_solver_loss, LAMBDAS
-
-    ds = SparseLinearSystemDataset(n=8, num_samples=10, density=0.1, seed=2)
-    topo = build_union_topology(ds, n=8, num_proj=2)
-    cell_lib = make_cell_library('tanh')
-    stage, active, _ = topology_to_stage(topo, cell_lib=cell_lib)
-    core = KirchhoffNet(stages=[stage], transfers=[], stage_times=[0.3], stage_steps=[8])
-    inp = InputMapper(in_dim=8, out_dim=8)
-    out = OutputMapper(node_dim=2, out_dim=8)
-    net = KirchhoffNetWithIO(inp, core, out, hid_count=8, proj_count=2)
-
-    b, x_star, A = ds[0]
-    b, x_star, A = b.unsqueeze(0), x_star.unsqueeze(0), A.unsqueeze(0)
-    ctx = SimContext()
-    loss_task, loss_structural, parts = compute_solver_loss(net, b, x_star, A, ctx, return_parts=True)
-    check("total loss finite", math.isfinite(parts["total"]))
-    check("residual finite", math.isfinite(parts["residual"]))
-    check("solution finite", math.isfinite(parts["solution"]))
-    check("sparsity finite", math.isfinite(parts["sparsity"]))
-    check("edge_gate finite (CP: Σ z_e)", math.isfinite(parts["edge_gate"]))
-    check("node_gate finite (CP: Σ u_j)", math.isfinite(parts["node_gate"]))
-    check("power finite (CP: static power proxy)", math.isfinite(parts["power"]))
-    check("capacitance finite (CP: cap area proxy)", math.isfinite(parts["capacitance"]))
-    check("rail finite", math.isfinite(parts["rail"]))
-    check("entropy finite", math.isfinite(parts["entropy"]))
-    check("reg_scale reported (RR-A)", "reg_scale" in parts)
 
 
 def test_baseline_jacobi():
@@ -802,7 +630,6 @@ def test_io_honest_split():
     from topology import ring_graph, StageTopologyBuilder, topology_to_stage
     from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
     from io_mapper import InputMapper, OutputMapper
-    from sim_context import SimContext
 
     cell_lib = make_cell_library('tanh')
     n_hid, n_proj = 4, 2
@@ -825,7 +652,6 @@ def test_io_honest_split():
     check("R1.1: hidden portion of x0 is non-zero (tanh write)",
           x0_full[0, :n_hid].abs().sum() > 0)
 
-    ctx = SimContext()
     y, _ = net(u, store_trajectory=False)
     check("R1.3: forward produces output of expected shape (1,1)",
           y.shape == (1, 1))
@@ -871,7 +697,6 @@ def test_mapper_only_ablation():
     from topology import ring_graph, StageTopologyBuilder, topology_to_stage
     from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
     from io_mapper import InputMapper, OutputMapper
-    from sim_context import SimContext
 
     cell_lib = make_cell_library('tanh')
     hid = ring_graph(4, radius=1)
@@ -885,7 +710,6 @@ def test_mapper_only_ablation():
     net = KirchhoffNetWithIO(inp, core, out, hid_count=4, proj_count=0)
 
     u = torch.tensor([[0.5]])
-    ctx = SimContext()
     y, _ = net(u, store_trajectory=False)
     expected = out(inp(u))
     check("R2.2: mapper-only output equals OutputMapper(InputMapper(u))",
@@ -900,7 +724,6 @@ def test_mapper_only_ablation_fast():
     from topology import ring_graph, StageTopologyBuilder, topology_to_stage
     from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
     from io_mapper import InputMapper, OutputMapper
-    from sim_context import SimContext
 
     cell_lib = make_cell_library('tanh')
     hid = ring_graph(4, radius=1)
@@ -914,7 +737,6 @@ def test_mapper_only_ablation_fast():
     net = KirchhoffNetWithIO(inp, core, out, hid_count=4, proj_count=0)
 
     u = torch.randn(128, 1)
-    ctx = SimContext()
 
     with torch.no_grad():
         y, trajs = net(u, store_trajectory=True)
@@ -961,7 +783,6 @@ def test_complexity_proxy():
     from topology import ring_graph, StageTopologyBuilder, topology_to_stage
     from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
     from io_mapper import InputMapper, OutputMapper
-    from sim_context import SimContext
     from train import _stage_soft_weights, _stage_multiplicities
     import torch.nn.functional as F
 
@@ -1244,7 +1065,6 @@ def test_gate_application_in_rhs():
     print("\nTest 47: gates applied in DifferentialStage.rhs (CP-2, deprecate-node-gates)")
     from cell_library import make_cell_library
     from topology import ring_graph, StageTopologyBuilder, topology_to_stage
-    from sim_context import SimContext
     import torch
 
     cell_lib = make_cell_library('tanh')
@@ -1262,7 +1082,7 @@ def test_gate_application_in_rhs():
         stage.u_logits.fill_(-10.0)
 
     x = torch.randn(2, 3) * 0.1
-    dx = stage.rhs(x, ctx=SimContext(), tau=1.0)
+    dx = stage.rhs(x, tau=1.0)
 
     # With edge gates closed (z~0), i_edge ~ 0, dx = (0 - leak - clip) / C.
     # Leak is F.softplus(-3) ~ 0.05, so leak_term ~ 0.005, clip ~ 0 for small x.
@@ -1270,7 +1090,7 @@ def test_gate_application_in_rhs():
     with torch.no_grad():
         stage.z_logits.fill_(5.0)
         # u_logits stays -10 — node gates are bypassed so this shouldn't affect rhs.
-    dx_open_edge = stage.rhs(x, ctx=SimContext(), tau=1.0)
+    dx_open_edge = stage.rhs(x, tau=1.0)
 
     diff = (dx - dx_open_edge).abs().max().item()
     check("CP-2: edge gates modify RHS output (closed vs open differ)",
@@ -1280,7 +1100,7 @@ def test_gate_application_in_rhs():
     # Verify node gates have NO effect in rhs.
     with torch.no_grad():
         stage.u_logits.fill_(5.0)
-    dx_u_open = stage.rhs(x, ctx=SimContext(), tau=1.0)
+    dx_u_open = stage.rhs(x, tau=1.0)
     diff_u = (dx_open_edge - dx_u_open).abs().max().item()
     check("CP-2 (deprecate-node-gates): node gate changes do NOT affect RHS output",
           diff_u < 1e-6,
@@ -1293,7 +1113,6 @@ def test_complexity_regularizers():
     from topology import ring_graph, StageTopologyBuilder, topology_to_stage
     from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
     from io_mapper import InputMapper, OutputMapper
-    from sim_context import SimContext
     from train import _stage_edge_gates, _stage_node_gates, _stage_multiplicities
     import torch
 
@@ -1735,7 +1554,6 @@ def test_prune_io_forward_pass_preserved_when_zero_edges_removed():
 
     if pre_edges == post_edges:
         from kirchhoff_net import KirchhoffNetWithIO
-        from train import default_ctx_factory
 
         stage0_remap = stage_remaps[0]
         last_remap = stage_remaps[-1]
@@ -1764,12 +1582,10 @@ def test_prune_io_forward_pass_preserved_when_zero_edges_removed():
         pruned_net.eval()
 
         u = torch.randn(8, in_dim)
-        ctx_raw = default_ctx_factory(net)(u.size(0), device="cpu")
-        ctx_pruned = default_ctx_factory(pruned_net)(u.size(0), device="cpu")
         try:
             with torch.no_grad():
-                y_raw, _ = net(u, ctx_raw)
-                y_pruned, _ = pruned_net(u, ctx_pruned)
+                y_raw, _ = net(u)
+                y_pruned, _ = pruned_net(u)
             check("PIT-3: 0-edge-prune forward outputs match (atol=1e-6)",
                   torch.allclose(y_raw, y_pruned, atol=1e-6, rtol=1e-5),
                   f"max diff = {(y_raw - y_pruned).abs().max().item():.2e}")
@@ -2236,7 +2052,6 @@ def test_apply_ablation():
     print("\nTest 35: apply_ablation utility (R2.1-R2.4)")
     from topology import build_net_from_preset
     from cell_library import make_cell_library
-    from sim_context import SimContext
     from train import apply_ablation
 
     cell_lib = make_cell_library('tanh')
@@ -2358,7 +2173,6 @@ def test_sparse_io_dense_fallback_matches_old():
     from topology import build_net_from_preset
     from cell_library import make_cell_library
     from io_mapper import InputMapper, OutputMapper
-    from sim_context import SimContext
 
     net = build_net_from_preset(
         "sinx", cell_lib=make_cell_library('tanh'),
@@ -2372,7 +2186,6 @@ def test_sparse_io_dense_fallback_matches_old():
           net.write_idx is None and net.read_idx is None)
 
     u = torch.linspace(-math.pi, math.pi, 16).unsqueeze(1)
-    ctx = SimContext()
     with torch.no_grad():
         y_dense, _ = net(u, store_trajectory=False)
     check("dense mode: forward output finite",
@@ -2383,11 +2196,9 @@ def test_sparse_io_gradients_flow_to_read_targets():
     print("\nTest 41: gradient flows only to read_idx nodes (SR2)")
     from topology import build_net_from_preset
     from cell_library import make_cell_library
-    from sim_context import SimContext
 
     net = build_net_from_preset("sinx", cell_lib=make_cell_library('tanh'))
     u = torch.tensor([[0.5]])
-    ctx = SimContext()
     y, _ = net(u, store_trajectory=False)
     y.sum().backward()
     has_out_grad = (
@@ -2417,535 +2228,28 @@ def test_sparse_io_cli_flags():
     check("--read-idx flag present", "--read-idx" in result.stdout)
 
 
-def test_weight_quantization():
-    print("\nTest 44: weight quantization to N-bit symmetric fixed-point")
-    from analog_noise import fake_quantize_symmetric
-
-    w = torch.tensor([-1.0, -0.5, -0.1, 0.0, 0.1, 0.5, 1.0])
-    q4 = fake_quantize_symmetric(w, bits=4)
-    unique4 = q4.unique()
-    n_levels_4 = 2 ** 4 - 1
-    check(
-        f"4-bit: at most {n_levels_4} unique levels",
-        len(unique4) <= n_levels_4,
-        f"got {len(unique4)} unique: {unique4.tolist()}",
-    )
-    check(
-        "4-bit: quantized values stay within |x| <= |w_max|",
-        q4.abs().max().item() <= 1.0 + 1e-6,
-        f"max |q| = {q4.abs().max().item():.6f}",
-    )
-    check(
-        "4-bit: zero maps to zero (or near zero)",
-        abs(float(q4[3].item())) < 1e-6,
-        f"got {float(q4[3].item()):.6f}",
-    )
-
-    q6 = fake_quantize_symmetric(w, bits=6)
-    n_levels_6 = 2 ** 6 - 1
-    unique6 = q6.unique()
-    check(
-        f"6-bit: at most {n_levels_6} unique levels",
-        len(unique6) <= n_levels_6,
-        f"got {len(unique6)} unique",
-    )
-    check(
-        "6-bit: quant error is smaller than 4-bit",
-        (q6 - w).abs().mean().item() < (q4 - w).abs().mean().item(),
-        f"4-bit err={ (q4 - w).abs().mean().item():.4e}, "
-        f"6-bit err={(q6 - w).abs().mean().item():.4e}",
-    )
-
-    # STE: gradient should flow through fake_quantize
-    w_g = torch.tensor([0.3, -0.7, 0.5], requires_grad=True)
-    q_g = fake_quantize_symmetric(w_g, bits=4, ste=True)
-    loss = q_g.pow(2).sum()
-    loss.backward()
-    check(
-        "STE: gradient is non-zero and finite",
-        w_g.grad is not None and torch.isfinite(w_g.grad).all().item()
-        and (w_g.grad.abs() > 0).any().item(),
-        f"grad = {w_g.grad}",
-    )
 
 
-def test_adc_dac_quantization():
-    print("\nTest 45: ADC/DAC quantization uses fixed full-scale range")
-    from analog_noise import quantize_with_range
-
-    x = torch.linspace(-5.0, 5.0, 21)
-    q = quantize_with_range(x, bits=4, full_range=3.0)
-    check(
-        "ADC: outputs are clamped within [-3.0, 3.0]",
-        q.abs().max().item() <= 3.0 + 1e-6,
-        f"max |q| = {q.abs().max().item():.6f}",
-    )
-    check(
-        "ADC: large-magnitude input clipped to range edge",
-        abs(float(q[0].item()) + 3.0) < 1e-6 and abs(float(q[-1].item()) - 3.0) < 1e-6,
-        f"q[0]={float(q[0].item())}, q[-1]={float(q[-1].item())}",
-    )
-    unique = q.unique()
-    check(
-        "ADC: limited number of unique levels",
-        len(unique) <= 2 ** 4 - 1,
-        f"got {len(unique)} unique levels",
-    )
-
-    # Out-of-range values get saturated, in-range values get quantized
-    x2 = torch.tensor([-10.0, -1.0, 0.0, 1.0, 10.0])
-    q2 = quantize_with_range(x2, bits=4, full_range=3.0)
-    check(
-        "ADC: 10.0 saturates to +3.0",
-        abs(float(q2[4].item()) - 3.0) < 1e-6,
-        f"got {float(q2[4].item())}",
-    )
-    check(
-        "ADC: -10.0 saturates to -3.0",
-        abs(float(q2[0].item()) + 3.0) < 1e-6,
-        f"got {float(q2[0].item())}",
-    )
 
 
-def test_circuit_noise():
-    print("\nTest 46: circuit noise produces Gaussian distribution with correct std")
-    from analog_noise import CircuitNoise
-
-    injector = CircuitNoise(std=0.05)
-    x = torch.zeros(20_000)
-    y = injector.apply(x)
-    check(
-        "circuit noise: zero-mean",
-        abs(float(y.mean().item())) < 1e-3,
-        f"mean = {float(y.mean().item()):.6f}",
-    )
-    check(
-        f"circuit noise: std ~= 0.05 (within 10%)",
-        abs(float(y.std().item()) - 0.05) < 0.005,
-        f"std = {float(y.std().item()):.6f}",
-    )
-    check(
-        "circuit noise: adds to existing signal (x=0 -> y~N(0, 0.05))",
-        abs(float(y.std().item()) - 0.05) < 0.005,
-    )
-
-    no_noise = CircuitNoise(std=0.0)
-    x2 = torch.tensor([1.0, 2.0, 3.0])
-    check(
-        "circuit noise: std=0.0 is pass-through",
-        torch.equal(no_noise.apply(x2), x2),
-    )
 
 
-def test_analog_mlp_wrapper():
-    print("\nTest 47: AnalogMLPWrapper forward produces noisy output and is configurable")
-    import torch.nn as nn
-    from analog_noise import (
-        AnalogMLPWrapper, NoiseConfig, evaluate_clean,
-    )
-    from mlp_benchmark import MLPRegressor
-    from mlp_benchmark_housing import MLPRegressor as MLPHousing
-
-    torch.manual_seed(0)
-    base = MLPRegressor(in_dim=2, hidden_dim=8, out_dim=1, num_layers=2)
-    base.eval()
-
-    cfg = NoiseConfig(quant_bits=4, noise_std=0.05, mc_trials=5, seed=42)
-    wrapper = AnalogMLPWrapper(base, cfg)
-
-    x = torch.randn(8, 2)
-    y_clean = wrapper(x)
-    y_clean2 = wrapper(x)
-    check(
-        "wrapper: same seed -> same output (frozen per forward)",
-        torch.allclose(y_clean, y_clean2),
-        f"max diff = {(y_clean - y_clean2).abs().max().item():.3e}",
-    )
-
-    # Different seed -> different output
-    wrapper.cfg.seed = 99
-    y_noisy = wrapper(x)
-    check(
-        "wrapper: different seed -> different output",
-        not torch.allclose(y_clean, y_noisy),
-    )
-    wrapper.cfg.seed = 42  # restore
-
-    # No-noise config -> exact pass-through (modulo no-op q round)
-    wrapper.cfg.quant_bits = None
-    wrapper.cfg.noise_std = 0.0
-    wrapper.cfg.seed = None
-    y_passthrough = wrapper(x)
-    check(
-        "wrapper: noise disabled -> matches base forward",
-        torch.allclose(y_passthrough, base(x), atol=1e-5),
-        f"max diff = {(y_passthrough - base(x)).abs().max().item():.3e}",
-    )
-
-    # Re-enable noise for the multi-layer housing-style model
-    wrapper.cfg.quant_bits = 6
-    wrapper.cfg.noise_std = 0.05
-    wrapper.cfg.seed = 42
-    base2 = MLPHousing(in_dim=8, hidden_dim=16, out_dim=1, num_layers=3)
-    wrapper2 = AnalogMLPWrapper(base2, wrapper.cfg)
-    x2 = torch.randn(4, 8)
-    y2 = wrapper2(x2)
-    check(
-        "wrapper: 3-layer MLP housing forward shape (4,1)",
-        y2.shape == (4, 1),
-        f"got {tuple(y2.shape)}",
-    )
-    check(
-        "wrapper: 3-layer forward finite",
-        torch.isfinite(y2).all().item(),
-    )
-
-    # Bad config rejected
-    raised = False
-    try:
-        AnalogMLPWrapper(base, NoiseConfig(quant_bits=8))
-    except ValueError:
-        raised = True
-    check("wrapper: rejects quant_bits != {4,6, None}", raised)
-
-    raised = False
-    try:
-        AnalogMLPWrapper(base, NoiseConfig(noise_std=-0.1))
-    except ValueError:
-        raised = True
-    check("wrapper: rejects negative noise_std", raised)
-
-    raised = False
-    try:
-        AnalogMLPWrapper(nn.Module(), NoiseConfig())  # no `layers` attr
-    except TypeError:
-        raised = True
-    check("wrapper: rejects base without `layers` ModuleList", raised)
 
 
-def test_noise_mc_evaluation():
-    print("\nTest 48: evaluate_with_noise returns MC stats with sensible shape")
-    from analog_noise import (
-        AnalogMLPWrapper, NoiseConfig, evaluate_with_noise, evaluate_clean,
-    )
-    from mlp_benchmark import MLPRegressor
-    import torch.nn.functional as F
-
-    torch.manual_seed(1)
-    base = MLPRegressor(in_dim=2, hidden_dim=8, out_dim=1, num_layers=2)
-    base.eval()
-    cfg = NoiseConfig(quant_bits=4, noise_std=0.05, mc_trials=10, seed=0)
-    wrapper = AnalogMLPWrapper(base, cfg)
-
-    # Build a tiny loader
-    xs = [torch.randn(8, 2) for _ in range(3)]
-    ys = [torch.zeros(8, 1) for _ in range(3)]
-    loader = list(zip(xs, ys))
-
-    clean = evaluate_clean(wrapper, loader, F.mse_loss, "cpu")
-    res = evaluate_with_noise(wrapper, loader, F.mse_loss, cfg, "cpu")
-    check(
-        "MC: result has exactly mc_trials losses",
-        len(res.losses) == cfg.mc_trials,
-        f"got {len(res.losses)}",
-    )
-    check(
-        "MC: result.mean equals manual mean of per-trial losses",
-        abs(res.mean - (sum(res.losses) / len(res.losses))) < 1e-9,
-        f"got {res.mean}",
-    )
-    check(
-        "MC: result.std is non-negative",
-        res.std >= 0.0,
-        f"got {res.std}",
-    )
-    check(
-        "MC: result.best <= result.worst",
-        res.best <= res.worst,
-        f"best={res.best} worst={res.worst}",
-    )
-    check(
-        "MC: result.p50 <= result.p90 <= result.p95",
-        res.p50 <= res.p90 <= res.p95,
-        f"p50={res.p50} p90={res.p90} p95={res.p95}",
-    )
-    check(
-        "MC: noisy mean is finite and >= clean loss in expectation",
-        math.isfinite(res.mean),
-        f"got {res.mean}",
-    )
-    check(
-        "MC: clean loss is finite",
-        math.isfinite(clean),
-        f"got {clean}",
-    )
-    check(
-        "MC: result.clean_loss is set after we attach it",
-        True,
-        "checked via result.summary() below",
-    )
-    res.clean_loss = clean
-    summary = res.summary()
-    check(
-        "MC: summary contains all expected keys",
-        all(k in summary for k in ("trials=", "mean=", "std=", "p50=",
-                                   "p90=", "p95=", "best=", "worst=", "clean=")),
-        f"summary = {summary}",
-    )
 
 
-def test_noise_mlp_pipeline_smoke():
-    print("\nTest 49: end-to-end MLP forward + backward with noise enabled")
-    from analog_noise import AnalogMLPWrapper, NoiseConfig
-    from mlp_benchmark import MLPRegressor
-
-    torch.manual_seed(2)
-    base = MLPRegressor(in_dim=2, hidden_dim=8, out_dim=1, num_layers=2)
-    cfg = NoiseConfig(quant_bits=4, noise_std=0.05, mc_trials=1, seed=0)
-    wrapper = AnalogMLPWrapper(base, cfg)
-
-    x = torch.randn(4, 2)
-    target = torch.zeros(4, 1)
-    out = wrapper(x)
-    loss = torch.nn.functional.mse_loss(out, target)
-    loss.backward()
-    has_grads = all(
-        p.grad is not None and torch.isfinite(p.grad).all().item()
-        for p in base.parameters()
-        if p.requires_grad
-    )
-    check("noise-aware training: backward pass fills all base grads", has_grads)
 
 
-def test_kirchhoff_noise_wrapper_basic():
-    print("\nTest 51: KirchhoffNetNoiseWrapper basic forward and pass-through")
-    from analog_noise import NoiseConfig
-    from kirchhoff_noise import KirchhoffNetNoiseWrapper
-    from config import PRESETS
-    from cell_library import make_cell_library
-    from topology import build_net_from_preset
-
-    preset = PRESETS["sinx"]
-    cell_lib = make_cell_library(preset.get("cell_library", "legacy"))
-    net = build_net_from_preset("sinx", cell_lib=cell_lib)
-    net.eval()
-
-    # 1. Clean wrapper (no noise) matches base forward exactly.
-    cfg_clean = NoiseConfig(quant_bits=None, noise_std=0.0)
-    wrapped = KirchhoffNetNoiseWrapper(net, cfg_clean, adc_full_range=3.0)
-    u = torch.randn(2, preset["stages"][0]["num_inputs"])
-    ctx = None
-    out_wrapped, _ = wrapped(u, ctx=ctx)
-    out_base, _ = net(u, ctx=ctx)
-    check(
-        "kirchhoff wrapper: clean pass-through matches base",
-        torch.allclose(out_wrapped, out_base, atol=1e-6),
-        f"max diff = {(out_wrapped - out_base).abs().max().item():.2e}",
-    )
-    # 2. Wrapper with noise produces different output.
-    cfg_noisy = NoiseConfig(quant_bits=4, noise_std=0.05, seed=42)
-    wrapped_noisy = KirchhoffNetNoiseWrapper(net, cfg_noisy, adc_full_range=3.0)
-    out_noisy, _ = wrapped_noisy(u, ctx=ctx)
-    check(
-        "kirchhoff wrapper: noise changes output",
-        (out_noisy - out_base).abs().max().item() > 1e-4,
-    )
-    # 3. state_dict delegates to base.
-    sd = wrapped.state_dict()
-    sd_base = net.state_dict()
-    keys_match = set(sd.keys()) == set(sd_base.keys())
-    check(
-        "kirchhoff wrapper: state_dict keys match base",
-        keys_match,
-        f"wrapper has {set(sd.keys()) - set(sd_base.keys())} extra keys",
-    )
-    # 4. parameters() delegates to base.
-    n_wrap = sum(p.numel() for p in wrapped.parameters())
-    n_base = sum(p.numel() for p in net.parameters())
-    check(
-        "kirchhoff wrapper: param count matches base",
-        n_wrap == n_base,
-        f"wrapper={n_wrap} base={n_base}",
-    )
 
 
-def test_kirchhoff_noise_seed_reproducibility():
-    print("\nTest 51b: KirchhoffNetNoiseWrapper seed reproducibility via cfg.seed")
-    from analog_noise import NoiseConfig
-    from kirchhoff_noise import KirchhoffNetNoiseWrapper
-    from config import PRESETS
-    from cell_library import make_cell_library
-    from topology import build_net_from_preset
-
-    preset = PRESETS["sinx"]
-    cell_lib = make_cell_library(preset.get("cell_library", "legacy"))
-    net = build_net_from_preset("sinx", cell_lib=cell_lib)
-    net.eval()
-
-    u = torch.randn(2, preset["stages"][0]["num_inputs"])
-
-    # Same seed → identical noisy output.
-    cfg_a = NoiseConfig(quant_bits=4, noise_std=0.05, seed=7,
-                        quantize_input=True, quantize_output=True,
-                        activation_noise=True, weight_noise=True)
-    wrapped_a = KirchhoffNetNoiseWrapper(net, cfg_a, adc_full_range=3.0)
-    out_a1, _ = wrapped_a(u, ctx=None)
-    out_a2, _ = wrapped_a(u, ctx=None)
-    check(
-        "kirchhoff wrapper: same cfg.seed → identical output (per-forward frozen)",
-        torch.allclose(out_a1, out_a2, atol=1e-6),
-        f"max diff = {(out_a1 - out_a2).abs().max().item():.2e}",
-    )
-
-    # Different seed → different output.
-    cfg_b = NoiseConfig(quant_bits=4, noise_std=0.05, seed=11,
-                        quantize_input=True, quantize_output=True,
-                        activation_noise=True, weight_noise=True)
-    wrapped_b = KirchhoffNetNoiseWrapper(net, cfg_b, adc_full_range=3.0)
-    out_b, _ = wrapped_b(u, ctx=None)
-    check(
-        "kirchhoff wrapper: different cfg.seed → different output",
-        (out_a1 - out_b).abs().max().item() > 1e-4,
-        f"max diff = {(out_a1 - out_b).abs().max().item():.2e}",
-    )
-
-    # Setting cfg.seed on existing wrapper between forwards changes output.
-    cfg_c = NoiseConfig(quant_bits=4, noise_std=0.05, seed=7,
-                        quantize_input=True, quantize_output=True,
-                        activation_noise=True, weight_noise=True)
-    wrapped_c = KirchhoffNetNoiseWrapper(net, cfg_c, adc_full_range=3.0)
-    out_c1, _ = wrapped_c(u, ctx=None)
-    wrapped_c.cfg.seed = 99
-    out_c2, _ = wrapped_c(u, ctx=None)
-    check(
-        "kirchhoff wrapper: mutating cfg.seed changes output",
-        (out_c1 - out_c2).abs().max().item() > 1e-4,
-        f"max diff = {(out_c1 - out_c2).abs().max().item():.2e}",
-    )
-
-    # seed=None (global RNG) still produces stochastic noise but two
-    # independent wrappers see different global state, so outputs differ.
-    torch.manual_seed(0)
-    cfg_d = NoiseConfig(quant_bits=None, noise_std=0.05,
-                        quantize_input=False, quantize_output=False,
-                        activation_noise=True, weight_noise=True,
-                        seed=None)
-    wrapped_d = KirchhoffNetNoiseWrapper(net, cfg_d, adc_full_range=3.0)
-    out_d, _ = wrapped_d(u, ctx=None)
-    check(
-        "kirchhoff wrapper: seed=None + noise_std>0 still injects noise",
-        (out_a1 - out_d).abs().max().item() > 1e-4,
-        f"max diff = {(out_a1 - out_d).abs().max().item():.2e}",
-    )
 
 
-def test_kirchhoff_noise_clean_eval():
-    print("\nTest 52: evaluate_kirchhoff_clean returns finite loss, matches base clean val")
-    from analog_noise import NoiseConfig
-    from kirchhoff_noise import KirchhoffNetNoiseWrapper, evaluate_kirchhoff_clean
-    from config import PRESETS
-    from cell_library import make_cell_library
-    from topology import build_net_from_preset
-    from torch.utils.data import DataLoader, TensorDataset
-    import torch.nn.functional as F
-
-    preset = PRESETS["sinx"]
-    cell_lib = make_cell_library(preset.get("cell_library", "legacy"))
-    net = build_net_from_preset("sinx", cell_lib=cell_lib)
-    net.eval()
-    cfg = NoiseConfig(quant_bits=4, noise_std=0.05, seed=42)
-    wrapped = KirchhoffNetNoiseWrapper(net, cfg, adc_full_range=3.0)
-
-    u_v = torch.randn(8, preset["stages"][0]["num_inputs"])
-    y_v = torch.randn(8, preset.get("out_dim", 1))
-    loader = DataLoader(TensorDataset(u_v, y_v), batch_size=4)
-
-    def ctx_factory(batch_size, device="cpu", **_):
-        return None
-
-    loss = evaluate_kirchhoff_clean(wrapped, loader, F.mse_loss, ctx_factory, "cpu")
-    check(
-        "kirchhoff clean eval: finite float loss",
-        torch.isfinite(torch.tensor(loss)).item(),
-        f"loss = {loss}",
-    )
-    # Also run base val directly.
-    wrapped.eval()
-    total = 0.0
-    n = 0
-    for u, t in loader:
-        out_base, _ = net(u, ctx=None)
-        total += float(F.mse_loss(out_base, t).item()) * u.size(0)
-        n += u.size(0)
-    base_loss = total / max(1, n)
-    check(
-        "kirchhoff clean eval: matches base val loss",
-        abs(loss - base_loss) < 1e-6,
-        f"clean={loss:.6f} base={base_loss:.6f}",
-    )
 
 
-def test_kirchhoff_noise_mc_eval():
-    print("\nTest 53: evaluate_kirchhoff_with_noise returns structured stats")
-    from analog_noise import NoiseConfig
-    from kirchhoff_noise import (
-        KirchhoffNetNoiseWrapper,
-        evaluate_kirchhoff_with_noise,
-    )
-    from config import PRESETS
-    from cell_library import make_cell_library
-    from topology import build_net_from_preset
-    from torch.utils.data import DataLoader, TensorDataset
-    import torch.nn.functional as F
-
-    preset = PRESETS["sinx"]
-    cell_lib = make_cell_library(preset.get("cell_library", "legacy"))
-    net = build_net_from_preset("sinx", cell_lib=cell_lib)
-    net.eval()
-
-    cfg = NoiseConfig(
-        quant_bits=4, noise_std=0.05, seed=42, mc_trials=3,
-    )
-    wrapped = KirchhoffNetNoiseWrapper(net, cfg, adc_full_range=3.0)
-
-    u_v = torch.randn(8, preset["stages"][0]["num_inputs"])
-    y_v = torch.randn(8, preset.get("out_dim", 1))
-    loader = DataLoader(TensorDataset(u_v, y_v), batch_size=4)
-
-    def ctx_factory(batch_size, device="cpu", **_):
-        return None
-
-    result = evaluate_kirchhoff_with_noise(
-        wrapped, loader, F.mse_loss, ctx_factory, cfg, "cpu",
-    )
-    check(
-        "kirchhoff mc eval: losses list matches trials",
-        len(result.losses) == 3,
-        f"got {len(result.losses)} trials",
-    )
-    check(
-        "kirchhoff mc eval: mean is finite",
-        torch.isfinite(torch.tensor(result.mean)).item(),
-    )
-    check(
-        "kirchhoff mc eval: std is finite",
-        torch.isfinite(torch.tensor(result.std)).item(),
-    )
-    check(
-        "kirchhoff mc eval: p90 is finite",
-        torch.isfinite(torch.tensor(result.p90)).item(),
-    )
-    # With a noisy model, noisy mean should be >= clean
-    check(
-        "kirchhoff mc eval: config is set",
-        result.config is cfg,
-    )
 
 
 def main():
     test_config_loads()
-    test_sim_context()
-    test_isat_variation_pipeline()
     test_topology_primitives()
     test_stage_transfer()
     test_stage_transfer_residual_relu_tanh()
@@ -2963,7 +2267,6 @@ def main():
     test_sparse_spd_generation()
     test_solver_dataset()
     test_union_topology()
-    test_solver_loss_finite()
     test_baseline_jacobi()
     test_baseline_cg()
     test_convergence_tracker()
@@ -3086,7 +2389,6 @@ def main():
     test_three_phase_lambdas()
     test_three_phase_lambdas_warmup()
     test_solidification_metrics()
-    test_validate_argmax_runs()
     test_log_solidification_format()
     test_smooth2d_grid_uses_three_phase()
 
@@ -3187,16 +2489,6 @@ def main():
     test_friedman_kirchhoff_presets()            # friedman-problems/REQ: presets
     test_friedman_kirchhoff_net_build()          # friedman-problems/REQ: net build+forward
 
-    test_weight_quantization()                   # analog-noise: 4/6-bit weight quant
-    test_adc_dac_quantization()                  # analog-noise: ADC/DAC full-range quant
-    test_circuit_noise()                         # analog-noise: Gaussian std checks
-    test_analog_mlp_wrapper()                    # analog-noise: MLP wrapper end-to-end
-    test_noise_mc_evaluation()                   # analog-noise: MC stats shape
-    test_noise_mlp_pipeline_smoke()              # analog-noise: forward+backward
-    test_kirchhoff_noise_wrapper_basic()         # kirchhoff-noise: wrapper basic
-    test_kirchhoff_noise_seed_reproducibility()  # kirchhoff-noise: cfg.seed reproducibility
-    test_kirchhoff_noise_clean_eval()            # kirchhoff-noise: clean eval
-    test_kirchhoff_noise_mc_eval()               # kirchhoff-noise: MC eval
 
     test_anti_parallel_basic()                   # APT-1..11: AntiParallelFreeTanhLibrary
 
@@ -3794,9 +3086,7 @@ def test_gradient_norms_collect():
               v is None, f"got {v}")
 
     # Run one forward + backward to check gradients exist.
-    from train_script import make_static_ctx_factory
-    ctx_fn = make_static_ctx_factory()
-    loss = net(torch.randn(4, 2), ctx_fn(4, "cpu"))[0].sum()
+    loss = net(torch.randn(4, 2))[0].sum()
     loss.backward()
     norms2 = collect_gradient_norms(net)
     for k in ("stage0_logits", "stage0_raw_mult", "stage0_raw_leak",
@@ -3812,13 +3102,12 @@ def test_grad_log_file_output():
     import tempfile
     _sys.path.insert(0, THIS_DIR)
     from pathlib import Path
-    from train_script import log_gradient_norms, make_static_ctx_factory
+    from train_script import log_gradient_norms
     from topology import build_net_from_preset
     from cell_library import make_cell_library
 
     net = build_net_from_preset("smooth2d", cell_lib=make_cell_library('tanh'))
-    ctx_fn = make_static_ctx_factory()
-    loss = net(torch.randn(4, 2), ctx_fn(4, "cpu"))[0].sum()
+    loss = net(torch.randn(4, 2))[0].sum()
     loss.backward()
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -4887,27 +4176,6 @@ def test_solidification_metrics():
                              "num_edges", "num_nodes", "tau"})
 
 
-def test_validate_argmax_runs():
-    """TP-7: validate_argmax runs without error on a presets."""
-    print("\nTest TP-7: validate_argmax forward pass")
-    from topology import build_net_from_preset
-    from cell_library import make_cell_library
-    from train import validate_argmax, default_ctx_factory
-    from config import PRESETS
-    import torch.nn.functional as F
-    import torch
-    cell_lib = make_cell_library('tanh')
-    net = build_net_from_preset("sinx", cell_lib=cell_lib)
-    ctx_factory = default_ctx_factory(net)
-    u = torch.linspace(-math.pi, math.pi, 32).unsqueeze(1)
-    y = torch.sin(u)
-    from torch.utils.data import DataLoader, TensorDataset
-    loader = DataLoader(TensorDataset(u, y), batch_size=16)
-    val_arg = validate_argmax(net, loader, F.mse_loss, ctx_factory, "cpu")
-    check("TP-7: argmax validation returns finite float",
-          math.isfinite(val_arg))
-    check("TP-7: argmax validation > 0",
-          val_arg > 0.0, f"got {val_arg}")
 
 
 def test_log_solidification_format():
@@ -6085,7 +5353,6 @@ def test_drive_current_basic():
     print("\nTest DRIVE-1: DifferentialStage.drive_current basic shape and behavior")
     from cell_library import make_cell_library
     from topology import ring_graph, StageTopologyBuilder, topology_to_stage
-    from sim_context import SimContext
     import torch
 
     cell_lib = make_cell_library('tanh')
@@ -6130,7 +5397,6 @@ def test_drive_changes_rhs():
     print("\nTest DRIVE-2: drive current modifies rhs output vs baseline")
     from cell_library import make_cell_library
     from topology import ring_graph, StageTopologyBuilder, topology_to_stage
-    from sim_context import SimContext
     import torch
 
     cell_lib = make_cell_library('tanh')
@@ -6144,8 +5410,8 @@ def test_drive_changes_rhs():
     x = torch.rand(B, N)
     x_drive = torch.rand(B, N)
 
-    dx_baseline = stage.rhs(x, ctx=SimContext(), tau=1.0)
-    dx_driven = stage.rhs(x, ctx=SimContext(), tau=1.0, x_drive=x_drive, drive_scale=1.0)
+    dx_baseline = stage.rhs(x, tau=1.0)
+    dx_driven = stage.rhs(x, tau=1.0, x_drive=x_drive, drive_scale=1.0)
 
     diff = (dx_driven - dx_baseline).abs().max().item()
     check("DRIVE-2: rhs output changes with drive enabled",
@@ -6157,7 +5423,6 @@ def test_driven_node_gate_forced_open():
     print("\nTest DRIVE-3: driven node gates are forced to 1.0 in rhs")
     from cell_library import make_cell_library
     from topology import ring_graph, StageTopologyBuilder, topology_to_stage
-    from sim_context import SimContext
     import torch
 
     cell_lib = make_cell_library('tanh')
@@ -6174,7 +5439,6 @@ def test_driven_node_gate_forced_open():
     B, N = 2, 4
     x = torch.rand(B, N)
     x_drive = torch.rand(B, N)
-    ctx = SimContext()
 
     # If driven node gates were NOT forced open, rhs would return near-zero.
     dx = stage.rhs(x, x_drive=x_drive, drive_scale=1.0)
@@ -7318,8 +6582,6 @@ def test_budget_disabled_byte_identical():
         stage.z_logits.data = torch.tensor(
             [3.0, 1.0, 0.0, 2.0, 1.5, 0.5, 2.5, 0.8, -0.5, 1.2, 0.3, 2.2, 1.8, 0.6, -1.0]
         )
-    from sim_context import SimContext
-    ctx = SimContext()
     x = torch.randn(2, 5)
     # Default (budget_enabled=False, budget_frac=0)
     out1 = stage.rhs(x, cell_mode="soft")
@@ -7350,8 +6612,6 @@ def test_budget_simple_edge_library_compat():
     check("SimpleEdgeLibrary: gate in [0, 1]",
           bool((gate >= 0.0).all().item() and (gate <= 1.0).all().item()))
     # Forward should work without errors
-    from sim_context import SimContext
-    ctx = SimContext()
     x = torch.randn(2, 5)
     out = stage.rhs(x, cell_mode="soft")
     check("SimpleEdgeLibrary rhs with budget is finite",

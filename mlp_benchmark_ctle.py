@@ -37,7 +37,6 @@ Outputs to ``--output`` (defaults to ``./output/mlp_ctle``):
   - ``output_fit.png`` (predictions vs. targets scatter, one panel per output)
   - ``model.pt``
   - ``final_metrics.txt`` (best / final val MSE, per-dim MSE, per-dim R²)
-  - ``noise_metrics.txt`` (when --noise or --noise-aware is set)
 """
 
 from __future__ import annotations
@@ -59,12 +58,6 @@ from torch.utils.data import DataLoader, TensorDataset
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from analog_noise import (
-    AnalogMLPWrapper,
-    NoiseConfig,
-    evaluate_clean,
-    evaluate_with_noise,
-)
 from config import OPTIM
 from train_ctle import (
     PARAM_COLS,
@@ -208,7 +201,7 @@ def _per_dim_stats(
     }
 
 
-def validate(net, val_loader, task_fn, device, wrapper=None) -> tuple[float, dict[str, np.ndarray]]:
+def validate(net, val_loader, task_fn, device) -> tuple[float, dict[str, np.ndarray]]:
     """Compute mean MSE and per-dim stats over ``val_loader``."""
     net.eval()
     total = 0.0
@@ -219,10 +212,7 @@ def validate(net, val_loader, task_fn, device, wrapper=None) -> tuple[float, dic
         for u, target in val_loader:
             u = u.to(device)
             target = target.to(device)
-            if wrapper is not None:
-                out = wrapper(u)
-            else:
-                out = net(u)
+            out = net(u)
             loss = task_fn(out, target)
             total += float(loss.item()) * u.size(0)
             n += u.size(0)
@@ -248,7 +238,7 @@ def denormalize_predictions(
 
 def compute_denorm_metrics(
     net, val_loader, target_mean, target_std, inverse_stats, device,
-    denorm_task_fn, wrapper=None,
+    denorm_task_fn,
 ) -> dict[str, float]:
     """Compute MSE / MAE in the original (un-normalized) logit space.
 
@@ -264,10 +254,7 @@ def compute_denorm_metrics(
         for u, t in val_loader:
             u = u.to(device)
             t = t.to(device)
-            if wrapper is not None:
-                out = wrapper(u)
-            else:
-                out = net(u)
+            out = net(u)
             preds_norm.append(out.detach())
             targets_norm.append(t.detach())
     if not preds_norm:
@@ -497,31 +484,6 @@ def main():
                              "matching distill_ctle_kirchhoff.py; the KirchhoffNet "
                              "default of 5.0 from OPTIM['grad_clip_norm'] is too "
                              "loose for the MLP). 0 or negative = no clipping.")
-    parser.add_argument("--noise", action="store_true",
-                        help="Enable realistic hardware noise "
-                             "(quantization + circuit noise) on the trained "
-                             "model and report Monte Carlo evaluation stats.")
-    parser.add_argument("--noise-aware", action="store_true",
-                        help="Train under analog noise so the MLP becomes "
-                             "robust to it. Implies --noise for final eval.")
-    parser.add_argument("--quant-bits", type=int, choices=[4, 6], default=4,
-                        help="Bit-width for weight and ADC/DAC quantization "
-                             "(default: 4).")
-    parser.add_argument("--noise-std", type=float, default=0.05,
-                        help="Standard deviation of additive Gaussian circuit "
-                             "noise on weights and activations (default: 0.05).")
-    parser.add_argument("--mc-trials", type=int, default=20,
-                        help="Number of Monte Carlo trials for noisy "
-                             "evaluation (default: 20).")
-    parser.add_argument("--adc-full-range", type=float, default=3.0,
-                        help="Symmetric full-scale range for ADC/DAC "
-                             "quantization (default: 3.0).")
-    parser.add_argument("--noise-seed", type=int, default=0,
-                        help="Seed for noise sampling (default: 0).")
-    parser.add_argument("--no-adc", action="store_true",
-                        help="Disable per-layer ADC/DAC quantization "
-                             "(pure-digital accelerator mode: weight "
-                             "quantization + circuit noise only).")
     parser.add_argument("--use-cosine-scheduler", dest="use_cosine",
                         action="store_true", default=True,
                         help="Use CosineAnnealingWarmRestarts scheduler "
@@ -632,21 +594,6 @@ def main():
     n_params = count_parameters(net)
     net.to(device_t)
 
-    noise_cfg = NoiseConfig(
-        quant_bits=args.quant_bits if args.noise or args.noise_aware else None,
-        noise_std=args.noise_std if args.noise or args.noise_aware else 0.0,
-        mc_trials=args.mc_trials,
-        seed=args.noise_seed,
-        quantize_input=not args.no_adc,
-        quantize_output=not args.no_adc,
-        quantize_intermediate=not args.no_adc,
-    )
-    train_wrapper: AnalogMLPWrapper | None = None
-    if args.noise_aware:
-        train_wrapper = AnalogMLPWrapper(
-            net, noise_cfg, adc_full_range=args.adc_full_range,
-        )
-        train_wrapper.to(device_t)
 
     optimizer = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler: CosineAnnealingWarmRestarts | None = None
@@ -726,10 +673,7 @@ def main():
             u = u.to(device_t)
             target = target.to(device_t)
             optimizer.zero_grad()
-            if train_wrapper is not None:
-                out = train_wrapper(u)
-            else:
-                out = net(u)
+            out = net(u)
             loss = F.mse_loss(out, target)
             loss.backward()
             if grad_clip_norm and grad_clip_norm > 0.0:
@@ -743,7 +687,7 @@ def main():
         avg_train = total_loss / max(1, n_batches)
         do_validate = (epoch % args.validate_every == 0) or (epoch == epochs - 1)
         if do_validate:
-            val_loss, stats = validate(net, val_loader, lambda o, t: F.mse_loss(o, t), device_t, wrapper=train_wrapper)
+            val_loss, stats = validate(net, val_loader, lambda o, t: F.mse_loss(o, t), device_t)
         else:
             val_loss = val_history[-1] if val_history else avg_train
             stats = stats_history[-1] if stats_history else {
@@ -829,10 +773,7 @@ def main():
     val_batch = next(iter(val_loader))
     u_val, y_val = val_batch[0][:64], val_batch[1][:64]
     with torch.no_grad():
-        if train_wrapper is not None:
-            out_val = train_wrapper(u_val.to(device_t))
-        else:
-            out_val = net(u_val.to(device_t))
+        out_val = net(u_val.to(device_t))
     plot_output_fit(
         out_val, y_val,
         save_path=str(out_dir / "output_fit.png"),
@@ -842,13 +783,13 @@ def main():
 
     full_val_loss, full_stats = validate(
         net, val_loader, lambda o, t: F.mse_loss(o, t), device_t,
-        wrapper=train_wrapper,
+        
     )
     denorm = compute_denorm_metrics(
         net, val_loader, target_mean, target_std,
         inverse_stats=None, device=device_t,
         denorm_task_fn=lambda o, t: F.mse_loss(o, t),
-        wrapper=train_wrapper,
+        
     )
     print(
         f"[mlp_ctle] final val MSE = {full_val_loss:.6f} "
@@ -879,60 +820,6 @@ def main():
         for name, var in zip(PARAM_COLS, full_stats["per_dim_var"]):
             f.write(f"  {name}: {var:.6e}\n")
 
-    if args.noise or args.noise_aware:
-        print(
-            f"[mlp_ctle] running MC noise eval: quant_bits={args.quant_bits} "
-            f"noise_std={args.noise_std} trials={args.mc_trials} "
-            f"adc_full_range={args.adc_full_range} seed={args.noise_seed} "
-            f"adc_enabled={not args.no_adc}"
-        )
-        eval_cfg = NoiseConfig(
-            quant_bits=args.quant_bits,
-            noise_std=args.noise_std,
-            mc_trials=args.mc_trials,
-            seed=args.noise_seed,
-            quantize_input=not args.no_adc,
-            quantize_output=not args.no_adc,
-            quantize_intermediate=not args.no_adc,
-        )
-        eval_wrapper = AnalogMLPWrapper(
-            net, eval_cfg, adc_full_range=args.adc_full_range,
-        )
-        eval_wrapper.to(device_t)
-        clean_loss = evaluate_clean(
-            eval_wrapper, val_loader, lambda o, t: F.mse_loss(o, t), device_t,
-        )
-        noise_result = evaluate_with_noise(
-            eval_wrapper, val_loader, lambda o, t: F.mse_loss(o, t),
-            eval_cfg, device_t,
-        )
-        noise_result.clean_loss = clean_loss
-        print(
-            f"[mlp_ctle] noise eval: clean={clean_loss:.6f} "
-            f"noisy_mean={noise_result.mean:.6f} "
-            f"noisy_std={noise_result.std:.6f} "
-            f"p90={noise_result.p90:.6f} p95={noise_result.p95:.6f}"
-        )
-        with open(out_dir / "noise_metrics.txt", "w") as f:
-            f.write(f"quant_bits: {args.quant_bits}\n")
-            f.write(f"noise_std: {args.noise_std}\n")
-            f.write(f"mc_trials: {args.mc_trials}\n")
-            f.write(f"adc_full_range: {args.adc_full_range}\n")
-            f.write(f"noise_seed: {args.noise_seed}\n")
-            f.write(f"noise_aware_training: {bool(args.noise_aware)}\n")
-            f.write(f"adc_quantization: {not bool(args.no_adc)}\n")
-            f.write(f"clean_val_mse: {clean_loss:.6f}\n")
-            f.write(f"noisy_mean: {noise_result.mean:.6f}\n")
-            f.write(f"noisy_std: {noise_result.std:.6f}\n")
-            f.write(f"noisy_p50: {noise_result.p50:.6f}\n")
-            f.write(f"noisy_p90: {noise_result.p90:.6f}\n")
-            f.write(f"noisy_p95: {noise_result.p95:.6f}\n")
-            f.write(f"noisy_best: {noise_result.best:.6f}\n")
-            f.write(f"noisy_worst: {noise_result.worst:.6f}\n")
-            f.write(f"degradation_mean: {noise_result.mean - clean_loss:.6f}\n")
-            f.write("per_trial_losses:\n")
-            for i, l in enumerate(noise_result.losses):
-                f.write(f"  trial_{i:03d}: {l:.6f}\n")
 
     print(f"[mlp_ctle] artifacts in {out_dir}")
 

@@ -4,7 +4,6 @@ CLI:
     train_script.py --problem {sinx,housing} [--output OUTPUT]
                     [--epochs EPOCHS] [--lr LR]
                     [--ablation {none,mapper-only,empty-graph}]
-                    [--variation]
 
 Outputs to --output:
   - loss_history.txt
@@ -82,7 +81,6 @@ from config import (
     SCHEDULE_FOUR_PHASE,
     SOLVER,
     TAU,
-    VARIATION,
     DEGREE_BUDGET,
     VCA,
     make_smooth2d_grid_preset,
@@ -90,7 +88,6 @@ from config import (
 from cell_library import make_cell_library, SimpleEdgeLibrary
 from topology import build_net_from_preset
 from kirchhoff_net import format_parameter_breakdown
-from sim_context import SimContext, sample_random_context
 from train import (
     compute_loss,
     compute_solver_loss,
@@ -122,18 +119,14 @@ from io_mapper import (
 
 # Monkey-patch _compute_regularizers to handle DataParallel wrapping
 # (train.py is read-only on Kaggle; DataParallel strips module internals)
-# kirchhoff-noise: also unwraps KirchhoffNetNoiseWrapper before stage access.
 import train as _train_module
 _orig_compute_regularizers = _train_module._compute_regularizers
 # Patch _compute_regularizers to handle DataParallel wrapping
 
 def _dp_safe_compute_regularizers(net, trajs, lambdas):
-    # Unwrap DataParallel first (outer-most), then kirchhoff-noise wrapper
-    # so regularizer code reaches the base KirchhoffNetWithIO stages.
+    # Unwrap DataParallel so regularizer code reaches the base KirchhoffNetWithIO stages.
     if isinstance(net, torch.nn.DataParallel):
         net = net.module
-    if hasattr(net, "base") and hasattr(net, "_stage_noise_std"):
-        net = net.base
     return _orig_compute_regularizers(net, trajs, lambdas)
 
 _train_module._compute_regularizers = _dp_safe_compute_regularizers
@@ -649,9 +642,6 @@ def _save_config_snapshot(out_dir: Path, problem: str, args, lambdas: dict,
         f.write("\nOPTIM:\n")
         for k, v in OPTIM.items():
             f.write(f"  {k}: {v}\n")
-        f.write("\nVARIATION:\n")
-        for k, v in VARIATION.items():
-            f.write(f"  {k}: {v}\n")
         f.write("\nI/O MAPPING:\n")
         if net is not None:
             from io_mapper import FanOutInputMapper, ProjectedSparseInputMapper, SparseInputMapper, InputMapper
@@ -704,274 +694,6 @@ def _save_config_snapshot(out_dir: Path, problem: str, args, lambdas: dict,
                     f"  l2_lambda: "
                     f"{lambdas.get('skip_linear_l2', 0.0)}\n"
                 )
-
-def _run_noise_diagnostics(
-    raw_net,
-    val_loader,
-    task_fn,
-    ctx_factory,
-    device,
-    args,
-    out_dir,
-    best_epoch,
-    best_val,
-    best_metric_name,
-    compile_enabled,
-    schedule_mode,
-    needs_prune):
-    """Collect 8 diagnostic data points at the post-training noise-eval site.
-
-    Goal: isolate why `clean_val_mse` in noise_metrics.txt diverges from
-    the last validation loss in loss_history.txt (observed for smooth2d_grid
-    but not housing_grid). Writes a structured `noise_diagnostics.txt`.
-
-    Diagnostics:
-      D1 validate(raw_net) directly — training path
-      D2 evaluate_kirchhoff_clean via fresh wrapper — noise path
-      D3 tensor-level output comparison on one batch
-      D4 checkpoint metadata (best_epoch, best_val, best_metric_name)
-      D5 raw_net state_dict hash vs saved model.pt
-      D6 device location of model and input tensors
-      D7 torch.compile state of cell_lib
-    """
-    import hashlib
-    from analog_noise import NoiseConfig
-    from kirchhoff_noise import KirchhoffNetNoiseWrapper, evaluate_kirchhoff_clean
-
-    diag: dict[str, object] = {}
-    diag["problem"] = str(args.problem)
-    diag["needs_prune"] = bool(needs_prune)
-    diag["compile_enabled"] = bool(compile_enabled)
-
-    # D4 — checkpoint metadata
-    diag["D4_best_epoch"] = int(best_epoch)
-    diag["D4_best_val"] = float(best_val)
-    diag["D4_best_metric_name"] = str(best_metric_name)
-
-    # D6 — device location
-    try:
-        diag["D6_raw_net_device"] = str(next(raw_net.parameters()).device)
-    except Exception as e:
-        diag["D6_raw_net_device"] = f"ERR: {e}"
-    try:
-        diag["D6_input_device"] = str(next(iter(val_loader))[0].device)
-    except Exception as e:
-        diag["D6_input_device"] = f"ERR: {e}"
-
-    # D5 — model state hash vs saved model.pt
-    try:
-        raw_state = raw_net.state_dict()
-        state_keys = sorted(raw_state.keys())
-        flat = []
-        for k in state_keys:
-            flat.append(k)
-            flat.append(raw_state[k].detach().cpu().reshape(-1).tolist())
-        state_str = repr(flat)
-        diag["D5_raw_net_hash"] = hashlib.sha256(state_str.encode()).hexdigest()
-        diag["D5_raw_net_keys"] = len(state_keys)
-
-        pt_path = out_dir / "model.pt"
-        if pt_path.exists():
-            pt_state = torch.load(pt_path, map_location="cpu")
-            pt_keys = sorted(pt_state.keys())
-            pt_flat = []
-            for k in pt_keys:
-                pt_flat.append(k)
-                pt_flat.append(pt_state[k].detach().cpu().reshape(-1).tolist())
-            pt_str = repr(pt_flat)
-            diag["D5_model_pt_hash"] = hashlib.sha256(pt_str.encode()).hexdigest()
-            diag["D5_model_pt_keys"] = len(pt_keys)
-            diag["D5_state_matches_model_pt"] = bool(
-                diag["D5_raw_net_hash"] == diag["D5_model_pt_hash"]
-            )
-        else:
-            diag["D5_model_pt_hash"] = "MISSING"
-            diag["D5_state_matches_model_pt"] = False
-    except Exception as e:
-        diag["D5_error"] = f"ERR: {e}"
-
-    # D7 — compile state of cell_lib
-    try:
-        diag["D7_compile_enabled"] = bool(compile_enabled)
-        stages = list(raw_net.core.stages)
-        compiled_per_stage = []
-        shared_libs = []
-        for i, s in enumerate(stages):
-            lib = getattr(s, "cell_lib", None)
-            is_compiled = lib is not None and hasattr(lib.forward, "__wrapped__")
-            compiled_per_stage.append(bool(is_compiled))
-        for i in range(len(stages)):
-            for j in range(i + 1, len(stages)):
-                if stages[i].cell_lib is stages[j].cell_lib:
-                    shared_libs.append(f"{i}-{j}")
-        diag["D7_cell_lib_compiled_per_stage"] = compiled_per_stage
-        diag["D7_shared_cell_lib_pairs"] = shared_libs
-    except Exception as e:
-        diag["D7_error"] = f"ERR: {e}"
-
-    # D1 — direct clean validation (training path)
-    # Ensure raw_net is on `device` before validation. After the prune
-    # pipeline (needs_prune=True) raw_net is moved to CPU to free GPU
-    # memory (see line ~3646); validation would otherwise fail with
-    # "Input type (CUDA) and weight type (CPU) do not match".
-    try:
-        raw_net.to(device)
-        raw_net.eval()
-        v1 = validate(
-            raw_net, val_loader, task_fn, ctx_factory, device)
-        diag["D1_validate_raw_net"] = float(v1)
-    except Exception as e:
-        diag["D1_validate_raw_net"] = f"ERR: {e}"
-
-    # D2 — clean evaluation via wrapper (noise eval path)
-    try:
-        eval_cfg = NoiseConfig(
-            quant_bits=args.quant_bits,
-            noise_std=args.noise_std,
-            quantize_input=True,
-            quantize_output=True,
-            quantize_intermediate=True,
-            weight_noise=True,
-            activation_noise=True,
-            mc_trials=args.mc_trials,
-            seed=args.noise_seed)
-        diag_wrapper = KirchhoffNetNoiseWrapper(
-            raw_net, eval_cfg, adc_full_range=args.adc_full_range)
-        diag_wrapper.to(device)
-        diag_wrapper.eval()
-        v2 = evaluate_kirchhoff_clean(
-            diag_wrapper, val_loader, task_fn, ctx_factory, device)
-        diag["D2_evaluate_kirchhoff_clean"] = float(v2)
-    except Exception as e:
-        diag["D2_evaluate_kirchhoff_clean"] = f"ERR: {e}"
-
-    # D3 — tensor-level output comparison on one batch
-    try:
-        u_sample, _ = next(iter(val_loader))
-        u_sample = u_sample[:8].to(device)
-        ctx_sample = ctx_factory(u_sample.size(0), device=device)
-        with torch.no_grad():
-            out_raw, _ = raw_net(
-                u_sample, ctx=ctx_sample, store_trajectory=False)
-            out_wrap, _ = diag_wrapper(
-                u_sample, ctx=ctx_sample)
-        diff = (out_raw - out_wrap).abs()
-        diag["D3_max_output_diff"] = float(diff.max().item())
-        diag["D3_mean_output_diff"] = float(diff.mean().item())
-        diag["D3_raw_out_sample"] = [float(x) for x in out_raw[:3].flatten()[:6].tolist()]
-        diag["D3_wrap_out_sample"] = [float(x) for x in out_wrap[:3].flatten()[:6].tolist()]
-    except Exception as e:
-        diag["D3_error"] = f"ERR: {e}"
-
-    # Write diagnostics
-    diag_path = out_dir / "noise_diagnostics.txt"
-    with open(diag_path, "w") as f:
-        f.write("# Noise Evaluation Diagnostics\n")
-        f.write(f"# problem: {args.problem}\n")
-        f.write(f"# needs_prune: {needs_prune}\n")
-        f.write(f"# compile_enabled: {compile_enabled}\n\n")
-        for key, val in diag.items():
-            f.write(f"{key}: {val}\n")
-    print(f"[diag] wrote {diag_path}")
-
-def _run_noise_evaluation(
-    base_net,
-    val_loader,
-    task_fn,
-    ctx_factory,
-    device,
-    args,
-    out_dir: Path,
-    label: str,
-    metric_name: str = "mse") -> dict:
-    """Run kirchhoff-noise MC evaluation on ``base_net`` and write metrics.
-
-    Wraps ``base_net`` in ``KirchhoffNetNoiseWrapper``, runs a clean eval
-    plus ``args.mc_trials`` noisy trials, and writes
-    ``out_dir / f"noise_metrics_{label}.txt"`` (or
-    ``noise_metrics.txt`` when ``label == "main"``).
-
-    Both the clean and noisy passes are evaluated without noise injection.
-    Legacy (non-phased) models
-    trained purely with soft cells will therefore be evaluated in STE
-    mode — flag this in any legacy-result reporting.
-
-    Returns:
-        dict with keys ``clean_val`` (float), ``noise_mean``,
-        ``noise_std``, ``noise_p50``, ``noise_p90``, ``noise_p95``,
-        ``degradation_mean``, ``per_trial_losses``.
-    """
-    from analog_noise import NoiseConfig
-    from kirchhoff_noise import (
-        KirchhoffNetNoiseWrapper,
-        evaluate_kirchhoff_clean,
-        evaluate_kirchhoff_with_noise)
-
-    eval_cfg = NoiseConfig(
-        quant_bits=args.quant_bits,
-        noise_std=args.noise_std,
-        quantize_input=True,
-        quantize_output=True,
-        quantize_intermediate=True,
-        weight_noise=True,
-        activation_noise=True,
-        mc_trials=args.mc_trials,
-        seed=args.noise_seed)
-    eval_wrapper = KirchhoffNetNoiseWrapper(
-        base_net, eval_cfg, adc_full_range=args.adc_full_range)
-    eval_wrapper.to(device)
-    eval_wrapper.eval()
-
-    print(
-        f"[noise] {label}: running MC noise eval: quant_bits={args.quant_bits} "
-        f"noise_std={args.noise_std} trials={args.mc_trials} "
-        f"adc_full_range={args.adc_full_range} seed={args.noise_seed}"
-    )
-    clean_val = evaluate_kirchhoff_clean(
-        eval_wrapper, val_loader, task_fn, ctx_factory, device)
-    result = evaluate_kirchhoff_with_noise(
-        eval_wrapper, val_loader, task_fn, ctx_factory, eval_cfg, device)
-    result.clean_loss = clean_val
-    degradation = result.mean - clean_val
-    print(
-        f"[noise] {label}: clean={clean_val:.6f} "
-        f"noisy_mean={result.mean:.6f} noisy_std={result.std:.6f} "
-        f"p90={result.p90:.6f} p95={result.p95:.6f} "
-        f"degradation_mean={degradation:+.6f}"
-    )
-
-    suffix = "" if label == "main" else f"_{label}"
-    metrics_path = out_dir / f"noise_metrics{suffix}.txt"
-    with open(metrics_path, "w") as f:
-        f.write(f"quant_bits: {args.quant_bits}\n")
-        f.write(f"noise_std: {args.noise_std}\n")
-        f.write(f"mc_trials: {args.mc_trials}\n")
-        f.write(f"adc_full_range: {args.adc_full_range}\n")
-        f.write(f"noise_seed: {args.noise_seed}\n")
-        f.write(f"noise_aware_training: {bool(args.noise_aware)}\n")
-        f.write(f"label: {label}\n")
-        f.write(f"clean_val_{metric_name}: {clean_val:.6f}\n")
-        f.write(f"noisy_mean: {result.mean:.6f}\n")
-        f.write(f"noisy_std: {result.std:.6f}\n")
-        f.write(f"noisy_p50: {result.p50:.6f}\n")
-        f.write(f"noisy_p90: {result.p90:.6f}\n")
-        f.write(f"noisy_p95: {result.p95:.6f}\n")
-        f.write(f"noisy_best: {result.best:.6f}\n")
-        f.write(f"noisy_worst: {result.worst:.6f}\n")
-        f.write(f"degradation_mean: {degradation:.6f}\n")
-        f.write("per_trial_losses:\n")
-        for i, l in enumerate(result.losses):
-            f.write(f"  trial_{i:03d}: {l:.6f}\n")
-
-    return {
-        "clean_val": clean_val,
-        "noise_mean": result.mean,
-        "noise_std": result.std,
-        "noise_p50": result.p50,
-        "noise_p90": result.p90,
-        "noise_p95": result.p95,
-        "degradation_mean": degradation,
-        "per_trial_losses": result.losses}
 
 def make_data_sinx(batch_size: int, val_size: int = 1024):
     train_size = 8192
@@ -1387,7 +1109,7 @@ def make_data(problem: str, batch_size: int, noise_std: float = 0.0,
 def _unwrap_raw_net(net):
     return net.module if isinstance(net, torch.nn.DataParallel) else net
 
-def validate(net, val_loader, task_fn, ctx_factory, device):
+def validate(net, val_loader, task_fn, device):
     net.eval()
     total = 0.0
     n = 0
@@ -1395,7 +1117,6 @@ def validate(net, val_loader, task_fn, ctx_factory, device):
         for u, target in val_loader:
             u = u.to(device)
             target = target.to(device)
-            ctx = ctx_factory(u.size(0), device=device)
             out, _ = net(u, store_trajectory=False)
             loss = task_fn(out, target)
             total += float(loss.item()) * u.size(0)
@@ -1407,7 +1128,6 @@ def validate_with_inverse(
     net,
     val_loader,
     task_fn,
-    ctx_factory,
     device,
     inverse_stats: dict | None,
     ) -> dict:
@@ -1433,7 +1153,6 @@ def validate_with_inverse(
         for u, target in val_loader:
             u = u.to(device)
             target = target.to(device)
-            ctx = ctx_factory(u.size(0), device=device)
             out, _ = net(u, store_trajectory=False)
             loss = task_fn(out, target)
             total += float(loss.item()) * u.size(0)
@@ -1463,14 +1182,11 @@ def validate_with_inverse(
 def collect_predictions(
     net,
     inputs,
-    ctx_factory,
     device) -> torch.Tensor:
     net.eval()
     with torch.no_grad():
-        ctx = ctx_factory(inputs.size(0), device=device)
         out, _ = net(
             inputs,
-            ctx=ctx,
             store_trajectory=True)
     net.train()
     return out
@@ -1769,12 +1485,6 @@ def log_vca_gates(path: Path, epoch: int, net, val_loader,
                 f"{prefix}{epoch}\t{phase}\t{si}\t{gmean:.6e}\t{gstd:.6e}\t"
                 f"{gmin:.6e}\t{gmax:.6e}\t{bj:.6e}\n"
             )
-
-def make_static_ctx_factory():
-    """Build a ctx_factory that always returns a default (variation-off) context."""
-    def _factory(batch_size_: int, device: torch.device = "cpu", **_):
-        return SimContext()
-    return _factory
 
 def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
     """Populate ``parser`` with the train_script CLI flags.  Split out of
@@ -2132,9 +1842,6 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--ablation", choices=["none", "mapper-only", "empty-graph"], default="none",
         help="Structural ablation to apply (default: none). R2.")
-    parser.add_argument(
-        "--variation", dest="variation", action="store_true", default=False,
-        help="Enable PVT/mismatch injection during training (default: off, R6.3).")
     parser.add_argument(
         "--write-mode", choices=["one_to_one", "dense", "fan_out", "sparse_proj"], default=None,
         help="Input write mapping (default: from preset). 'one_to_one' uses "
@@ -2500,46 +2207,6 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "(equivalent to 'residual'). 1..N-1 = low-rank factorization "
              "with N×r and r×N factors. Ignored for other activation modes.")
 
-    # --- kirchhoff-noise: ADC/DAC quant + circuit noise (analog-noise parity) ---
-    parser.add_argument(
-        "--noise", dest="noise", action="store_true", default=False,
-        help="Run Monte Carlo analog-noise evaluation (ADC/DAC quant + "
-             "circuit noise) on the trained model and write "
-             "noise_metrics.txt. Composes with --variation: variation "
-             "perturbs gm/isat via SimContext, noise perturbs state "
-             "voltages per stage.")
-    parser.add_argument(
-        "--noise-aware", dest="noise_aware", action="store_true", default=False,
-        help="Train under analog noise so the KirchhoffNet becomes robust "
-             "to ADC/DAC quantization and circuit noise. Implies --noise "
-             "for final evaluation.")
-    parser.add_argument(
-        "--quant-bits", type=int, choices=[4, 6], default=4,
-        dest="quant_bits",
-        help="Bit-width for ADC/DAC quantization (default: 4). Used when "
-             "--noise or --noise-aware is set.")
-    parser.add_argument(
-        "--noise-std", type=float, default=0.05,
-        dest="noise_std",
-        help="Standard deviation of additive Gaussian circuit noise on "
-             "the analog state voltages and on the output mapper (default: "
-             "0.05). Used when --noise or --noise-aware is set.")
-    parser.add_argument(
-        "--mc-trials", type=int, default=20,
-        dest="mc_trials",
-        help="Number of Monte Carlo trials for noisy evaluation "
-             "(default: 20). Used when --noise or --noise-aware is set.")
-    parser.add_argument(
-        "--adc-full-range", type=float, default=3.0,
-        dest="adc_full_range",
-        help="Symmetric full-scale range for ADC/DAC quantization "
-             "(default: 3.0). Used when --noise or --noise-aware is set.")
-    parser.add_argument(
-        "--noise-seed", type=int, default=0,
-        dest="noise_seed",
-        help="Seed for analog-noise sampling (default: 0). Each MC trial "
-             "uses noise_seed + trial_idx as its seed. Used when --noise "
-             "or --noise-aware is set.")
     parser.add_argument(
         "--seed", type=int, default=None,
         help="Random seed for torch/numpy/python RNGs and cuDNN. "
@@ -3374,7 +3041,7 @@ def main():
         f"output={out_dir} amp={amp_enabled} compile={compile_enabled} "
         f"parallel={parallel_enabled} ({n_gpus} GPUs) "
         f"validate_every={args.validate_every} early_stop={args.early_stop} "
-        f"ablation={args.ablation} variation={args.variation} "
+        f"ablation={args.ablation} "
         f"input_mapper={in_mapper_name} output_mapper={out_mapper_name} "
         f"hid_count={net.hid_count} proj_count={net.proj_count} "
         f"write_idx={list(net.write_idx) if net.write_idx is not None else None} "
@@ -3538,79 +3205,6 @@ def main():
         return m.module if isinstance(m, torch.nn.DataParallel) else m
 
     raw_net = _unwrap(net)
-
-    # kirchhoff-noise: build the noise-aware training wrapper if requested.
-    # When --noise-aware is set, we use ``train_wrapper`` for forward passes
-    # inside compute_loss (the regularizer monkey-patch above unwraps to base
-    # for stage access). When only --noise is set, the wrapper is built later
-    # for post-training MC eval.
-    train_wrapper: "KirchhoffNetNoiseWrapper | None" = None
-    train_noise_cfg: "NoiseConfig | None" = None
-    if args.noise_aware:
-        from analog_noise import NoiseConfig
-        from kirchhoff_noise import KirchhoffNetNoiseWrapper
-        train_noise_cfg = NoiseConfig(
-            quant_bits=args.quant_bits,
-            noise_std=args.noise_std,
-            quantize_input=True,
-            quantize_output=True,
-            quantize_intermediate=True,
-            weight_noise=True,
-            activation_noise=True,
-            seed=args.noise_seed)
-        # Wrap the BASE KirchhoffNetWithIO so the wrapper.base is the
-        # unwrapped model. The wrapper's parameters() / state_dict()
-        # delegate to base, so DataParallel state_dict/parameters of
-        # the original net still work. We then mirror ``net``'s
-        # DataParallel wrapping so the noise-aware forward still
-        # benefits from multi-GPU parallelism. The regularizer monkey
-        # patch unwraps both layers to reach the base stages.
-        train_wrapper = KirchhoffNetNoiseWrapper(
-            raw_net, train_noise_cfg, adc_full_range=args.adc_full_range)
-        train_wrapper.to(device)
-        if parallel_enabled and n_gpus >= 2:
-            train_wrapper = torch.nn.DataParallel(
-                train_wrapper, device_ids=list(range(n_gpus)))
-            print(f"[noise] DataParallel enabled on {n_gpus} GPUs for train_wrapper")
-        print(
-            f"[noise] noise-aware training: quant_bits={args.quant_bits} "
-            f"noise_std={args.noise_std} adc_full_range={args.adc_full_range} "
-            f"seed={args.noise_seed}"
-        )
-
-    if args.noise or args.noise_aware:
-        print(
-            f"[noise] {'noise-aware training + ' if args.noise_aware else ''}"
-            f"post-training MC eval enabled: quant_bits={args.quant_bits} "
-            f"noise_std={args.noise_std} mc_trials={args.mc_trials} "
-            f"adc_full_range={args.adc_full_range} seed={args.noise_seed}"
-        )
-
-    if args.variation:
-        gss = VARIATION["global_gain_shift_std"]
-        ems = VARIATION["edge_mismatch_std"]
-        giss = VARIATION.get("global_isat_shift_std", 0.0)
-        ims = VARIATION.get("edge_isat_mismatch_std", 0.0)
-        print(
-            f"[variation] enabled: global_gain_shift_std={gss} "
-            f"edge_mismatch_std={ems} global_isat_shift_std={giss} "
-            f"edge_isat_mismatch_std={ims}"
-        )
-        # Capture raw_net by value via default arg so the closure
-        # does not break when raw_net is later reassigned (e.g. to
-        # None during the free-memory step before building pruned_net).
-        _raw_net = raw_net
-        def ctx_factory(batch_size_: int, device: torch.device = device, **_):
-            total_edges = sum(s.num_edges() for s in _raw_net.core.stages)
-            return sample_random_context(
-                num_edges=total_edges,
-                device=device,
-                gain_shift_std=gss,
-                mismatch_std=ems,
-                global_isat_shift_std=giss,
-                isat_mismatch_std=ims)
-    else:
-        ctx_factory = make_static_ctx_factory()
 
     optimizer = make_optimizer(
         net, lr=lr,
@@ -3841,7 +3435,6 @@ def main():
             raw_net_snapshot = net.module if isinstance(net, torch.nn.DataParallel) else net
             param_snapshots = {name: p.data.detach().clone() for name, p in raw_net_snapshot.named_parameters()}
         for batch in train_loader:
-            ctx = ctx_factory(batch[0].size(0), device=device)
             optimizer.zero_grad()
             u, target = batch
             u = u.to(device)
@@ -3853,8 +3446,8 @@ def main():
                 kd_teacher = teacher_net
                 kd_lambda = float(SCHEDULE_FOUR_PHASE.get("lambda_kd", 1.0))
             loss_task, loss_structural, _ = compute_loss(
-                train_wrapper if train_wrapper is not None else net,
-                u, target, ctx, task_fn,
+                net,
+                u, target, task_fn,
                 lambdas=effective_lambdas, return_parts=True,
                 amp=amp_enabled, amp_dtype=amp_dtype, reg_scale=reg_scale,
                 teacher=kd_teacher, kd_lambda=kd_lambda,
@@ -3881,12 +3474,12 @@ def main():
         if do_validate:
             if inverse_stats is not None:
                 val_metrics = validate_with_inverse(
-                    net, val_loader, task_fn, ctx_factory, device,
+                    net, val_loader, task_fn, device,
                     inverse_stats=inverse_stats)
                 val_loss = val_metrics["val"]
             else:
                 val_loss = validate(
-                    net, val_loader, task_fn, ctx_factory, device)
+                    net, val_loader, task_fn, device)
                 val_metrics = None
             val_v_history.append(val_loss)
             if inverse_stats is not None and val_metrics is not None:
@@ -4027,7 +3620,7 @@ def main():
     ax.set_xlabel("epoch")
     ax.set_ylabel("loss")
     ax.set_title(
-        f"{args.problem} — training loss [ablation={args.ablation}, variation={args.variation}]"
+        f"{args.problem} — training loss [ablation={args.ablation}]"
     )
     ax.legend()
     ax.grid(True, alpha=0.3)
@@ -4080,7 +3673,6 @@ def main():
 
     val_batch = next(iter(val_loader))
     u_val, y_val = val_batch[0][:64].to(device), val_batch[1][:64].to(device)
-    ctx = ctx_factory(u_val.size(0), device=device)
     with torch.no_grad():
         out, trajs = net(
             u_val, store_trajectory=True)
@@ -4097,13 +3689,6 @@ def main():
 
     plot_network(
         raw_net, save_path=str(out_dir / "pipeline.png"))
-
-    # ----------------------------------------------------------------
-    # kirchhoff-noise: post-training MC noise evaluation. Skip during
-    # pruning pipeline because the noise eval reuses val_loader; do it
-    # AFTER pruning+retrain completes instead so the noise metrics
-    # describe the final deployable network.
-    # ----------------------------------------------------------------
 
     # ----------------------------------------------------------------
     # Complexity-regularized pruning pipeline (CP-6).
@@ -4270,10 +3855,8 @@ def main():
                 raw_net.to("cpu")
             except Exception:
                 pass
-            # Keep raw_net alive on CPU so the post-training noise evaluation
-            # can still use it. GPU memory is freed by .to("cpu") above;
-            # setting raw_net = None would break the noise eval call below
-            # that passes raw_net to _run_noise_evaluation().
+            # Keep raw_net alive on CPU (later steps still reference it).
+            # GPU memory is freed by .to("cpu") above.
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -4343,7 +3926,7 @@ def main():
         # For three_phase, Phase C retrain is always enabled and uses the remainder
         # of the epoch budget. For legacy, respect the --retrain flag.
         retrain_enabled = args.retrain if schedule_mode == "legacy" else True
-        best_state_pruned = None  # initialized for noise eval (may be overwritten by retrain)
+        best_state_pruned = None  # may be overwritten by retrain
         if retrain_enabled and pre_edges - post_edges == 0:
             print(
                 f"[prune] 0 edges removed — skipping Phase C retrain "
@@ -4479,13 +4062,12 @@ def main():
                     retrain_raw = pruned_net.module if isinstance(pruned_net, torch.nn.DataParallel) else pruned_net
                     retrain_param_snapshots = {name: p.data.detach().clone() for name, p in retrain_raw.named_parameters()}
                 for batch in retrain_train_loader:
-                    ctx = ctx_factory(batch[0].size(0), device=device)
                     retrain_optimizer.zero_grad()
                     u_b, tgt_b = batch
                     u_b = u_b.to(device)
                     tgt_b = tgt_b.to(device)
                     loss_task, loss_structural, _ = compute_loss(
-                        pruned_net, u_b, tgt_b, ctx, task_fn,
+                        pruned_net, u_b, tgt_b, task_fn,
                         lambdas=effective_c_lambdas_r, return_parts=True,
                         amp=amp_enabled, amp_dtype=amp_dtype, reg_scale=reg_r,
                         device_l2_lambda=args.device_l2_lambda)
@@ -4520,12 +4102,12 @@ def main():
                 if repoch % args.validate_every == 0 or repoch == c_epochs - 1:
                     if inverse_stats is not None:
                         val_metrics_c = validate_with_inverse(
-                            pruned_net, val_loader, task_fn, ctx_factory, device,
+                            pruned_net, val_loader, task_fn, device,
                             inverse_stats=inverse_stats)
                         val = val_metrics_c["val"]
                     else:
                         val_metrics_c = None
-                        val = validate(pruned_net, val_loader, task_fn, ctx_factory, device_c)
+                        val = validate(pruned_net, val_loader, task_fn, device_c)
                     retrain_val_history.append(val)
                     if retrain_orig_history is not None and val_metrics_c is not None:
                         retrain_orig_history.append(val_metrics_c)
@@ -4608,7 +4190,6 @@ def main():
             with torch.no_grad():
                 out_pruned, _ = pruned_net(
                     u_val,
-                    ctx=ctx_factory(u_val.size(0), device=device),
                     store_trajectory=False)
             plot_output_fit(
                 out_pruned, y_val, loss_name=PRESETS[args.problem]["loss"],
@@ -4652,45 +4233,6 @@ def main():
                     f.write(f"best_mae_pruned_orig: {mp['mae_orig']:.6f}\n")
                     f.write(f"best_mape_pruned_orig: {mp['mape_orig']:.6f}\n")
                 f.write(f"scheduler: {args.use_scheduler}\n")
-
-    # ----------------------------------------------------------------
-    # Diagnostic probe: collect D1-D8 right before noise eval so we can
-    # isolate the noise-eval clean-loss mismatch vs training val loss.
-    # ----------------------------------------------------------------
-    if args.noise or args.noise_aware:
-        _run_noise_diagnostics(
-            raw_net, val_loader, task_fn, ctx_factory,
-            device, args, out_dir,
-            best_epoch, best_val, best_metric_name,
-            compile_enabled, schedule_mode, needs_prune)
-
-    # ----------------------------------------------------------------
-    # kirchhoff-noise: final MC noise evaluation on the deployable
-    # network. With prune+retrain this is the pruned network; otherwise
-    # it's the best-checkpoint pre-prune network. Runs only when
-    # --noise or --noise-aware is set.
-    # ----------------------------------------------------------------
-    if args.noise or args.noise_aware:
-        metric_name = PRESETS[args.problem]["loss"]
-        if needs_prune:
-            # When pruning is on, evaluate both pre-prune (best checkpoint)
-            # and post-prune (deployable) networks so the user can compare.
-            raw_pruned = pruned_net.module if isinstance(pruned_net, torch.nn.DataParallel) else pruned_net
-            if best_state_pruned is not None:
-                raw_pruned.load_state_dict(best_state_pruned)
-            _run_noise_evaluation(
-                raw_net, val_loader, task_fn, ctx_factory,
-                device, args, out_dir, "main",
-                metric_name=metric_name)
-            _run_noise_evaluation(
-                raw_pruned, val_loader, task_fn, ctx_factory,
-                device, args, out_dir, "pruned",
-                metric_name=metric_name)
-        else:
-            _run_noise_evaluation(
-                raw_net, val_loader, task_fn, ctx_factory,
-                device, args, out_dir, "main",
-                metric_name=metric_name)
 
     print(f"[train] done — artifacts in {out_dir}")
 

@@ -65,6 +65,17 @@ def test_bo_driver_passes_hw_flags_through():
         raw = fh.read()
     assert raw.count(b"\r\n") == raw.count(b"\n"), "kn_bayes_opt.py must stay CRLF"
     src = raw.decode("utf-8")
-    for s in ('"--hw-config"', '"--hw-preset"', "add_degrade_thr_arg(parser)",
-              "cmd += hw_argv_ctle", "cmd += hw_argv_train", '"hw_config_hash": hw_cfg.hash()'):
+    for s in ("parse_hw_args(parser)", "add_degrade_thr_arg(parser)",
+              "cmd += hw_argv_ctle", "cmd += hw_argv_train", '"hw_config_hash": hw_cfg.hash()',
+              'hw_argv_train = ["--hw-config", str(hw_json)]'):
         assert s in src, s
+
+
+def test_bo_driver_accepts_every_hw_flag():
+    """The slurm HW_EXTRA flags (--hw-tm ...) must parse in the BO driver too."""
+    r = subprocess.run([sys.executable, os.path.join(ROOT, "kn_bayes_opt.py"), "--help"],
+                       capture_output=True, text=True, timeout=120, cwd=ROOT)
+    assert r.returncode == 0
+    for flag in ("--hw-config", "--hw-preset", "--hw-tm", "--hw-tm-c-hold-ff",
+                 "--hw-slope-bound", "--zig-degrade-thr"):
+        assert flag in r.stdout, flag

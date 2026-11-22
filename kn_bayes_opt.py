@@ -101,8 +101,8 @@ from optuna.samplers import TPESampler
 from optuna.pruners import NopPruner, SuccessiveHalvingPruner
 
 import bo_param_sampling as bps
-from hw import hw_config_from_args
-from hw.cli import add_degrade_thr_arg, hw_passthrough_argv
+from hw import hw_config_from_args, parse_hw_args
+from hw.cli import add_degrade_thr_arg
 
 
 def _preset_use_robust(problem: str) -> bool:
@@ -945,15 +945,13 @@ def main() -> None:
                              "from a single trial run, then exit before BO starts.")
     parser.add_argument("--ctle-objective", choices=["validation", "test"], default="validation",
                         help="CTLE BO objective source (default: validation; fixes the test-leakage bug).")
-    # Phase 3b 2.2: the hardware model, passed through verbatim to every
-    # trial subprocess (train_script.py and the CTLE dagger/Phase-A script).
-    parser.add_argument("--hw-config", default=None, metavar="PATH",
-                        help="HWConfig JSON (units/constraints/timemux) passed to every "
-                             "trial as --hw-config.  Its HWConfig.hash() is part of the "
-                             "sampling fingerprint.")
-    parser.add_argument("--hw-preset", default=None, metavar="NAME",
-                        help="hw/presets/<NAME>.json passed to every trial as --hw-preset "
-                             "(--hw-config overrides it).  Part of the sampling fingerprint.")
+    # Phase 3b 2.2: the hardware model.  Every hardware flag of the entry
+    # scripts is accepted (--hw-config, --hw-preset, --hw-<flag>, --hw-tm*);
+    # they are resolved ONCE here into an HWConfig, written to
+    # <run_dir>/hw_config_<hash>.json and every trial subprocess
+    # (train_script.py and the CTLE dagger/Phase-A script) gets that file as
+    # --hw-config.  HWConfig.hash() is part of the sampling fingerprint.
+    parse_hw_args(parser)
     add_degrade_thr_arg(parser)  # --zig-degrade-thr (CTLE trials only)
     args = parser.parse_args()
 
@@ -965,10 +963,6 @@ def main() -> None:
             raise ValueError("--zig-degrade-thr only applies to --dataset ctle")
         if not args.zig_degrade_thr > 0.0:
             raise ValueError("--zig-degrade-thr must be > 0")
-    hw_argv_ctle = hw_passthrough_argv(args)
-    hw_argv_train = hw_passthrough_argv(args, include_degrade_thr=False)
-    print(f"[hw] HWConfig {'OFF (legacy)' if hw_cfg.is_off() else 'ON'} "
-          f"hash={hw_cfg.hash()} trial passthrough={hw_argv_ctle}", flush=True)
 
     if args.param_budget is not None and args.param_budget < 1:
         raise ValueError("--param-budget must be >= 1")
@@ -1022,7 +1016,18 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     run_dir = out_dir / f"{args.dataset}_knet_e{args.epochs}"
     run_dir.mkdir(parents=True, exist_ok=True)
-    hw_cfg.to_json(str(run_dir / "hw_config.json"))
+    # The resolved HWConfig as the single trial argument (the hash in the name
+    # keeps a refused resume with another config from overwriting it).
+    hw_argv_train = []
+    if not hw_cfg.is_off():
+        hw_json = (run_dir / f"hw_config_{hw_cfg.hash()}.json").resolve()
+        hw_cfg.to_json(str(hw_json))
+        hw_argv_train = ["--hw-config", str(hw_json)]
+    hw_argv_ctle = list(hw_argv_train)
+    if args.zig_degrade_thr is not None:
+        hw_argv_ctle += ["--zig-degrade-thr", repr(float(args.zig_degrade_thr))]
+    print(f"[hw] HWConfig {'OFF (legacy)' if hw_cfg.is_off() else 'ON'} "
+          f"hash={hw_cfg.hash()} trial passthrough={hw_argv_ctle}", flush=True)
 
     study_name = args.study_name or f"{args.dataset}_knet_e{args.epochs}"
     storage = f"sqlite:///{run_dir / (study_name + '.db')}"

@@ -8,6 +8,56 @@ e.g. after an intentional retrain-related change, and say so in the commit.
     venv/bin/python -m pytest tests/test_golden.py -q        # ~20 s
     venv/bin/python tests/golden/make_golden.py [--only paper ...]   # rewrite goldens
 
+## Regenerations
+
+Log of the intentional regenerations: date, reason, commit and the old-vs-new
+numbers.  Only the listed cases were rewritten; every other golden file is
+untouched (bit-identical).
+
+### 2026-11-22 - core resistive shunt counted twice (dynamic `freeze_read=False` path)
+
+* **Reason (bug fix)**: with `freeze_read=False` the dynamic core path of
+  `DifferentialStage.rhs` called `cell_lib(...)` (`FreeTanhLibrary.forward` =
+  `i_tanh + i_res`) and the explicit `if self._has_resistive:` block then added
+  the parallel resistive shunt AGAIN, so the core shunt entered the KCL sum
+  twice (exactly 2.000x the single-count value on `TOY_NET`).  The fix
+  (`7cda290`) uses the tanh-only `forward_tanh` in the dynamic core path,
+  exactly like the frozen path, so the shunt is counted once.  The frozen path
+  (`freeze_read=True`, the paper model), the boundary / sense / mesh paths and
+  the `hw_compliance` path already counted it once and are unchanged.
+* **Commits**: `7cda290` (the fix), `0527056` (the `--refresh` mode of the
+  generator used for the refresh), this commit (the refreshed file + this log).
+* **Affected case**: `paper_freeze_read_off` only - the single golden case
+  built with `freeze_read=False`.  The other 17 cases (`fixed_mlp_knet`,
+  `paper`, `paper_rawinit`, `friedman2`, `toy_mimo` and the 12 paper variants)
+  and the separate `paper_trial_0011` checkpoint case all use
+  `freeze_read=True` and are bit-identical (max |dy| = 0).
+* **Command**:
+  `venv/bin/python tests/golden/make_golden.py --refresh --only paper_freeze_read_off`
+  (`--refresh` keeps the SAVED `state_dict`: a plain `--only` regeneration can
+  no longer reproduce the pre-surgery init at HEAD, because the seeded
+  parameter noise is drawn per parameter in sorted-name order - see the
+  comment block in `make_golden.py`).
+* **Old vs new** (float64, 64 rows):
+
+  | quantity | old | new | max abs diff |
+  |---|---|---|---|
+  | forward `y` | max abs 2.708721 | max abs 2.708765 | **1.364192e-03** (rel 5.036e-04) |
+  | per-stage states | - | - | 3.931783e-02 |
+  | loss | 1.88893905833 | 1.88868350272 | 2.555556e-04 |
+  | gradients (222 tensors) | - | - | 4.879132e-04 |
+
+  `state_dict`, `spec`, `inputs`, `target`, `sorted_keys`, `n_params` and
+  `no_grad_names` are unchanged (max abs diff 0.0); only `meta.git_head` moved
+  (`d334aca` -> `0527056`).  The largest relative gradient changes are the
+  shunt conductance `core.stages.*.cell_lib.g_resistive_raw` (rel ~0.5) and
+  `core.stages.3.vca_W_core` (rel 0.62) - i.e. exactly the parameters whose
+  gradient flows through the shunt.
+* **Why this is the intended change**: the rhs difference between the old and
+  the new dynamic core path equals the analytic scatter of
+  `G * (x_src - x_dst)` exactly once (ratio 1.000000, residual 4e-10 from the
+  float32 KCL accumulator), with and without `--vca-gate-shunt`.
+
 ## What each golden file holds
 `spec` (build kwargs), `state_dict` (full, incl. int `src/dst/boundary_*/readout_sense_src`
 buffers), `sorted_keys`, `n_params`, `inputs` (64 rows), `target`, `y` (forward),

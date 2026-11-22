@@ -1,39 +1,48 @@
-results
-__pycache__
-network_visualization
-test_smoke.py
-different_configuration_output_logs.md
-implementation_notes_deq_gpt_54.md
-implementation_notes_deq_kimi.md
-kirchhoff_ode_inefficiency.md
-1
-output
-*.md
-*.log
-*report*
-docs
-_count_params.py
-kirchhofftoken.txt
+# ---- environments / caches ----
+venv/
+venv*/
+.venv*/
+__pycache__/
+*.pyc
+.pytest_cache/
+.opencode/
+
+# ---- checkpoints, databases, run outputs ----
+*.pt
+*.pth
+*.db
+*.npz
+*.cbm
+output/
+output*/
+outputs/
+outputs*/
 dagger_output/
+results/
+network_visualization/
+catboost_info/
+
+# ---- logs (key paper logs live in docs/logs/) ----
 *.out
-*ipynb*
-*.sh
+*.log
+!docs/logs/*.out
+!docs/logs/*.log
+
+# ---- secrets / personal ----
 auth_token.txt
+kirchhofftoken.txt
+*token*
+*@*
+*alliancecan*
+
+# ---- archives, big data, scratch ----
 *.zip
-dagger_knet_best_model_selection_improvement_plan.md
-test_dagger_best_model_selection.py
-*output*
-augmented-cvae-ctle
-dry_run_knet_input_clipping.py
+augmented-cvae-ctle/
+Paper/
+how_to_train_your_hippo.pdf
+comparison_report.html
+tmp/
+tree_rematch/
 
-check_optuna_versions.py
-probe_study_db.py
-test_bo_guard.py
-*test*
-
-*db*
-Paper
-docs/gln-learned-sharpness.md
-plot_bo_descent.py
-plot_bo_descent_4pane.py
-plot_phase_a_ctle_descent.py
+# ---- nested third-party repo (zhengqigao/kirchhoffnet), see README ----
+kirchhoffnet/

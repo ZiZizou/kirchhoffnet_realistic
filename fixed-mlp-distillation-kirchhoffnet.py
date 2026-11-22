@@ -46,6 +46,8 @@ from ctle_dagger_common import (
 )
 from kirchhoff_net import format_parameter_breakdown
 from topology import build_net_from_config
+from hw import HWConfig, hw_or_none
+from hw.cli import add_entry_hw_args, setup_hw_config
 
 
 SPEC_COLS = ["power", "stage_2_jitter", "stage_2_eye_max_height", "stage_2_eye_max_width"]
@@ -109,7 +111,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--zig-artifact-dir", default=None,
                         help="Directory containing the HybridHurdle/ZIG files; defaults to the teacher checkpoint directory.")
     parser.add_argument("--zig-validity-threshold", type=float, default=0.5)
-    parser.add_argument("--zig-degrade-threshold", type=float, default=DEGRADE_REL_THRESHOLD)
+    # --zig-degrade-thr: the Phase 3b 2.2 spelling of the same override
+    parser.add_argument("--zig-degrade-threshold", "--zig-degrade-thr", dest="zig_degrade_threshold",
+                        type=float, default=DEGRADE_REL_THRESHOLD)
     parser.add_argument("--zig-min-degraded-dims", type=int, default=MIN_DEGRADED_DIMS)
     parser.add_argument("--isolation-tolerance-pp", type=float, default=3.0,
                         help="Maximum absolute teacher/student failure-rate gap, in percentage points, for PASS.")
@@ -139,6 +143,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kn-vca-gate-shunt", type=parse_bool, default=False)
     parser.add_argument("--kn-vca-separate-core-bus", type=parse_bool, default=True)
     parser.add_argument("--vca-bias", type=parse_bool, default=False)
+    # Phase 3b 2.2: --hw-config / --hw-preset / --hw-<flag> / --hw-tm*
+    add_entry_hw_args(parser, degrade_thr=False)
     return parser.parse_args()
 
 
@@ -259,6 +265,8 @@ class KirchhoffStudent(nn.Module):
             vca_enabled=args.kn_vca, vca_rank=args.kn_vca_rank, vca_core_enabled=args.kn_vca_core,
             vca_gate_shunt=args.kn_vca_gate_shunt,
             vca_separate_core_bus=args.kn_vca_separate_core_bus, vca_bias=args.vca_bias,
+            hw=hw_or_none(HWConfig.from_dict(args.hw_resolved))
+            if getattr(args, "hw_resolved", None) else None,
         )
 
     def scale_input(self, specs: torch.Tensor) -> torch.Tensor:
@@ -493,6 +501,10 @@ def main() -> None:
         raise ValueError(f"--kn-x-max must be positive, got {args.kn_x_max}")
     os.makedirs(args.output, exist_ok=True)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    # Phase 3b 2.2: log + save hw_config.json; the resolved dict rides in
+    # ``args`` (JSON-serialisable, so it lands in the checkpoint's args too).
+    args.hw_resolved = setup_hw_config(args, output_dir=args.output,
+                                       logger=logging.getLogger()).to_dict()
     device = resolve_device(args.device)
     set_seed(args.seed)
     logging.info("Fixed MLP -> KNet distillation; device=%s, seed=%d", device, args.seed)

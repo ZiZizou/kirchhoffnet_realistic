@@ -30,36 +30,66 @@ All module files include `hrknet_constants.vams`. The fast structural suite chec
 
 The primitive blocks model shunt and leak conductances, node capacitance, legacy soft rail clipping, S&H acquisition/injection/hold droop, crossbar accumulation, VCA gain (`2·sigmoid(z)`), GLN tail trim, and a transfer rewrite conductance. The transfer's ReLU and rail clamp use narrow smooth approximations to avoid hard discontinuities. `phase_ctrl` sequences hold → transfer/write → bank switch → evolve with explicit per-phase durations after a rising `clk`; it remains unvalidated against `hw/timemux.py`.
 
-## Spectre invocation
+## Spectre compilation
 
-Use a scratch run directory outside the worktree and source the kit before calling Spectre. The exact verified shell pattern is:
+Run all generated inputs, Cadence setup files, PSF databases, and logs under the git-excluded run root. The kit is sourced only after entering the run directory, because sourcing it writes `cds.lib`, `display.drf`, `pdk.cdsinit`, and `tech.lib` into the current directory.
+
+Exact per-netlist invocation (the wrapper keeps the short-lived remote shell alive):
 
 ```sh
-tcsh -c "source ~/workarea_GF22_FDX_EXT/kit.gf22fdx_ext.v1.0_4.1_stack19_oa.csh >& /dev/null; cd /tmp/taskD2_runs/<module>; spectre -format psfascii <module>.scs"
+bash -c 'nohup tcsh -c "cd <rundir>; source ~/workarea_GF22_FDX_EXT/kit.gf22fdx_ext.v1.0_4.1_stack19_oa.csh >& /dev/null; spectre -format psfascii <net>.scs +log <net>.log" > <rundir>/run.out 2>&1 &'
 ```
 
-The per-module elaboration helper is `scripts/spectre/compile_modules.py`; it writes decks/logs only under `/tmp/taskD2_runs`. Run it with `/home/annaik/Documents/kirchhoffnet_refactor/venv/bin/python scripts/spectre/compile_modules.py`. It has **not** been executed in this delegated session: the remote sandbox denied creating `/tmp/taskD2_runs`, and Cadence setup files must not be generated in the worktree.
+Run the compile matrix from the phase4b worktree with:
 
-## Spectre-versus-reference results
+```sh
+bash -c 'cd /home/annaik/Documents/kirchhoffnet_refactor/.worktrees/phase4b; mkdir -p /home/annaik/Documents/kirchhoffnet_refactor/.agent_scratch/taskD2/runs/compile_session; nohup /home/annaik/Documents/kirchhoffnet_refactor/venv/bin/python scripts/spectre/compile_modules.py > /home/annaik/Documents/kirchhoffnet_refactor/.agent_scratch/taskD2/runs/compile_session/helper.out 2>&1 &'
+```
 
-| Module / mode | Maximum absolute error | Maximum relative error | Status |
-|---|---:|---:|---|
-| `ota_edge` legacy / hw | not measured | not measured | Spectre blocked; no compile result |
-| `shunt` | not measured | not measured | Spectre blocked; no characterization deck |
-| `node_cap_leak` | not measured | not measured | Spectre blocked; no transient run |
-| `rail_clip` | not measured | not measured | Spectre blocked |
-| `sample_hold` | not measured | not measured | Spectre blocked; hold/droop not characterized |
-| `boundary_sense_ota` | not measured | not measured | Spectre blocked |
-| `crossbar_accumulator` | not measured | not measured | Spectre blocked |
-| `interstage_transfer` | not measured | not measured | Spectre blocked; event/timing not characterized |
-| `vca_bias` | not measured | not measured | Spectre blocked; torch comparison not run |
-| `gln_bias` | not measured | not measured | Spectre blocked; torch comparison not run |
-| `phase_ctrl` | not measured | not measured | Spectre blocked; no timing comparison |
+The helper emits an independent tiny `ahdl_include` + DC deck per `.va` module and records the complete Spectre output. Results from Spectre 23.1.0.063:
+
+| Module | Compile | Spectre errors / warnings |
+|---|---|---:|
+| `ota_edge` | PASS | 0 / 0 |
+| `shunt` | PASS | 0 / 0 |
+| `node_cap_leak` | PASS | 0 / 0 |
+| `rail_clip` | PASS | 0 / 0 |
+| `sample_hold` | PASS | 0 / 0 |
+| `boundary_sense_ota` | PASS | 0 / 0 |
+| `crossbar_accumulator` | PASS | 0 / 0 |
+| `interstage_transfer` | PASS | 0 / 0 |
+| `vca_bias` | PASS | 0 / 0 |
+| `gln_bias` | PASS | 0 / 0 |
+| `phase_ctrl` | PASS | 0 / 0 |
+
+No Verilog-A source changes were needed to compile these modules. Spectre emitted routine notices (e.g. output filter relaxation on the compile-only DC decks), but no warnings.
+
+## Spectre-versus-reference characterization
+
+`/home/annaik/Documents/kirchhoffnet_refactor/venv/bin/python scripts/spectre/characterize.py` generates one PSFASCII DC deck with 25 parallel test cases, reads the PSFASCII operating point, converts measured branch currents to `Iu` model units, and compares to the exact formulas implemented by the Verilog-A cells. The legacy OTA set covers both signs, nonzero theta, saturation, the 0.01·u floor, and the compliance boundary; hardware cases include differential and two cap-divider code pairs. This comparison uses copied analytic formulas, not a full `FreeTanhLibrary` forward call.
+
+| Module / mode | Cases | Maximum absolute error | Maximum relative error |
+|---|---:|---:|---:|
+| `ota_edge` legacy | 16 | 8.52e-16 Iu | 8.36e-15 |
+| `ota_edge` hw (differential / cap-divider) | 6 | 5.68e-16 Iu | 8.64e-16 |
+| `shunt` DC | 3 | 2.84e-16 Iu | 1.87e-16 |
+| `node_cap_leak` | — | not measured | not measured |
+| `rail_clip` | — | not measured | not measured |
+| `sample_hold` | — | not measured | not measured |
+| `boundary_sense_ota` | — | not measured | not measured |
+| `crossbar_accumulator` | — | not measured | not measured |
+| `interstage_transfer` | — | not measured | not measured |
+| `vca_bias` | — | not measured | not measured |
+| `gln_bias` | — | not measured | not measured |
+| `phase_ctrl` | — | not measured | not measured |
+
+The characterization result JSON and all raw runs are under `.agent_scratch/taskD2/runs/characterize_<timestamp>/`; no Cadence-generated files belong in the worktree. The Spectre-backed test is slow-marked and explicitly run with `python -m pytest tests/test_veriloga_modules.py -q -m slow -k spectre`; it skips if `tcsh`, the kit setup, or Spectre is unavailable.
 
 ## Known gaps / release status
 
-- No Spectre compile has been run and no per-module PSF characterization/error table exists yet. The helper currently provides compile decks only; it is not the requested set of torch-correlated testbenches.
-- The canonical A/B code modes exist, but per-stage parameter arrays/indexing and complete timemux bank switching are still missing. The exporter and parameter table must drive the actual instances consistently.
-- HW OTA compliance is a behavioral leg approximation and needs comparison against `hw.constraints.leg_factors`/`compliance_legs` (including normalization and 85 °C thermal voltage). The specified Isat ceiling is not enforced inside this primitive.
-- S&H `kT/C` noise and exact acquisition/droop characterization are absent; deterministic injection/droop are only approximate circuit abstractions.
-- Transfer smoothening, event timing, VCA/GLN bias transforms, crossbar polarity/reference, and phase sequencing still require cell-level torch comparisons. Do not claim model equivalence or use for tapeout.
+- Characterization is partial: node-cap RC transient, sample/hold capture and droop, crossbar accumulation, transfer clamp, VCA/GLN against their gating functions, boundary OTA, rail clip, and phase duration edges against `hw/timemux.py` remain to be simulated and compared. Thus this is not full module equivalence validation.
+- The exact OTA/shunt cell equations match Spectre for the tested points; there is not yet full Torch/PyTorch coverage for the core or all gating functions.
+- The canonical A/B modes compile, but per-stage parameter arrays/indexing and complete timemux bank switching are still missing. The exporter and parameter table must drive actual instances consistently.
+- HW OTA compliance is a behavioral leg approximation and still needs comparison against `hw.constraints.leg_factors`/`compliance_legs` (including normalization and 85 °C thermal voltage). The specified Isat ceiling is not enforced inside this primitive.
+- S&H `kT/C` noise and exact acquisition/droop characterization are absent; deterministic injection/droop remain approximate circuit abstractions.
+- Transfer smoothening, event timing, crossbar polarity/reference, and phase sequencing still require cell-level validation. Do not claim full model equivalence or use for tapeout.

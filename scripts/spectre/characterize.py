@@ -95,15 +95,34 @@ def ref_value(case, values):
     if module in ("ota_edge", "shunt"):
         return ref_current(case, values["src"], values["dst"]), IU, "Iu"
     if module in ("vca_bias", "gln_bias"):
-        z = case["bias"] + sum(w*u for w,u in zip(case["weights"], case["u"]))
         if module == "vca_bias":
-            return 2.0 / (1.0 + math.exp(-z)), 1.0, "gain"
+            import torch
+            from gating.vca import vca_edge_gain
+            u = torch.tensor([case["u"]], dtype=torch.float64)
+            W = torch.eye(4, dtype=torch.float64)
+            edge = torch.tensor([case["weights"]], dtype=torch.float64)
+            bias = torch.tensor([case["bias"]], dtype=torch.float64)
+            return float(vca_edge_gain(u, W, edge, bias)[0, 0]), 1.0, "gain"
+        # GLN's integrated call requires a GLNRails instance and a cell family;
+        # this standalone exporter primitive is its clamped log-tail equation.
+        z = case["bias"] + sum(w*u for w,u in zip(case["weights"], case["u"]))
         return math.exp(max(-case["delta_max"], min(case["delta_max"], z))), 1.0, "trim"
+    # Use the repository's actual transfer module, including its hardware rail clamp.
+    import torch
+    from types import SimpleNamespace
+    from stage_transfer import StageTransfer
     p = case["params"]
-    x = case["x"]
-    relu = max(x-p["vth"], 0.0)  # exact torch/ReLU reference; VA uses a smooth approximation.
-    y = p["w1"]*x+p["w2"]*math.tanh(x)+p["w3"]*relu
-    y = max(-p["x_hard"], min(p["x_hard"], y))
+    x = torch.tensor([[case["x"]]], dtype=torch.float64)
+    hw = SimpleNamespace(
+        constraints=SimpleNamespace(hw_clamp_transfer=True),
+        units=SimpleNamespace(x_hard=p["x_hard"]))
+    transfer = StageTransfer(1, 1, activation="residual-relu-tanh", hw=hw).double()
+    with torch.no_grad():
+        transfer.residual_w1.fill_(p["w1"])
+        transfer.residual_w2.fill_(p["w2"])
+        transfer.residual_w3.fill_(p["w3"])
+        transfer.residual_vth.fill_(p["vth"])
+    y = float(transfer(x)[0, 0])
     return VCM+VU*y, VU, "x"
 
 

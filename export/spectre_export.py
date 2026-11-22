@@ -26,7 +26,9 @@ def _softplus(x):
 def _cell_table(lib):
     A, B = lib.ab_values()
     theta = lib.theta_values()
-    return {
+    constraints = getattr(lib, "hw_constraints", None)
+    alpha = 0.0 if constraints is not None and constraints.hw_no_alpha else float(lib.ALPHA)
+    result = {
         "A": _tensor(A), "B": _tensor(B),
         "sign": _tensor(torch.sign(lib.s_raw)),
         "gm": _tensor(lib.gm_eff_values()), "isat": _tensor(lib.isat_values()),
@@ -34,9 +36,16 @@ def _cell_table(lib):
         "conductance": _tensor(torch.nn.functional.softplus(lib.g_resistive_raw)),
         "gm_min": float(lib.gm_min), "gm_max": float(lib.gm_max),
         "isat_min": float(lib.isat_min), "isat_max": float(lib.isat_max),
-        "alpha": float(lib.ALPHA), "beta_softness": float(lib._beta_softness),
+        "alpha": alpha, "beta_softness": float(lib._beta_softness),
         "has_bias": theta is not None, "has_resistive": hasattr(lib, "resistive_current"),
     }
+    if constraints is not None and constraints.hw_ab_mode == "cap_divider":
+        levels = 2 ** int(constraints.hw_ab_bits) - 1
+        result["ab_codes"] = {
+            "k_A": torch.round(torch.sigmoid(lib.cap_a_raw.detach()) * levels).to(torch.int64).cpu().tolist(),
+            "k_B": torch.round(torch.sigmoid(lib.cap_b_raw.detach()) * levels).to(torch.int64).cpu().tolist(),
+            "levels": levels, "rmax": float(constraints.hw_ab_rmax)}
+    return result
 
 def _physical_cell(cell, units):
     """Physical-unit companion; normalized cell values remain interpreter inputs."""
@@ -73,6 +82,18 @@ def build_param_table(model, mode="legacy", hw=None) -> dict:
             raise ValueError("export does not support hw_power_lambda: training-only power objective")
         if constraints.hw_vca_bits is not None:
             raise ValueError("export does not support hw_vca_bits: quantized VCA logits are not resolved")
+        refused = {
+            "hw_compliance": constraints.hw_compliance,
+            "hw_clamp_transfer": constraints.hw_clamp_transfer,
+            "hw_c_node": constraints.hw_c_node is not None,
+            "hw_gln_mode": constraints.hw_gln_mode is not None,
+            "hw_isat_eff_clamp": constraints.hw_isat_eff_clamp,
+        }
+        active = [name for name, enabled in refused.items() if enabled]
+        if active:
+            raise ValueError("export does not support forward-affecting flags: " + ", ".join(active))
+        if getattr(hw, "timemux", None) is not None and getattr(hw.timemux, "enable", False):
+            raise ValueError("export does not support hw.timemux: S&H/timemux dynamics are not resolved")
     stages = []
     for i, s in enumerate(net.core.stages):
         n = int(s.num_nodes)

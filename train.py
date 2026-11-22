@@ -31,6 +31,7 @@ from cell_library import (
     FreeTanhLibrary,
 )
 from io_mapper import OutputAffine
+from hw.constraints import hw_power_penalty, net_hw
 
 
 __all__ = [
@@ -597,6 +598,16 @@ def compute_loss(
         if device_l2_lambda > 0:
             loss_device_l2 = device_l2_lambda * _device_l2_penalty(net)
 
+        # Phase 3a 3.9 power penalty L_pow = hw_power_lambda * P_avg / P_ref.
+        # Off (no term at all) unless the net carries hw with lambda > 0.  Not
+        # scaled by reg_scale: it is a physical cost, not a structural prior.
+        loss_hw_power = None
+        _hw = net_hw(net)
+        if _hw is not None and float(_hw.constraints.hw_power_lambda) > 0.0:
+            _base = net.module if isinstance(net, torch.nn.DataParallel) else net
+            loss_hw_power = hw_power_penalty(
+                net, _hw, u=x0 if isinstance(_base, KirchhoffNetWithIO) else None)
+
         total_task = loss_task + float(lambdas.get("rail", 0.0)) * loss_rail
         structural = reg_scale * (
             float(lambdas.get("edge_gate", 0.0)) * loss_edge_gate
@@ -604,6 +615,8 @@ def compute_loss(
             + float(lambdas.get("sparsity", 0.0)) * loss_sparsity
             + float(lambdas.get("entropy", 0.0)) * loss_entropy
         ) + loss_device_l2
+        if loss_hw_power is not None:
+            structural = structural + loss_hw_power
 
     if return_parts:
         parts = {
@@ -617,6 +630,8 @@ def compute_loss(
             "reg_scale": float(reg_scale),
             "total": float((total_task + structural).item()),
         }
+        if loss_hw_power is not None:
+            parts["hw_power"] = float(loss_hw_power.item())
         return total_task, structural, parts
     return total_task, structural
 

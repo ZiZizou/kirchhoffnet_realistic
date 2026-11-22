@@ -1043,7 +1043,8 @@ def prune_network(
         residual_rank = getattr(net.transfers[i], 'residual_rank', -1)
         new_transfers.append(StageTransfer(new_widths[i], new_widths[i + 1],
                                            activation=activation,
-                                           residual_rank=residual_rank))
+                                           residual_rank=residual_rank,
+                                           hw=getattr(net.transfers[i], "hw", None)))
 
     return KirchhoffNet(
         stages=new_stages,
@@ -2087,7 +2088,8 @@ def build_net_from_config(
                 transfer_out_nodes += output_ode_count
             transfers.append(StageTransfer(transfer_in_nodes, transfer_out_nodes,
                                            activation=interstage_activation,
-                                           residual_rank=interstage_residual_rank))
+                                           residual_rank=interstage_residual_rank,
+                                           hw=hw))
 
     core = KirchhoffNet(
         stages=stage_modules,

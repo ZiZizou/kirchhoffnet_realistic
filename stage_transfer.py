@@ -62,8 +62,12 @@ class StageTransfer(nn.Module):
         out_nodes: int,
         activation: str = "none",
         residual_rank: int = -1,
+        hw=None,
     ) -> None:
         super().__init__()
+        # Hardware configuration (``hw.HWConfig`` or ``None``).  A plain
+        # attribute, not a submodule: it adds nothing to ``state_dict``.
+        self.hw = hw
         if in_nodes < 0 or out_nodes < 0:
             raise ValueError(f"Negative node count: in={in_nodes}, out={out_nodes}")
         if activation not in STAGE_TRANSFER_VALID_ACTIVATIONS:
@@ -164,7 +168,30 @@ class StageTransfer(nn.Module):
                 # r == 0: pure diagonal, no mixing term to add.
 
             out = transformed
-        return out
+
+        c = None if self.hw is None else self.hw.constraints
+        if c is None or not c.hw_clamp_transfer:
+            return out
+        return self.clamp_to_rails(out)
+
+    def clamp_to_rails(self, out: torch.Tensor) -> torch.Tensor:
+        """Phase 3a 3.4 (``hw_clamp_transfer``): the transfer writes a node voltage,
+        so its output cannot leave the supply rails ``[-x_hard, x_hard]``
+        (``x_hard = VDD/(2 Vu)``, 5.714 units at Vu = 0.07 V).
+
+        Hard clamp in the forward pass with a straight-through (identity)
+        gradient: ``clamp(out.detach()) + (out - out.detach())``.  The forward
+        value is exactly the clamped write (the second term is an exact 0); the
+        backward pass is that of the unclamped transfer, so a saturated write
+        still passes gradient to the transfer parameters and to the upstream
+        stage (a plain ``torch.clamp`` would zero it).
+
+        Only the interstage transfers get this hook: the post-readout transfer
+        of ``KirchhoffNetWithIO`` acts on the ``OutputAffine`` output (a
+        digital/post-processing quantity, not a node voltage) and is left alone.
+        """
+        x_hard = float(self.hw.units.x_hard)
+        return torch.clamp(out.detach(), -x_hard, x_hard) + (out - out.detach())
 
     def extra_repr(self) -> str:
         parts = [

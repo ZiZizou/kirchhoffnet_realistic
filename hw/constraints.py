@@ -11,6 +11,7 @@ Flag names and defaults are exactly those of Phase 3a section 3.11 (all off).
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass, fields
 from typing import Any, Optional
 
@@ -562,3 +563,111 @@ def model_power_penalty(net, u, units: Optional[HWUnits] = None, kappa: float = 
             _add(stage.output_ode_cell_lib, stage.output_ode_z_logits, "readout")
         isat_l.append(torch.cat(iv)), z_l.append(torch.cat(zv)), g_l.append(torch.cat(gv))
     return power_penalty(isat_l, z_l, g_l, units, kappa)
+
+
+def _unwrap(net):
+    """Strip ``DataParallel`` / ``DistributedDataParallel`` wrappers."""
+    while isinstance(net, (torch.nn.DataParallel, torch.nn.parallel.DistributedDataParallel)):
+        net = net.module
+    return net
+
+
+def net_hw(net):
+    """The ``HWConfig`` of a built network (first stage that carries one), or ``None``."""
+    core = getattr(_unwrap(net), "core", _unwrap(net))
+    for st in getattr(core, "stages", ()):
+        hw = getattr(st, "hw", None)
+        if hw is not None:
+            return hw
+    return None
+
+
+def hw_power_penalty(net, hw=None, u: Optional[torch.Tensor] = None,
+                     p_ref: float = POWER_REF_W) -> torch.Tensor:
+    """The 3.9 power loss ``L_pow = hw_power_lambda * P_avg / P_ref`` (a scalar tensor).
+
+    ``net``: a ``KirchhoffNetWithIO`` / ``KirchhoffNet`` (optionally DataParallel-wrapped).
+    ``hw``: its ``HWConfig`` (default: the one the stages carry).  ``u``: the raw network
+    input of the batch, so the VCA gain ``g_vca`` enters ``P_avg`` (``None``: g_vca = 1;
+    pass ``None`` for a plain ``KirchhoffNet`` whose input is a state, not ``u``).
+    Returns an exact 0 (no graph) when ``hw`` is ``None`` or ``hw_power_lambda == 0``.
+    """
+    net = _unwrap(net)
+    hw = net_hw(net) if hw is None else hw
+    ref = next(net.parameters())
+    lam = 0.0 if hw is None else float(hw.constraints.hw_power_lambda)
+    if lam <= 0.0:
+        return ref.new_zeros(())
+    return lam * model_power_penalty(net, u, hw.units) / float(p_ref)
+
+
+# ---------------------------------------------------------------------------
+# 3.3 stiffness diagnostic (hw_check_stiffness)
+# ---------------------------------------------------------------------------
+def stage_small_signal_lambda(stage, u: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Upper bound of the per-node decay rate ``lambda_n`` ``[N]`` of a stage.
+
+    ``lambda_n = (sum_e Isat_e gm_eff_e A^_e z_e g_e + sum_e G_e z_e + leak_n) / c_node_n``
+    over the edge terminals at ``n`` (sech^2 = 1, i.e. the tanh at its steepest).  ``A^`` is the
+    attenuation of the terminal (``B`` at the destination, ``A`` at a drained source), ``z`` the
+    edge gate, ``g`` the worst-case (batch max) VCA gain when ``u`` is given, ``G`` the parallel
+    resistive shunt (counted once).  Families with an output leg on a stage node: core (both
+    ends unless ``read_only_source``), boundary and legacy temporal mesh (destination only).
+    The shared-sense OTAs drive the ideal Vref rail and the crossbar accumulators see no
+    self-conductance, so those nodes get only their leak.  GLN gm modulation is not included
+    (the static gm is used).
+    """
+    ref = stage.z_logits
+    lam = torch.zeros(stage.num_nodes, dtype=ref.dtype, device=ref.device)
+
+    def _fam(lib, logits, family, src, dst, drain_src, gate_shunt):
+        if lib is None or logits is None or dst.numel() == 0:
+            return
+        z = torch.sigmoid(logits)
+        g = stage.edge_gain(family, u) if u is not None else None
+        g = torch.ones_like(z) if g is None else g.abs().amax(0).to(z.dtype)
+        k = lib.isat_values() * lib.gm_eff_values() * z * g
+        A, B = lib.ab_values()
+        lam.index_add_(0, dst, (k * B).to(lam.dtype))
+        if drain_src:
+            lam.index_add_(0, src, (k * A).to(lam.dtype))
+        if hasattr(lib, "g_resistive_raw"):
+            G = F.softplus(lib.g_resistive_raw) * z
+            if gate_shunt:
+                G = G * g
+            lam.index_add_(0, dst, G.to(lam.dtype))
+            if drain_src:
+                lam.index_add_(0, src, G.to(lam.dtype))
+
+    _fam(stage.cell_lib, stage.z_logits, "core", stage.src, stage.dst,
+         not stage.read_only_source, bool(getattr(stage, "vca_gate_shunt", False)))
+    if getattr(stage, "_has_boundary", False):
+        _fam(stage.boundary_cell_lib, stage.boundary_z_logits, "boundary",
+             stage.boundary_src, stage.boundary_dst, False, True)
+    if getattr(stage, "_has_output_ode", False):
+        _fam(stage.output_ode_cell_lib, stage.output_ode_z_logits, "readout",
+             stage.output_ode_src, stage.output_ode_dst, False, True)
+    lam = lam + stage._effective_leak().to(device=lam.device, dtype=lam.dtype)
+    c = stage.node_capacitance(lam.view(1, -1))
+    if torch.is_tensor(c):
+        return lam / c.view(-1)
+    return lam / float(c)
+
+
+def stiffness_report(net, u: Optional[torch.Tensor] = None, warn: bool = True,
+                     limit: float = STIFFNESS_LIMIT) -> list:
+    """``max_n dt * lambda_n`` per stage of a built network (``dt = t_span / num_steps``).
+
+    Warns (``RuntimeWarning``) when some stage exceeds ``limit`` (Heun is unstable above 2).
+    """
+    core = getattr(_unwrap(net), "core", _unwrap(net))
+    out = []
+    with torch.no_grad():
+        for i, st in enumerate(core.stages):
+            dt = float(core.stage_times[i]) / float(core.stage_steps[i])
+            out.append(float(stiffness_dt_lambda(dt, stage_small_signal_lambda(st, u)).max()))
+    if warn and out and max(out) > limit:
+        warnings.warn(f"hw_check_stiffness: max(dt*lambda) per stage = "
+                      f"{[round(v, 3) for v in out]} exceeds {limit} (Heun unstable); "
+                      f"raise num_steps", RuntimeWarning, stacklevel=2)
+    return out

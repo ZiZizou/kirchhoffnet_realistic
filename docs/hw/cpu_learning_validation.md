@@ -117,16 +117,81 @@ spreads mean these three-seed means are not robust performance guarantees.
 | toy_mimo | phase3a_full | 2.25× | 1.78× | MSE misses 2×; rail passes 2/3; stiffness passes 1/3. |
 | toy_mimo | phase3b_tm | 2.72× | 1.65× | MSE misses 2.5×; rail and stiffness miss all 3 seeds. |
 
-### Conclusion (pending integration and ablation checks)
+## Heun step-refinement study
 
-The fair LR sweep shows that lr=0.1 is the best tested setting for both
-unconstrained tasks and for nearly every constrained task/preset; Friedman2
-phase3b_tm selects 0.03. Friedman2 core/full match or slightly outperform the
-best unconstrained mean in this small held-out sample, while phase3b_tm and all
-Toy constrained presets retain a sizable relative-MSE cost. Seed variability is
-large, particularly for Friedman2 core/full and Toy core. These results support
-an LR retune but do not establish invariant compliance or CTLE performance; the
-Toy stiffness/rail failures and the CTLE SLURM retrain remain separate checks.
+The Toy runs that exceeded the harness's Heun limit at `lr=0.01` were retrained
+with the same seeds: core seeds 1/2, full seeds 0/1, and phase3b_tm seeds 0/1/2.
+The actual net uses `[6, 6]` Heun steps per stage; each trained model was then
+re-integrated with `[12, 12]` and `[24, 24]` steps. Relative output-change MSE is
+`mean((y_n-y_base)^2) / mean(y_base^2)` on the 256 held-out inputs. `max |x|`
+is the maximum absolute internal state over the held-out trajectories.
+
+`max dt·ρ(J)` below is the harness's trajectory Jacobian metric from the
+schema-2 `lr=0.01` baseline (32 sampled rows). `stiffness_report` is the
+per-stage small-signal diagnostic in `hw.constraints`, shown separately; they
+are not interchangeable. The exact trajectory metric was >2 for all seven
+cases, but `stiffness_report` was only 0.125–0.244 at the base step count.
+
+| Preset / seed | Base trajectory max dt·ρ(J) | Relative output-change MSE ×2 / ×4 | max \|x\| ×2 / ×4 | `stiffness_report` max dt·λ base / ×2 / ×4 |
+|---|---:|---:|---:|---:|
+| phase3a_core / 1 | 4.12 | 4.03e−6 / 5.62e−6 | 6.629 / 6.631 | 0.244 / 0.122 / 0.061 |
+| phase3a_core / 2 | 2.76 | 2.09e−6 / 2.34e−6 | 4.885 / 4.885 | 0.152 / 0.076 / 0.038 |
+| phase3a_full / 0 | 2.77 | 4.13e−7 / 4.74e−7 | 5.714 / 5.714 | 0.228 / 0.114 / 0.057 |
+| phase3a_full / 1 | 5.37 | 2.20e−6 / 3.43e−6 | 5.959 / 5.714 | 0.133 / 0.067 / 0.033 |
+| phase3b_tm / 0 | 2.92 | 1.15e−6 / 1.32e−6 | 5.714 / 5.714 | 0.135 / 0.068 / 0.034 |
+| phase3b_tm / 1 | 3.67 | 1.24e−6 / 1.83e−6 | 5.548 / 5.530 | 0.205 / 0.102 / 0.051 |
+| phase3b_tm / 2 | 2.07 | 4.79e−7 / 7.26e−7 | 5.714 / 5.714 | 0.125 / 0.062 / 0.031 |
+
+The `stiffness_report` values scale as expected with `dt`, but in this sample
+its small-signal bound fails to reveal the larger trajectory Jacobian values.
+The finer integrations change the held-out output negligibly (all relative
+changes < 6e−6). The full/seed-1 rail overshoot is reproduced at the base count
+(6.704) and falls to the hardware rail `x_hard=5.714` at ×4. Core-only has no
+enforced rail, so its 6.63 peak remains diagnostic rather than a compliance
+failure. This points to a timestep-sensitive rail excursion, not a material
+held-out-output integration error.
+
+### Fourfold steps trained from scratch
+
+| Preset / seed | Base held MSE | ×4 scratch held MSE | max \|x\| | max `stiffness_report` dt·λ | Base / ×4 wall time (s) |
+|---|---:|---:|---:|---:|---:|
+| phase3a_core / 1 | 0.04304 | 0.04137 | 6.067 | 0.054 | 58 / 253 |
+| phase3a_core / 2 | 0.01559 | 0.02781 | 5.410 | 0.039 | 64 / 250 |
+| phase3a_full / 0 | 0.03402 | 0.03952 | 5.714 | 0.052 | 102 / 428 |
+| phase3a_full / 1 | 0.03666 | 0.05636 | 5.714 | 0.051 | 102 / 425 |
+| phase3b_tm / 0 | 0.02934 | 0.02473 | 5.714 | 0.032 | 102 / 429 |
+| phase3b_tm / 1 | 0.02307 | 0.03614 | 4.910 | 0.016 | 102 / 417 |
+| phase3b_tm / 2 | 0.03406 | 0.03695 | 5.714 | 0.037 | 102 / 425 |
+
+All fourfold scratch runs retained the slope bound; compliance-enabled full/tm
+runs stayed at or below `x_hard`. The 4× models took 250–429 s versus 58–102 s
+for the base-step training (about 4× wall time). Their held-out MSE changes are
+mixed rather than consistently improved, so retraining at finer steps does not
+show a systematic optimizer-quality gain.
+
+**Verdict and step rule.** For these cases, integration error is not the driver
+of output MSE: the fixed-weight output changes are several orders below the
+held-out MSE. A finer grid does remove the single full-preset rail overshoot.
+For timestep selection, target `max dt·λ ≤ 1` with
+`hw.constraints.stiffness_report`, then confirm with the trajectory Jacobian
+audit. Because the latter reported up to 5.37 at six steps while
+`stiffness_report` reported at most 0.244, do not use the small-signal report
+alone for this workload. Scaling the worst observed trajectory value by `dt`
+suggests at least 33 steps per stage for a target of 1; 48 (8× the current 6)
+is a simple conservative trial setting, subject to rechecking the trajectory
+metric after retraining.
+
+### Conclusion (pending ablation and CTLE recommendations)
+
+The fair LR sweep shows that `lr=0.1` is best tested for both unconstrained
+tasks and nearly every constrained task/preset; Friedman2 phase3b_tm selects
+0.03. Friedman2 core/full match or slightly outperform the best unconstrained
+mean in this small held-out sample, while phase3b_tm and all Toy constrained
+presets retain a sizable relative-MSE cost. The step-refinement run finds tiny
+fixed-weight output changes even when the baseline trajectory stiffness metric
+exceeds the Heun bound; finer steps do remove one full-preset rail excursion.
+Seed variability remains large. These CPU toys do not establish CTLE
+performance; a controlled CTLE retrain is still required.
 
 ## Pruning investigation
 

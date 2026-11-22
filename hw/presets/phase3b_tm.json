@@ -1,0 +1,31 @@
+{
+  "units": {},
+  "constraints": {
+    "hw_ratio_ab": true,
+    "hw_slope_bound": true,
+    "hw_ic_coupling": true,
+    "hw_no_alpha": true,
+    "hw_compliance": true,
+    "hw_c_node": "physical",
+    "hw_gln_mode": "tail",
+    "hw_gln_delta_max": 1.3862943611198906,
+    "hw_vref_symmetric": true,
+    "hw_vref_bits": 6,
+    "hw_xbar_bound": true,
+    "hw_xbar_bits": 5,
+    "hw_xbar_mode": "signed"
+  },
+  "timemux": {
+    "enable": true,
+    "c_hold_ff": 100.0,
+    "inject_mv": 1.0,
+    "inject_gain_err": 0.0,
+    "droop_mv": 1.0,
+    "ktc": true,
+    "settle": false,
+    "c_int_ff": 3.0,
+    "isat_floor": 0.0,
+    "xfer_mode": "full",
+    "param_bits": null
+  }
+}

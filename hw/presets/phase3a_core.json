@@ -1,0 +1,10 @@
+{
+  "units": {},
+  "constraints": {
+    "hw_ratio_ab": true,
+    "hw_slope_bound": true,
+    "hw_ic_coupling": true,
+    "hw_no_alpha": true
+  },
+  "timemux": {}
+}

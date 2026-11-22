@@ -287,6 +287,14 @@ output_ode_src: list[int] | None = None,
             self.clip_sharpness_raw = nn.Parameter(
                 torch.tensor(raw0, dtype=torch.float32)
             )
+            # Phase 3b W5 step 2: under hw_compliance the soft clip is replaced
+            # by the leg-wise output compliance (3.4), so the clip sharpness
+            # is dead: it is FROZEN (requires_grad=False) but stays in the
+            # state_dict, exactly like the dead a_raw / b_raw of hw_ratio_ab.
+            # It therefore does not inflate the trainable-parameter count
+            # (BO budget) nor reach the optimiser.
+            if self.hw_constraints is not None and self.hw_constraints.hw_compliance:
+                self.clip_sharpness_raw.requires_grad_(False)
         else:
             # Fixed path: no parameter, no buffer — the float stays in
             # ``self.clip_softness`` (kept for backward compat with the

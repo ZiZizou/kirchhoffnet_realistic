@@ -36,7 +36,7 @@ The state-dict map classifies serialized keys as topology, mapped parameter, or 
 
 ### Python interpreter support matrix
 
-The standalone interpreter resolves and reproduces the table for the following forward-affecting hardware groups: symmetric/6-bit Vref; bounded/5-bit signed crossbar; transfer rail clamp; physical node capacitance; and GLN tail modulation (including `delta_max`). They are applied in the same transfer/RHS location as the model and are tested independently on perturbed `TOY_NET` parameters. The existing core and core-differential toy preset round trips also remain exact.
+The standalone interpreter resolves and reproduces the table for symmetric/6-bit Vref; bounded/5-bit signed crossbar; transfer rail clamp; physical node capacitance; GLN tail modulation (including `delta_max`); and the supported shared-sense/core compliance paths. They are applied in the same transfer/RHS location as the model and tested on perturbed `TOY_NET` parameters. The existing core and core-differential toy preset round trips also remain exact.
 
 | Configuration | Result on toy round-trip | Notes |
 |---|---:|---|
@@ -48,11 +48,12 @@ The standalone interpreter resolves and reproduces the table for the following f
 | core + physical node capacitance | 0 / 0 | exact |
 | core + GLN tail, `delta_max=ln(4)` | 0 / 0 | exact for current TOY_NET GLN configuration |
 | `phase3a_full` with `hw_compliance=false` | 0 output / 0 state | combined non-compliance flags compose exactly |
-| `phase3a_full` | rejected | `hw_compliance` remains unsupported (see below) |
-| `phase3b_tm` | rejected | compliance plus active S&H/timemux dynamics remain unsupported |
+| `phase3a_core` with `hw_compliance=true` | ≤ 1e-9 output / state | leg-wise core, boundary, shared-sense and accumulator compliance; frozen core legs |
+| `phase3a_full` | ≤ 1e-9 output / state | full preset composed with compliance |
+| temporal output mesh + compliance | rejected | mesh destination compliance is not yet mirrored |
 
-Remaining refused flags: `hw_compliance` requires all of the model's leg-wise current locations (core, boundary terminals, shared-sense, crossbar accumulator and temporal output mesh), replacing the input soft gate and soft clip while preserving the distinction between live node voltages and frozen leg currents; a single signed edge current plus global soft clip cannot represent these equations. `hw_isat_eff_clamp` needs per-family post-gate/VCA Isat clamping. `hw_vca_bits` needs quantized VCA logits. Stochastic mismatch needs the model's shared per-slot draws. `hw_power_lambda` is a training objective, not an inference behavior. Active timemux requires sample/hold injection, hold-only droop, optional kT/C draws, internal-capacitance settling, and transfer-mode handling; it remains rejected, including `phase3b_tm`. The current interpreter does not accept a `noise=` draw interface, so kT/C is not being approximated as deterministic. Validate flags using `HWConfig` before export.
+`hw_compliance` is resolved for core, boundary terminals, shared-sense readout, crossbar accumulators, live compliance factors with frozen legs, replacement of the input soft gate/soft clip, and the model's VCA-gated boundary/readout shunts. Export explicitly rejects `hw_compliance` when a temporal output mesh is present, rather than silently approximating it. Neither compliance round-trip fixture uses a temporal output mesh. `hw_isat_eff_clamp` needs per-family post-gate/VCA Isat clamping. `hw_vca_bits` needs quantized VCA logits. Stochastic mismatch needs the model's shared per-slot draws. `hw_power_lambda` is a training objective, not an inference behavior. Active timemux requires sample/hold injection, hold-only droop, optional kT/C draws, internal-capacitance settling, and transfer-mode handling; it remains rejected, including `phase3b_tm`. The current interpreter does not accept a `noise=` draw interface, so kT/C is not being approximated as deterministic. Validate flags using `HWConfig` before export.
 
 ## Validation
 
-The interpreter has no model imports. The paper-checkpoint legacy path and per-stage dynamics, unit conversions, and hardware toy round trips are tested. The listed supported single groups each have an individual round-trip case with maximum output and final-state error 0. The full suite is not an analog signoff: Spectre/ahdlcmi availability and Verilog-A simulation are environment dependent. `phase3a_full` and `phase3b_tm` are intentionally not reported as supported until their remaining dynamics are represented.
+The interpreter has no model imports. The paper-checkpoint legacy path and per-stage dynamics, unit conversions, and hardware toy round trips are tested. Compliance round trips are checked at a 1e-9 maximum absolute tolerance; other listed groups retain their exact round-trip checks. The full suite is not an analog signoff: Spectre/ahdlcmi availability and Verilog-A simulation are environment dependent. Temporal-output-mesh compliance and active timemux dynamics remain explicitly rejected.

@@ -164,7 +164,9 @@ def stage_rhs(table, stage_idx, x_live, x_held, u_inputs):
             ip,inn=_legs(cell,src,dst,u,"boundary",st)
             ip,inn=ip*gate,inn*gate
             if vg is not None: ip,inn=ip*vg,inn*vg
-            cur=_compliant_destination(ip,inn,dst,units)+_t(cell["conductance"],x)*(src-dst)*gate
+            shunt=_t(cell["conductance"],x)*(src-dst)*gate
+            if vg is not None: shunt=shunt*vg
+            cur=_compliant_destination(ip,inn,dst,units)+shunt
         else:
             cur=_cell(cell,src,dst,u,"boundary",st)*gate
             if vg is not None: cur=cur*vg
@@ -181,7 +183,9 @@ def stage_rhs(table, stage_idx, x_live, x_held, u_inputs):
             ip,inn=_legs(cell,src,dst,u,"readout",st)
             ip,inn=ip*gate,inn*gate
             if vg is not None: ip,inn=ip*vg,inn*vg
-            cur=_compliant_destination(ip,inn,dst,units)+_t(cell["conductance"],x)*(src-dst)*gate
+            shunt=_t(cell["conductance"],x)*(src-dst)*gate
+            if vg is not None: shunt=shunt*vg
+            cur=_compliant_destination(ip,inn,dst,units)+shunt
         else:
             cur=_cell(cell,src,dst,u,"readout",st)*gate
             if vg is not None: cur=cur*vg

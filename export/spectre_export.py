@@ -161,6 +161,10 @@ def build_param_table(model, mode="legacy", hw=None) -> dict:
                 "A_hat": core_cell["A"], "B_hat": core_cell["B"],
             }
         stages.append(stage_table)
+    if mode == "hw" and constraints is not None and constraints.hw_compliance:
+        if any(getattr(s, "_has_output_ode", False) for s in net.core.stages):
+            raise ValueError("export does not support hw_compliance with temporal output mesh; "
+                             "the standalone interpreter only resolves shared-sense readout")
     transfers=[]
     for t in net.core.transfers:
         transfers.append({"in_nodes":t.in_nodes,"out_nodes":t.out_nodes,"activation":t.activation,

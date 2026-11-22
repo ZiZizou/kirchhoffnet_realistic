@@ -125,6 +125,8 @@ def test_interpreter_has_no_model_imports():
     ("phase3a_core", {"hw_c_node": "physical"}),
     ("phase3a_core", {"hw_gln_mode": "tail", "hw_gln_delta_max": 1.3862943611198906}),
     ("phase3a_full", {"hw_compliance": False}),
+    ("phase3a_core", {"hw_compliance": True}),
+    ("phase3a_full", {}),
 ])
 def test_toy_net_hw_interpreter_roundtrip(tmp_path, preset, overrides):
     """The resolved table must reproduce the actual constrained TOY_NET forward."""
@@ -160,5 +162,5 @@ def test_toy_net_hw_interpreter_roundtrip(tmp_path, preset, overrides):
     out_err = (got["logits"] - want).abs().max().item()
     state_err = max((a - b).abs().max().item() for a, b in zip(got["stage_states"], captured))
     print(f"{preset}: output max error={out_err:.3g}, final-state max error={state_err:.3g}")
-    assert out_err <= 1e-6, f"{preset} output max error {out_err:.3g}"
-    assert state_err <= 1e-6, f"{preset} state max error {state_err:.3g}"
+    assert out_err <= 1e-9, f"{preset} output max error {out_err:.3g}"
+    assert state_err <= 1e-9, f"{preset} state max error {state_err:.3g}"

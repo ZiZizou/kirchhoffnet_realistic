@@ -3604,7 +3604,7 @@ def main():
                     tgt_b = tgt_b.to(device)
                     loss_task, loss_structural, _ = compute_loss(
                         pruned_net, u_b, tgt_b, task_fn,
-                        lambdas=effective_c_lambdas_r, return_parts=True,
+                        lambdas=effective_c_lambdas, return_parts=True,
                         amp=amp_enabled, amp_dtype=amp_dtype, reg_scale=reg_r,
                         device_l2_lambda=args.device_l2_lambda)
                     if retrain_scaler is not None and retrain_scaler._enabled:

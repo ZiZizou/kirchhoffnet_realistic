@@ -51,3 +51,6 @@ kirchhoffnet/
 !assets/**/*.npz
 !assets/**/*.log
 !assets/**/*.out
+
+# ---- golden numerical baseline (small, committed) ----
+!tests/golden/data/*.pt

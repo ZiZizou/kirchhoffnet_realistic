@@ -197,3 +197,49 @@ def test_compliance_forward_backward_is_finite():
     y, grads, _ = toy_forward_backward(hw_of(hw_compliance=True))
     assert torch.isfinite(y).all()
     assert all(torch.isfinite(g).all() for g in grads.values() if g is not None)
+
+
+# ---------------------------------------------------------------------------
+# 3.4 interstage transfer clamp
+# ---------------------------------------------------------------------------
+def test_clamp_transfer_bounds_the_write_with_a_straight_through_gradient():
+    from stage_transfer import StageTransfer
+    hw = hw_of(hw_clamp_transfer=True)
+    x_hard = hw.units.x_hard
+    t = StageTransfer(4, 6, activation="residual-relu-tanh", hw=hw).double()
+    with torch.no_grad():
+        t.residual_w1.fill_(2.0)
+    x = torch.tensor([[-9.0, -1.0, 2.0, 7.5]], dtype=D, requires_grad=True)
+    y = t(x)
+    assert float(y.abs().max()) <= x_hard          # exact, no ulp overshoot
+    assert float(y[0, 0]) == -x_hard and float(y[0, 3]) == x_hard
+    ref = StageTransfer(4, 6, activation="residual-relu-tanh").double()
+    ref.load_state_dict(t.state_dict())
+    y_ref = ref(x)
+    inside = y_ref.abs() < x_hard
+    torch.testing.assert_close(y[inside], y_ref[inside], rtol=0, atol=0)
+    # straight-through: the gradient is that of the unclamped transfer
+    g, = torch.autograd.grad(y.sum(), x)
+    g_ref, = torch.autograd.grad(y_ref.sum(), x)
+    torch.testing.assert_close(g, g_ref, rtol=0, atol=0)
+    assert float(g[0, 0]) != 0.0
+
+
+def test_clamp_transfer_is_threaded_through_the_builder():
+    hw = hw_of(hw_clamp_transfer=True)
+    net = build_toy(hw)
+    assert len(net.core.transfers) >= 1
+    assert all(tr.hw is hw for tr in net.core.transfers)
+    # the post-readout transfer acts on the OutputAffine output, not a node voltage
+    assert getattr(net.post_readout_transfer, "hw", None) is None
+    tr = net.core.transfers[0]
+    x = torch.full((2, tr.in_nodes), 40.0, dtype=D)
+    assert float(tr(x).abs().max()) <= hw.units.x_hard
+    plain = build_toy(None)
+    assert float(plain.core.transfers[0](x).abs().max()) > hw.units.x_hard
+
+
+def test_clamp_transfer_forward_backward_is_finite():
+    y, grads, _ = toy_forward_backward(hw_of(hw_clamp_transfer=True))
+    assert torch.isfinite(y).all()
+    assert all(torch.isfinite(g).all() for g in grads.values() if g is not None)

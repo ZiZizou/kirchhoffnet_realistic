@@ -1063,7 +1063,7 @@ class KNetDistillWrapper:
 
     def forward(self, x):
         u = self.scale_input(x)
-        logits, _trajs = self.net(u, store_trajectory=False, solver="heun")
+        logits, _trajs = self.net(u, store_trajectory=False)
         return logits
 
     def get_bounded_output(self, x):

@@ -277,7 +277,7 @@ class KirchhoffStudent(nn.Module):
         return scaled.clamp(-self.input_rail, self.input_rail)
 
     def forward(self, specs: torch.Tensor) -> torch.Tensor:
-        logits, _ = self.net(self.scale_input(specs), store_trajectory=False, solver="heun")
+        logits, _ = self.net(self.scale_input(specs), store_trajectory=False)
         return logits
 
     def predict_log_params(self, specs: torch.Tensor) -> torch.Tensor:

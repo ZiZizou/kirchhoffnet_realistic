@@ -1984,7 +1984,7 @@ class LocalKirchhoffStudentWrapper(nn.Module):
         Compatible with the MLP student API consumed by RegimeAwareLoss.
         """
         u = self.scale_input(x)
-        logits, _trajs = self.net(u, store_trajectory=False, solver="heun")
+        logits, _trajs = self.net(u, store_trajectory=False)
         return logits
 
     def predict(self, x: torch.Tensor) -> dict:
@@ -3011,7 +3011,7 @@ def log_rail_probe(student, specs_arr, n=256, x_max=None, device=DEVICE):
         student.eval()
         with torch.no_grad():
             u = student.scale_input(specs_t)
-            _, trajs = student.net(u, store_trajectory=True, solver="heun")
+            _, trajs = student.net(u, store_trajectory=True)
         if was_training:
             student.train()
         if not trajs:

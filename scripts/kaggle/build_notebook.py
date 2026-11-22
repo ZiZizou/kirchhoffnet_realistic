@@ -126,8 +126,14 @@ print(result)
 '''),
 cell("code", '''# Optional toy ablation is deliberately isolated from the CTLE ladder.
 if RUN_TOY_ABLATION:
-    print("Toy ablation: follow docs/hw/cpu_learning_validation.md harness; run >=10 seeds, report mean and 95% CI.")
-    print("The CPU validation harness defines the toy presets; no CTLE weights are changed here.")
+    ablation_dir = Path(OUT_DIR) / "toy_ablation"
+    seeds = int(os.getenv("KNB_TOY_SEEDS", "10"))
+    steps = int(os.getenv("KNB_TOY_STEPS", "400"))
+    jobs = int(os.getenv("KNB_TOY_JOBS", str(max(1, min(32, (os.cpu_count() or 2) // 2)))))
+    subprocess.check_call([sys.executable, str(repo / "scripts/hw_toy_ablation.py"),
+        "--seeds", str(seeds), "--steps", str(steps), "--jobs", str(jobs),
+        "--threads-per-job", "1", "--out-dir", str(ablation_dir)], cwd=repo)
+    print("toy ablation reports:", ablation_dir / "toy_ablation_summary.md")
 '''),
 cell("code", '''# Downloadable artifact for Kaggle Output / persistence.
 archive = shutil.make_archive(str(Path(OUT_DIR).resolve()), "zip", root_dir=OUT_DIR)

@@ -3575,7 +3575,7 @@ def main():
                     reg_r = 1.0
                     # Solidification metrics during Phase C.
                     if solid_log_path is not None and repoch % args.validate_every == 0:
-                        _log_solidification(solid_log_path, global_epoch, c_metrics)
+                        _log_solidification(solid_log_path, global_epoch, {})
                 else:
                     retrain_warmup = (0 if (not args.fresh_init) else max(1, c_epochs // 2))
                     retrain_tau_init = float(TAU.get("final_pretrain", TAU["init"]))

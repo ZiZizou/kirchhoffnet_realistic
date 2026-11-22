@@ -181,17 +181,57 @@ suggests at least 33 steps per stage for a target of 1; 48 (8× the current 6)
 is a simple conservative trial setting, subject to rechecking the trajectory
 metric after retraining.
 
-### Conclusion (pending ablation and CTLE recommendations)
+## Friedman2 phase3a_core ablation
+
+The ablation used Friedman2 at its phase3a_core best tested rate, `lr=0.1`,
+with three seeds and 400 Adam steps per setting. Ratios are relative to the
+three-seed core baseline at `g_min=1/16` (mean held-out MSE 0.001335); seed
+spread is max/min held-out MSE. Per-run outputs are in `/tmp/w8a/ablation/` and
+the aggregate is `/tmp/w8a/ablation/summary.json`.
+
+| Setting | Enabled constraints | Mean held MSE | Ratio vs core | Seed spread | Mean wall time (s) |
+|---|---|---:|---:|---:|---:|
+| Single ratio-ab | `hw_ratio_ab` | 0.000427 | 0.32× | 3.16× | 86 |
+| Single slope bound | `hw_slope_bound` | 0.000399 | 0.30× | 1.70× | 82 |
+| IC coupling¹ | `hw_slope_bound` + `hw_ic_coupling` | 0.000984 | 0.74× | 5.04× | 91 |
+| Single no-alpha | `hw_no_alpha` | 0.001874 | 1.40× | 6.61× | 80 |
+| Core minus ratio-ab | slope + IC coupling + no-alpha | 0.000844 | 0.63× | 6.62× | 88 |
+| Core minus slope² | ratio-ab + no-alpha (IC coupling also off) | 0.000810 | 0.61× | 4.91× | 93 |
+| Core minus IC coupling | ratio-ab + slope + no-alpha | 0.002984 | 2.23× | 12.34× | 90 |
+| Core minus no-alpha | ratio-ab + slope + IC coupling | 0.000534 | 0.40× | 1.82× | 102 |
+| Core, `g_min=1/16` | all four core flags | 0.001335 | 1.00× | 5.79× | 97 |
+| Core, `g_min=1/32` | all four core flags | 0.001001 | 0.75× | 2.33× | 92 |
+| Core, `g_min=1/64` | all four core flags | 0.001973 | 1.48× | 3.78× | 92 |
+
+¹ `hw_ic_coupling` is invalid on its own: `HWConstraints` requires
+`hw_slope_bound`, so the table uses the minimal valid pair. ² Removing only
+`hw_slope_bound` while retaining IC coupling is also invalid; this row removes
+the dependent pair and is not a single-flag contrast.
+
+Within the core, removing `hw_no_alpha` cuts mean MSE by about 60%, while
+removing `hw_ratio_ab` cuts it by about 37%; these are the clearest cost signals
+in this small ablation. Removing IC coupling instead raises mean MSE to 2.23×
+the core reference, suggesting the coupling helps here. Interactions are
+substantial: the single-flag runs do not rank the constraints the same way as
+core-minus-one runs. Lowering the attenuation floor from 1/16 to 1/32 improves
+mean MSE by about 25% and reduces seed spread, but 1/64 is worse than the
+baseline. Thus a lower floor partly recovers the loss, non-monotonically; the
+three-seed results do not justify choosing 1/64 as a default.
+
+### Conclusion (pending CTLE recommendations)
 
 The fair LR sweep shows that `lr=0.1` is best tested for both unconstrained
 tasks and nearly every constrained task/preset; Friedman2 phase3b_tm selects
 0.03. Friedman2 core/full match or slightly outperform the best unconstrained
 mean in this small held-out sample, while phase3b_tm and all Toy constrained
-presets retain a sizable relative-MSE cost. The step-refinement run finds tiny
-fixed-weight output changes even when the baseline trajectory stiffness metric
-exceeds the Heun bound; finer steps do remove one full-preset rail excursion.
-Seed variability remains large. These CPU toys do not establish CTLE
-performance; a controlled CTLE retrain is still required.
+presets retain a sizable relative-MSE cost. Refinement shows tiny fixed-weight
+output changes but one rail excursion resolves at ×4; the small-signal
+`stiffness_report` does not capture the larger trajectory-Jacobian metric.
+Friedman2 ablation suggests `hw_no_alpha` and `hw_ratio_ab` are the clearest
+cost contributors within the core, while `hw_ic_coupling` is beneficial in this
+sample; `g_min=1/32` modestly helps and `1/64` does not. Seed variability
+remains large. These CPU toys do not establish CTLE performance; a controlled
+CTLE retrain is still required.
 
 ## Pruning investigation
 

@@ -32,6 +32,7 @@ import make_golden as mg  # noqa: E402
 import test_golden as tg  # noqa: E402  (the golden helpers: IGNORED_KEYS, load, spec_of)
 
 from hw import HWConfig  # noqa: E402
+from hw.timemux import TimeMuxConfig  # noqa: E402
 
 RTOL, ATOL = tg.RTOL, tg.ATOL
 TRAJ_RTOL, TRAJ_ATOL = tg.TRAJ_RTOL, tg.TRAJ_ATOL
@@ -39,10 +40,13 @@ TRAJ_RTOL, TRAJ_ATOL = tg.TRAJ_RTOL, tg.TRAJ_ATOL
 CASES = tg.CASES
 TRAJ_CASES = tg.TRAJ_CASES
 
-# the two ways of asking for "no hardware constraints"
+# the ways of asking for "no hardware constraints"
 MODES = {
     "none": None,
     "all_defaults": HWConfig(),
+    # the time-multiplexed fabric exists but is switched off: still the
+    # legacy path (the boundary is never built)
+    "timemux_disabled": HWConfig(timemux=TimeMuxConfig(enable=False)),
 }
 
 
@@ -105,19 +109,22 @@ def test_hw_off_reproduces_the_golden_trajectory(case, mode):
     assert t["losses"].numel() == mg.TRAJ_STEPS
 
 
-def test_the_two_modes_agree_with_each_other():
-    """``hw=None`` and ``hw=HWConfig()`` are the same numbers, bit for bit."""
+def test_the_modes_agree_with_each_other():
+    """Every way of asking for "no hardware constraints" is bit for bit the same."""
     case = CASES[0]
     rec = tg.load(case)
     a = mg.run_case(tg.spec_of(rec), golden_sd=rec["state_dict"],
                     ignored=tg.IGNORED_KEYS, hw=None)
-    b = mg.run_case(tg.spec_of(rec), golden_sd=rec["state_dict"],
-                    ignored=tg.IGNORED_KEYS, hw=HWConfig())
-    assert torch.equal(a["y"], b["y"])
-    assert torch.equal(a["loss"], b["loss"])
-    assert sorted(a["model"].state_dict()) == sorted(b["model"].state_dict())
-    for k in a["grads"]:
-        assert torch.equal(a["grads"][k], b["grads"][k]), k
+    for name, mode in sorted(MODES.items()):
+        if mode is None:
+            continue
+        b = mg.run_case(tg.spec_of(rec), golden_sd=rec["state_dict"],
+                        ignored=tg.IGNORED_KEYS, hw=mode)
+        assert torch.equal(a["y"], b["y"]), name
+        assert torch.equal(a["loss"], b["loss"]), name
+        assert sorted(a["model"].state_dict()) == sorted(b["model"].state_dict()), name
+        for k in a["grads"]:
+            assert torch.equal(a["grads"][k], b["grads"][k]), (name, k)
 
 
 def test_all_default_hw_config_is_off():

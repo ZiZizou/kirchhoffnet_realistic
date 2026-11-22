@@ -1051,6 +1051,7 @@ def prune_network(
         stage_times=list(net.stage_times),
         stage_steps=list(net.stage_steps),
         mismatch=getattr(net, "mismatch", None),
+        hw=getattr(net, "hw", None),
     ), stage_remaps
 
 
@@ -2094,6 +2095,7 @@ def build_net_from_config(
         stage_times=stage_times,
         stage_steps=stage_steps,
         mismatch=mismatch,
+        hw=hw,
     )
 
     grouped_cfg = cfg.get("grouped_readout")

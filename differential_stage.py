@@ -1241,6 +1241,7 @@ output_ode_src: list[int] | None = None,
         num_steps: int | None = None,
         store_trajectory: bool = True,
         u: torch.Tensor | None = None,
+        x_hold: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Integrate the stage with fixed-step Heun (2nd-order predictor-corrector).
 
@@ -1255,6 +1256,7 @@ output_ode_src: list[int] | None = None,
             x0=x0, t_span=t_span, num_steps=num_steps,
             store_trajectory=store_trajectory,
             u=u,
+            x_hold=x_hold,
         )
 
     def _forward_heun(
@@ -1264,6 +1266,7 @@ output_ode_src: list[int] | None = None,
         num_steps: int | None,
         store_trajectory: bool,
         u: torch.Tensor | None = None,
+        x_hold: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         t_span = float(t_span if t_span is not None else SOLVER["t_span"])
         num_steps = int(num_steps if num_steps is not None else SOLVER["num_steps"])
@@ -1288,7 +1291,12 @@ output_ode_src: list[int] | None = None,
         # (the resistive current is added per-step from evolving voltages).
         i_edge_const = None
         if self.freeze_read:
-            i_edge_const = self._compute_i_edge_const(x0, gate_core_cached)
+            # Time-multiplexed fabric (Phase 3b 2.3): the frozen core read
+            # may see the value the hold capacitor presents (``x_hold``).
+            # Every other current (shunt, sense, boundary, leak) still
+            # reads the live ``x``.  ``x_hold=None`` is the legacy path.
+            x_core = x0 if x_hold is None else x_hold
+            i_edge_const = self._compute_i_edge_const(x_core, gate_core_cached)
 
         # freeze_boundary: precompute the boundary tanh KCL contribution once
         # from (u, x0). Mirrors the freeze_read pattern for this edge family.

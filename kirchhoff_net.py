@@ -25,8 +25,18 @@ import torch.nn as nn
 from differential_stage import DifferentialStage
 from stage_transfer import StageTransfer
 
+try:  # the hardware layer is optional (the legacy path must still import)
+    from hw.timemux import StageBoundary
+except ImportError:  # pragma: no cover
+    StageBoundary = None
+
 
 __all__ = ["KirchhoffNet", "KirchhoffNetWithIO", "format_parameter_breakdown"]
+
+#: Seed of the per-node sign buffers of the time-multiplexed boundary.  The
+#: signs are regenerated deterministically from this seed (Phase 3b 2.1), so
+#: two builds of the same net sample the same nodes the same way.
+BOUNDARY_SEED_BASE = 12345
 
 
 def format_parameter_breakdown(breakdown: dict) -> str:
@@ -93,6 +103,7 @@ class KirchhoffNet(nn.Module):
         stage_times: list[float],
         stage_steps: list[int],
         mismatch=None,
+        hw=None,
     ) -> None:
         super().__init__()
         if len(stages) != len(stage_times) or len(stages) != len(stage_steps):
@@ -112,6 +123,32 @@ class KirchhoffNet(nn.Module):
         # 3.9 mismatch state (shared by every stage: one physical fabric).
         # Plain attribute (not a parameter/buffer), so the state_dict is unchanged.
         self.mismatch = mismatch
+        # -- Phase 3b: the time-multiplexed fabric (sample-and-hold) ------
+        # ``hw`` is a plain attribute (not a submodule), so it never appears
+        # in the state_dict.  The boundaries register their per-node sign
+        # buffers with persistent=False, so attaching them does not change
+        # the state_dict either (Phase 3b 2.4(b)).
+        self.hw = hw
+        self.timemux = getattr(hw, "timemux", None) if hw is not None else None
+        boundaries = None
+        if (self.timemux is not None and getattr(self.timemux, "enable", False)
+                and len(self.transfers) > 0 and StageBoundary is not None):
+            units = getattr(hw, "units", None)
+            noise_eval = False
+            constraints = getattr(hw, "constraints", None)
+            if constraints is not None:
+                noise_eval = bool(getattr(constraints, "hw_mismatch_eval", False))
+            boundaries = nn.ModuleList([
+                StageBoundary(
+                    self.timemux,
+                    n_nodes=int(stages[i].num_nodes),
+                    units=units,
+                    noise_eval=noise_eval,
+                    seed=BOUNDARY_SEED_BASE + i,
+                )
+                for i in range(len(self.transfers))
+            ])
+        self.boundaries = boundaries
 
         offset = 0
         self._edge_offsets = [offset]
@@ -129,6 +166,9 @@ class KirchhoffNet(nn.Module):
         x = initial_state if initial_state is not None else x0
         all_trajs = []
         stage_outputs = []
+        # the value the hold capacitor presents to the next stage (None when
+        # the time-multiplexed fabric is off)
+        x_hold = None
         if self.mismatch is not None:
             # 3.9: one fresh set of per-slot mismatch draws per batch; every
             # stage of this forward then sees the same epsilons.
@@ -140,14 +180,64 @@ class KirchhoffNet(nn.Module):
                 num_steps=self.stage_steps[i],
                 store_trajectory=store_trajectory,
                 u=u,
+                x_hold=x_hold,
             )
             stage_outputs.append(x.detach())
             if store_trajectory and traj is not None:
                 all_trajs.append(traj)
             if i < len(self.transfers):
-                x = self.transfers[i](x)
+                if self.boundaries is not None:
+                    # Phase 3b 2.3: the sample-and-hold boundary sits
+                    # between the stage call and the interstage transfer.
+                    # ``x_hold`` is what the next stage reads through its
+                    # frozen core read (the hold cap droops); ``x`` is what
+                    # the transfer reads (the node does not droop).
+                    x_hold, x = self.boundaries[i].capture(x, i)
+                    x = self._apply_transfer(i, x)
+                    # the hold cap drives the frozen core read of stage i+1
+                    x_hold = self._apply_transfer(i, x_hold)
+                else:
+                    x = self.transfers[i](x)
+                    x_hold = None
         self.last_stage_outputs = stage_outputs
         return x, all_trajs if store_trajectory else None
+
+    # -- the interstage transfer (with the time-multiplexed variants) --
+
+    @staticmethod
+    def _transfer_width(tr, x):
+        """The width adjustment of ``StageTransfer.forward`` (truncate / zero-pad)."""
+        if tr.out_nodes == tr.in_nodes:
+            return x
+        if tr.out_nodes < tr.in_nodes:
+            return x[:, : tr.out_nodes]
+        return torch.cat([x, x.new_zeros(x.size(0), tr.out_nodes - tr.in_nodes)], dim=1)
+
+    def _apply_transfer(self, i, x):
+        """Apply the interstage transfer ``i``.
+
+        With ``xfer_mode == "full"`` this is the transfer module itself (the
+        legacy path, byte for byte).  Any other mode uses the helper of
+        ``hw/timemux.py`` (``shared_vth``, ``quant``, ``kick``, ``no_tanh``,
+        ``no_relu``) on the width-adjusted state.
+        """
+        tr = self.transfers[i]
+        if self.boundaries is None or self.timemux.xfer_mode == "full":
+            return tr(x)
+        if getattr(tr, "residual_w1", None) is None:
+            warnings.warn(
+                f"KirchhoffNet: the time-multiplexed transfer mode "
+                f"{self.timemux.xfer_mode!r} needs a 'residual-relu-tanh' "
+                f"transfer, but transfer {i} has activation "
+                f"{getattr(tr, 'activation', '?')!r}: the transfer module "
+                f"is used instead.",
+                stacklevel=2,
+            )
+            return tr(x)
+        out = self._transfer_width(tr, x)
+        return self.boundaries[i].apply_transfer(
+            out, tr.residual_w1, tr.residual_w2, tr.residual_w3, tr.residual_vth
+        )
 
     def parameter_breakdown(self) -> dict:
         """Return parameter counts per component for the regularizer / loss."""

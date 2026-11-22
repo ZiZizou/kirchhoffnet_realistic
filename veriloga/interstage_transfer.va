@@ -8,11 +8,12 @@ module interstage_transfer(in,out,enable);
   real x,y,relu_x,g_on;
   analog begin
     x=(V(in)-Vcm)/Vu;
-    // Smooth ReLU and rail clamp avoid nonphysical hard discontinuities. At
-    // smooth_width -> 0 these converge to the torch full-transfer equation.
-    relu_x=0.5*((x-vth)+sqrt((x-vth)*(x-vth)+smooth_width*smooth_width));
+    // Stage transfer is a discrete rewrite, so use the exact torch ReLU and
+    // hard rail clamp. The constitutive current remains continuous in V(out);
+    // only its target has the expected piecewise-smooth stage function.
+    relu_x=max(x-vth,0.0);
     y=w1*x+w2*tanh(x)+w3*relu_x;
-    y=x_hard*tanh(y/x_hard);
+    y=min(max(y,-x_hard),x_hard);
     g_on=1.0/Roff+(1.0/Ron-1.0/Roff)/(1.0+limexp(-(V(enable)-0.5)/enable_width));
     // During the transfer phase the capacitor is rewritten toward its new
     // value; outside the phase only the tiny off conductance remains.

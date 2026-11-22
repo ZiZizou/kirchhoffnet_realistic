@@ -53,7 +53,8 @@ RTOL, ATOL = 1e-6, 1e-7           # forward / loss / grads
 TRAJ_RTOL, TRAJ_ATOL = 1e-5, 1e-7  # 30 Adam steps accumulate rounding
 
 DATA = mg.DATA_DIR
-CASES = sorted(f[:-3] for f in os.listdir(DATA) if f.endswith(".pt")) if os.path.isdir(DATA) else []
+_SEPARATE = {"paper_trial_0011"}   # real-checkpoint case, tested in tests/test_paper_checkpoint.py
+CASES = sorted(f[:-3] for f in os.listdir(DATA) if f.endswith(".pt") and f[:-3] not in _SEPARATE) if os.path.isdir(DATA) else []
 
 _cache: dict[str, dict] = {}
 

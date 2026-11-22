@@ -59,6 +59,14 @@ def cases():
         out.append({"module": "interstage_transfer", "mode": "hw_clamp", "x": x,
                     "params": {"w1": 0.8, "w2": 0.4, "w3": 0.2, "vth": 0.1,
                                "x_hard": 5.714, "smooth_width": 1e-5}})
+    # Rail-clip DC points span both soft rails and the interior.
+    for x in (-6.0, -4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 6.0):
+        out.append({"module": "rail_clip", "mode": "dc", "x": x,
+                    "params": {"x_max": 4.0, "sharp": 0.02, "Iclip": 0.05}})
+    # Transient node capacitor/leak tests: trajectories start at normalized x0.
+    for x0 in (-4.0, -1.0, 2.0, 6.0):
+        out.append({"module": "node_cap_leak", "mode": "tran", "x0": x0,
+                    "params": {"c_eff": 1.0, "g_leak": 0.0486}})
     return out
 
 
@@ -110,6 +118,15 @@ def ref_value(case, values):
         # this standalone exporter primitive is its clamped log-tail equation.
         z = case["bias"] + sum(w*u for w,u in zip(case["weights"], case["u"]))
         return math.exp(max(-case["delta_max"], min(case["delta_max"], z))), 1.0, "trim"
+    if module == "rail_clip":
+        import torch
+        from cell_library import FreeTanhLibrary
+        from differential_stage import DifferentialStage
+        p = case["params"]
+        stage = DifferentialStage(1, [], [], FreeTanhLibrary(0), x_max=p["x_max"],
+                                  clip_current=p["Iclip"], clip_softness=p["sharp"])
+        x = torch.tensor([[case["x"]]], dtype=torch.float64)
+        return float(stage.soft_clip(x)[0, 0]), 1.0, "Iu"
     # Use the repository's actual transfer module, including its hardware rail clamp.
     import torch
     from types import SimpleNamespace
@@ -127,6 +144,30 @@ def ref_value(case, values):
         transfer.residual_vth.fill_(p["vth"])
     y = float(transfer(x)[0, 0].detach())
     return VCM+VU*y, VU, "x"
+
+
+def psf_waveforms(path):
+    traces = {}
+    time_value = None
+    in_value = False
+    for line in path.read_text(errors="replace").splitlines():
+        if line.strip() == "VALUE":
+            in_value = True
+            continue
+        if line.strip() == "END":
+            in_value = False
+            continue
+        if not in_value:
+            continue
+        m = re.match(r'"([^"]+)"\s+([-+0-9.eE]+)', line.strip())
+        if not m:
+            continue
+        name, value = m.group(1), float(m.group(2))
+        if name == "time":
+            time_value = value
+        else:
+            traces.setdefault(name, []).append((time_value, value))
+    return traces
 
 
 def psf_nodes(path):
@@ -178,6 +219,16 @@ def run(args):
                 params["delta_max"] = c["delta_max"]
             lines.append(f"Xdut{i} ({' '.join(ports)}) {c['module']} " +
                          " ".join(f"{k}={v}" for k,v in params.items()))
+        elif c["module"] == "rail_clip":
+            node = f"clip{i}"
+            lines += [f"Vclip{i} ({node} 0) vsource dc={VCM+VU*c['x']:.17g}",
+                      f"Xdut{i} ({node}) rail_clip " + " ".join(
+                          f"{k}={v}" for k,v in c["params"].items())]
+        elif c["module"] == "node_cap_leak":
+            node = f"leak{i}"
+            lines += [f"Xdut{i} ({node}) node_cap_leak " + " ".join(
+                          f"{k}={v}" for k,v in c["params"].items()),
+                      f"ic {node}={VCM+VU*c['x0']:.17g}"]
         else:
             vin, en, output = f"in{i}", f"en{i}", f"out{i}"
             lines += [f"Vin{i} ({vin} 0) vsource dc={VCM+VU*c['x']:.17g}",
@@ -186,6 +237,12 @@ def run(args):
                       f"Xdut{i} ({vin} {output} {en}) interstage_transfer " +
                       " ".join(f"{k}={v}" for k,v in c["params"].items())]
     lines += ["saveOptions options save=all", "dcOp dc"]
+    if any(c["module"] == "node_cap_leak" for c in cs):
+        from hw.units import HWUnits
+        units = HWUnits()
+        tau = units.cu / (0.0486 * units.gu)
+        lines += ["simulatorOptions options reltol=1e-8 vabstol=1e-12 iabstol=1e-18",
+                  f"tran tran stop={5*tau:.17g} maxstep={tau/200:.17g} errpreset=conservative"]
     deck = run_dir / "characterize.scs"
     deck.write_text("\n".join(lines) + "\n")
     command = (f"cd {run_dir}; source {SETUP} >& /dev/null; "
@@ -205,6 +262,8 @@ def run(args):
     raw = run_dir / "characterize.raw" / "dcOp.dc"
     nodes = psf_nodes(raw)
     rows = []
+    traces = psf_waveforms(run_dir / "characterize.raw" / "tran.tran.tran")
+    hw_units = __import__("hw.units", fromlist=["HWUnits"]).HWUnits()
     for i,c in enumerate(cs):
         module = c["module"]
         if module in ("ota_edge", "shunt"):
@@ -216,6 +275,13 @@ def run(args):
         elif module in ("vca_bias", "gln_bias"):
             measured = nodes[f"out{i}"]
             values = {}
+        elif module == "rail_clip":
+            # Vsource branch current is positive into the source; convert A to Iu.
+            measured = -nodes[f"Vclip{i}:p"] / IU
+            values = {}
+        elif module == "node_cap_leak":
+            # Transient waveform is parsed from the PSFASCII tran dataset below.
+            continue
         else:
             measured = nodes[f"out{i}"]
             values = {}
@@ -226,9 +292,21 @@ def run(args):
                      "abs_error_model_units": abs_err, "rel_error": rel_err,
                      "measured_model_units": measured/scale,
                      "reference_model_units": expected/scale})
+    for i, c in enumerate(cs):
+        if c["module"] != "node_cap_leak":
+            continue
+        samples = traces[f"leak{i}"]
+        errors = []
+        for t, voltage in samples:
+            x_meas = (voltage - VCM) / VU
+            x_ref = c["x0"] * math.exp(-c["params"]["g_leak"] * (t / hw_units.tu) / c["params"]["c_eff"])
+            errors.append(abs(x_meas - x_ref))
+        max_error = max(errors)
+        rows.append({"module": "node_cap_leak", "mode": "tran", "x0": c["x0"],
+                     "samples": len(samples), "error_units": "x",
+                     "abs_error_model_units": max_error, "rel_error": max_error / max(abs(c["x0"]), 1e-12)})
     report = {"run_dir": str(run_dir), "measured_cases": len(rows), "uncharacterized": [
-        "node_cap_leak", "rail_clip", "sample_hold", "boundary_sense_ota",
-        "crossbar_accumulator", "phase_ctrl"], "results": rows}
+        "sample_hold", "boundary_sense_ota", "crossbar_accumulator", "phase_ctrl"], "results": rows}
     out = run_dir / "characterization.json"
     out.write_text(json.dumps(report, indent=2) + "\n")
     for module in sorted({r["module"] for r in rows}):

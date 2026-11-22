@@ -135,17 +135,20 @@ def stage_rhs(table, stage_idx, x_live, x_held, u_inputs):
     clip=float(settings["clip_current"])*(torch.sigmoid((x-x_max)/sharp)-torch.sigmoid((-x-x_max)/sharp))
     return (acc.to(dtype=x.dtype)-leak.unsqueeze(0)*x-clip)/float(settings["c_eff"])
 
-def _transfer(x, t):
+def _transfer(x, t, clamp_x_hard=None):
     n=int(t["in_nodes"])
     if t["out_nodes"] < n: out=x[:,:int(t["out_nodes"])]
     elif t["out_nodes"] > n: out=torch.cat((x,x.new_zeros(x.shape[0],int(t["out_nodes"])-n)),dim=1)
     else: out=x
     act=t["activation"]
     if act == "residual-relu-tanh":
-        return _t(t["residual_w1"],out)*out+_t(t["residual_w2"],out)*torch.tanh(out)+_t(t["residual_w3"],out)*torch.relu(out-_t(t["residual_vth"],out))
-    if act == "relu": return torch.relu(out)
-    if act in ("residual","residual_mixing"):
-        return _t(t["residual_w1"],out)*out+_t(t["residual_w2"],out)*torch.tanh(out)
+        out = _t(t["residual_w1"],out)*out+_t(t["residual_w2"],out)*torch.tanh(out)+_t(t["residual_w3"],out)*torch.relu(out-_t(t["residual_vth"],out))
+    elif act == "relu":
+        out = torch.relu(out)
+    elif act in ("residual","residual_mixing"):
+        out = _t(t["residual_w1"],out)*out+_t(t["residual_w2"],out)*torch.tanh(out)
+    if clamp_x_hard is not None:
+        out = torch.clamp(out.detach(), -float(clamp_x_hard), float(clamp_x_hard)) + (out - out.detach())
     return out
 
 def simulate(table, x):
@@ -164,7 +167,9 @@ def simulate(table, x):
             k2=stage_rhs(resolved,i,pred,held,u)
             state=state+0.5*dt*(k1+k2)
         finals.append(state)
-        if i<len(resolved["transfers"]): state=_transfer(state,resolved["transfers"][i])
+        if i<len(resolved["transfers"]):
+            clamp = resolved.get("units", {}).get("x_hard") if resolved.get("hw_flags", {}).get("hw_clamp_transfer") else None
+            state=_transfer(state,resolved["transfers"][i],clamp_x_hard=clamp)
     top=resolved["topology"]
     start=int(resolved["stages"][-1]["topology"]["readout_dst_start"])
     count=int(resolved["topology"]["readout_count"])

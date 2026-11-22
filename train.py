@@ -36,9 +36,6 @@ from io_mapper import OutputAffine
 
 __all__ = [
     "compute_loss",
-    "compute_solver_loss",
-    "residual_loss",
-    "solution_loss",
     "tau_for_epoch",
     "reg_schedule",
     "apply_reg_schedule",
@@ -834,107 +831,6 @@ class _NullContext:
     def __exit__(self, exc_type, exc_val, exc_tb):
         return False
 
-
-# ---------- sparse linear solver losses ----------
-
-def residual_loss(x_pred: torch.Tensor, b: torch.Tensor, A: torch.Tensor) -> torch.Tensor:
-    """Mean squared residual ||A x_pred - b||^2 over batch.
-
-    Args:
-        x_pred: [batch, n] network output (predicted solution).
-        b: [batch, n] right-hand side.
-        A: [batch, n, n] (or broadcastable) system matrix.
-
-    Returns:
-        Scalar mean squared residual.
-    """
-    if A.dim() == 2:
-        Ax = x_pred @ A.T
-    else:
-        Ax = torch.bmm(A, x_pred.unsqueeze(-1)).squeeze(-1)
-    residual = Ax - b
-    return residual.pow(2).mean()
-
-
-def solution_loss(x_pred: torch.Tensor, x_star: torch.Tensor) -> torch.Tensor:
-    """Mean squared error ||x_pred - x_star||^2."""
-    return (x_pred - x_star).pow(2).mean()
-
-
-def compute_solver_loss(
-    net: KirchhoffNetWithIO | KirchhoffNet,
-    b: torch.Tensor,
-    x_star: torch.Tensor,
-    A: torch.Tensor,
-    lambdas: dict | None = None,
-    return_parts: bool = False,
-    amp: bool = False,
-    amp_dtype: torch.dtype = torch.float16,
-    reg_scale: float = 1.0,
-):
-    """Solver loss = residual + 0.1 * solution + regularizers.
-
-    Same regularizer set as compute_loss (edge_gate, rail). Task loss is the
-    residual plus a small direct solution error to stabilize early training.
-    ``reg_scale`` applies the staged warm-up factor.
-
-    If `amp` is True, wraps forward+loss in torch.cuda.amp.autocast for
-    mixed-precision training. Caller is responsible for GradScaler.
-    """
-    if lambdas is None:
-        lambdas = LAMBDAS
-
-    autocast_ctx = (
-        torch.amp.autocast("cuda", dtype=amp_dtype) if amp else _NullContext()
-    )
-    with autocast_ctx:
-        out, trajs = net(b, store_trajectory=True)
-
-        loss_res = residual_loss(out, b, A)
-        loss_sol = solution_loss(out, x_star)
-        loss_task = loss_res + 0.1 * loss_sol
-
-        if trajs is None:
-            if return_parts:
-                return loss_task, loss_task.new_zeros(()), {
-                    "task": float(loss_task.item()),
-                    "residual": float(loss_res.item()),
-                    "solution": float(loss_sol.item()),
-                }
-            return loss_task, loss_task.new_zeros(())
-
-        loss_edge_gate, loss_rail, loss_tanh_sat, \
-            loss_sparsity, loss_entropy = _compute_regularizers(net, trajs, lambdas)
-
-        total_task = (
-            loss_task
-            + float(lambdas.get("rail", 0.0)) * loss_rail
-        )
-        structural = reg_scale * (
-            float(lambdas.get("edge_gate", 0.0)) * loss_edge_gate
-            + float(lambdas.get("tanh_sat", 0.0)) * loss_tanh_sat
-            + float(lambdas.get("sparsity", 0.0)) * loss_sparsity
-            + float(lambdas.get("entropy", 0.0)) * loss_entropy
-        )
-
-    if return_parts:
-        parts = {
-            "task": float(loss_task.item()),
-            "residual": float(loss_res.item()),
-            "solution": float(loss_sol.item()),
-            "edge_gate": float(loss_edge_gate.item()),
-            "rail": float(loss_rail.item()),
-            "tanh_sat": float(loss_tanh_sat.item()),
-            "sparsity": float(loss_sparsity.item()),
-            "entropy": float(loss_entropy.item()),
-            "reg_scale": float(reg_scale),
-            "total": float((total_task + structural).item()),
-        }
-        return total_task, structural, parts
-    return total_task, structural
-
-
-# ---------- tau annealing ----------
 
 def tau_for_epoch(
     epoch: int,

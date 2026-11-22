@@ -89,7 +89,6 @@ from topology import build_net_from_preset
 from kirchhoff_net import format_parameter_breakdown
 from train import (
     compute_loss,
-    compute_solver_loss,
     make_optimizer,
     tau_for_epoch,
     reg_schedule,

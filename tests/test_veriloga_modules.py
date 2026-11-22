@@ -84,4 +84,13 @@ def test_spectre_ota_and_shunt_match_analytic_reference():
     }]
     assert max(r["abs_error_model_units"] for r in exact) < 1e-5
     transfer = [r for r in report["results"] if r["module"] == "interstage_transfer"]
-    assert max(r["abs_error_model_units"] for r in transfer) < 2.0
+    assert max(r["abs_error_model_units"] for r in transfer) <= 1e-6
+    # Every characterization reported by this deck has an explicit tolerance.
+    tolerances = {
+        "ota_edge": 1e-5, "shunt": 1e-5, "interstage_transfer": 1e-6,
+        "vca_bias": 1e-5, "gln_bias": 1e-5,
+    }
+    for module, tolerance in tolerances.items():
+        rows = [r for r in report["results"] if r["module"] == module]
+        assert rows, f"missing Spectre cases for {module}"
+        assert max(r["abs_error_model_units"] for r in rows) <= tolerance

@@ -15,8 +15,11 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 ROOT = Path(__file__).resolve().parents[2]
 RUN_ROOT = Path("/home/annaik/Documents/kirchhoffnet_refactor/.agent_scratch/taskD2/runs")
@@ -122,7 +125,7 @@ def ref_value(case, values):
         transfer.residual_w2.fill_(p["w2"])
         transfer.residual_w3.fill_(p["w3"])
         transfer.residual_vth.fill_(p["vth"])
-    y = float(transfer(x)[0, 0])
+    y = float(transfer(x)[0, 0].detach())
     return VCM+VU*y, VU, "x"
 
 

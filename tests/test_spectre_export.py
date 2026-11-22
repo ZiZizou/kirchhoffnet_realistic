@@ -51,3 +51,27 @@ def test_stage_rhs_matches_model_call_path():
         got=stage_rhs(table,stage_idx,x_live,x_held,u)
         err=(got-want).abs().max().item()
         assert err <= 1e-9, f"stage {stage_idx} max absolute error {err:.3g}"
+
+
+def test_standalone_interp_matches_paper_forward():
+    model=load_paper_checkpoint(CKPT,dtype=torch.float64)
+    table=json.loads(json.dumps(spectre_export.build_param_table(model)))
+    # Fixed canonical physical-domain rows (positive component values).
+    x=torch.tensor([
+        [0.001,0.010,0.10,1.00], [0.002,0.020,0.20,1.20],
+        [0.004,0.030,0.30,1.50], [0.010,0.060,0.60,1.80],
+        [0.030,0.100,0.90,2.00], [0.060,0.200,1.10,2.20],
+        [0.100,0.400,1.30,2.40], [0.200,0.800,1.50,2.60],
+    ],dtype=torch.float64)
+    captured=[]
+    hooks=[]
+    for stage in model.net.core.stages:
+        hooks.append(stage.register_forward_hook(lambda _m,_i,out: captured.append(out[0].detach().clone())))
+    with torch.no_grad():
+        want=model(x)
+    for hook in hooks: hook.remove()
+    got=simulate(table,x)
+    err=(got["logits"]-want).abs().max().item()
+    assert err <= 1e-6, f"logit max absolute error {err:.3g}"
+    state_err=max((a-b).abs().max().item() for a,b in zip(got["stage_states"],captured))
+    assert state_err <= 1e-6, f"per-stage final-state max absolute error {state_err:.3g}"

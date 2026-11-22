@@ -108,7 +108,7 @@ for split in ("train", "val", "test"):
 best = run_dir / "phase_a_best.pt"
 if rungs[RUNG]:
     audit = [sys.executable, "-m", "hw.audit", "--checkpoint", str(best), "--kn-isat-max", "16", "--kn-gm-max", "4.241970", "--canonical", DATA_CANONICAL, "--json", str(run_dir / "hw_audit.json")]
-    subprocess.run(audit, cwd=repo, check=False)
+    subprocess.run(audit, cwd=repo, check=True
 try:
     import matplotlib.pyplot as plt
     h = hist["history"]

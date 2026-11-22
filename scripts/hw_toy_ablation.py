@@ -15,6 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
+sys.path.insert(0, str(ROOT / "tests" / "golden"))
 import test_hw_learning as harness  # noqa: E402
 from joblib import Parallel, delayed  # noqa: E402
 from scipy.stats import t as student_t  # noqa: E402

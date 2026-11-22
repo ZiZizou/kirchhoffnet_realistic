@@ -692,6 +692,9 @@ try:
     _bo_parser.add_argument('--common-eval-size', type=int, default=None)
     _bo_parser.add_argument('--common-eval-seed', type=int, default=None)
     _bo_parser.add_argument('--earlystop-eval-every', type=int, default=None)
+    _bo_parser.add_argument('--kn-steps-per-stage', type=int, default=None, help='Override Heun steps per stage (positive integer).')
+    _bo_parser.add_argument('--resume', type=str, default=None, help='Resume Phase-A training from phase_a_last.pt.')
+    _bo_parser.add_argument('--phase-a-sample-limit', type=int, default=None, help='Limit rows in each split for smoke tests.')
     _bo_parser.add_argument('--batch-size', type=int, default=None)
     _bo_parser.add_argument('--initial-dataset-cache-dir', type=str, default=None)
     _bo_parser.add_argument('--count-params-only', action='store_true',
@@ -839,6 +842,8 @@ try:
         os.makedirs(INITIAL_DATASET_CACHE_DIR, exist_ok=True)
     if _bo_args.kn_num_stages is not None:
         KN_NUM_STAGES = _bo_args.kn_num_stages
+    if _bo_args.kn_steps_per_stage is not None and _bo_args.kn_steps_per_stage < 1:
+        raise ValueError('--kn-steps-per-stage must be >= 1')
     if _bo_args.kn_num_hidden is not None:
         KN_NUM_HIDDEN = _bo_args.kn_num_hidden
     if _bo_args.kn_small_world_k is not None:
@@ -3118,6 +3123,7 @@ evaluator = StudentEvaluator(
 #  KN_BOUNDARY_FAN_OUT, KN_INPUT_RAIL).
 student = LocalKirchhoffStudentWrapper(
     num_stages=KN_NUM_STAGES,
+    stage_num_steps=_bo_args.kn_steps_per_stage,
     num_hidden=KN_NUM_HIDDEN,
     small_world_k=KN_SMALL_WORLD_K,
     small_world_p=KN_SMALL_WORLD_P,
@@ -3392,6 +3398,8 @@ if _bo_args.prepare_canonical_dataset is not None or _bo_args.canonical_dataset 
             "lr": float(_bo_args.lr if _bo_args.lr is not None else LR_INITIAL),
             "weight_decay": float(_bo_args.weight_decay if _bo_args.weight_decay is not None else WEIGHT_DECAY),
             "output_dir": OUTPUT_DIR,
+            "resume": _bo_args.resume,
+            "sample_limit": _bo_args.phase_a_sample_limit,
             "grad_clip": 1.0,
             "val_eval_every": int(_bo_args.earlystop_eval_every if _bo_args.earlystop_eval_every is not None
                                    else EARLYSTOP_EVAL_EVERY),

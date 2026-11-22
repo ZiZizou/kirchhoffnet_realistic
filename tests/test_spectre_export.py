@@ -20,13 +20,13 @@ def test_paper_legacy_interpreter_matches_forward(tmp_path):
     err=(got-want).abs().max().item()
     assert err < 1e-12, f"max absolute error {err:.3g}"
 
-@pytest.mark.parametrize("fabric",["timemux","copies"])
-def test_export_fabric_parameter_values_identical(tmp_path,fabric):
-    out=tmp_path/fabric
-    spectre_export.export(CKPT,out,mode="legacy",fabric=fabric,specs=1)
-    table=json.loads((out/"params.json").read_text())
-    assert table["fabric"]==fabric
-    assert table["state_dict"]
+def test_export_fabric_parameter_values_identical(tmp_path):
+    tables=[]
+    for fabric in ("timemux","copies"):
+        out=tmp_path/fabric
+        spectre_export.export(CKPT,out,mode="legacy",fabric=fabric,specs=1)
+        tables.append(json.loads((out/"params.json").read_text()))
+    assert tables[0]["state_dict"] == tables[1]["state_dict"]
 
 def test_unmapped_state_key_fails(monkeypatch,tmp_path):
     class Fake:

@@ -3046,6 +3046,12 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
                     )
                 else:
                     valid_nll = None
+                # TODO(phase3b W4, hw_power_penalty): when the student carries
+                # an HWConfig with constraints.hw_power_lambda > 0, add
+                # ``hw_power_lambda * hw_power_penalty(student.net)`` (the
+                # Phase 3a 3.9 circuit-power proxy) here and in the Huber-only
+                # branch below.  Not wired yet: hw_power_lambda is a no-op in
+                # Phase A.
                 loss = (mlp_weight * mse_mlp + fwd_weight * fwd_mse
                         + power_weight * power_term)
                 if w_eff > 0:

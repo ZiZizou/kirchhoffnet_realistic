@@ -269,6 +269,7 @@ if _LOCAL_KIRCHHOFF_DIR not in sys.path:
 from config import SOLVER, VCA
 from cell_library import make_cell_library
 from topology import build_net_from_config
+from hw import hw_or_none
 from kirchhoff_net import format_parameter_breakdown
 
 
@@ -440,6 +441,9 @@ def _log_hyperparameters():
         ("VALIDITY_THRESHOLD", VALIDITY_THRESHOLD),
         ("DEGRADE_REL_THRESHOLD", DEGRADE_REL_THRESHOLD),
         ("MIN_DEGRADED_DIMS", MIN_DEGRADED_DIMS),
+        ("HW_CONFIG_HASH", (globals()["KN_HW_CONFIG"].hash()
+                            + ("" if globals()["KN_HW"] is not None else " (off)"))
+         if "KN_HW_CONFIG" in globals() else "n/a"),
         ("LR_INITIAL", LR_INITIAL),
         ("LR_DECAY_AFTER_ITER", LR_DECAY_AFTER_ITER),
         ("LR_FLOOR", LR_FLOOR),
@@ -677,6 +681,9 @@ LOG_BOUNDS = [-15.0, 8]
 # can never leave this undefined for the checkpoint gate (~line 3059).
 # Audit fix (phase-a-fixes follow-up): previously defined only inside try.
 _phase_a_requested = False
+# Phase 3b 2.2: the hardware flags live in hw/cli.py (unit-tested there).
+# Imported OUTSIDE the try so an import error cannot silently drop them.
+from hw.cli import add_entry_hw_args, parse_known_args_hw_guarded  # noqa: E402
 try:
     import argparse as _argparse
     _bo_parser = _argparse.ArgumentParser(add_help=False)
@@ -794,7 +801,12 @@ try:
     _bo_parser.add_argument('--kn-dyn-lr-scale', type=float, default=1.0,
                             help='Multiplier on the LR for the remaining dynamic (cell library) '
                                  'parameters (Friedman recipe; default 1.0).')
-    _bo_args, _ = _bo_parser.parse_known_args()
+    # Phase 3b 2.2: --hw-config / --hw-preset / --hw-<flag> / --hw-tm* and the
+    # optional --zig-degrade-thr.  Unknown args are still ignored EXCEPT a
+    # leftover --hw-* / --zig-* flag, which raises SystemExit (a BaseException,
+    # so the ``except Exception`` below cannot demote it to a warning).
+    add_entry_hw_args(_bo_parser)
+    _bo_args, _ = parse_known_args_hw_guarded(_bo_parser)
     # Phase-A request flag (plan phase-a-fixes, bug 1): when set, the
     # checkpoint restore below MUST be skipped so a stale shared-default
     # checkpoint (e.g. /home/annaik/.../dagger_checkpoint.pt from a prior
@@ -915,6 +927,23 @@ if getattr(_bo_args, "kn_readout", None) is not None:
             f"got {_bo_args.kn_readout!r}"
         )
     KN_READOUT = str(_bo_args.kn_readout)
+
+
+# Phase 3b 2.2: hardware config + the optional failure-threshold override.
+# Resolved OUTSIDE the BO-override try/except so a missing preset or a bad
+# JSON key fails fast.  KN_HW is None for an all-default config (legacy path).
+from hw.cli import setup_hw_config as _setup_hw_config  # noqa: E402
+from hw.cli import resolve_degrade_threshold as _resolve_degrade_threshold  # noqa: E402
+KN_HW_CONFIG = _setup_hw_config(_bo_args, output_dir=OUTPUT_DIR, logger=_logger)
+KN_HW = hw_or_none(KN_HW_CONFIG)
+if getattr(_bo_args, "zig_degrade_thr", None) is not None:
+    # The failure rule is a single constant (ctle_metrics_config); this is
+    # an experiment-only override.  Set before the function definitions below
+    # so their ``threshold=ERROR_THRESHOLD`` defaults pick it up.
+    DEGRADE_REL_THRESHOLD = _resolve_degrade_threshold(_bo_args, DEGRADE_REL_THRESHOLD)
+    ERROR_THRESHOLD = DEGRADE_REL_THRESHOLD
+    _logger.info(f"[hw] --zig-degrade-thr override: DEGRADE_REL_THRESHOLD = "
+                 f"ERROR_THRESHOLD = {DEGRADE_REL_THRESHOLD}")
 
 
 # =============================================================================
@@ -1747,8 +1776,11 @@ class LocalKirchhoffStudentWrapper(nn.Module):
                  gln_B: int = 4,
                  gln_rank: int = 2,
                  gln_alpha_init: float = 1.0,
-                 gln_families: str | None = None):
+                 gln_families: str | None = None,
+                 hw=None):
         super().__init__()
+        # Phase 3b 2.2: the HWConfig (None / all-default = legacy fabric).
+        self.hw = hw_or_none(hw)
 
         if param_log_bounds is None:
             param_log_bounds = PARAM_LOG_BOUNDS
@@ -1907,6 +1939,7 @@ class LocalKirchhoffStudentWrapper(nn.Module):
             vca_gate_shunt=self.vca_gate_shunt,
             vca_separate_core_bus=self.vca_separate_core_bus,
             vca_bias=self.vca_bias,
+            hw=self.hw,
         )
         self._state_dim = num_hidden
         # local readout size is num_targets; the OutputAffine returns logits.
@@ -3119,6 +3152,7 @@ student = LocalKirchhoffStudentWrapper(
     gln_rank=KN_GLN_RANK,
     gln_alpha_init=KN_GLN_ALPHA_INIT,
     gln_families=KN_GLN_FAMILIES,
+    hw=KN_HW,
 ).to(DEVICE)
 
 _logger.info(
@@ -3363,6 +3397,8 @@ if _bo_args.prepare_canonical_dataset is not None or _bo_args.canonical_dataset 
                                    else EARLYSTOP_EVAL_EVERY),
             "earlystop_patience": int(EARLYSTOP_PATIENCE_EPOCHS),
             "error_threshold": ERROR_THRESHOLD,
+            # --zig-degrade-thr override (== the unified constant when absent)
+            "DEGRADE_REL_THRESHOLD": DEGRADE_REL_THRESHOLD,
             "validity_weight": float(_bo_args.phase_a_validity_weight),
             "validity_ramp_start": int(_bo_args.phase_a_validity_ramp_start),
             "validity_ramp_epochs": int(_bo_args.phase_a_validity_ramp_epochs),
@@ -3387,6 +3423,10 @@ if _bo_args.prepare_canonical_dataset is not None or _bo_args.canonical_dataset 
                      f"ramp=[{ctx_phase_a['validity_ramp_start']}+{ctx_phase_a['validity_ramp_epochs']}] "
                      f"mlp_w={ctx_phase_a['mlp_weight']} fwd_w={ctx_phase_a['fwd_weight']} "
                      f"power_w={ctx_phase_a['power_weight']}")
+        # TODO(phase3b W4, hw_power_penalty): the Phase-A loss does not yet add
+        # the hardware power penalty (KN_HW.constraints.hw_power_lambda *
+        # hw_power_penalty(student.net)); see the matching TODO at the loss
+        # site in ctle_dagger_common.run_phase_a_training.
         run_phase_a_training(student, ctx_phase_a, model_name="phase_a_knet")
         _logger.info("[phaseA] canonical-dataset gate: training complete; exiting before DAgger body")
         sys.exit(0)

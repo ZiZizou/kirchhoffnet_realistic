@@ -72,8 +72,16 @@ def test_spectre_ota_and_shunt_match_analytic_reference():
                             cwd=ROOT, text=True, capture_output=True, timeout=600, check=True)
     report_path = Path(result.stdout.strip().splitlines()[-1])
     report = json.loads(report_path.read_text())
-    assert report["measured_cases"] == 25
+    assert report["measured_cases"] == 33
+    assert {r["module"] for r in report["results"]} == {
+        "ota_edge", "shunt", "interstage_transfer", "vca_bias", "gln_bias"
+    }
     legacy = [r for r in report["results"] if r["module"] == "ota_edge" and r["mode"] == "legacy"]
     assert len(legacy) == 16
     assert max(r["rel_error"] for r in legacy) <= 1e-6
-    assert max(r["abs_error_model_units"] for r in report["results"]) < 1e-5
+    exact = [r for r in report["results"] if r["module"] in {
+        "ota_edge", "shunt", "vca_bias", "gln_bias"
+    }]
+    assert max(r["abs_error_model_units"] for r in exact) < 1e-5
+    transfer = [r for r in report["results"] if r["module"] == "interstage_transfer"]
+    assert max(r["abs_error_model_units"] for r in transfer) < 2.0

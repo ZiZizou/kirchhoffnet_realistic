@@ -114,16 +114,17 @@ def setup_hw_config(args, output_dir: Optional[str] = None,
     bad JSON key) propagate - they must never be demoted to a warning.
     """
     hw = hw_config_from_args(args)
-    log = logger or logging.getLogger("hw")
+    # no logger -> print (train_script.py reports through stdout)
+    emit = logger.info if logger is not None else (lambda m: print(m, flush=True))
     state = "OFF (legacy path)" if hw.is_off() else "ON"
-    log.info(f"[hw] HWConfig {state} hash={hw.hash()} "
-             f"preset={getattr(args, 'hw_preset', None)} "
-             f"config={getattr(args, 'hw_config', None)}\n{hw.to_json()}")
+    emit(f"[hw] HWConfig {state} hash={hw.hash()} "
+         f"preset={getattr(args, 'hw_preset', None)} "
+         f"config={getattr(args, 'hw_config', None)}\n{hw.to_json()}")
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
         path = os.path.join(output_dir, filename)
         hw.to_json(path)
-        log.info(f"[hw] wrote {path}")
+        emit(f"[hw] wrote {path}")
     return hw
 
 

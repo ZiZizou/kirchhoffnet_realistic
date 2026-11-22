@@ -85,6 +85,8 @@ from config import (
     make_housing_grid_preset)
 from cell_library import make_cell_library
 from topology import build_net_from_preset
+from hw import hw_or_none
+from hw.cli import add_entry_hw_args, setup_hw_config
 from kirchhoff_net import format_parameter_breakdown
 from train import (
     compute_loss,
@@ -1436,6 +1438,9 @@ def log_vca_gates(path: Path, epoch: int, net, val_loader,
 def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
     """Populate ``parser`` with the train_script CLI flags.  Split out of
     ``main()`` so smoke tests can introspect the flag surface (PP-5)."""
+    # Phase 3b 2.2: --hw-config / --hw-preset / --hw-<flag> / --hw-tm*
+    # (no --zig-degrade-thr: train_script has no ZIG failure rule).
+    add_entry_hw_args(parser, degrade_thr=False)
     parser.add_argument(
         "--problem", choices=["sinx", "housing", "smooth2d", "smooth2d_grid", "housing_grid", "friedman1", "friedman2", "friedman3"], default="sinx",
         help="Task to train (default: sinx)")
@@ -2411,6 +2416,10 @@ def main():
         else int(OPTIM["batch_size"]))
 
     out_dir = _ensure_dir(args.output.resolve())
+    # Phase 3b 2.2: resolve, print and save the hardware config (all-default
+    # -> hw=None -> the legacy fabric).
+    hw_cfg = setup_hw_config(args, output_dir=str(out_dir))
+    hw = hw_or_none(hw_cfg)
     lambdas = _resolve_lambdas(args.problem)
     if args.no_edge_gates:
         lambdas["edge_gate"] = 0.0
@@ -2704,7 +2713,8 @@ def main():
         gln_B=args.gln_B,
         gln_rank=args.gln_rank,
         gln_alpha_init=args.gln_alpha_init,
-        gln_families=args.gln_families)
+        gln_families=args.gln_families,
+        hw=hw)
     net.to(device)
 
     if args.no_edge_gates:

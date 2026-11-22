@@ -220,6 +220,7 @@ def _mismatch(v):
 _TYPES = {
     "hw_vref_bits": _opt_int, "hw_xbar_bits": _opt_int, "hw_vca_bits": _opt_int,
     "hw_alpha_bwd": float, "hw_power_lambda": float, "hw_gln_delta_max": float,
+    "hw_ab_mode": _opt_str, "hw_ab_bits": int, "hw_ab_rmax": float,
     "hw_xbar_mode": str, "hw_c_node": _opt_str, "hw_gln_mode": _opt_str,
     "hw_mismatch_sigma": _mismatch,
 }

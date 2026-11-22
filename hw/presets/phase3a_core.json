@@ -1,10 +1,12 @@
 {
   "units": {},
   "constraints": {
-    "hw_ratio_ab": true,
     "hw_slope_bound": true,
     "hw_ic_coupling": true,
-    "hw_no_alpha": true
+    "hw_no_alpha": true,
+    "hw_ab_mode": "cap_divider",
+    "hw_ab_bits": 3,
+    "hw_ab_rmax": 2.0
   },
   "timemux": {}
 }

@@ -379,7 +379,7 @@ def test_gln_tail_and_isat_clamp():
 def test_flag_names_and_defaults_are_3a_3_11():
     c = C.HWConstraints()
     want = {
-        "hw_ratio_ab": False, "hw_slope_bound": False, "hw_ic_coupling": False,
+        "hw_ratio_ab": False, "hw_ab_mode": None, "hw_ab_bits": 3, "hw_ab_rmax": 2.0, "hw_slope_bound": False, "hw_ic_coupling": False,
         "hw_compliance": False, "hw_clamp_transfer": False, "hw_no_alpha": False, "hw_alpha_bwd": 0.0,
         "hw_vref_symmetric": False, "hw_vref_bits": None, "hw_theta_bound": False,
         "hw_xbar_bound": False, "hw_xbar_bits": None, "hw_xbar_mode": "signed", "hw_c_node": None,

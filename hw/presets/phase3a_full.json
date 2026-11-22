@@ -6,6 +6,7 @@
     "hw_ic_coupling": true,
     "hw_no_alpha": true,
     "hw_compliance": true,
+    "hw_clamp_transfer": true,
     "hw_c_node": "physical",
     "hw_gln_mode": "tail",
     "hw_gln_delta_max": 1.3862943611198906,

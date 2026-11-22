@@ -182,6 +182,9 @@ class TimeMuxConfig:
         xfer_mode: one of :data:`XFER_MODES`.
         param_bits: QAT bit width for the stage parameters (Isat, g, ratio,
             theta, G, W, transfer).  ``None`` disables parameter quantisation.
+        node_quant_bits: bit width of the node-voltage quantiser at the
+            boundary (``None`` = off; the doc's optional 8-bit quantiser is
+            ``node_quant_bits=8``).
     """
 
     enable: bool = False
@@ -195,6 +198,7 @@ class TimeMuxConfig:
     isat_floor: float = 0.0
     xfer_mode: str = "full"
     param_bits: int | None = None
+    node_quant_bits: int | None = None
 
     def __post_init__(self):
         self.enable = bool(self.enable)
@@ -215,6 +219,12 @@ class TimeMuxConfig:
             self.param_bits = int(self.param_bits)
             if self.param_bits <= 0:
                 raise ValueError(f"param_bits must be >= 1, got {self.param_bits}")
+        if self.node_quant_bits is not None:
+            self.node_quant_bits = int(self.node_quant_bits)
+            if self.node_quant_bits <= 0:
+                raise ValueError(
+                    f"node_quant_bits must be >= 1, got {self.node_quant_bits}"
+                )
 
     # -- (de)serialisation --------------------------------------------------
 
@@ -415,7 +425,8 @@ class StageBoundary(nn.Module):
         x_hard: hard rail in units; overrides ``units``.
         n_slope: subthreshold slope factor n (used for tau_e).
         quant_bits: bit width of the node-voltage quantiser (``None`` = off,
-            the doc's optional 8-bit quantiser is ``quant_bits=8``).
+            the doc's optional 8-bit quantiser is ``quant_bits=8``).  When it
+            is not given, ``config.node_quant_bits`` is used.
         noise_eval: keep the stochastic noise on in eval mode.
         seed: seed of the per-node sign buffers.
     """
@@ -446,6 +457,9 @@ class StageBoundary(nn.Module):
 
         self.n_nodes = int(n_nodes)
         self.noise_eval = bool(noise_eval)
+        if quant_bits is None:
+            # the config owns the node-quantiser width (timemux.node_quant_bits)
+            quant_bits = getattr(config, "node_quant_bits", None)
         self.quant_bits = None if quant_bits is None else int(quant_bits)
         self.n_slope = float(n_slope)
         self.seed = int(seed)

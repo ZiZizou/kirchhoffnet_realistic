@@ -1,9 +1,10 @@
 """Hardware layer for HR-KNet: units, retrain constraints, and the aggregate ``HWConfig``.
 
-    HWConfig = {units: HWUnits, constraints: HWConstraints, timemux: Optional[Any]}
+    HWConfig = {units: HWUnits, constraints: HWConstraints, timemux: Optional[TimeMuxConfig]}
 
-``timemux`` is opaque here (a dict, or the ``TimeMuxConfig`` object that ``hw/timemux.py`` defines);
-this module only stores, serialises and hashes it.
+``timemux`` is the ``TimeMuxConfig`` object of ``hw/timemux.py`` (``None`` when the
+time-multiplexed fabric model is off); this module parses it from the JSON/CLI,
+serialises it and hashes it.
 
 CLI (Phase 3b 2.2): ``--hw-config PATH``, ``--hw-preset NAME`` and one ``--hw-<flag>`` per constraint
 flag.  Precedence: CLI flag > ``--hw-config`` > preset > default.
@@ -21,10 +22,11 @@ from dataclasses import dataclass, field, fields
 from typing import Any, Optional
 
 from .constraints import MISMATCH_DEFAULT, HWConstraints
+from .timemux import XFER_MODES, TimeMuxConfig
 from .units import HWUnits
 
-__all__ = ["HWConfig", "HWConstraints", "HWUnits", "parse_hw_args", "hw_config_from_args",
-           "hw_or_none", "PRESET_DIR"]
+__all__ = ["HWConfig", "HWConstraints", "HWUnits", "TimeMuxConfig", "parse_hw_args",
+           "hw_config_from_args", "hw_or_none", "PRESET_DIR"]
 
 PRESET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "presets")
 _SECTIONS = ("units", "constraints", "timemux")
@@ -42,6 +44,26 @@ def _timemux_to_plain(tm: Any):
     raise TypeError(f"cannot serialise timemux config of type {type(tm).__name__}")
 
 
+def _timemux_from_any(tm: Any) -> Optional[TimeMuxConfig]:
+    """Build a :class:`TimeMuxConfig` from whatever the JSON / the CLI gave us.
+
+    ``None`` and an empty mapping both mean "no time-multiplexing model"
+    (the section then stays ``None`` and not an empty config).
+    """
+    if tm is None:
+        return None
+    if isinstance(tm, TimeMuxConfig):
+        return TimeMuxConfig.from_dict(tm.to_dict())
+    if isinstance(tm, dict):
+        if not tm:
+            return None
+        return TimeMuxConfig.from_dict(tm)
+    raise TypeError(
+        "timemux config must be a mapping or a TimeMuxConfig, got "
+        f"{type(tm).__name__}"
+    )
+
+
 def _timemux_enabled(tm: Any) -> bool:
     """Opaque 'is the time-multiplexing model on' test: None, {} or enable=False are off."""
     if tm is None:
@@ -56,7 +78,7 @@ def _timemux_enabled(tm: Any) -> bool:
 class HWConfig:
     units: HWUnits = field(default_factory=HWUnits)
     constraints: HWConstraints = field(default_factory=HWConstraints)
-    timemux: Optional[Any] = None
+    timemux: Optional[TimeMuxConfig] = None
 
     # ------------------------------------------------------------------
     def is_off(self) -> bool:
@@ -84,7 +106,7 @@ class HWConfig:
             raise KeyError(f"HWConfig.units: unknown keys {sorted(bad)}; valid: {sorted(uf)}")
         return cls(units=HWUnits(**ud),
                    constraints=HWConstraints.from_dict(d.get("constraints") or {}),
-                   timemux=copy.deepcopy(d.get("timemux")))
+                   timemux=_timemux_from_any(d.get("timemux")))
 
     def to_json(self, path: Optional[str] = None, indent: Optional[int] = 2) -> str:
         s = json.dumps(self.to_dict(), indent=indent, sort_keys=True)
@@ -214,6 +236,22 @@ def parse_hw_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                            metavar="BOOL", help=f"HWConstraints.{f.name} (default {f.default!r})")
     g.add_argument("--hw-noise-eval", dest="hw_mismatch_eval", type=_str2bool, nargs="?", const=True,
                    default=None, metavar="BOOL", help="alias of --hw-mismatch-eval")
+    # -- the time-multiplexed fabric model (Phase 3b section 2.2) --
+    g.add_argument("--hw-tm", dest="hw_tm", type=_str2bool, nargs="?", const=True,
+                   default=None, metavar="BOOL",
+                   help="enable the time-multiplexed fabric model (S&H, injection, droop, kT/C)")
+    g.add_argument("--hw-tm-xfer-mode", dest="hw_tm_xfer_mode", default=None,
+                   metavar="MODE", choices=list(XFER_MODES),
+                   help="interstage transfer variant: " + ", ".join(XFER_MODES))
+    g.add_argument("--hw-tm-param-bits", dest="hw_tm_param_bits", type=_opt_int,
+                   default=None, metavar="N",
+                   help="QAT bit width of the stage parameters (None = off)")
+    g.add_argument("--hw-tm-c-hold-ff", dest="hw_tm_c_hold_ff", type=float,
+                   default=None, metavar="F",
+                   help="hold capacitance per sampled node [fF]")
+    g.add_argument("--hw-tm-node-quant-bits", dest="hw_tm_node_quant_bits", type=_opt_int,
+                   default=None, metavar="N",
+                   help="node-voltage quantiser width at the boundary (None = off)")
     return parser
 
 
@@ -236,4 +274,14 @@ def hw_config_from_args(args) -> HWConfig:
             cli[f.name] = v
     if cli:
         merged = _merge(merged, {"constraints": cli})
+    tm_cli = {}
+    if getattr(args, "hw_tm", None) is not None:
+        tm_cli["enable"] = bool(args.hw_tm)
+    for _name in ("hw_tm_xfer_mode", "hw_tm_param_bits", "hw_tm_c_hold_ff",
+                  "hw_tm_node_quant_bits"):
+        _v = getattr(args, _name, None)
+        if _v is not None:
+            tm_cli[_name[len("hw_tm_"):]] = _v
+    if tm_cli:
+        merged = _merge(merged, {"timemux": tm_cli})
     return HWConfig.from_dict(merged)

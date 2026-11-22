@@ -71,24 +71,44 @@ loss/gradient count; all rows also had finite held-out outputs.
 | 4d. Quantized code grid | **Pass:** every active quantization check is within 1e-6 codes (observed max ≈7e-15). | Quantization is correct to floating-point precision. |
 | 5. Seed spread ≤2× | **Pass** for Friedman2 phase3b_tm and Toy full/tm. **Fail** for Friedman2 core/full (3.90× / 2.83×) and Toy core (2.28×). | At lr=0.03 the Friedman2 spread nearly passes (2.05× / 1.53× / 2.01×); factor-2 is a very tight proposed threshold for three random initializations. No threshold changed. |
 
-The lr=0.01 runs show final/initial loss reduction on every preset, but that alone
-does not mean the optimizer reached a comparable validation solution. The
-Friedman2 MSE failures are primarily an under-trained **constrained** optimizer
-at the default learning rate, not a weak unconstrained reference. This was
-checked with a fair same-400-step, same-seed LR sweep at `lr=0.03` (all models,
-both tasks; prior run records in `/tmp/w5learn/lr3e-2`). The unconstrained
-Friedman2 R² remains ≥0.988 in that sweep, and all three Friedman2 constrained
-MSE ratios improve to within their proposed limits. The LR=0.03 records predate
-the cache-schema fix; their only stale field was `no_grad_params` listing the
-compliance-frozen clip-sharpness values. The current builder confirms those
-parameters have `requires_grad=False`; the old run had no gradients or updates
-for them, so the reported losses/metrics remain comparable. Toy phase3a_full
-and phase3b_tm still exceed their MSE caps at lr=0.03, despite small training-loss
-ratios and a good unconstrained reference: that is a remaining constrained-model
-quality cost and/or an uncalibrated proposed cap, not a reason to loosen it
-without broader data.
+## Fair learning-rate selection
 
-| Task | Preset | Mean MSE ratio at lr=0.03 | Seed spread | Additional observed outcome |
+The original results above use `lr=0.01`. To avoid judging constraints against an
+underfit unconstrained model, all 24 task/preset/seed combinations were rerun at
+`lr ∈ {0.003, 0.01, 0.03, 0.1}` with the same 400-step budget. Every selected
+record has `result_schema=2`; the grid is summarized in `/tmp/w8a/fair_lr.json`.
+For each task and preset, the selected learning rate minimizes that preset's
+three-seed mean held-out MSE. This is an explicitly held-out-data selection, so
+the resulting ratios are descriptive/model-selection results, not an untouched
+generalization estimate. Each constrained mean is divided by the unconstrained
+mean at that task's own best learning rate (0.1 for both tasks), not by the
+unconstrained MSE at the constrained preset's learning rate. Seed spread is
+max/min held-out MSE across the three selected runs.
+
+| Task | Preset | Best lr | Mean held-out MSE | Ratio vs task's unconstrained best | Seed spread |
+|---|---|---:|---:|---:|---:|
+| friedman2 | none (reference) | 0.1 | 0.001690 | 1.00× | 11.11× |
+| friedman2 | phase3a_core | 0.1 | 0.001335 | 0.79× | 5.79× |
+| friedman2 | phase3a_full | 0.1 | 0.001389 | 0.82× | 7.44× |
+| friedman2 | phase3b_tm | 0.03 | 0.006139 | 3.63× | 2.07× |
+| toy_mimo | none (reference) | 0.1 | 0.003500 | 1.00× | 3.43× |
+| toy_mimo | phase3a_core | 0.1 | 0.007207 | 2.06× | 5.94× |
+| toy_mimo | phase3a_full | 0.1 | 0.013594 | 3.88× | 3.02× |
+| toy_mimo | phase3b_tm | 0.1 | 0.015325 | 4.38× | 2.42× |
+
+The fair selection materially changes the story from the prior `lr=0.03`
+comparison: the Friedman2 core/full means are slightly below the independently
+selected unconstrained reference, while phase3b_tm remains 3.63× higher. All
+three constrained Toy means are worse than the unconstrained reference, with the
+full and time-multiplexed presets showing the largest costs. The wide seed
+spreads mean these three-seed means are not robust performance guarantees.
+
+> **Superseded note — old same-lr `lr=0.03` comparison.** The table below is kept
+> only as an audit trail. Its denominator was the unconstrained MSE at `lr=0.03`,
+> which is worse than the unconstrained model's best-lr MSE; it therefore
+> understates the constrained-model cost and must not be used as the fair result.
+
+| Task | Preset | Mean MSE ratio at lr=0.03 (old denominator) | Seed spread | Additional observed outcome |
 |---|---|---:|---:|---|
 | friedman2 | phase3a_core | 0.81× | 2.05× | MSE passes; spread narrowly fails. |
 | friedman2 | phase3a_full | 0.74× | 1.53× | MSE and spread pass. |
@@ -97,17 +117,16 @@ without broader data.
 | toy_mimo | phase3a_full | 2.25× | 1.78× | MSE misses 2×; rail passes 2/3; stiffness passes 1/3. |
 | toy_mimo | phase3b_tm | 2.72× | 1.65× | MSE misses 2.5×; rail and stiffness miss all 3 seeds. |
 
-### Conclusion
+### Conclusion (pending integration and ablation checks)
 
-All four presets can reduce training loss substantially on both small synthetic
-tasks. At the default lr, constrained Friedman2 has unacceptable relative
-validation MSE, but a fair lr retune recovers it; the proposed seed-spread cap
-still narrowly misses for two presets. On Toy, the core-only and full presets
-miss MSE at lr=0.01, while phase3b_tm passes that single MSE cap; at lr=0.03,
-core-only passes but full/tm still miss. The Toy stability/rail misses show that
-learning success does not establish physical invariants. These are small CPU
-toys only; none substitutes for the CTLE SLURM retrain required to validate the
-actual workload.
+The fair LR sweep shows that lr=0.1 is the best tested setting for both
+unconstrained tasks and for nearly every constrained task/preset; Friedman2
+phase3b_tm selects 0.03. Friedman2 core/full match or slightly outperform the
+best unconstrained mean in this small held-out sample, while phase3b_tm and all
+Toy constrained presets retain a sizable relative-MSE cost. Seed variability is
+large, particularly for Friedman2 core/full and Toy core. These results support
+an LR retune but do not establish invariant compliance or CTLE performance; the
+Toy stiffness/rail failures and the CTLE SLURM retrain remain separate checks.
 
 ## Pruning investigation
 

@@ -524,3 +524,127 @@ def test_stiffness_report_on_the_toy_net():
     assert len(rep) == len(net.core.stages)
     assert all(math.isfinite(v) and v > 0 for v in rep)
 
+
+# ---------------------------------------------------------------------------
+# every W2c flag alone on TOY_NET: finite forward + backward, and its invariant
+# ---------------------------------------------------------------------------
+def _run_toy(hw, hooks=False):
+    spec = dict(mg.TOY_NET)
+    net = build_toy(hw, spec)
+    x = mg.make_inputs(spec)
+    seen = {"transfer": [], "stage": []}
+    hs = []
+    if hooks:
+        for tr in net.core.transfers:
+            hs.append(tr.register_forward_hook(lambda m, a, o: seen["transfer"].append(o.detach())))
+        for st in net.core.stages:
+            hs.append(st.register_forward_hook(
+                lambda m, a, o: seen["stage"].append(o[1].detach() if o[1] is not None else o[0].detach())))
+    net.train()
+    net.zero_grad(set_to_none=True)
+    y = mg.model_forward(net, x)
+    loss = y.pow(2).mean()
+    if hw is not None:
+        from hw.constraints import hw_power_penalty
+        loss = loss + hw_power_penalty(net, hw, u=x)
+    loss.backward()
+    for h in hs:
+        h.remove()
+    return net, x, y, seen
+
+
+_LEGACY = {}
+
+
+def _legacy_y():
+    if "y" not in _LEGACY:
+        _LEGACY["y"] = _run_toy(None)[2].detach()
+    return _LEGACY["y"]
+
+
+def _on_grid(v, lo, hi, bits):
+    code = (v.detach() - lo) / (hi - lo) * (2 ** bits - 1)
+    return bool(((code - code.round()).abs() < 1e-6).all())
+
+
+def _inv_compliance(net, x, y, seen, hw):
+    assert max(float(t.abs().max()) for t in seen["stage"]) <= 1.05 * hw.units.x_hard
+    assert all(float(st.clip_term(torch.full((1, st.num_nodes), 9.0, dtype=D)).abs().max()) == 0.0
+               for st in net.core.stages)
+
+
+def _inv_clamp(net, x, y, seen, hw):
+    assert seen["transfer"]
+    assert max(float(t.abs().max()) for t in seen["transfer"]) <= hw.units.x_hard
+
+
+def _inv_vref_sym(net, x, y, seen, hw):
+    for st in _sense_stages(net):
+        assert abs(float(st.sense_vref())) <= st.x_max
+        assert st.raw_vref_sense.grad is not None and float(st.raw_vref_sense.grad.abs().sum()) > 0
+
+
+def _inv_vref_bits(net, x, y, seen, hw):
+    for st in _sense_stages(net):
+        assert _on_grid(st.sense_vref(), 0.0, st.x_max, hw.constraints.hw_vref_bits)
+
+
+def _inv_xbar_bound(net, x, y, seen, hw):
+    from hw.constraints import W_MAX
+    st = _xbar_stage(net)
+    with torch.no_grad():
+        st.readout_crossbar_W.mul_(50.0)
+    assert float(st.crossbar_weights().abs().max()) <= W_MAX
+
+
+def _inv_xbar_bits(net, x, y, seen, hw):
+    from hw.constraints import W_MAX
+    W = _xbar_stage(net).crossbar_weights()
+    assert _on_grid(W, -W_MAX, W_MAX, hw.constraints.hw_xbar_bits)
+    assert _xbar_stage(net).readout_crossbar_W.grad is not None
+
+
+def _inv_same_as_legacy(net, x, y, seen, hw):
+    torch.testing.assert_close(y.detach(), _legacy_y(), rtol=0, atol=0)
+
+
+def _inv_c_physical(net, x, y, seen, hw):
+    assert float((y.detach() - _legacy_y()).abs().max()) > 0.0
+    for st in net.core.stages:
+        assert bool((st.node_capacitance(y) > 0).all())
+
+
+def _inv_power(net, x, y, seen, hw):
+    _inv_same_as_legacy(net, x, y, seen, hw)          # the forward is untouched
+    g = net.core.stages[0].cell_lib.isat_raw.grad
+    assert g is not None and bool((g > 0).any())
+
+
+def _inv_stiffness(net, x, y, seen, hw):
+    _inv_same_as_legacy(net, x, y, seen, hw)
+    assert all(math.isfinite(st.last_dt_lambda) and st.last_dt_lambda > 0 for st in net.core.stages)
+
+
+FLAG_CASES = [
+    ("compliance", dict(hw_compliance=True), _inv_compliance),
+    ("clamp_transfer", dict(hw_clamp_transfer=True), _inv_clamp),
+    ("vref_symmetric", dict(hw_vref_symmetric=True), _inv_vref_sym),
+    ("vref_bits", dict(hw_vref_bits=6), _inv_vref_bits),
+    ("xbar_bound", dict(hw_xbar_bound=True), _inv_xbar_bound),
+    ("xbar_bits", dict(hw_xbar_bits=5), _inv_xbar_bits),
+    ("xbar_mode_alone", dict(hw_xbar_mode="offset_binary"), _inv_same_as_legacy),
+    ("c_node_uniform", dict(hw_c_node="uniform"), _inv_same_as_legacy),
+    ("c_node_physical", dict(hw_c_node="physical"), _inv_c_physical),
+    ("power_lambda", dict(hw_power_lambda=1.0), _inv_power),
+    ("check_stiffness", dict(hw_check_stiffness=True), _inv_stiffness),
+]
+
+
+@pytest.mark.parametrize("name,flags,invariant", FLAG_CASES, ids=[c[0] for c in FLAG_CASES])
+def test_each_w2c_flag_alone_on_toy_net(name, flags, invariant):
+    hw = hw_of(**flags)
+    net, x, y, seen = _run_toy(hw, hooks=True)
+    assert torch.isfinite(y).all()
+    grads = [p.grad for p in net.parameters() if p.grad is not None]
+    assert grads and all(torch.isfinite(g).all() for g in grads)
+    invariant(net, x, y, seen, hw)

@@ -3,18 +3,19 @@
 
 The caller must run this on ssr0 with access to the GF22FDX setup and a
 Spectre license. All generated inputs, Cadence setup drops, and results live
-under /tmp/taskD2_runs, never in the source worktree.
+under .agent_scratch/taskD2/runs, never in the source worktree.
 """
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 VA = ROOT / "veriloga"
-RUN_ROOT = Path("/tmp/taskD2_runs")
+RUN_ROOT = Path("/home/annaik/Documents/kirchhoffnet_refactor/.agent_scratch/taskD2/runs")
 SETUP = "~/workarea_GF22_FDX_EXT/kit.gf22fdx_ext.v1.0_4.1_stack19_oa.csh"
 PORTS = {
     "ota_edge": ("src", "dst"),
@@ -69,12 +70,13 @@ def main() -> int:
         deck = write_deck(module, run_dir)
         command = (
             f"source {SETUP} >& /dev/null; cd {run_dir}; "
-            f"spectre -format psfascii {deck.name}"
+            f"spectre -format psfascii {deck.name} +log {module}.log"
         )
         result = subprocess.run(["tcsh", "-c", command], cwd=run_dir, text=True,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         (run_dir / "spectre.log").write_text(result.stdout)
-        ok = result.returncode == 0 and "ERROR" not in result.stdout.upper()
+        summary = re.search(r"spectre completes with (\d+) errors, (\d+) warnings", result.stdout)
+        ok = result.returncode == 0 and summary is not None and tuple(map(int, summary.groups())) == (0, 0)
         print(f"{'PASS' if ok else 'FAIL'} {module}: {run_dir / 'spectre.log'}")
         if not ok:
             failed.append(module)

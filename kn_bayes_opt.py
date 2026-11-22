@@ -44,7 +44,6 @@ Seed trial (trial 0):
 
     Fixed flags for friedman1 / friedman2 / smooth2d (all trials on those
     datasets):
-        --solver heun
         --interstage-activation residual-relu-tanh
         --mapper-lr-scale 1.0  --struct-lr-scale 4  --dyn-lr-scale 1.0
         --grad-log --grad-log-every 10  --validate-every 10
@@ -274,7 +273,6 @@ START_POINTS: dict[str, dict[str, Any]] = {
 
 EXTRA_FLAGS_FOR_PROBLEM: dict[str, list[str]] = {
     "friedman1": [
-        "--solver", "heun",
         "--interstage-activation", "residual-relu-tanh",
         "--mapper-lr-scale", "1.0",
         "--struct-lr-scale", "4",
@@ -284,7 +282,6 @@ EXTRA_FLAGS_FOR_PROBLEM: dict[str, list[str]] = {
         "--validate-every", "10",
     ],
     "friedman2": [
-        "--solver", "heun",
         "--interstage-activation", "residual-relu-tanh",
         "--mapper-lr-scale", "1.0",
         "--struct-lr-scale", "4",
@@ -294,7 +291,6 @@ EXTRA_FLAGS_FOR_PROBLEM: dict[str, list[str]] = {
         "--validate-every", "10",
     ],
     "smooth2d": [
-        "--solver", "heun",
         "--interstage-activation", "residual-relu-tanh",
         "--mapper-lr-scale", "1.0",
         "--struct-lr-scale", "4",

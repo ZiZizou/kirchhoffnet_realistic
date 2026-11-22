@@ -38,11 +38,41 @@ def _cell_table(lib):
         "has_bias": theta is not None, "has_resistive": hasattr(lib, "resistive_current"),
     }
 
-def build_param_table(model, mode="legacy") -> dict:
-    """Return a JSON-ready, resolved behavioral description of a loaded network."""
+def _physical_cell(cell, units):
+    """Physical-unit companion; normalized cell values remain interpreter inputs."""
+    return {"A_hat": cell["A"], "B_hat": cell["B"],
+            "Isat_eff_A": (torch.as_tensor(cell["isat"]) * units.iu).tolist(),
+            "G_eff_S": (torch.as_tensor(cell["conductance"]) * units.gu).tolist(),
+            "gm_eff_S": (torch.as_tensor(cell["gm"]) * units.gu).tolist(),
+            "theta_V": (torch.as_tensor(cell["theta"]) * units.vu).tolist()}
+
+def build_param_table(model, mode="legacy", hw=None) -> dict:
+    """Return a JSON-ready, resolved behavioral description of a network.
+
+    Accepts any model exposing the repository's KirchhoffNetWithIO interface;
+    ``hw`` may be an HWConfig or a constraints-like object.  The model's own
+    resolved cell values remain authoritative because those are what forward uses.
+    """
     if mode not in {"legacy", "hw"}:
         raise ValueError("mode must be legacy|hw")
     net = model.net
+    if hw is None:
+        from hw.constraints import net_hw
+        hw = net_hw(net)
+    if mode == "hw" and hw is not None:
+        hw.validate() if hasattr(hw, "validate") else hw.constraints.validate()
+    constraints = getattr(hw, "constraints", hw)
+    hw_flags = constraints.to_dict() if constraints is not None and hasattr(constraints, "to_dict") else {}
+    units = getattr(hw, "units", HWUnits())
+    if mode == "hw" and constraints is not None:
+        # Stochastic mismatch draws and training-only objectives cannot be
+        # represented by one deterministic inference table.
+        if constraints.mismatch_active():
+            raise ValueError("export does not support hw_mismatch_sigma: stochastic mismatch draws")
+        if constraints.hw_power_lambda:
+            raise ValueError("export does not support hw_power_lambda: training-only power objective")
+        if constraints.hw_vca_bits is not None:
+            raise ValueError("export does not support hw_vca_bits: quantized VCA logits are not resolved")
     stages = []
     for i, s in enumerate(net.core.stages):
         n = int(s.num_nodes)
@@ -65,7 +95,11 @@ def build_param_table(model, mode="legacy") -> dict:
                "b_core": _tensor(s.vca_b_core) if s.vca_b_core is not None else None,
                "b_boundary": _tensor(s.vca_b_boundary) if s.vca_b_boundary is not None else None,
                "b_readout": _tensor(s.vca_b_readout) if s.vca_b_readout is not None else None}
-        stages.append({
+        core_cell = _cell_table(s.cell_lib)
+        boundary_cell = _cell_table(s.boundary_cell_lib) if s.boundary_cell_lib else None
+        readout_cell = _cell_table(s.readout_sense_cell_lib) if s.readout_sense_cell_lib else None
+        output_cell = _cell_table(s.output_ode_cell_lib) if s.output_ode_cell_lib else None
+        stage_table = {
             "index": i, "num_nodes": n,
             "topology": {"src": _tensor(s.src), "dst": _tensor(s.dst),
                 "boundary_src": _tensor(s.boundary_src), "boundary_dst": _tensor(s.boundary_dst),
@@ -78,14 +112,26 @@ def build_param_table(model, mode="legacy") -> dict:
                 "freeze_read":bool(s.freeze_read), "freeze_boundary":bool(s.freeze_boundary),
                 "freeze_temporal_read":bool(s.freeze_temporal_read), "read_only_source":bool(s.read_only_source),
                 "readout_mode":s.readout_mode, "leak_mode":s.leak_mode},
-            "cells":{"core":_cell_table(s.cell_lib), "boundary":_cell_table(s.boundary_cell_lib) if s.boundary_cell_lib else None,
-                "readout":_cell_table(s.readout_sense_cell_lib) if s.readout_sense_cell_lib else None,
-                "output_ode":_cell_table(s.output_ode_cell_lib) if s.output_ode_cell_lib else None},
+            "cells":{"core":core_cell, "boundary":boundary_cell, "readout":readout_cell,
+                "output_ode":output_cell},
             "gates":{"core":_sigmoid(s.z_logits), "boundary":_sigmoid(s.boundary_z_logits) if s.boundary_z_logits is not None else [],
                 "readout":_sigmoid(s.readout_sense_z_logits) if s.readout_sense_z_logits is not None else [],
                 "output_ode":_sigmoid(s.output_ode_z_logits) if s.output_ode_z_logits is not None else []},
             "readout":{"crossbar_W":_tensor(s.crossbar_weights()), "vref":_tensor(s.sense_vref())},
-            "vca":vca, "gln":gln_table})
+            "vca":vca, "gln":gln_table}
+        if mode == "hw":
+            stage_table["physical"] = {
+                "cells": {name: (_physical_cell(cell, units) if cell is not None else None)
+                          for name, cell in stage_table["cells"].items()},
+                "C_node_F": (torch.as_tensor(_tensor(s.node_capacitance(torch.zeros((1,n), dtype=s.z_logits.dtype, device=s.z_logits.device))).reshape(-1)) * units.cu).tolist(),
+                "leak_S": (torch.as_tensor(_tensor(s._effective_leak())).reshape(-1) * units.gu).tolist(),
+                "Vref_V": (units.vcm + torch.as_tensor(stage_table["readout"]["vref"]) * units.vu).tolist(),
+                "clip_current_A": float(s.clip_current) * units.iu,
+                "t_span_s": float(net.core.stage_times[i]) * units.tu,
+                "dt_s": float(net.core.stage_times[i]) / int(net.core.stage_steps[i]) * units.tu,
+                "A_hat": core_cell["A"], "B_hat": core_cell["B"],
+            }
+        stages.append(stage_table)
     transfers=[]
     for t in net.core.transfers:
         transfers.append({"in_nodes":t.in_nodes,"out_nodes":t.out_nodes,"activation":t.activation,
@@ -95,7 +141,7 @@ def build_param_table(model, mode="legacy") -> dict:
             "residual_vth":_tensor(t.residual_vth) if t.residual_vth is not None else None})
     post=net.post_readout_transfer
     affine=net.output_mapper
-    return {"schema":"kirchhoffnet-resolved-params-v1", "mode":mode,
+    return {"schema":"kirchhoffnet-resolved-params-v1", "mode":mode, "hw_flags":hw_flags,
         "input":{"kind":"log10_minmax", "log_min":_tensor(model.input_log_min), "log_max":_tensor(model.input_log_max),
             "input_rail":float(model.input_rail), "initial_state":"zeros", "boundary_enabled":bool(net.enable_boundary)},
         "topology":{"stages":len(stages), "hidden_nodes":int(net.hid_count), "readout_start":int(net.read_start),
@@ -107,10 +153,10 @@ def build_param_table(model, mode="legacy") -> dict:
             "post_transfer":{"activation":post.activation,"residual_w1":_tensor(post.residual_w1),"residual_w2":_tensor(post.residual_w2),
                 "residual_w3":_tensor(post.residual_w3),"residual_vth":_tensor(post.residual_vth)}}}
 
-def export(checkpoint, out, mode="legacy", fabric="timemux", specs=16, hw_config=None):
+def export_model(model, out, mode="legacy", fabric="timemux", specs=16, hw_config=None, hw=None):
+    """Export an already-built KirchhoffNetWithIO (paper or custom architecture)."""
     if mode not in {"legacy", "hw"} or fabric not in {"timemux", "copies"}:
         raise ValueError("mode must be legacy|hw and fabric timemux|copies")
-    model = load_paper_checkpoint(checkpoint, dtype=torch.float64)
     sd = model.state_dict()
     # Every key is accounted for. Topology tensors are netlist connectivity;
     # all remaining tensors are explicit behavioral parameters in the table.
@@ -129,6 +175,8 @@ def export(checkpoint, out, mode="legacy", fabric="timemux", specs=16, hw_config
             raise ValueError(f"unmapped state_dict key: {key}")
     missing = set(sd) - set(entries)
     if missing: raise ValueError(f"unmapped state_dict keys: {sorted(missing)}")
+    if not hasattr(model, "net") or not hasattr(model.net, "core"):
+        raise TypeError("model must expose the KirchhoffNetWithIO .net.core interface")
     cfg = getattr(model.net, "config", {})
     units = HWUnits()
     params = {"format":"hrknet-spectre-params-v1", "mode":mode, "fabric":fabric,
@@ -136,7 +184,7 @@ def export(checkpoint, out, mode="legacy", fabric="timemux", specs=16, hw_config
       "Iu_A":units.iu,"Gu_S":units.gu,"Vcm_V":units.vcm,"x_hard":units.x_hard},
       "solver":{"name":"heun", "t_span":float(sum(model.net.core.stage_times)), "num_steps":int(sum(model.net.core.stage_steps))},
       "interstage_transfer":"instantaneous stage-boundary rewrite", "hw_config":hw_config,
-      "resolved":build_param_table(model, mode),
+      "resolved":build_param_table(model, mode, hw=hw),
       "state_dict":entries, "mapping":{"mapped_parameter_keys":mapped,"topology_keys":topology,
       "digital_offchip_keys":[k for k,v in entries.items() if v["kind"]=="digital_offchip"]}}
     out=Path(out); out.mkdir(parents=True,exist_ok=True)
@@ -155,11 +203,24 @@ def export(checkpoint, out, mode="legacy", fabric="timemux", specs=16, hw_config
     (out/"hrknet.scs").write_text("\n".join(lines)+"\n")
     return params
 
+def export(checkpoint, out, mode="legacy", fabric="timemux", specs=16, hw_config=None):
+    """Paper-checkpoint compatibility wrapper around :func:`export_model`."""
+    model = load_paper_checkpoint(checkpoint, dtype=torch.float64)
+    hw = None
+    if hw_config:
+        from hw import HWConfig
+        hw = HWConfig.from_json(hw_config)
+    return export_model(model, out, mode, fabric, specs, hw_config, hw)
+
 def main():
     p=argparse.ArgumentParser()
-    p.add_argument("--checkpoint",required=True); p.add_argument("--hw-config")
+    p.add_argument("--checkpoint",required=True)
     p.add_argument("--mode",choices=["legacy","hw"],default="legacy")
     p.add_argument("--fabric",choices=["timemux","copies"],default="timemux")
     p.add_argument("--specs",type=int,default=16); p.add_argument("--out",required=True)
-    a=p.parse_args(); export(a.checkpoint,a.out,a.mode,a.fabric,a.specs,a.hw_config)
+    from hw import parse_hw_args, hw_config_from_args
+    parse_hw_args(p)
+    a=p.parse_args(); cfg=hw_config_from_args(a)
+    model=load_paper_checkpoint(a.checkpoint,dtype=torch.float64)
+    export_model(model,a.out,a.mode,a.fabric,a.specs,cfg.to_dict(),cfg)
 if __name__=="__main__": main()

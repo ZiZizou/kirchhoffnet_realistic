@@ -1,5 +1,6 @@
 import ast
 import json
+import tempfile
 from pathlib import Path
 import pytest
 import torch
@@ -37,13 +38,13 @@ def test_unmapped_state_key_fails(monkeypatch,tmp_path):
         spectre_export.export("ignored",tmp_path)
 
 
-def test_unconsumed_known_name_fails(monkeypatch,tmp_path):
-    class Fake:
-        net=type("Net",(),{"config":{}})()
-        def state_dict(self): return {"net.core.stages.0.unused.z_logits":torch.tensor(1.)}
-    monkeypatch.setattr(spectre_export,"load_paper_checkpoint",lambda *a,**k:Fake())
-    with pytest.raises(ValueError,match="unmapped state_dict key"):
-        spectre_export.export("ignored",tmp_path)
+def test_unconsumed_known_name_fails(tmp_path):
+    model = load_paper_checkpoint(CKPT, dtype=torch.float64)
+    unused = torch.nn.Module()
+    unused.register_parameter("a_raw", torch.nn.Parameter(torch.tensor(1., dtype=torch.float64)))
+    model.net.core.stages[0].cell_lib.add_module("unused", unused)
+    with pytest.raises(ValueError, match="unmapped state_dict key: net.core.stages.0.cell_lib.unused.a_raw"):
+        spectre_export.export_model(model, tmp_path)
 
 def test_stage_rhs_matches_model_call_path():
     model=load_paper_checkpoint(CKPT,dtype=torch.float64)
@@ -149,6 +150,7 @@ def test_toy_net_hw_interpreter_roundtrip(tmp_path, preset, overrides):
         for name, p in sorted(model.named_parameters()):
             p.add_(0.015 * torch.randn(p.shape, generator=gen, dtype=p.dtype))
     table = json.loads(json.dumps(spectre_export.build_param_table(model, mode="hw", hw=cfg)))
+    spectre_export.export_model(model, tmp_path / "export", mode="hw", hw=cfg)
     inputs = torch.tensor([[0.08, 0.2, 0.7, 1.4], [0.12, 0.4, 0.9, 1.8],
                            [0.16, 0.5, 1.1, 2.2]], dtype=torch.float64)
     captured, hooks = [], []
@@ -185,6 +187,8 @@ def _build_timemux_toy(preset, tm_overrides):
 
 def _assert_tm_matches(model, cfg, inputs, noise=None):
     table = json.loads(json.dumps(spectre_export.build_param_table(model, mode="hw", hw=cfg)))
+    with tempfile.TemporaryDirectory() as export_dir:
+        spectre_export.export_model(model, export_dir, mode="hw", hw=cfg)
     if noise is not None:
         for boundary, draw in zip(model.net.core.boundaries, noise):
             boundary.noise_eval = True

@@ -1,15 +1,27 @@
 """Strict state-dict exporter for the behavioural Spectre fabric."""
 from __future__ import annotations
 import argparse, json
+from torch.utils._python_dispatch import TorchDispatchMode
 from pathlib import Path
 import torch
 from checkpoints import load_paper_checkpoint
 from hw.units import HWUnits
 
-# These tensors intentionally remain digital/off-chip: input log scaling and
-# affine/post-readout transforms are performed by the external testbench.
+# Explicit digital/off-chip exceptions. Each reason describes work performed
+# outside the behavioral network represented by the resolved table.
 DIGITAL_OFFCHIP_KEYS = [
-    "input_log_min", "input_log_max", "log_lo", "log_hi", "net.output_mapper.*", "net.post_readout_transfer.*",
+    "input_log_min",  # Input-domain log scaling is applied by the testbench.
+    "input_log_max",  # Input-domain log scaling is applied by the testbench.
+    "log_lo",         # Legacy input log bounds are testbench preprocessing.
+    "log_hi",         # Legacy input log bounds are testbench preprocessing.
+    "net.output_mapper.*",  # Output affine/nonlinear mapping is off-chip.
+    "net.post_readout_transfer.*",  # Post-readout residual transfer is off-chip.
+    "net.core.stages.*.cell_lib.a_raw",  # Legacy A is unused when cap-divider A/B mode is active.
+    "net.core.stages.*.cell_lib.b_raw",  # Legacy B is unused when cap-divider A/B mode is active.
+    "net.core.stages.*.boundary_cell_lib.a_raw",  # Same retained legacy parameter in boundary cells.
+    "net.core.stages.*.boundary_cell_lib.b_raw",  # Same retained legacy parameter in boundary cells.
+    "net.core.stages.*.readout_sense_cell_lib.a_raw",  # Same retained legacy parameter in readout cells.
+    "net.core.stages.*.readout_sense_cell_lib.b_raw",  # Same retained legacy parameter in readout cells.
 ]
 
 def _tensor(v):
@@ -55,7 +67,7 @@ def _physical_cell(cell, units):
             "gm_eff_S": (torch.as_tensor(cell["gm"], dtype=torch.float64) * units.gu).tolist(),
             "theta_V": (torch.as_tensor(cell["theta"]) * units.vu).tolist()}
 
-def build_param_table(model, mode="legacy", hw=None) -> dict:
+def _build_param_table(model, mode="legacy", hw=None) -> dict:
     """Return a JSON-ready, resolved behavioral description of a network.
 
     Accepts any model exposing the repository's KirchhoffNetWithIO interface;
@@ -186,45 +198,72 @@ def build_param_table(model, mode="legacy", hw=None) -> dict:
             "post_transfer":{"activation":post.activation,"residual_w1":_tensor(post.residual_w1),"residual_w2":_tensor(post.residual_w2),
                 "residual_w3":_tensor(post.residual_w3),"residual_vth":_tensor(post.residual_vth)}}}
 
-def _consumed_parameter_key(key):
-    """Whitelist state-dict locations read by the resolved table builder."""
-    parts = key.split(".")
-    leaf = parts[-1]
-    if leaf in {"a_raw", "b_raw", "r_raw", "cap_a_raw", "cap_b_raw", "s_raw", "gm_raw", "isat_raw", "theta_raw", "g_resistive_raw"}:
-        return len(parts) >= 5 and parts[:3] == ["net", "core", "stages"] and parts[4] in {
-            "cell_lib", "boundary_cell_lib", "readout_sense_cell_lib", "output_ode_cell_lib"}
-    if leaf in {"z_logits", "boundary_z_logits", "readout_sense_z_logits", "output_ode_z_logits", "clip_sharpness_raw", "raw_vref_sense", "readout_crossbar_W", "vca_W", "vca_W_core", "vca_v_boundary", "vca_v_readout", "vca_v_core", "vca_b_core", "vca_b_boundary", "vca_b_readout"}:
-        return len(parts) == 5 and parts[:3] == ["net", "core", "stages"]
-    if leaf in {"residual_w1", "residual_w2", "residual_w3", "residual_vth"}:
-        return len(parts) >= 5 and (parts[:3] == ["net", "core", "transfers"] or parts[:2] == ["net", "post_readout_transfer"])
-    if leaf in {"a", "c", "alpha_raw", "P", "Q"}:
-        return parts[:2] == ["net", "gln_rails"]
-    return False
+class _StateReadTracker(TorchDispatchMode):
+    """Record state-dict tensors participating in builder tensor operations."""
+    def __init__(self, state_dict):
+        super().__init__()
+        self.keys_by_ptr = {}
+        self.consumed = set()
+        for key, value in state_dict.items():
+            if isinstance(value, torch.Tensor):
+                self.keys_by_ptr.setdefault(value.data_ptr(), set()).add(key)
+
+    def _observe(self, value):
+        if isinstance(value, torch.Tensor):
+            self.consumed.update(self.keys_by_ptr.get(value.data_ptr(), ()))
+        elif isinstance(value, (tuple, list)):
+            for item in value: self._observe(item)
+        elif isinstance(value, dict):
+            for item in value.values(): self._observe(item)
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        self._observe(args)
+        self._observe(kwargs or {})
+        return func(*args, **(kwargs or {}))
+
+
+def _build_param_table_tracked(model, mode="legacy", hw=None):
+    state = model.state_dict(keep_vars=True)
+    tracker = _StateReadTracker(state)
+    with tracker:
+        table = _build_param_table(model, mode, hw)
+    return table, tracker.consumed
+
+
+def build_param_table(model, mode="legacy", hw=None) -> dict:
+    """Build a resolved table while preserving the public table-only API."""
+    return _build_param_table_tracked(model, mode, hw)[0]
+
 
 def export_model(model, out, mode="legacy", fabric="timemux", specs=16, hw_config=None, hw=None):
     """Export an already-built KirchhoffNetWithIO (paper or custom architecture)."""
     if mode not in {"legacy", "hw"} or fabric not in {"timemux", "copies"}:
         raise ValueError("mode must be legacy|hw and fabric timemux|copies")
-    sd = model.state_dict()
-    # Every key is accounted for. Topology tensors are netlist connectivity;
-    # all remaining tensors are explicit behavioral parameters in the table.
+    from fnmatch import fnmatchcase
+    if not hasattr(model, "net") or not hasattr(model.net, "core"):
+        for key in model.state_dict():
+            if not any(fnmatchcase(key, pattern) for pattern in DIGITAL_OFFCHIP_KEYS):
+                raise ValueError(f"unmapped state_dict key: {key}")
+        raise TypeError("model must expose the KirchhoffNetWithIO .net.core interface")
+    sd = model.state_dict(keep_vars=True)
+    resolved, consumed = _build_param_table_tracked(model, mode, hw)
+    # Every serialized tensor is consumed by the builder, used as topology, or
+    # explicitly declared digital/off-chip below.
     topology_leaves = {"src", "dst", "boundary_src", "boundary_dst", "output_ode_src", "output_ode_dst", "readout_sense_src"}
-    param_leaves = {"clip_sharpness_raw","z_logits","boundary_z_logits","readout_sense_z_logits","readout_crossbar_W","raw_vref_sense","vca_W","vca_W_core","vca_v_boundary","vca_v_readout","vca_v_core","a_raw","b_raw","s_raw","gm_raw","isat_raw","theta_raw","g_resistive_raw","residual_w1","residual_w2","residual_w3","residual_vth","a","c","alpha_raw","P","Q"}
     entries, mapped, topology = {}, [], []
     for key, value in sd.items():
         leaf=key.rsplit(".",1)[-1]
-        if key in DIGITAL_OFFCHIP_KEYS or key.startswith(("net.output_mapper.","net.post_readout_transfer.")):
+        always_digital = any(fnmatchcase(key, pattern) for pattern in DIGITAL_OFFCHIP_KEYS[:6])
+        if always_digital or (key not in consumed and any(fnmatchcase(key, pattern) for pattern in DIGITAL_OFFCHIP_KEYS[6:])):
             entries[key] = {"kind":"digital_offchip", "value":_tensor(value)}
-        elif leaf in topology_leaves:
+        elif key in consumed and leaf in topology_leaves:
             topology.append(key); entries[key] = {"kind":"topology", "value":_tensor(value)}
-        elif leaf in param_leaves and _consumed_parameter_key(key):
+        elif key in consumed:
             entries[key] = {"kind":"parameter", "value":_tensor(value)}; mapped.append(key)
         else:
             raise ValueError(f"unmapped state_dict key: {key}")
     missing = set(sd) - set(entries)
     if missing: raise ValueError(f"unmapped state_dict keys: {sorted(missing)}")
-    if not hasattr(model, "net") or not hasattr(model.net, "core"):
-        raise TypeError("model must expose the KirchhoffNetWithIO .net.core interface")
     cfg = getattr(model.net, "config", {})
     units = HWUnits()
     params = {"format":"hrknet-spectre-params-v1", "mode":mode, "fabric":fabric,
@@ -232,7 +271,7 @@ def export_model(model, out, mode="legacy", fabric="timemux", specs=16, hw_confi
       "Iu_A":units.iu,"Gu_S":units.gu,"Vcm_V":units.vcm,"x_hard":units.x_hard},
       "solver":{"name":"heun", "t_span":float(sum(model.net.core.stage_times)), "num_steps":int(sum(model.net.core.stage_steps))},
       "interstage_transfer":"instantaneous stage-boundary rewrite", "hw_config":hw_config,
-      "resolved":build_param_table(model, mode, hw=hw),
+      "resolved":resolved,
       "state_dict":entries, "mapping":{"mapped_parameter_keys":mapped,"topology_keys":topology,
       "digital_offchip_keys":[k for k,v in entries.items() if v["kind"]=="digital_offchip"]}}
     out=Path(out); out.mkdir(parents=True,exist_ok=True)

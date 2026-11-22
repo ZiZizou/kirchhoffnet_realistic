@@ -134,6 +134,15 @@ class FreeTanhLibrary(nn.Module):
         sig_gm = torch.sigmoid(self.gm_raw)
         return self.gm_min + (self.gm_max - self.gm_min) * sig_gm        # [E]
 
+    def isat_values(self) -> torch.Tensor:
+        """Saturation current per edge ``[E]`` from the bounded sigmoid map.
+
+        Same expression as :meth:`_tanh_core` uses, exposed so the hardware layer
+        (``hw/constraints.py``) can read Isat without duplicating the parameterisation.
+        """
+        sig_isat = torch.sigmoid(self.isat_raw)
+        return (self.isat_min + (self.isat_max - self.isat_min) * sig_isat).clamp_min(1e-6)  # [E]
+
     def _tanh_core(
         self,
         x_src: torch.Tensor,

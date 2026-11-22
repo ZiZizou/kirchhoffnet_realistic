@@ -86,6 +86,9 @@ class HWConstraints:
             v = getattr(self, name)
             if v is not None and (int(v) != v or int(v) < 1):
                 raise ValueError(f"{name} must be None or an int >= 1, got {v!r}")
+        if self.hw_ic_coupling and not self.hw_slope_bound:
+            raise ValueError("hw_ic_coupling needs hw_slope_bound (gm_eff = s_max*f_IC*g is the 3.2 formula "
+                             "with f active)")
         if self.hw_alpha_bwd < 0 or self.hw_power_lambda < 0:
             raise ValueError("hw_alpha_bwd and hw_power_lambda must be >= 0")
         if self.hw_gln_delta_max <= 0:
@@ -507,3 +510,53 @@ def vca_quantize(logits: torch.Tensor, bits: Optional[int], zeta_max: float = ZE
 def stiffness_dt_lambda(dt: float, lam: torch.Tensor) -> torch.Tensor:
     """``dt * lambda`` per node (Heun is stable for dt*lambda <= 2)."""
     return dt * lam
+
+
+# ---------------------------------------------------------------------------
+# glue used by the model hooks
+# ---------------------------------------------------------------------------
+class IsatScale:
+    """Marker passed through the ``gm_override`` slot of the cell: a ``[B, E]`` multiplier on Isat
+    (``hw_gln_mode="tail"``).  The slope stays at the cell's static hardware value."""
+
+    __slots__ = ("m",)
+
+    def __init__(self, m: torch.Tensor) -> None:
+        self.m = m
+
+
+def acc_compliance(i: torch.Tensor, x_a: torch.Tensor, units: HWUnits, **kw) -> torch.Tensor:
+    """Compliance of a crossbar accumulator node: the net current ``i`` is delivered by one leg at a
+    time (``relu(i)`` by the P leg, ``relu(-i)`` by the N leg), each rolled off at the node voltage."""
+    f_top, f_bot = leg_factors(x_a, units, True, **kw)
+    return torch.relu(i) * f_top - torch.relu(-i) * f_bot
+
+
+def model_power_penalty(net, u, units: Optional[HWUnits] = None, kappa: float = KAPPA) -> torch.Tensor:
+    """``P_avg`` [W] of a built network from its current parameters (3a 3.9).
+
+    Per stage the slots are the core, boundary, sense and mesh OTAs; ``sigma(z)`` is the edge gate and
+    ``g_vca`` the batch-mean VCA gain (1 when VCA does not gate the family or ``u`` is None)."""
+    core = getattr(net, "core", net)
+    isat_l, z_l, g_l = [], [], []
+    for stage in core.stages:
+        iv, zv, gv = [], [], []
+
+        def _add(lib, logits, family):
+            if lib is None or logits is None:
+                return
+            isat = lib.isat_values()
+            z = torch.sigmoid(logits)
+            g = stage.edge_gain(family, u) if u is not None else None
+            g = torch.ones_like(isat) if g is None else g.mean(0)
+            iv.append(isat), zv.append(z), gv.append(g)
+
+        _add(stage.cell_lib, stage.z_logits, "core")
+        if getattr(stage, "_has_boundary", False):
+            _add(stage.boundary_cell_lib, stage.boundary_z_logits, "boundary")
+        if getattr(stage, "_has_shared_readout", False):
+            _add(stage.readout_sense_cell_lib, stage.readout_sense_z_logits, "readout")
+        if getattr(stage, "_has_output_ode", False):
+            _add(stage.output_ode_cell_lib, stage.output_ode_z_logits, "readout")
+        isat_l.append(torch.cat(iv)), z_l.append(torch.cat(zv)), g_l.append(torch.cat(gv))
+    return power_penalty(isat_l, z_l, g_l, units, kappa)

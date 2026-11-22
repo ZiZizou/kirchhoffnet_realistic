@@ -439,3 +439,78 @@ def test_cli_precedence_cli_over_config_over_preset(tmp_path, monkeypatch):
     assert c.constraints.hw_vref_bits == 7 and c.constraints.hw_slope_bound
     with pytest.raises(FileNotFoundError):
         hw_config_from_args(_parser().parse_args(["--hw-preset", "does_not_exist"]))
+
+
+# ---------------------------------------------------------------------------
+# 3.3 flag validation: the IC coupling is the 3.2 formula with f active
+# ---------------------------------------------------------------------------
+def test_ic_coupling_requires_slope_bound():
+    with pytest.raises(ValueError):
+        C.HWConstraints(hw_ic_coupling=True)
+    C.HWConstraints(hw_ic_coupling=True, hw_slope_bound=True)   # must not raise
+
+
+# ---------------------------------------------------------------------------
+# glue helpers used by the model hooks
+# ---------------------------------------------------------------------------
+def test_isat_scale_marker_carries_the_multiplier():
+    m = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=D)
+    s = C.IsatScale(m)
+    assert s.m is m
+
+
+def test_acc_compliance_delivers_the_net_current_at_vcm():
+    i = torch.tensor([-2.0, -0.5, 0.0, 0.5, 2.0], dtype=D)
+    x_a = torch.zeros(5, dtype=D)
+    torch.testing.assert_close(C.acc_compliance(i, x_a, U), i, rtol=0, atol=1e-12)
+    # at the + rail the P leg (source) is dead: nothing can be sourced any more
+    x_hi = torch.full((5,), U.x_hard + 1.0, dtype=D)
+    out_hi = C.acc_compliance(i, x_hi, U)
+    assert float(out_hi[2:].abs().max()) == 0.0        # i >= 0 -> no sourcing
+    assert bool((out_hi[:2] < 0).all())                 # i < 0  -> still sunk
+    # at the - rail the N leg (sink) is dead: nothing can be sunk any more
+    x_lo = torch.full((5,), -U.x_hard - 1.0, dtype=D)
+    out_lo = C.acc_compliance(i, x_lo, U)
+    assert float(out_lo[:3].abs().max()) == 0.0        # i <= 0 -> no sinking
+    assert bool((out_lo[3:] > 0).all())                 # i > 0  -> still sourced
+
+
+def test_model_power_penalty_of_a_built_net_is_finite_and_positive():
+    import make_golden as mg
+    spec = dict(mg.TOY_NET)
+    net = mg.make_model(spec, None)
+    u = torch.zeros(3, spec["in_dim"], dtype=D)
+    p = C.model_power_penalty(net, u)
+    assert p.ndim == 0
+    assert math.isfinite(float(p)) and float(p) > 0.0
+
+
+def test_model_power_penalty_matches_the_hand_sum():
+    import make_golden as mg
+    spec = dict(mg.TOY_NET)
+    net = mg.make_model(spec, None)
+    u = torch.zeros(3, spec["in_dim"], dtype=D)
+    p = C.model_power_penalty(net, u)
+    # hand-computed mean over stages of kappa*VDD*Iu*sum_e Isat*sigma(z)*g
+    units = U
+    kappa = C.KAPPA
+    per_stage = []
+    stages = net.core.stages
+    for st in stages:
+        fams = [(st.cell_lib, st.z_logits, "core")]
+        if getattr(st, "_has_boundary", False):
+            fams.append((st.boundary_cell_lib, st.boundary_z_logits, "boundary"))
+        if getattr(st, "_has_shared_readout", False):
+            fams.append((st.readout_sense_cell_lib, st.readout_sense_z_logits, "readout"))
+        if getattr(st, "_has_output_ode", False):
+            fams.append((st.output_ode_cell_lib, st.output_ode_z_logits, "readout"))
+        s = 0.0
+        for lib, logits, fam in fams:
+            z = torch.sigmoid(logits)
+            isat = lib.isat_values()
+            g = st.edge_gain(fam, u)
+            g = torch.ones_like(isat) if g is None else g.mean(0)
+            s += float((isat * z * g).sum())
+        per_stage.append(s)
+    expect = kappa * units.vdd * units.iu * sum(per_stage) / len(per_stage)
+    assert float(p) == pytest.approx(expect, rel=1e-9)

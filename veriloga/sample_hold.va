@@ -1,0 +1,16 @@
+`include "constants.vams"
+`include "disciplines.vams"
+module sample_hold(in,out,clk);
+  input in,clk; output out; electrical in,out,clk;
+  parameter real C_hold=100e-15, R_on=1e3, R_off=1e12;
+  parameter real inject_v=0.0, droop_tau=1e99;
+  parameter real Vlogic=0.5;
+  integer sampled;
+  analog begin
+    @(cross(V(clk)-Vlogic,+1)) sampled=1;
+    @(cross(V(clk)-Vlogic,-1)) sampled=0;
+    I(out) <+ (sampled ? (V(out)-V(in))/R_on : (V(out)-V(in))/R_off);
+    I(out) <+ C_hold*ddt(V(out));
+    I(out) <+ C_hold*V(out)/droop_tau;
+  end
+endmodule

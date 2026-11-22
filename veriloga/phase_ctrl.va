@@ -1,0 +1,15 @@
+`include "constants.vams"
+`include "disciplines.vams"
+module phase_ctrl(clk,phase,stage);
+  input clk; output phase,stage; electrical clk,phase,stage;
+  parameter integer stages=7;
+  parameter real t_hold=1e-9,t_transfer=1e-9,t_switch=1e-9,t_evolve=50e-9;
+  integer p,s; real t0;
+  analog begin
+    @(initial_step) begin p=0;s=0;t0=$abstime;end
+    @(timer(t0+t_hold+t_transfer+t_switch+t_evolve, t_hold+t_transfer+t_switch+t_evolve)) begin
+      p=(p+1)%4; if (p==0) s=(s+1)%stages;
+    end
+    V(phase) <+ p; V(stage) <+ s;
+  end
+endmodule

@@ -1,0 +1,15 @@
+`include "constants.vams"
+`include "disciplines.vams"
+`include "hrknet_constants.vams"
+// Boundary/sense OTA primitive. The exporter emits an ota_edge instance with
+// ideal source and Vref ports; this named module documents the block contract.
+module boundary_sense_ota(src,dst);
+  inout src,dst; electrical src,dst;
+  parameter real gm=1.0,Isat=1.0,A=1.0,B=1.0,theta=0.0,s=1.0,z_gate=1.0;
+  parameter real Vcm=`HRK_VCM,Vu=`HRK_VU;
+  real xs,xd;
+  analog begin
+    xs=(V(src)-Vcm)/Vu; xd=(V(dst)-Vcm)/Vu;
+    I(src,dst) <+ Isat*z_gate*tanh(gm*(s*(A*xs-B*xd)+theta))*`HRK_IU;
+  end
+endmodule

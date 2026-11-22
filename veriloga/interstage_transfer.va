@@ -1,0 +1,15 @@
+`include "constants.vams"
+`include "disciplines.vams"
+module interstage_transfer(in,out,enable);
+  input in,enable; output out; electrical in,out,enable;
+  parameter real w1=1.0,w2=0.0,w3=0.0,vth=0.0,x_hard=5.714,Vcm=0.4,Vu=0.07;
+  parameter real Ron=1e3,Roff=1e12;
+  real x,y;
+  analog begin
+    x=(V(in)-Vcm)/Vu;
+    y=w1*x+w2*tanh(x)+w3*((x>vth)?x-vth:0.0);
+    if (y>x_hard) y=x_hard;
+    if (y< -x_hard) y= -x_hard;
+    I(out) <+ (V(out)-(Vcm+Vu*y))/((V(enable)>0.5)?Ron:Roff);
+  end
+endmodule

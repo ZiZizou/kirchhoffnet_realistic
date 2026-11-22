@@ -1,0 +1,13 @@
+`include "constants.vams"
+`include "disciplines.vams"
+`include "hrknet_constants.vams"
+module crossbar_accumulator(sense,acc);
+  input sense; inout acc; electrical sense,acc;
+  parameter real weight=0.0, Vref=0.4, Gunit=1e-6, Cacc=50e-15;
+  parameter real Vcm=0.4;
+  analog begin
+    I(acc) <+ weight*Gunit*(V(sense)-Vref);
+    I(acc) <+ Cacc*ddt(V(acc));
+    I(acc) <+ 1e-12*(V(acc)-Vcm);
+  end
+endmodule

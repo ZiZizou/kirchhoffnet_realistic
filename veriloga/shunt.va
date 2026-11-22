@@ -1,0 +1,14 @@
+`include "constants.vams"
+`include "disciplines.vams"
+`include "hrknet_constants.vams"
+module shunt(src,dst);
+  inout src,dst; electrical src,dst;
+  parameter real G=0.0, z_gate=1.0, vca=1.0;
+  parameter integer vca_gate_shunt=0;
+  real mult;
+  analog begin
+    mult=z_gate;
+    if (vca_gate_shunt!=0) mult=mult*vca;
+    I(src,dst) <+ G*mult*(V(src)-V(dst))*`HRK_GU;
+  end
+endmodule

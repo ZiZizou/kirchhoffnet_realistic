@@ -1,0 +1,38 @@
+`include "constants.vams"
+`include "disciplines.vams"
+`include "hrknet_constants.vams"
+// Conservative two-terminal behavioral OTA edge. Conductance/current parameters
+// are expressed in legacy model units; physical scaling is done by the exporter.
+module ota_edge(src,dst);
+  inout src,dst; electrical src,dst;
+  parameter integer mode=0; // 0 legacy, 1 hardware
+  parameter real A=1.0, B=1.0, s=1.0, theta=0.0;
+  parameter real gm=1.0, Isat=1.0, z_gate=1.0, vca=1.0, gln=1.0;
+  parameter real ab_mode=0; // hook: 0 legacy, 1 ratio, 2 differential, 3 cap_divider
+  parameter real Ahat=1.0, Bhat=1.0, Vcm=`HRK_VCM, Vu=`HRK_VU;
+  parameter real vth=0.02585, gate_width=0.02, x_max=4.0;
+  parameter real g_hw=1.0, g_min=0.0625;
+  parameter real floor_term=0.01, sigma_z=1.0;
+  real xs,xd,u,t,aa,bb,ii,gate;
+  analog begin
+    xs=(V(src)-Vcm)/Vu; xd=(V(dst)-Vcm)/Vu;
+    aa=A; bb=B;
+    if (mode==1) begin aa=Ahat; bb=Bhat; end
+    // ab_mode is intentionally a parameter hook for Task A wiring.
+    if (mode==1 && ab_mode==2) begin aa=1.0; bb=1.0; end
+    if (mode==1 && ab_mode==3) begin aa=Ahat; bb=Bhat; end
+    if (mode==1) u=gm*(g_min+(1.0-g_min)*g_hw)*gln*(s*(aa*xs-bb*xd)+theta);
+    else u=gm*(s*(aa*xs-bb*xd)+theta);
+    // Legacy 0.01*u gradient-floor term is part of forward, not derivative;
+    // preserve it as the specified additive tanh argument term.
+    if (mode==0) u=u+floor_term*u;
+    t=tanh(u);
+    gate=z_gate*sigma_z*vca;
+    if (mode==0) begin
+      gate=gate*limexp((x_max-abs(V(src)))/gate_width)/(1.0+limexp((x_max-abs(V(src)))/gate_width));
+      gate=gate*limexp((x_max-abs(V(dst)))/gate_width)/(1.0+limexp((x_max-abs(V(dst)))/gate_width));
+    end
+    ii=Isat*gate*t;
+    I(src,dst) <+ ii*`HRK_IU;
+  end
+endmodule

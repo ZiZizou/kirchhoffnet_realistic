@@ -25,12 +25,12 @@ module ota_edge(src,dst);
     else u=gm*(s*(aa*xs-bb*xd)+theta);
     // Legacy 0.01*u gradient-floor term is part of forward, not derivative;
     // preserve it as the specified additive tanh argument term.
-    if (mode==0) u=u+floor_term*u;
     t=tanh(u);
+    if (mode==0) t=t+floor_term*u;
     gate=z_gate*sigma_z*vca;
     if (mode==0) begin
-      gate=gate*limexp((x_max-abs(V(src)))/gate_width)/(1.0+limexp((x_max-abs(V(src)))/gate_width));
-      gate=gate*limexp((x_max-abs(V(dst)))/gate_width)/(1.0+limexp((x_max-abs(V(dst)))/gate_width));
+      gate=gate/(1.0+limexp(-(x_max-abs(xs))/gate_width));
+      gate=gate/(1.0+limexp(-(x_max-abs(xd))/gate_width));
     end
     ii=Isat*gate*t;
     I(src,dst) <+ ii*`HRK_IU;

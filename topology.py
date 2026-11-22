@@ -1251,8 +1251,6 @@ def topology_to_stage(
     write_idx: list[int] | None = None,
     leak_mode: str = "programmable",
     leak_constant: float | None = None,
-    dynamic_leak: bool = False,
-    dynamic_leak_input_proj: bool = False,
     read_only_source: bool = False,
     freeze_read: bool = False,
     freeze_boundary: bool = False,
@@ -1458,8 +1456,6 @@ def topology_to_stage(
         write_idx=write_idx,
         leak_mode=leak_mode,
         leak_constant=leak_constant,
-        dynamic_leak=dynamic_leak,
-        dynamic_leak_input_proj=dynamic_leak_input_proj,
         read_only_source=read_only_source,
         freeze_read=freeze_read,
         freeze_boundary=freeze_boundary,
@@ -1720,8 +1716,6 @@ def build_net_from_config(
     gln_rank: int = 2,
     gln_alpha_init: float = 1.0,
     gln_families: str | None = None,
-    dynamic_leak: bool = False,
-    dynamic_leak_input_proj: bool = False,
     boundary_first_stage_only: bool = False,
 ):
     """Build a KirchhoffNetWithIO from a full config dict.
@@ -1822,8 +1816,6 @@ def build_net_from_config(
             f"drive_mode must be 'fan_out' or 'projection', got {drive_mode!r}"
         )
     # knet-gated-memory (plan): cfg dict > explicit kwarg.
-    dynamic_leak_effective = bool(cfg.get("dynamic_leak", dynamic_leak))
-    dynamic_leak_input_proj_effective = bool(cfg.get("dynamic_leak_input_proj", dynamic_leak_input_proj))
     encoder_type = cfg.get("encoder_type", "linear")
     decoder_type = cfg.get("decoder_type", "linear")
     encoder_hidden_dim = int(cfg.get("encoder_hidden_dim", 64))
@@ -2241,8 +2233,6 @@ def build_net_from_config(
             vca_gate_shunt=vca_gate_shunt,
             vca_separate_core_bus=vca_separate_core_bus,
             vca_bias=vca_bias_effective,
-            dynamic_leak=dynamic_leak_effective,
-            dynamic_leak_input_proj=dynamic_leak_input_proj_effective,
             x_max=x_max,
             c_eff=c_eff,
             learnable_clip_sharpness=learnable_clip_sharpness,

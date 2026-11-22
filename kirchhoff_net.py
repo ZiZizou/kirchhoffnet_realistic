@@ -589,7 +589,6 @@ class KirchhoffNetWithIO(nn.Module):
                     "raw_vref_sense": 0,
                     "vca_W": 0,
                     "vca_v": 0,
-                    "dyn_leak": 0,
                     "other": 0,
                 })
                 matched = False
@@ -629,8 +628,6 @@ class KirchhoffNetWithIO(nn.Module):
                     stage_bucket["vca_W"] += n; matched = True
                 elif tail.startswith("vca_v_"):
                     stage_bucket["vca_v"] += n; matched = True
-                elif tail in ("dyn_leak_a", "dyn_leak_b", "dyn_leak_c", "dyn_leak_W_u"):
-                    stage_bucket["dyn_leak"] += n; matched = True
                 if not matched:
                     stage_bucket["other"] += n
         return {

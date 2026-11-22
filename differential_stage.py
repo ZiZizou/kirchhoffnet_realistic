@@ -192,8 +192,6 @@ class DifferentialStage(nn.Module):
         drive_isat: float | None = None,
         leak_mode: str = "programmable",
         leak_constant: float | None = None,
-        dynamic_leak: bool = False,
-        dynamic_leak_input_proj: bool = False,
         read_only_source: bool = False,
         freeze_read: bool = False,
         freeze_boundary: bool = False,
@@ -229,14 +227,6 @@ output_ode_src: list[int] | None = None,
         if leak_mode not in ("programmable", "non-programmable"):
             raise ValueError(f"leak_mode must be 'programmable' or 'non-programmable', got {leak_mode!r}")
         self.leak_mode = leak_mode
-        # Dynamic leak (knet-gated-memory plan): per-node
-        # leak_eff_j = softplus(a_j * x_j + b_j * u_proj + c_j), where
-        # ``u_proj`` is either ``sum(u)`` (default) or ``(W_u @ u)[0]``
-        # (scalar projection when ``dynamic_leak_input_proj=True``). Off by
-        # default; init a=0, b=0, c=raw_leak_init so the epoch-0 effective
-        # leak matches ``softplus(raw_leak)`` exactly.
-        self.dynamic_leak_enabled = bool(dynamic_leak)
-        self.dynamic_leak_input_proj = bool(dynamic_leak_input_proj)
         self.vca_enabled = bool(vca_enabled)
         self.vca_rank = int(vca_rank) if vca_enabled else int(vca_rank)
         self._vca_in_dim = int(vca_in_dim)
@@ -326,31 +316,6 @@ output_ode_src: list[int] | None = None,
             self.raw_leak = nn.Parameter(torch.full((num_nodes,), float(INIT["raw_leak_init"])))
         else:
             self.leak_constant = float(leak_constant if leak_constant is not None else INIT["leak_constant"])
-
-        # Dynamic leak parameters (knet-gated-memory). ``dyn_leak_a`` is the
-        # per-node self-coupling on ``x_j``, ``dyn_leak_b`` is the per-node
-        # input coupling on ``u_proj`` (scalar), and ``dyn_leak_c`` is the
-        # per-node bias initialized to ``raw_leak_init`` so
-        # ``softplus(c) == softplus(raw_leak)`` at init. With ``a=b=0`` the
-        # logit into softplus is exactly ``c`` regardless of ``x`` and ``u``,
-        # so the legacy ``softplus(raw_leak)`` path is reproduced exactly.
-        # The optional ``dyn_leak_W_u`` is a single-scalar projection
-        # ``(1, in_dim)`` used when ``dynamic_leak_input_proj=True``.
-        if self.dynamic_leak_enabled:
-            self.dyn_leak_a = nn.Parameter(torch.zeros(num_nodes))
-            self.dyn_leak_b = nn.Parameter(torch.zeros(num_nodes))
-            c_init = float(self.raw_leak.detach().mean().item()) if self.leak_mode == "programmable" else math.log(math.expm1(float(INIT["leak_constant"])))
-            self.dyn_leak_c = nn.Parameter(torch.full((num_nodes,), c_init))
-            if self.dynamic_leak_input_proj:
-                in_dim_hint = int(self._vca_in_dim) if int(self._vca_in_dim) > 0 else 1
-                self.dyn_leak_W_u = nn.Parameter(torch.zeros(1, in_dim_hint))
-            else:
-                self.dyn_leak_W_u = None
-        else:
-            self.dyn_leak_a = None
-            self.dyn_leak_b = None
-            self.dyn_leak_c = None
-            self.dyn_leak_W_u = None
 
         # Gate parameters for complexity-regularized pruning (CP-1, CP-2).
         # z_e = sigmoid(z_logits) is the edge gate: multiplies the edge current.
@@ -774,54 +739,17 @@ output_ode_src: list[int] | None = None,
                 f"frac<0 disables budget; frac>1 is a no-op (all ones).",
             )
 
-    def _effective_leak(self, num_nodes: int | None = None,
-                        x: torch.Tensor | None = None,
-                        u: torch.Tensor | None = None) -> torch.Tensor:
+    def _effective_leak(self, num_nodes: int | None = None) -> torch.Tensor:
         """Return the per-node effective leak.
 
         Programmable: ``softplus(raw_leak)`` (per-node).
         Non-programmable: ``leak_constant`` (scalar, same for all nodes).
-        Dynamic (knet-gated-memory): when ``dynamic_leak_enabled=True`` and a
-        callable regime is requested, returns
-        ``softplus(a*x + b*u_proj + c)`` where ``a, b, c`` are
-        per-node parameters and ``u_proj`` is a scalar per call. ``x`` must
-        be ``[N]`` (per-node) and ``u`` must be ``[in_dim]`` or ``[B, in_dim]``.
-        Init is ``a=0, b=0, c=raw_leak_init`` so the dynamic path matches the
-        static path at epoch 0 (bit-identical forward).
         """
         if num_nodes is None:
             num_nodes = self.num_nodes
-        if self.dynamic_leak_enabled and x is not None:
-            x_n = x if x.dim() == 1 else x.reshape(-1)
-            if x_n.shape[0] != num_nodes:
-                raise ValueError(
-                    f"_effective_leak(x): expected {num_nodes} per-node values, "
-                    f"got {tuple(x_n.shape)}"
-                )
-            if u is not None:
-                if u.dim() == 2:
-                    u_s = u[0] if u.shape[0] >= 1 else u.reshape(-1)
-                else:
-                    u_s = u
-                if self.dyn_leak_W_u is not None:
-                    w = self.dyn_leak_W_u
-                    if u_s.shape[-1] != w.shape[-1]:
-                        raise ValueError(
-                            f"_effective_leak(u): dyn_leak_W_u expects last dim {w.shape[-1]}, "
-                            f"got {tuple(u_s.shape)}"
-                        )
-                    u_proj = (w @ u_s.unsqueeze(-1)).squeeze(-1).squeeze()
-                else:
-                    u_proj = u_s.sum()
-                u_term = self.dyn_leak_b * u_proj
-            else:
-                u_term = torch.zeros((), dtype=x_n.dtype, device=x_n.device)
-            logits = self.dyn_leak_a * x_n + u_term + self.dyn_leak_c
-            return F.softplus(logits)
         if self.leak_mode == "programmable":
             return F.softplus(self.raw_leak)
-        else:
-            return torch.full((num_nodes,), self.leak_constant, dtype=torch.float32)
+        return torch.full((num_nodes,), self.leak_constant, dtype=torch.float32)
 
     def _compute_budget_gate(self) -> torch.Tensor:
         """Compute the per-destination (or per-source) competitive budget gate.
@@ -1567,10 +1495,7 @@ output_ode_src: list[int] | None = None,
                 )
                 acc = acc_f32.to(dtype=x.dtype)
 
-        leak = self._effective_leak(
-            x=(x[0] if x.dim() >= 2 else x) if self.dynamic_leak_enabled else None,
-            u=u,
-        ).unsqueeze(0).to(x.device)  # [1, N]
+        leak = self._effective_leak().unsqueeze(0).to(x.device)  # [1, N]
         leak_term = leak * x
 
         clip_term = self.soft_clip(x)
@@ -1750,13 +1675,6 @@ output_ode_src: list[int] | None = None,
         else:
             device_n = 0
         raw_leak_n = int(self.raw_leak.numel()) if hasattr(self, "raw_leak") else 0
-        dyn_leak_n = (
-            int(self.dyn_leak_a.numel())
-            + int(self.dyn_leak_b.numel())
-            + int(self.dyn_leak_c.numel())
-            + (int(self.dyn_leak_W_u.numel()) if self.dyn_leak_W_u is not None else 0)
-            if getattr(self, "dyn_leak_a", None) is not None else 0
-        )
         bz = int(self.boundary_z_logits.numel()) if self.boundary_z_logits is not None else 0
         bdev = 0
         if self.boundary_cell_lib is not None:
@@ -1890,7 +1808,6 @@ output_ode_src: list[int] | None = None,
         )
         return {
             "raw_leak": raw_leak_n,
-            "dyn_leak": dyn_leak_n,
             "z_logits": int(self.z_logits.numel()),
             "u_logits": int(self.u_logits.numel()),
             "device_param": device_n,

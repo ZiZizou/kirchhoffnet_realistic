@@ -21,12 +21,15 @@ import os
 from dataclasses import dataclass, field, fields
 from typing import Any, Optional
 
-from .constraints import MISMATCH_DEFAULT, HWConstraints
+from .constraints import (MISMATCH_DEFAULT, HWConstraints, hw_power_penalty, net_hw,
+                          stage_small_signal_lambda, stiffness_report)
 from .timemux import XFER_MODES, TimeMuxConfig
 from .units import HWUnits
 
 __all__ = ["HWConfig", "HWConstraints", "HWUnits", "TimeMuxConfig", "parse_hw_args",
-           "hw_config_from_args", "hw_or_none", "PRESET_DIR"]
+           "hw_config_from_args", "hw_or_none", "PRESET_DIR",
+           # Phase 3b W5: the loss / diagnostic entry points of hw.constraints
+           "hw_power_penalty", "net_hw", "stiffness_report", "stage_small_signal_lambda"]
 
 PRESET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "presets")
 _SECTIONS = ("units", "constraints", "timemux")

@@ -2990,6 +2990,35 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
         eye_scale_j=eye_scale_j, scaler_y_p=scaler_y_p, device=DEVICE,
     )
 
+    # Phase 3b W5: the 3.9 circuit-power penalty (hw_power_lambda * P_avg /
+    # P_ref).  Active only when the student's KNet carries an HWConfig with
+    # hw_power_lambda > 0; otherwise nothing below touches the loss, so the
+    # off path is bit-identical to the pre-hw one.
+    _hw_student = getattr(student, "module", student)
+    _hw_net = getattr(_hw_student, "net", None)
+    _hw_cfg = None
+    if _hw_net is not None:
+        from hw.constraints import net_hw
+        _hw_cfg = getattr(_hw_student, "hw", None) or net_hw(_hw_net)
+    _hw_pow_on = (_hw_cfg is not None
+                  and float(_hw_cfg.constraints.hw_power_lambda) > 0.0
+                  and hasattr(_hw_student, "scale_input"))
+    if _hw_pow_on:
+        from hw.constraints import hw_power_penalty
+        _logger.info(f"[phaseA] hw_power_penalty ON: hw_power_lambda="
+                     f"{float(_hw_cfg.constraints.hw_power_lambda):g}")
+
+    def _hw_u_batch(specs):
+        # the network input u of the batch, without bumping the student's
+        # input-rail clipping counters (scale_input is also called by forward)
+        c0 = getattr(_hw_student, "_clip_elements", None)
+        i0 = getattr(_hw_student, "_input_elements", None)
+        with torch.no_grad():
+            u = _hw_student.scale_input(specs)
+        if c0 is not None:
+            _hw_student._clip_elements, _hw_student._input_elements = c0, i0
+        return u
+
     for epoch in range(epochs):
         student.train()
         # Ramped validity weight (1-based epochs): 0 up to ramp start, linear
@@ -3006,6 +3035,7 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
         total_mlp_mse = 0.0
         total_fwd_mse = 0.0
         total_power = 0.0
+        total_hw_power = 0.0
         n_batches = 0
         first_batch_ratios = None
         for specs_batch, params_target, mlp_logits_target in train_loader:
@@ -3046,12 +3076,7 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
                     )
                 else:
                     valid_nll = None
-                # TODO(phase3b W4, hw_power_penalty): when the student carries
-                # an HWConfig with constraints.hw_power_lambda > 0, add
-                # ``hw_power_lambda * hw_power_penalty(student.net)`` (the
-                # Phase 3a 3.9 circuit-power proxy) here and in the Huber-only
-                # branch below.  Not wired yet: hw_power_lambda is a no-op in
-                # Phase A.
+                # (the hw power penalty is added after both loss branches)
                 loss = (mlp_weight * mse_mlp + fwd_weight * fwd_mse
                         + power_weight * power_term)
                 if w_eff > 0:
@@ -3092,6 +3117,14 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
                 else:
                     valid_nll = None
                     loss = huber_term
+            if _hw_pow_on:
+                # Phase 3a 3.9 / 3b W5: hw_power_lambda * P_avg / P_ref (the
+                # lambda is applied inside hw_power_penalty)
+                hw_pow = hw_power_penalty(_hw_net, _hw_cfg, u=_hw_u_batch(specs_batch))
+                loss = loss + hw_pow
+                total_hw_power += float(hw_pow.detach().item())
+                if epoch == 0 and n_batches == 0:
+                    _logger.info(f"[phaseA] epoch-1 hw_power_penalty={float(hw_pow.detach()):.4g}")
             if not torch.isfinite(loss):
                 _logger.warning(
                     f"[phaseA] non-finite loss at epoch {epoch+1}, batch {n_batches}; skipping"
@@ -3118,6 +3151,9 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
         avg_mlp_mse = total_mlp_mse / max(1, n_batches) if mlp_guided else float("nan")
         avg_fwd_mse = total_fwd_mse / max(1, n_batches) if mlp_guided else float("nan")
         avg_power = total_power / max(1, n_batches) if mlp_guided else float("nan")
+        if _hw_pow_on:
+            _logger.info(f"[phaseA] epoch {epoch+1} mean hw_power_penalty="
+                         f"{total_hw_power / max(1, n_batches):.4g}")
         avg_val = _phase_a_huber_eval(student, val_loader, DEVICE)
         # ZIG failure eval runs only on eval epochs (or the final epoch).
         # Patience is counted in *eval cycles*: non-eval epochs must not

@@ -3423,10 +3423,9 @@ if _bo_args.prepare_canonical_dataset is not None or _bo_args.canonical_dataset 
                      f"ramp=[{ctx_phase_a['validity_ramp_start']}+{ctx_phase_a['validity_ramp_epochs']}] "
                      f"mlp_w={ctx_phase_a['mlp_weight']} fwd_w={ctx_phase_a['fwd_weight']} "
                      f"power_w={ctx_phase_a['power_weight']}")
-        # TODO(phase3b W4, hw_power_penalty): the Phase-A loss does not yet add
-        # the hardware power penalty (KN_HW.constraints.hw_power_lambda *
-        # hw_power_penalty(student.net)); see the matching TODO at the loss
-        # site in ctle_dagger_common.run_phase_a_training.
+        # Phase 3b W5: run_phase_a_training adds the hardware power penalty
+        # (KN_HW.constraints.hw_power_lambda * P_avg / P_ref via
+        # hw.constraints.hw_power_penalty(student.net)) when hw_power_lambda > 0.
         run_phase_a_training(student, ctx_phase_a, model_name="phase_a_knet")
         _logger.info("[phaseA] canonical-dataset gate: training complete; exiting before DAgger body")
         sys.exit(0)

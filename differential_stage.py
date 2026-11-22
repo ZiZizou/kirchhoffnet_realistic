@@ -331,6 +331,9 @@ output_ode_src: list[int] | None = None,
         # additional current ``G * (Vsrc - Vdest)`` per edge from evolving
         # voltages, bypassing ``freeze_read``. Cached here so the dispatch
         # in ``rhs`` is a fast attribute check instead of a hasattr scan.
+        # The shunt is added EXACTLY ONCE in ``rhs`` (the ``_has_resistive``
+        # block), so the core cell current there must be the tanh-only
+        # ``forward_tanh`` -- see the dynamic core path of ``rhs``.
         self._has_resistive = hasattr(cell_lib, "resistive_current")
 
         # Boundary-terminal OTA edges (boundary-fan-out plan).
@@ -1272,16 +1275,33 @@ output_ode_src: list[int] | None = None,
                 acc.index_add_(1, self.src, into_src.float())
             acc = acc.to(dtype=x.dtype)
         elif i_edge_const is None:
-            i_edge = self.cell_lib(
-                x_src=x_src,
-                x_dst=x_dst,
-                x_max=self.x_max,
-            )
+            if self._has_resistive and hasattr(self.cell_lib, "forward_tanh"):
+                # Tanh-only current.  ``cell_lib(...)`` is the FULL cell forward
+                # (``i_tanh + i_res``), so using it here would count the
+                # parallel resistive shunt TWICE: once inside the cell and
+                # once in the ``_has_resistive`` block below.  The frozen path
+                # (``_compute_i_edge_const``) uses ``forward_tanh`` for the
+                # same reason -- the shunt is added exactly once, by that
+                # block -- so the dynamic and the frozen path now agree.
+                i_edge = self.cell_lib.forward_tanh(
+                    x_src=x_src,
+                    x_dst=x_dst,
+                    x_max=self.x_max,
+                )
+            else:
+                i_edge = self.cell_lib(
+                    x_src=x_src,
+                    x_dst=x_dst,
+                    x_max=self.x_max,
+                )
             i_edge = i_edge * edge_mask.unsqueeze(0)  # [B, E]
             # Core VCA gate (freeze_read OFF): multiplied per-substep
             # from the cached gate (constant per sample). Semantically,
             # scales the entire nonlinear I-V curve per sample, like a
-            # real VCA. No-op when vca_gate_core is None.
+            # real VCA. No-op when vca_gate_core is None.  It scales the
+            # tanh part of the core current only; the parallel resistive
+            # shunt is gated separately (--vca-gate-shunt), exactly like
+            # in the frozen path.
             if vca_gate_core is not None:
                 i_edge = i_edge * vca_gate_core                # [B, E]
             i_edge = self._clamp_isat_eff(i_edge, self.cell_lib, edge_mask, vca_gate_core)
@@ -1322,7 +1342,10 @@ output_ode_src: list[int] | None = None,
 
         # Parallel resistive shunt (FreeTanhLibrary): always uses evolving
         # voltages, bypassing ``freeze_read``. Gated by the same edge_mask /
-        # edge_mask as the tanh current.
+        # edge_mask as the tanh current.  This block is the ONLY place the
+        # core shunt is added, so the core cell current above must be the
+        # tanh-only ``forward_tanh``: the shunt is then counted exactly
+        # once, in the dynamic path and in the frozen path alike.
         if self._has_resistive:
             i_res = self.cell_lib.resistive_current(x_src, x_dst)
             i_res = i_res * edge_mask.unsqueeze(0)              # [B, E]

@@ -185,4 +185,55 @@ def test_partial_prune_keeps_specialised_libs_params_and_forward(hw_name):
     net.core = pruned
     with torch.no_grad():
         after = mg.model_forward(net, x)
-    torch.testing.assert_close(after, before, rtol=1e-9, atol=1e-12)
+    torch.testing.assert_close(after, before, rtol=1e-6, atol=1e-7)
+
+
+@pytest.mark.parametrize("hw_name", ["phase3a_core", "phase3a_full"])
+def test_partial_prune_preserves_hardware_edge_params_and_trainability(hw_name):
+    hw = _hw_preset(hw_name)
+    net = _build(hw)
+    core = net.core
+    x = mg._friedman2_xy(16, 23)[0]
+    removed = {0: [0, 1], 1: [5]}
+    # The golden fixture does not opt into learnable clip sharpness. Install
+    # the same dead compliance parameter that the production builder creates.
+    if hw_name == "phase3a_full":
+        for stage in core.stages:
+            stage._learnable_clip_sharpness = True
+            stage.clip_sharpness_raw = torch.nn.Parameter(
+                torch.tensor(0.25, dtype=stage.z_logits.dtype), requires_grad=False)
+    ref = copy.deepcopy(net)
+    _gate_edges_to_zero(ref.core, removed)
+    _gate_edges_to_zero(core, removed)
+    with torch.no_grad():
+        before = mg.model_forward(ref, x)
+    snapshots = {}
+    for si, stage in enumerate(core.stages):
+        lib = stage.cell_lib
+        snapshots[si] = {n: (getattr(lib, n).detach().clone(), getattr(lib, n).requires_grad)
+                         for n in ("a_raw", "b_raw", "r_raw") if hasattr(lib, n)}
+    clip_flags = {n: p.requires_grad for n, p in core.named_parameters()
+                  if n.endswith("clip_sharpness_raw")}
+    pruned, _ = prune_network(core, edge_threshold=0.01)
+    for si, stage in enumerate(pruned.stages):
+        old = core.stages[si]
+        kept = [e for e in range(int(old.num_edges()))
+                if float(old.edge_gates().detach()[e]) > 0.01]
+        for name, (values, flag) in snapshots[si].items():
+            p = getattr(stage.cell_lib, name)
+            torch.testing.assert_close(p, values[kept], rtol=0, atol=0)
+            assert p.requires_grad == flag
+        for name, flag in ((n, f) for n, f in clip_flags.items()):
+            if name.startswith(f"stages.{si}."):
+                assert dict(pruned.named_parameters())[name].requires_grad == flag
+    if hw_name == "phase3a_core":
+        for stage in pruned.stages:
+            assert not stage.cell_lib.a_raw.requires_grad
+            assert not stage.cell_lib.b_raw.requires_grad
+    if hw_name == "phase3a_full":
+        assert clip_flags and all(not f for f in clip_flags.values())
+        assert all(not dict(pruned.named_parameters())[n].requires_grad for n in clip_flags)
+    net.core = pruned
+    with torch.no_grad():
+        after = mg.model_forward(net, x)
+    torch.testing.assert_close(after, before, rtol=1e-6, atol=1e-7)

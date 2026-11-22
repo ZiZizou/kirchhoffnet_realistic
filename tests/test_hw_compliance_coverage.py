@@ -131,6 +131,19 @@ def _restore_gates(snapshot):
             p.copy_(v)
 
 
+def _zero_vref(net):
+    """Put the sense Vref rail at 0 V (the symmetric map at raw = 0).
+
+    The sense legs roll off at the Vref rail (3.4 applied to the sense OTA),
+    so the rail has to sit at Vcm for the factor to be 1.
+    """
+    with torch.no_grad():
+        for st in net.core.stages:
+            raw = getattr(st, "raw_vref_sense", None)
+            if isinstance(raw, torch.Tensor):
+                raw.fill_(0.0)
+
+
 def _kill_gates(net, keep):
     """Zero the edge gate of every family except ``keep``.
 
@@ -179,6 +192,8 @@ def test_every_family_matches_the_plain_path_at_x0(spec_name, freeze_read,
     comp.load_state_dict(plain.state_dict())
     _set_theta(plain)
     _set_theta(comp)
+    _zero_vref(plain)
+    _zero_vref(comp)
     u = _inputs()
     snap_p = _gate_snapshot(plain)
     snap_c = _gate_snapshot(comp)
@@ -206,6 +221,8 @@ def test_the_compliance_path_actually_rolls_the_legs_off(spec_name):
     comp.load_state_dict(plain.state_dict())
     _set_theta(plain)
     _set_theta(comp)
+    _zero_vref(plain)
+    _zero_vref(comp)
     u = _inputs()
     sp, sc = plain.core.stages[0], comp.core.stages[0]
     x = torch.zeros(B, sp.num_nodes, dtype=D)
@@ -266,6 +283,8 @@ def test_leak_is_present_and_identical_in_both_paths(spec_name, freeze_read):
     comp.load_state_dict(plain.state_dict())
     _set_theta(plain)
     _set_theta(comp)
+    _zero_vref(plain)
+    _zero_vref(comp)
     u = _inputs()
     _kill_all_gates(plain)
     _kill_all_gates(comp)

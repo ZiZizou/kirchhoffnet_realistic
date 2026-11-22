@@ -1,0 +1,9 @@
+/home/annaik/Documents/kirchhoffnet_realistic/ENV/bin/python /home/annaik/Documents/kirchhoffnet_realistic/dagger-nuance-distillation-kirchhoffnet.py --canonical-dataset "$CANONICAL" \
+  --phase-a-epochs 300 --kn-num-stages 7 --kn-num-hidden 11 --kn-small-world-k 2 --kn-small-world-p 0.200000 --kn-vca-rank 3 \
+  --kn-x-max 4.000000 --kn-gm-max 4.241970e+00 --kn-isat-max 2.868855e+01 --kn-moe-num-experts 3 --kn-moe-gate-rank 2 --kn-moe-top-k 1 \
+  --kn-mapper-lr-scale 1.0 --kn-struct-lr-scale 4.0 --kn-dyn-lr-scale 1.0 --lr 7.069359e-03 --weight-decay 6.087302e-03 --batch-size 512 --earlystop-eval-every 5 \
+  --phase-a-validity-weight 0.300000 --phase-a-validity-ramp-start 10 --phase-a-validity-ramp-epochs 30 --phase-a-mlp-weight "$MLP_W" --phase-a-fwd-weight "$FWD_W" --phase-a-power-weight "$PWR_W" \
+  --phase-a-power-norm train_mean --kn-readout shared-x2 --output /home/annaik/Documents/kirchhoffnet_realistic/outputs/manual_knet_distillation_mix_trials/trial_0011 \
+  --device cuda --seed 100 --phase-a-mlp-teacher-ckpt "$TEACHER_CKPT" \
+  --kn-learnable-clip-sharpness --kn-gln-rails --kn-gln-B 4 --kn-gln-rank 2 --kn-gln-families boundary,readout \
+  --t-span 4.660583 --boundary-fan-out "{\"0\": [0, 4], \"1\": [1, 5], \"2\": [2, 6], \"3\": [3, 7]}"

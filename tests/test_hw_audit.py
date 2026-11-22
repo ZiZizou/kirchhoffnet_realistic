@@ -1,0 +1,86 @@
+"""hw/audit.py on the paper checkpoint (Phase 3b W4 step 4).  Small row counts: fast."""
+
+import json
+import os
+
+import pytest
+import torch
+
+from hw import HWConfig
+from hw import audit as A
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CKPT = os.path.join(ROOT, "assets", "baselines", "paper_trial_0011", "phase_a_best.pt")
+
+
+@pytest.fixture(scope="module")
+def rows():
+    return A.canonical_rows(16)
+
+
+def test_audit_table_on_paper_checkpoint(rows):
+    res = A.audit(CKPT, HWConfig(), rows, stiff_rows=8)
+    checks = {r[0] for r in res["rows"]}
+    assert {"slope gm*max(A,B)", "rail max|x|", "Heun max(dt*rho)", "Isat range",
+            "Isat_eff range", "A/B ratio max(A/B,B/A)"} <= checks
+    assert all(r[5] in ("PASS", "WARN", "FAIL") for r in res["rows"])
+    assert res["y_finite"] and len(res["rails"]) == len(res["stiffness"]) == 7
+    # the paper model was trained without the hardware constraints: its Isat
+    # sits partly below the 0.6 floor (Phase 3b doc: core Isat 0.18-2.69)
+    lo, hi = res["edges"]["core"]["isat"]
+    assert lo == pytest.approx(0.176, abs=2e-3) and hi == pytest.approx(2.69, abs=1e-2)
+    # Heun is far from its stability limit (dt*rho << 2)
+    assert max(r["max_dt_rho"] for r in res["stiffness"]) < 0.5
+
+
+def test_capture_restores_rhs(rows):
+    m = A.load_model(CKPT, None)
+    y1 = m(rows)
+    A.run_capture(m, rows)
+    assert all("rhs" not in st.__dict__ for st in m.net.core.stages)
+    torch.testing.assert_close(m(rows), y1, rtol=0, atol=0)
+
+
+def test_sensitivity_droop_reaches_the_core_read(rows):
+    s = A.sensitivity(CKPT, rows, mv=1.0)
+    assert s["identity_max_abs"] == 0.0           # tm on at 0 mV == legacy, bit for bit
+    assert s["inject"]["dy_per_mv"] > 0 and s["droop"]["dy_per_mv"] > 0
+    # trained model: droop is a few % of injection, not ~1e-5 as at raw init
+    assert 1e-2 < s["droop_over_inject"] < 1.0
+    assert s["inject"]["stage_dx_per_mv"][0] == 0.0  # nothing before stage 0
+
+
+def test_raw_init_droop_cancels_in_the_repeated_edge_pairs(rows):
+    """At raw init every core cell is identical except the STE sign s; with
+    edge_repeats=2 a (src,dst) pair with opposite s cancels exactly (tanh is odd),
+    so a node whose pairs all have opposite signs has zero core-read gain."""
+    torch.manual_seed(0)
+    m = A.load_model(None, None, dtype=torch.float64)
+    _, recs, _ = A.run_capture(m, rows.double())
+    st = m.net.core.stages[1]
+    x0, u, _ = recs[1][0]
+    g = st.edge_gain("core", u)
+    s = torch.sign(st.cell_lib.s_raw.detach())
+    src, dst = st.src.tolist(), st.dst.tolist()
+    pairs = {}
+    for e, (a, b) in enumerate(zip(src, dst)):
+        pairs.setdefault((a, b), []).append(float(s[e]))
+    dead = [n for n in set(src) | set(dst)
+            if all(sum(v) == 0 for k, v in pairs.items() if n in k)]
+    assert dead, "expected at least one node with only cancelling pairs at this seed"
+    with torch.no_grad():
+        d = torch.zeros_like(x0)
+        d[:, dead[0]] = 0.0143
+        dI = st._compute_i_edge_const(x0 + d, g) - st._compute_i_edge_const(x0, g)
+    assert float(dI.abs().max()) < 1e-12
+
+
+def test_cli(tmp_path):
+    out = tmp_path / "a.json"
+    rc = A.main(["--checkpoint", CKPT, "--n-rows", "8", "--stiffness-rows", "4",
+                 "--json", str(out)])
+    assert rc == 0
+    d = json.loads(out.read_text())
+    assert d["n_rows"] == 8 and d["hw_off"] is True
+    rc = A.main(["--checkpoint", CKPT, "--n-rows", "8", "--stiffness-rows", "4", "--strict"])
+    assert rc == 1                                  # the unconstrained paper model fails

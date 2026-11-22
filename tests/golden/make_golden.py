@@ -303,25 +303,29 @@ class CtleStudent(nn.Module):
         return _net_forward(self.net, self.scale_input(specs))
 
 
-def _build_net(spec: dict):
+def _build_net(spec: dict, hw=None):
     from cell_library import make_cell_library
     from topology import build_net_from_config
     cfg = _build_cfg(spec)
     cl = {k: v for k, v in spec["cell_lib"].items() if k != "name"}
-    cell_lib = make_cell_library(spec["cell_lib"]["name"], **cl)
+    cell_lib = make_cell_library(spec["cell_lib"]["name"], **cl, hw=hw)
     kw = dict(spec["build"])
     kw["boundary_fan_out"] = _int_keys(kw["boundary_fan_out"])
-    return build_net_from_config(cfg, cell_lib=cell_lib, **kw)
+    return build_net_from_config(cfg, cell_lib=cell_lib, hw=hw, **kw)
 
 
-def make_model(spec: dict, golden_sd: dict | None = None):
+def make_model(spec: dict, golden_sd: dict | None = None, hw=None):
     """Build (float64) model.  golden_sd=None: seeded random init (generator
     side).  golden_sd given: build with a DIFFERENT seed and load the golden
-    state_dict (test side) - the init is never regenerated."""
+    state_dict (test side) - the init is never regenerated.
+
+    ``hw`` is the hardware configuration (``hw.HWConfig``) or ``None``.  With
+    every flag off it must not change a single number of the forward pass or
+    of the state_dict (Phase 3b 2.4(b))."""
     seed = int(spec["seed"]) + (0 if golden_sd is None else 1000)
     with f64():
         seed_all(seed)
-        net = _build_net(spec)
+        net = _build_net(spec, hw=hw)
         if spec["kind"] == "ctle":
             model = CtleStudent(net, 4, spec["cfg_extra"]["out_dim"], spec["input_rail"])
         else:
@@ -440,10 +444,10 @@ def evaluate(model, x, target):
             "grads": grads, "no_grad_names": sorted(no_grad), "target": target}
 
 
-def run_case(spec: dict, golden_sd: dict | None = None, ignored=()):
+def run_case(spec: dict, golden_sd: dict | None = None, ignored=(), hw=None):
     """Build model (golden_sd or seeded init), run forward/loss/backward."""
-    model = make_model(spec, None if golden_sd is None else golden_sd) \
-        if not ignored else _make_model_ignoring(spec, golden_sd, ignored)
+    model = make_model(spec, None if golden_sd is None else golden_sd, hw=hw) \
+        if not ignored else _make_model_ignoring(spec, golden_sd, ignored, hw=hw)
     x = make_inputs(spec)
     with f64():
         with torch.no_grad():
@@ -455,11 +459,11 @@ def run_case(spec: dict, golden_sd: dict | None = None, ignored=()):
     return res
 
 
-def _make_model_ignoring(spec, golden_sd, ignored):
+def _make_model_ignoring(spec, golden_sd, ignored, hw=None):
     seed = int(spec["seed"]) + 1000
     with f64():
         seed_all(seed)
-        net = _build_net(spec)
+        net = _build_net(spec, hw=hw)
         model = (CtleStudent(net, 4, spec["cfg_extra"]["out_dim"], spec["input_rail"])
                  if spec["kind"] == "ctle" else net).double()
     load_golden(model, golden_sd, ignored)
@@ -467,10 +471,10 @@ def _make_model_ignoring(spec, golden_sd, ignored):
     return model
 
 
-def run_trajectory(spec: dict, golden_sd: dict, ignored=()):
+def run_trajectory(spec: dict, golden_sd: dict, ignored=(), hw=None):
     """30 seeded Adam steps in float64 from the golden init, fixed data order."""
-    model = (make_model(spec, golden_sd) if not ignored
-             else _make_model_ignoring(spec, golden_sd, ignored))
+    model = (make_model(spec, golden_sd, hw=hw) if not ignored
+             else _make_model_ignoring(spec, golden_sd, ignored, hw=hw))
     X, Y = make_traj_data(spec)
     model.train()
     params = [p for p in model.parameters() if p.requires_grad]

@@ -371,3 +371,46 @@ def test_isat_eff_clamp_forward_backward_is_finite():
     y, grads, _ = toy_forward_backward(hw_of(hw_isat_eff_clamp=True))
     assert torch.isfinite(y).all()
     assert all(torch.isfinite(g).all() for g in grads.values() if g is not None)
+
+
+# ---------------------------------------------------------------------------
+# every wired flag, alone
+# ---------------------------------------------------------------------------
+# (flag name, extra kwargs, parameters that are dead under that flag)
+WIRED_FLAGS = [
+    ("hw_ratio_ab", {"hw_ratio_ab": True}, ("a_raw", "b_raw")),
+    ("hw_slope_bound", {"hw_slope_bound": True}, ()),
+    ("hw_ic_coupling", {"hw_slope_bound": True, "hw_ic_coupling": True}, ()),
+    ("hw_no_alpha", {"hw_no_alpha": True}, ()),
+    ("hw_alpha_bwd", {"hw_no_alpha": True, "hw_alpha_bwd": 0.05}, ()),
+    ("hw_theta_bound", {"hw_theta_bound": True}, ()),
+    ("hw_mismatch_sigma", {"hw_mismatch_sigma": dict(MISMATCH_DEFAULT)}, ()),
+    ("hw_mismatch_eval", {"hw_mismatch_eval": True}, ()),
+    ("hw_vca_bits", {"hw_vca_bits": 4}, ()),
+    ("hw_isat_eff_clamp", {"hw_isat_eff_clamp": True}, ()),
+    ("hw_gln_mode", {"hw_gln_mode": "tail"}, ()),
+]
+
+
+@pytest.mark.parametrize("name,kwargs,dead", WIRED_FLAGS)
+def test_each_wired_flag_alone_gives_a_finite_forward_and_backward(name, kwargs, dead):
+    y, grads, no_grad = toy_forward_backward(hw_of(**kwargs))
+    assert torch.isfinite(y).all()
+    assert all(torch.isfinite(g).all() for g in grads.values() if g is not None)
+    # only the documented parameters may stay without a gradient
+    for n in no_grad:
+        assert any(d in n for d in dead), f"{name}: unexpected dead parameter {n}"
+
+
+def test_the_ratio_form_and_the_slope_bound_hold_together():
+    """A + B = 2 under hw_ratio_ab and gm_eff*max(A_hat, B_hat) <= slope_max."""
+    hw = hw_of(hw_ratio_ab=True, hw_slope_bound=True)
+    lib = cell(hw=hw)
+    with torch.no_grad():
+        lib.r_raw.normal_(0.0, 5.0)
+        lib.gm_raw.normal_(0.0, 5.0)
+    A_r, B_r = lib.ratio_ab_values()
+    torch.testing.assert_close(A_r + B_r, torch.full_like(A_r, 2.0), rtol=0, atol=1e-12)
+    A, B = lib.ab_values()
+    gm = lib.gm_eff_values()
+    assert float((gm * torch.maximum(A, B)).max()) <= hw.units.slope_max * (1 + 1e-9)

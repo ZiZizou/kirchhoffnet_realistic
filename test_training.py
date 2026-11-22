@@ -1643,14 +1643,15 @@ def test_state_carryover_basic():
           state is not None and state.size(1) == expected_width)
 
 
-def test_state_carryover_with_narma_preset():
-    print("\nTest SC-2: state carryover with full NARMA-10 preset")
+def test_state_carryover_with_temporal_preset():
+    print("\nTest SC-2: state carryover with the sinx preset + temporal readout")
     from topology import build_net_from_preset
     from cell_library import make_cell_library
 
     cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset(
-        "narma10", cell_lib=cell_lib, enable_temporal_readout=True,
+        "sinx", cell_lib=cell_lib, enable_temporal_readout=True,
+        boundary_fan_out={0: [0, 1, 2]},
     )
     expected_width = net.hid_count + net.proj_count + net.output_ode_count
 
@@ -1673,7 +1674,8 @@ def test_state_carryover_grad_flow():
 
     cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset(
-        "narma10", cell_lib=cell_lib, enable_temporal_readout=True,
+        "sinx", cell_lib=cell_lib, enable_temporal_readout=True,
+        boundary_fan_out={0: [0, 1, 2]},
     )
     u1 = torch.randn(1, 1, requires_grad=True)
     u2 = torch.randn(1, 1, requires_grad=True)
@@ -1739,67 +1741,6 @@ def test_state_carryover_trajectory_off():
     y, trajs, state = net(torch.randn(2, 1), store_trajectory=True,
                           return_final_state=True)
     check("trajs is None when return_final_state=True", trajs is None)
-
-
-# ---------------------------------------------------------------------------
-# NARMA preset tests
-# ---------------------------------------------------------------------------
-
-def test_narma_preset_keys():
-    print("\nTest NP-1: NARMA preset has required keys")
-    from config import PRESET_NARMA10, PRESET_NARMA20
-
-    for name, p in [("PRESET_NARMA10", PRESET_NARMA10),
-                    ("PRESET_NARMA20", PRESET_NARMA20)]:
-        check(f"{name} has 'narma_order'",
-              "narma_order" in p)
-        check(f"{name} has 'boundary_fan_out'",
-              "boundary_fan_out" in p)
-        check(f"{name} has 'enable_temporal_readout'",
-              p.get("enable_temporal_readout", False))
-        check(f"{name} has 'output_ode_count' >= 1",
-              p.get("output_ode_count", 0) >= 1)
-        check(f"{name} has 'stages' with 1+ entries",
-              len(p.get("stages", [])) >= 1)
-        check(f"{name} narma_order is int >= 10",
-              isinstance(p["narma_order"], int) and p["narma_order"] >= 10)
-
-    check("PRESET_NARMA10 order is 10",
-          PRESET_NARMA10["narma_order"] == 10)
-    check("PRESET_NARMA20 order is 20",
-          PRESET_NARMA20["narma_order"] == 20)
-    check("PRESET_NARMA10 boundary_fan_out covers all hidden nodes",
-          len(PRESET_NARMA10["boundary_fan_out"].get(0, [])) == 25)
-    check("PRESET_NARMA20 boundary_fan_out covers all hidden nodes",
-          len(PRESET_NARMA20["boundary_fan_out"].get(0, [])) == 25)
-
-
-def test_narma_preset_forward():
-    print("\nTest NP-2: NARMA preset forward pass produces finite output")
-    from topology import build_net_from_preset
-    from cell_library import make_cell_library
-    from config import PRESET_NARMA10
-
-    cell_lib = make_cell_library('tanh_free')
-    net = build_net_from_preset(
-        "narma10", cell_lib=cell_lib, enable_temporal_readout=True,
-        boundary_fan_out=PRESET_NARMA10["boundary_fan_out"],
-    )
-    check("enable_boundary set on net",
-          getattr(net, "enable_boundary", False))
-    check("enable_temporal_readout set on net",
-          getattr(net, "enable_temporal_readout", False))
-    # Verify each stage has the proper flags.
-    for i, stage in enumerate(net.core.stages):
-        check(f"stage[{i}] has _has_boundary",
-              getattr(stage, "_has_boundary", False))
-        check(f"stage[{i}] has _has_output_ode",
-              getattr(stage, "_has_output_ode", False))
-    y, _ = net(torch.randn(4, 1))
-    check("output shape is (4, 1)",
-          tuple(y.shape) == (4, 1))
-    check("output is finite",
-          torch.isfinite(y).all().item())
 
 
 if __name__ == "__main__":

@@ -81,11 +81,6 @@ class DifferentialStage(nn.Module):
             throughout all Heun sub-iterations. Leak, clip, and drive
             current still read the evolving ``x`` at each step. Default
             ``False`` (standard behavior: read and write at the same time).
-            When ``core_refresh_interval > 0`` the core current is
-            recomputed every ``k`` Heun steps regardless of ``freeze_read``;
-            this lets a single ``freeze_read=False`` model emulate the
-            legacy ``freeze_read=True`` baseline (``k >= num_steps``) up
-            to fully dynamic (``k == 1``) by varying only the interval.
         freeze_boundary: When ``True``, boundary fan-out edge currents (the
             tanh cell contribution with edge gate + VCA gate folded in) are
             computed **once** from ``(u, x0)`` and held constant across all
@@ -223,9 +218,6 @@ output_ode_src: list[int] | None = None,
         vca_gate_shunt: bool = False,
         vca_separate_core_bus: bool = False,
         vca_bias: bool | None = None,
-        vca_use_hidden: bool = False,
-        core_refresh_interval: int = 0,
-        node_activation: str = "none",
     ) -> None:
         super().__init__()
         self.num_nodes = int(num_nodes)
@@ -234,44 +226,6 @@ output_ode_src: list[int] | None = None,
         self.freeze_read = bool(freeze_read)
         self.freeze_boundary = bool(freeze_boundary)
         self.freeze_temporal_read = bool(freeze_temporal_read)
-        # Periodic refresh of the core nonlinear current ``i_edge_const``
-        # inside the Heun inner loop (counted in Heun steps).
-        #   0  -> legacy ``freeze_read`` only (1 eval / window for NARMA,
-        #          1 eval / stage for static). Default for backward compat.
-        #   >=1 -> recompute ``i_edge_const`` from the evolving state every
-        #          k Heun steps (legacy equivalence: ``k >= num_steps`` ==
-        #          legacy ``freeze_read=True``; ``k == 1`` == legacy
-        #          ``freeze_read=False``). Layered on top of the
-        #          ``freeze_boundary`` / ``freeze_temporal_read`` /
-        #          resistive-shunt paths which keep their own dynamic /
-        #          frozen semantics.
-        # Node activation (narma-node-activation plan): per-node bounding
-        # applied to the voltages the edges MIX, before edge-current
-        # computation. ``"none"`` (default) is byte-identical legacy
-        # behavior; ``"tanh"`` broadcasts ``Y = x_max * tanh(x / x_max)``
-        # (Hopfield/ESN structure: edges always see bounded inputs, and the
-        # growing pre-activation self-regulates effective gain via sech^2);
-        # ``"identity"`` is a named no-op for the ablation matrix (forward
-        # matches ``"none"`` exactly; the config tag distinguishes them).
-        # Stored as a plain attribute: no parameter, no state_dict change.
-        # NOTE: when enabled, the cell-library compliance gates see the
-        # bounded broadcast (|Y| < x_max strictly), so they evaluate to ~1
-        # — node activation SUPERSEDES compliance gating by construction.
-        # Leak, clip, and drive terms in rhs intentionally keep reading the
-        # raw pre-activation ``x``. Boundary ``u`` terminals and the Vref
-        # rails are ideal voltage sources, never state nodes: they are NOT
-        # transformed.
-        if node_activation not in ("none", "tanh", "identity"):
-            raise ValueError(
-                f"node_activation must be 'none', 'tanh', or 'identity', "
-                f"got {node_activation!r}"
-            )
-        self.node_activation = str(node_activation)
-        if core_refresh_interval < 0:
-            raise ValueError(
-                f"core_refresh_interval must be >= 0, got {core_refresh_interval}"
-            )
-        self.core_refresh_interval = int(core_refresh_interval)
         if leak_mode not in ("programmable", "non-programmable"):
             raise ValueError(f"leak_mode must be 'programmable' or 'non-programmable', got {leak_mode!r}")
         self.leak_mode = leak_mode
@@ -286,13 +240,6 @@ output_ode_src: list[int] | None = None,
         self.vca_enabled = bool(vca_enabled)
         self.vca_rank = int(vca_rank) if vca_enabled else int(vca_rank)
         self._vca_in_dim = int(vca_in_dim)
-        # Hidden-conditioned VCA (knet-gated-memory plan): when True and VCA
-        # is enabled, the core edge VCA projection is widened to
-        # ``[in_dim + num_nodes, rank]`` via an additional zero-init
-        # ``vca_W_hidden`` parameter so the gate depends on the current
-        # hidden state ``x``. Epoch-0 forward is bit-identical (hidden block
-        # zero, so the widened projection contributes zero).
-        self.vca_use_hidden = bool(vca_use_hidden)
         self.vca_bias_enabled = bool(VCA.get("bias", False) if vca_bias is None else vca_bias)
         if self.vca_enabled and self.vca_rank < VCA["min_rank"]:
             raise ValueError(
@@ -774,26 +721,6 @@ output_ode_src: list[int] | None = None,
             else:
                 self.vca_v_core = None
             self.vca_b_core = nn.Parameter(torch.zeros(n_c)) if (self._vca_core_enabled and self.vca_bias_enabled) else None
-            # Hidden-conditioned VCA (knet-gated-memory): additional
-            # ``vca_W_hidden`` projection (num_nodes, rank) zero-init only
-            # when ``vca_use_hidden=True``. Prepended to ``vca_W`` (or
-            # ``vca_W_core`` when the separate-core-bus ablation is on) at
-            # gate-compute time so the core gate depends on ``x`` as well
-            # as ``u``. Epoch-0 forward is bit-identical: hidden block
-            # zero -> ``features @ W_hidden = 0`` -> no effect.
-            if self.vca_use_hidden and self._vca_core_enabled:
-                self.vca_W_hidden = nn.Parameter(
-                    torch.zeros(num_nodes, self.vca_rank)
-                )
-                if self.vca_separate_core_bus:
-                    self.vca_W_core_hidden = nn.Parameter(
-                        torch.zeros(num_nodes, self.vca_rank)
-                    )
-                else:
-                    self.vca_W_core_hidden = None
-            else:
-                self.vca_W_hidden = None
-                self.vca_W_core_hidden = None
         else:
             self.vca_W = None
             self.vca_W_core = None
@@ -806,8 +733,6 @@ output_ode_src: list[int] | None = None,
             self._vca_core_enabled = False
             self.vca_gate_shunt = False
             self.vca_separate_core_bus = False
-            self.vca_W_hidden = None
-            self.vca_W_core_hidden = None
 
     def num_edges(self) -> int:
         return int(self.src.numel())
@@ -1052,39 +977,15 @@ output_ode_src: list[int] | None = None,
             vca_logits = vca_logits + bias
         return 2.0 * torch.sigmoid(vca_logits)
 
-    def _compute_core_gate(self, u: torch.Tensor, x: torch.Tensor | None = None) -> torch.Tensor:
-        """Core VCA gate for the freeze_read-OFF and shunt gating paths.
+    def _compute_core_gate(self, u: torch.Tensor) -> torch.Tensor:
+        """Core VCA gate ``2 * sigma((u @ W_bus) @ v_c.T)``, shape ``[batch, E_core]``.
 
-        Computes ``2 * sigma( ((u @ W_bus + x @ W_h) @ v_c.T) )`` of shape
-        ``[batch, E_core]`` where the ``x @ W_h`` term is present only when
-        ``vca_use_hidden=True`` (gate depends on the full per-sample hidden
-        state, broadcast identically to every core edge before the per-edge
-        ``v_c`` embedding fans it out) and is exactly zero at epoch 0
-        (``W_h`` zero-init). Uses ``vca_W_core`` (and optionally
-        ``vca_W_core_hidden``) when the separate-core-bus ablation is
-        active, otherwise the shared ``vca_W`` (and ``vca_W_hidden``).
-
-        Caller is responsible for ensuring ``vca_enabled=True`` and
-        ``self._vca_core_enabled=True``, ``u`` is not None, and the
-        relevant projection and embedding have been built. When the flag
-        is on, ``x`` must be ``[B, num_nodes]`` (the stage state at sample
-        entry); the per-Heun-step variant is a documented follow-up.
+        Uses ``vca_W_core`` when the separate-core-bus ablation is active,
+        otherwise the shared ``vca_W``. Caller ensures ``vca_enabled=True``,
+        ``self._vca_core_enabled=True`` and ``u`` is not None.
         """
-        if self.vca_separate_core_bus:
-            W = self.vca_W_core
-            W_hidden = self.vca_W_core_hidden
-        else:
-            W = self.vca_W
-            W_hidden = self.vca_W_hidden
+        W = self.vca_W_core if self.vca_separate_core_bus else self.vca_W
         u_proj = u @ W                       # [batch, rank]
-        if W_hidden is not None and x is not None:
-            if x.dim() != 2 or x.shape[1] != self.num_nodes:
-                raise ValueError(
-                    f"_compute_core_gate(x): expected [B, {self.num_nodes}], "
-                    f"got {tuple(x.shape)}"
-                )
-            hidden_proj = x.to(u_proj.dtype) @ W_hidden.to(u_proj.dtype)  # [batch, rank]
-            u_proj = u_proj + hidden_proj
         vca_logits = u_proj @ self.vca_v_core.T  # [batch, E_core]
         if self.vca_b_core is not None:
             vca_logits = vca_logits + self.vca_b_core
@@ -1111,10 +1012,6 @@ output_ode_src: list[int] | None = None,
             return None
         u_src0 = u[:, self.boundary_src]
         x_dst0 = x0[:, self.boundary_dst]
-        # Node activation: the state-side input reads the bounded broadcast;
-        # the boundary terminal ``u`` is an ideal source, never transformed.
-        if self.node_activation == "tanh":
-            x_dst0 = self._node_broadcast(x0)[:, self.boundary_dst]
         cell_lib = self.boundary_cell_lib
         gln_rails = getattr(self, "gln_rails", None)
         if gln_rails is not None and "boundary" in gln_rails.families:
@@ -1174,11 +1071,6 @@ output_ode_src: list[int] | None = None,
             return None
         x_src0 = x0[:, self.output_ode_src]
         x_dst0 = x0[:, self.output_ode_dst]
-        # Node activation: both readout endpoints are state nodes.
-        if self.node_activation == "tanh":
-            _xb = self._node_broadcast(x0)
-            x_src0 = _xb[:, self.output_ode_src]
-            x_dst0 = _xb[:, self.output_ode_dst]
         cell_lib = self.output_ode_cell_lib
         if hasattr(cell_lib, "forward_tanh"):
             i_edge = cell_lib.forward_tanh(
@@ -1218,10 +1110,6 @@ output_ode_src: list[int] | None = None,
         if not self._has_shared_readout or self.readout_sense_src.numel() == 0:
             return None
         x_src0 = x0[:, self.readout_sense_src]            # [B, n_sense]
-        # Node activation: the sense source is a state node; the Vref dst
-        # below is an ideal rail, never transformed.
-        if self.node_activation == "tanh":
-            x_src0 = self._node_broadcast(x0)[:, self.readout_sense_src]
         cell_lib = self.readout_sense_cell_lib
         # Sense destination is the private Vref rail (an ideal voltage
         # source held constant during integration). Pass it as the
@@ -1263,19 +1151,14 @@ output_ode_src: list[int] | None = None,
     ) -> torch.Tensor:
         """Compute the core nonlinear KCL contribution that ``freeze_read`` holds.
 
-        Centralizes the Heun-path precompute so ``freeze_read=True`` and the
-        periodic ``core_refresh_interval`` refresh share one code path. Recomputes
-        the cell library (or ``forward_tanh`` when a parallel resistive shunt
+        Recomputes the cell library (or ``forward_tanh`` when a parallel resistive shunt
         exists — so the resistive term stays dynamic in ``rhs``), folds in the
         per-edge gate, optional budget gate, and core VCA gate, and returns
         the ``[batch, num_nodes]`` KCL accumulator in ``x_src_state``'s dtype.
 
         Args:
             x_src_state: Source state tensor ``[B, num_nodes]`` to read
-                ``x[src]`` and ``x[dst]`` from. For NARMA per-sample frozen
-                precompute this is the running state at window start; for
-                periodic refresh this is the current ``x`` at the refresh
-                boundary.
+                ``x[src]`` and ``x[dst]`` from (the stage-entry state).
             gate_core_cached: Precomputed ``[B, E_core]`` VCA gate (when VCA
                 is enabled on the core family), or ``None``.
 
@@ -1284,12 +1167,6 @@ output_ode_src: list[int] | None = None,
         """
         x_src0 = x_src_state[:, self.src]
         x_dst0 = x_src_state[:, self.dst]
-        # Node activation: frozen core precompute reads the bounded
-        # broadcast, matching the dynamic rhs path exactly.
-        if self.node_activation == "tanh":
-            _xb = self._node_broadcast(x_src_state)
-            x_src0 = _xb[:, self.src]
-            x_dst0 = _xb[:, self.dst]
         if self._has_resistive and hasattr(self.cell_lib, "forward_tanh"):
             i_edge = self.cell_lib.forward_tanh(
                 x_src=x_src0, x_dst=x_dst0, x_max=self.x_max,
@@ -1310,19 +1187,6 @@ output_ode_src: list[int] | None = None,
         if not self.read_only_source:
             acc_const.index_add_(1, self.src, -i_edge_f32)
         return acc_const.to(dtype=x_src_state.dtype)
-
-    def _node_broadcast(self, x: torch.Tensor) -> torch.Tensor:
-        """Bounded node broadcast for edge mixing (narma-node-activation).
-
-        ``"tanh"`` returns ``Y = x_max * tanh(x / x_max)`` — the voltages
-        the edges mix. ``"none"`` and ``"identity"`` return ``x`` unchanged
-        (the latter is a named no-op for ablation tagging). Callers gather
-        ``Y[:, idx]`` for every cell-library input that reads a STATE node;
-        boundary ``u`` terminals and Vref rails bypass this helper.
-        """
-        if self.node_activation == "tanh":
-            return self.x_max * torch.tanh(x / self.x_max)
-        return x
 
     def clip_sharpness(self) -> float | torch.Tensor:
         """Live soft-rail clip sharpness ``s`` (denominator of the sigmoid rails).
@@ -1418,15 +1282,6 @@ output_ode_src: list[int] | None = None,
         """
         x_src = x[:, self.src]
         x_dst = x[:, self.dst]
-        # Node activation (narma-node-activation): every cell-library input
-        # below that reads a STATE node uses the bounded broadcast ``xb``.
-        # Leak, clip, and drive keep the raw pre-activation ``x``; boundary
-        # ``u`` and Vref rails are ideal sources and bypass the transform.
-        # When ``node_activation="none"`` (default) ``xb is x``: byte-identical.
-        xb = self._node_broadcast(x)
-        if self.node_activation == "tanh":
-            x_src = xb[:, self.src]
-            x_dst = xb[:, self.dst]
 
         # GLN rails (F2): compute the rail activations once per stage entry
         # (u is constant per sample during the ODE integration) and reuse
@@ -1513,8 +1368,6 @@ output_ode_src: list[int] | None = None,
         if self._has_boundary and u is not None and self.boundary_src.numel() > 0:
             u_src = u[:, self.boundary_src]
             x_dst_b = x[:, self.boundary_dst]
-            if self.node_activation == "tanh":
-                x_dst_b = xb[:, self.boundary_dst]
             boundary_mask = torch.sigmoid(self.boundary_z_logits)  # [Eb]
             if i_boundary_const is None:
                 # Dynamic path: full cell forward (tanh + resistive shunt).
@@ -1580,11 +1433,8 @@ output_ode_src: list[int] | None = None,
         if self._has_ref:
             vref = torch.sigmoid(self.raw_vref) * self.x_max  # [1], in [0, x_max]
             vref_expanded = vref.view(1, 1).expand(x.size(0), self.num_nodes)  # [B, N]
-            # Node activation: the state-side dst reads the broadcast; the
-            # Vref src is an ideal rail, never transformed.
-            x_ref_dst = xb if self.node_activation == "tanh" else x
             i_ref = self.ref_cell_lib(
-                x_src=vref_expanded, x_dst=x_ref_dst, x_max=self.x_max,
+                x_src=vref_expanded, x_dst=x, x_max=self.x_max,
             )  # [B, N]
             ref_mask = torch.sigmoid(self.ref_z_logits)  # [N]
             i_ref = i_ref * ref_mask.unsqueeze(0)  # [B, N]
@@ -1605,9 +1455,6 @@ output_ode_src: list[int] | None = None,
         if self._has_output_ode and self.output_ode_src.numel() > 0:
             x_src_o = x[:, self.output_ode_src]  # hidden (read-only)
             x_dst_o = x[:, self.output_ode_dst]  # output ODE (writable)
-            if self.node_activation == "tanh":
-                x_src_o = xb[:, self.output_ode_src]
-                x_dst_o = xb[:, self.output_ode_dst]
             out_mask = torch.sigmoid(self.output_ode_z_logits)  # [Eo]
             if i_readout_const is None:
                 # Dynamic path: full cell forward (tanh + resistive shunt).
@@ -1662,8 +1509,6 @@ output_ode_src: list[int] | None = None,
             W = self.readout_crossbar_W                    # [d_out, n_sense]
             sense_mask = torch.sigmoid(self.readout_sense_z_logits)  # [n_sense]
             x_j = x[:, self.readout_sense_src]             # [B, n_sense]
-            if self.node_activation == "tanh":
-                x_j = xb[:, self.readout_sense_src]
             vref = (torch.sigmoid(self.raw_vref_sense) * self.x_max).to(x.dtype)
             x_dst_s = vref.view(1, 1).expand_as(x_j)
             if i_readout_const is None:
@@ -1788,7 +1633,7 @@ output_ode_src: list[int] | None = None,
         # — gate folds into i_edge_const).
         gate_core_cached = None
         if self._vca_core_enabled and u is not None and self.vca_v_core is not None:
-            gate_core_cached = self._compute_core_gate(u, x=x0 if self.vca_use_hidden else None)
+            gate_core_cached = self._compute_core_gate(u)
         # Diagnostic attribute (not read inside compiled rhs — rhs
         # receives the gate via the explicit kwarg below).
         self._gate_core_cached = gate_core_cached
@@ -1801,14 +1646,8 @@ output_ode_src: list[int] | None = None,
         # per-step). For cell libraries with a parallel resistive shunt, use
         # ``forward_tanh`` here so the resistive term stays dynamic in ``rhs``
         # (the resistive current is added per-step from evolving voltages).
-        # ``core_refresh_interval`` (k): when > 0, recompute every k Heun
-        # steps in the loop below. The precompute here still fires at step 0
-        # so the very first Heun step sees a frozen value identical to the
-        # legacy path; periodic refresh is layered on top in the loop.
-        # (The NARMA sequence path instead refreshes inside ``_heun_steps``;
-        # both loops share the same every-k-step rule.)
         i_edge_const = None
-        if self.freeze_read or self.core_refresh_interval > 0:
+        if self.freeze_read:
             i_edge_const = self._compute_i_edge_const(x0, gate_core_cached)
 
         # freeze_boundary: precompute the boundary tanh KCL contribution once
@@ -1828,10 +1667,7 @@ output_ode_src: list[int] | None = None,
         x = x0
         traj_chunks = [x] if store_trajectory else None
 
-        refresh_k = int(self.core_refresh_interval)
         for step in range(num_steps):
-            if refresh_k > 0 and step > 0 and step % refresh_k == 0:
-                i_edge_const = self._compute_i_edge_const(x, gate_core_cached)
             k1 = self.rhs(x, u=u, x_drive=x_drive, drive_scale=drive_scale,
                           i_edge_const=i_edge_const,
                           i_boundary_const=i_boundary_const,
@@ -1849,264 +1685,6 @@ output_ode_src: list[int] | None = None,
 
         traj = torch.stack(traj_chunks, dim=2) if store_trajectory else None
         return x, traj
-
-    def _forward_heun_sequence(
-        self,
-        x0: torch.Tensor,
-        t_span: float,
-        num_steps: int,
-        u_seq: torch.Tensor,
-        carry_keep: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Integrate over a sequence of per-sample inputs with state carryover.
-
-        Processes ``u_seq`` as ``T`` consecutive sample windows. For each
-        sample, runs ``num_steps`` Heun steps with that sample's ``u``
-        value, threading the final state into the next sample.
-
-        ``carry_keep`` (E2 carry-mask ablation): optional ``(N,)`` 0/1 mask
-        applied to the carried state at every sample boundary (``x *= mask``
-        after each window). ``None`` (default) = full carryover, legacy
-        behavior. A mask of zeros on the hidden/proj slice and ones on the
-        output-accumulator slice implements "reset core, carry output".
-        The caller builds the mask (it knows the state layout); the stage
-        just applies it.
-
-        This moves the per-sample Python loop into a single C++/CUDA call
-        boundary, reducing interpreter overhead for evaluation and training.
-
-        Args:
-            x0: Initial state, shape ``(B, N)``.
-            t_span: Integration window duration per sample.
-            num_steps: Heun steps per sample.
-            u_seq: Input sequence. Accepted shapes:
-                - ``(T,)`` or ``(T, D)`` — eval mode, single stream
-                  (``B=1``), with ``D`` boundary terminals per sample.
-                - ``(B, T)`` — batched scalar-input sequence.
-                - ``(B, T, D)`` — batched sequence with ``D`` boundary
-                  terminals per sample.
-
-        Returns:
-            Final states at each sample boundary, shape ``(T, B, N)``
-            (or ``(T, N)`` if B=1).
-        """
-        dt = t_span / float(num_steps)
-        B = x0.shape[0]
-
-        # Determine (batched, T) from u_seq shape.  For a single stream, a
-        # rank-2 tensor is ``(T, D)`` rather than a degenerate batched
-        # ``(1, T)`` tensor when it has the configured multi-terminal width.
-        # This lets a physical delay bank drive distinct boundary terminals
-        # without changing the scalar-input path.
-        n_input_terms = (
-            int(self.boundary_src.max().item()) + 1
-            if self._has_boundary and self.boundary_src.numel() > 0
-            else 1
-        )
-        # ``batched`` is True when the first axis is the batch dim.
-        if u_seq.dim() == 3:
-            batched = (u_seq.shape[0] == B)
-            T = u_seq.shape[1] if batched else u_seq.shape[0]
-        elif u_seq.dim() == 2:
-            is_single_stream_bank = (
-                B == 1 and n_input_terms > 1
-                and u_seq.shape[1] == n_input_terms
-            )
-            batched = (u_seq.shape[0] == B) and not is_single_stream_bank
-            T = u_seq.shape[1] if batched else u_seq.shape[0]
-        else:
-            # 1D: assume (T,) — single-stream eval, B=1
-            batched = False
-            T = u_seq.shape[0]
-
-        x = x0
-        states = torch.empty(T, B, x0.shape[1], dtype=x0.dtype, device=x0.device)
-
-        for t in range(T):
-            if not batched:
-                if u_seq.dim() == 1:
-                    u_t = u_seq[t].view(1, 1)
-                else:
-                    u_t = u_seq[t].unsqueeze(0)  # (1, D)
-            else:
-                # u_seq is (B, T) or (B, T, 1)
-                if u_seq.dim() == 2:
-                    u_t = u_seq[:, t].unsqueeze(-1)  # (B, 1)
-                else:
-                    u_t = u_seq[:, t, :]  # (B, 1)
-
-            # Compute the core VCA gate cache per sample (u_t changes
-            # every sample, so gate is per-sample in this path).
-            gate_core_cached = None
-            if self._vca_core_enabled and u_t is not None and self.vca_v_core is not None:
-                gate_core_cached = self._compute_core_gate(u_t, x=x if self.vca_use_hidden else None)
-            self._gate_core_cached = gate_core_cached
-
-            # freeze_read / core_refresh_interval: precompute edge currents
-            # from the current state (each sample window freezes from its own
-            # starting state, matching the per-sample _forward_heun semantics).
-            # Fold the core VCA gate into the frozen KCL contribution (per-
-            # sample precompute). When ``core_refresh_interval > 0``, the
-            # step-0 value is the seed for periodic refresh inside
-            # ``_heun_steps``; the legacy ``freeze_read=True`` path (no
-            # refresh) holds the value across the whole window byte-for-byte.
-            i_edge_const = None
-            if self.freeze_read or self.core_refresh_interval > 0:
-                i_edge_const = self._compute_i_edge_const(x, gate_core_cached)
-
-            # freeze_boundary / freeze_temporal_read: per-sample precompute so
-            # the frozen boundary/readout contributions track the running
-            # starting state (matching freeze_read semantics here). No-op when
-            # the family is absent on this stage.
-            i_boundary_const = None
-            if self.freeze_boundary:
-                i_boundary_const = self._compute_frozen_boundary(u_t, x)
-            i_readout_const = None
-            if self.freeze_temporal_read:
-                i_readout_const = self._compute_frozen_readout(u_t, x)
-
-            x = self._call_heun_steps(x, u_t, dt, num_steps, i_edge_const,
-                                      i_boundary_const, i_readout_const,
-                                      gate_core_cached)
-            if carry_keep is not None:
-                x = x * carry_keep.to(dtype=x.dtype, device=x.device)
-            states[t] = x
-
-        return states
-
-    def _call_heun_steps(
-        self,
-        x: torch.Tensor,
-        u_t: torch.Tensor,
-        dt: float,
-        num_steps: int,
-        i_edge_const: torch.Tensor | None,
-        i_boundary_const: torch.Tensor | None = None,
-        i_readout_const: torch.Tensor | None = None,
-        vca_gate_core: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Dispatch to compiled or uncompiled Heun steps with fallback.
-
-        ``torch.compile`` is lazy: the compilation error (e.g. missing C++
-        compiler on CPU) surfaces on the *first call*, not at
-        ``enable_sequence_compile()`` time. This wrapper catches such errors
-        and falls back to the original Python implementation so training
-        can proceed.
-
-        The periodic-refresh branch (``core_refresh_interval > 0``) is also
-        compiled: the interval is a per-run constant so Inductor specializes
-        on it (one specialization per k). If compilation fails for any
-        reason the eager path below is used instead — correctness is never
-        at risk, only speed.
-        """
-        if getattr(self, "_heun_steps_compiled", False):
-            try:
-                return self._heun_steps_compiled_fn(
-                    x, u_t, dt, num_steps,
-                    i_edge_const, i_boundary_const, i_readout_const,
-                    vca_gate_core,
-                )
-            except Exception as e:
-                print(
-                    f"  [torch.compile] runtime compilation failed: {e}\n"
-                    f"  [torch.compile] falling back to uncompiled Heun steps."
-                )
-                self._heun_steps_compiled = False
-        return self._heun_steps(
-            x, u_t, dt, num_steps,
-            i_edge_const, i_boundary_const, i_readout_const,
-            vca_gate_core,
-        )
-
-    def _heun_steps(
-        self,
-        x: torch.Tensor,
-        u_t: torch.Tensor,
-        dt: float,
-        num_steps: int,
-        i_edge_const: torch.Tensor | None,
-        i_boundary_const: torch.Tensor | None = None,
-        i_readout_const: torch.Tensor | None = None,
-        vca_gate_core: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Run ``num_steps`` Heun integration steps (predictor-corrector).
-
-        Extracted from :meth:`_forward_heun_sequence` so :func:`torch.compile`
-        can capture the hot inner loop into fused CUDA kernels. The outer
-        per-sample loop in ``_forward_heun_sequence`` stays Python so the
-        torch.compile recompilation cost is paid only once per
-        (B, N) shape combination, not per (T, num_steps) slice.
-
-        Periodic refresh (``core_refresh_interval = k > 0``): the core
-        nonlinear KCL contribution ``i_edge_const`` is recomputed from the
-        current state every k Heun steps. ``i_boundary_const`` /
-        ``i_readout_const`` and the resistive shunt keep their own
-        ``freeze_*`` semantics. When ``k >= num_steps`` the refresh never
-        fires inside the loop and behaviour matches legacy frozen (with the
-        step-0 seed computed by the caller).
-        """
-        k = int(self.core_refresh_interval)
-        if k <= 0:
-            for _ in range(num_steps):
-                k1 = self.rhs(x, u=u_t, x_drive=None, drive_scale=0.0,
-                              i_edge_const=i_edge_const,
-                              i_boundary_const=i_boundary_const,
-                              i_readout_const=i_readout_const,
-                              vca_gate_core=vca_gate_core)
-                x_pred = x + dt * k1
-                k2 = self.rhs(x_pred, u=u_t, x_drive=None, drive_scale=0.0,
-                              i_edge_const=i_edge_const,
-                              i_boundary_const=i_boundary_const,
-                              i_readout_const=i_readout_const,
-                              vca_gate_core=vca_gate_core)
-                x = x + 0.5 * dt * (k1 + k2)
-            return x
-        # Refresh path: recompute ``i_edge_const`` every k Heun steps.
-        # Step 0 already has the caller's seed value.
-        for step in range(num_steps):
-            if step > 0 and step % k == 0:
-                i_edge_const = self._compute_i_edge_const(x, vca_gate_core)
-            k1 = self.rhs(x, u=u_t, x_drive=None, drive_scale=0.0,
-                          i_edge_const=i_edge_const,
-                          i_boundary_const=i_boundary_const,
-                          i_readout_const=i_readout_const,
-                          vca_gate_core=vca_gate_core)
-            x_pred = x + dt * k1
-            k2 = self.rhs(x_pred, u=u_t, x_drive=None, drive_scale=0.0,
-                          i_edge_const=i_edge_const,
-                          i_boundary_const=i_boundary_const,
-                          i_readout_const=i_readout_const,
-                          vca_gate_core=vca_gate_core)
-            x = x + 0.5 * dt * (k1 + k2)
-        return x
-
-    def enable_sequence_compile(self) -> None:
-        """Wrap :meth:`_heun_steps` with :func:`torch.compile` for speed.
-
-        Call this once after the stage is built (and before training). On
-        CUDA, the inner Heun loop compiles into fused kernels via Inductor,
-        typically yielding 2-3x speedup on the per-sample hot path. On CPU
-        the speedup is smaller (if any); the flag is still safe to set.
-
-        If compilation fails at runtime (e.g. no C++ compiler on CPU-only
-        environments), :meth:`_call_heun_steps` catches the error and falls
-        back to the uncompiled version so training can proceed.
-
-        Cached: subsequent calls are no-ops.
-        """
-        if getattr(self, "_heun_steps_compiled", False):
-            return
-        try:
-            self._heun_steps_compiled_fn = torch.compile(
-                self._heun_steps, dynamic=False
-            )
-            self._heun_steps_compiled = True
-        except Exception as e:
-            print(
-                f"  [torch.compile] skipping sequence compile: {e}\n"
-                f"  [torch.compile] training will proceed without compilation."
-            )
-            self._heun_steps_compiled = False
 
     def edge_gates(self) -> torch.Tensor:
         """Return edge gate values z_e = σ(z_logits), shape [E]."""

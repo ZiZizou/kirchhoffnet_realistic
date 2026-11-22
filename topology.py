@@ -996,8 +996,6 @@ def prune_stage(
         vca_enabled=False,
         vca_rank=VCA["rank"],
         vca_in_dim=0,
-        core_refresh_interval=int(getattr(stage, "core_refresh_interval", 0)),
-        node_activation=str(getattr(stage, "node_activation", "none")),
     )
 
     if transfer_params:
@@ -1279,9 +1277,6 @@ def topology_to_stage(
     vca_gate_shunt: bool = False,
     vca_separate_core_bus: bool = False,
     vca_bias: bool | None = None,
-    vca_use_hidden: bool = False,
-    core_refresh_interval: int = 0,
-    node_activation: str = "none",
 ) -> tuple[DifferentialStage, list[int], dict[int, int]]:
     """Convert a SparseTopology into a DifferentialStage.
 
@@ -1489,9 +1484,6 @@ def topology_to_stage(
         vca_gate_shunt=vca_gate_shunt,
         vca_separate_core_bus=vca_separate_core_bus,
         vca_bias=vca_bias,
-        vca_use_hidden=vca_use_hidden,
-        core_refresh_interval=core_refresh_interval,
-        node_activation=node_activation,
     )
     return stage, active_nodes, id_map
 
@@ -1521,7 +1513,6 @@ def build_net_from_preset(
     freeze_temporal_read: bool = False,
     enable_skip_linear: bool = False,
     boundary_fan_out: dict[int, list[int]] | None = None,
-    allow_boundary_target_overlap: bool = False,
     enable_ref_edges: bool = False,
     enable_temporal_readout: bool = False,
     readout_mode: str = "ota_mesh",
@@ -1543,7 +1534,6 @@ def build_net_from_preset(
     gln_rank: int = 2,
     gln_alpha_init: float = 1.0,
     gln_families: str | None = None,
-    core_refresh_interval: int = 0,
 ):
     """Build a full KirchhoffNetWithIO from a config.PRESETS entry.
 
@@ -1670,7 +1660,6 @@ def build_net_from_preset(
         freeze_temporal_read=freeze_temporal_read,
         enable_skip_linear=enable_skip_linear,
         boundary_fan_out=boundary_fan_out,
-        allow_boundary_target_overlap=allow_boundary_target_overlap,
         enable_ref_edges=enable_ref_edges,
         enable_temporal_readout=enable_temporal_readout,
         readout_mode=readout_mode,
@@ -1692,7 +1681,6 @@ def build_net_from_preset(
         gln_rank=gln_rank,
         gln_alpha_init=gln_alpha_init,
         gln_families=gln_families,
-        core_refresh_interval=core_refresh_interval,
     )
 
 
@@ -1711,7 +1699,6 @@ def build_net_from_config(
     freeze_temporal_read: bool = False,
     enable_skip_linear: bool = False,
     boundary_fan_out: dict[int, list[int]] | None = None,
-    allow_boundary_target_overlap: bool = False,
     enable_ref_edges: bool = False,
     enable_temporal_readout: bool = False,
     readout_mode: str = "ota_mesh",
@@ -1733,14 +1720,9 @@ def build_net_from_config(
     gln_rank: int = 2,
     gln_alpha_init: float = 1.0,
     gln_families: str | None = None,
-    core_refresh_interval: int = 0,
-    vca_use_hidden: bool = False,
     dynamic_leak: bool = False,
     dynamic_leak_input_proj: bool = False,
     boundary_first_stage_only: bool = False,
-    node_activation: str | None = None,
-    allow_experimental_cells: bool = False,
-    no_clip: bool = False,
 ):
     """Build a KirchhoffNetWithIO from a full config dict.
 
@@ -1776,12 +1758,6 @@ def build_net_from_config(
     ``freeze_boundary`` can be specified either explicitly or via
     ``cfg['freeze_boundary']``. Explicit kwargs take precedence. No-op when
     boundary fan-out is not configured.
-
-    ``allow_boundary_target_overlap`` (``False`` default) permits more than
-    one boundary terminal to inject into the same hidden node. Each terminal
-    remains a distinct boundary OTA and its current sums through KCL. The
-    legacy duplicate-target guard remains the default; opt in for multi-tap
-    input banks where several delayed voltage terminals drive every node.
 
     ``freeze_temporal_read`` can be specified either explicitly or via
     ``cfg['freeze_temporal_read']``. Explicit kwargs take precedence.
@@ -1819,14 +1795,6 @@ def build_net_from_config(
     width. Mutually exclusive with ``decoder_type='residual_tanh'`` and
     ``grouped_readout``.
 
-    ``node_activation`` (narma-node-activation plan, default ``"none"``):
-    per-node bounding of the voltages the edges mix (``"tanh"`` broadcasts
-    ``Y = x_max * tanh(x / x_max)``). ``"none"`` is byte-identical legacy;
-    ``"identity"`` is a named no-op for ablations. Resolved cfg dict >
-    explicit kwarg. Any non-``"none"`` value additionally requires
-    ``allow_experimental_cells=True`` (narma-cell-isolation spec) —
-    otherwise ``ValueError`` — so the static train path cannot opt in.
-    Only the NARMA ``_build_fabric_net`` path passes the guard.
     """
     if leak_mode is None:
         leak_mode = cfg.get("leak_mode", "programmable")
@@ -1853,35 +1821,9 @@ def build_net_from_config(
         raise ValueError(
             f"drive_mode must be 'fan_out' or 'projection', got {drive_mode!r}"
         )
-    # Resolve core_refresh_interval: cfg > explicit kwarg (matches the
-    # freeze_read/freeze_boundary/freeze_temporal_read precedence above).
-    core_refresh_interval = int(cfg.get("core_refresh_interval", core_refresh_interval))
     # knet-gated-memory (plan): cfg dict > explicit kwarg.
-    vca_use_hidden_effective = bool(cfg.get("vca_use_hidden", vca_use_hidden))
     dynamic_leak_effective = bool(cfg.get("dynamic_leak", dynamic_leak))
     dynamic_leak_input_proj_effective = bool(cfg.get("dynamic_leak_input_proj", dynamic_leak_input_proj))
-    # narma-node-activation (plan + narma-cell-isolation spec): cfg dict >
-    # explicit kwarg. Any non-"none" value requires allow_experimental_cells
-    # (only the NARMA _build_fabric_net path passes it); the static
-    # train_script path can never opt in, so its builds stay byte-identical.
-    _node_act_raw = cfg.get("node_activation", node_activation)
-    node_activation_effective = str(_node_act_raw) if _node_act_raw is not None else "none"
-    if node_activation_effective not in ("none", "tanh", "identity"):
-        raise ValueError(
-            f"node_activation must be 'none', 'tanh', or 'identity', "
-            f"got {node_activation_effective!r}"
-        )
-    if node_activation_effective != "none" and not bool(allow_experimental_cells):
-        raise ValueError(
-            "node_activation='tanh'/'identity' is NARMA-experimental "
-            "(narma-cell-isolation spec): pass allow_experimental_cells=True "
-            "from the NARMA _build_fabric_net path. The static train path "
-            "must stay on node_activation='none'."
-        )
-    if core_refresh_interval < 0:
-        raise ValueError(
-            f"core_refresh_interval must be >= 0, got {core_refresh_interval}"
-        )
     encoder_type = cfg.get("encoder_type", "linear")
     decoder_type = cfg.get("decoder_type", "linear")
     encoder_hidden_dim = int(cfg.get("encoder_hidden_dim", 64))
@@ -1982,7 +1924,7 @@ def build_net_from_config(
                         f"range [0, {n_first_hid})"
                     )
                 all_b_targets.append(t)
-        if not allow_boundary_target_overlap and len(all_b_targets) != len(set(all_b_targets)):
+        if len(all_b_targets) != len(set(all_b_targets)):
             dupes = sorted(
                 {t for t in all_b_targets if all_b_targets.count(t) > 1}
             )
@@ -2299,11 +2241,8 @@ def build_net_from_config(
             vca_gate_shunt=vca_gate_shunt,
             vca_separate_core_bus=vca_separate_core_bus,
             vca_bias=vca_bias_effective,
-            vca_use_hidden=vca_use_hidden_effective,
             dynamic_leak=dynamic_leak_effective,
             dynamic_leak_input_proj=dynamic_leak_input_proj_effective,
-            node_activation=node_activation_effective,
-            clip_current=(0.0 if no_clip else None),
             x_max=x_max,
             c_eff=c_eff,
             learnable_clip_sharpness=learnable_clip_sharpness,
@@ -2311,7 +2250,6 @@ def build_net_from_config(
             clip_sharpness_min=clip_sharpness_min,
             clip_sharpness_max=clip_sharpness_max,
             gln_rails=gln_module,
-            core_refresh_interval=core_refresh_interval,
         )
         stage_modules.append(stage)
         stage_times.append(float(stages_cfg[stage_idx].get("t_span", 0.5)))

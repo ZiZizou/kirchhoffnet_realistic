@@ -423,6 +423,26 @@ def test_c_node_vector_is_not_in_the_state_dict():
     assert set(hw_net.state_dict()) == set(plain.state_dict())
 
 
+def test_c_node_physical_builds_on_a_net_with_c_eff_above_one():
+    """FRIEDMAN2 (c_eff = 9.06) builds and runs with hw_c_node='physical'.
+
+    Its ota_mesh accumulator carries 16 mesh gate+leg terminals = 52 fF of
+    parasitic: above C_u = 50 fF but below the node capacitance budget
+    ``c_eff * C_u = 453 fF``, so it must not be rejected any more.
+    """
+    hw = hw_of(hw_c_node="physical")
+    net = build_toy(hw, spec=mg.FRIEDMAN2_NET)
+    x = mg.make_inputs(dict(mg.FRIEDMAN2_NET))[:4]
+    net.eval()
+    with torch.no_grad():
+        y = mg.model_forward(net, x)
+    assert torch.isfinite(y).all()
+    for st in net.core.stages:
+        c = st.node_capacitance(torch.zeros(1, st.num_nodes, dtype=D))
+        assert float(c.mean()) == pytest.approx(st.c_eff, rel=1e-6)
+        assert float(c.min()) > 0.0
+
+
 # ---------------------------------------------------------------------------
 # 3.9 power penalty
 # ---------------------------------------------------------------------------

@@ -320,7 +320,7 @@ def c_node_vector(num_nodes: int, src, dst, units: HWUnits, mode: str, *,
                   boundary_dst=(), sense_src=(), mesh_src=(), mesh_dst=(),
                   acc_start: Optional[int] = None, n_xbar_cols: int = 0,
                   xbar_mode: str = "signed", c_gate: float = C_GATE, c_leg: float = C_LEG,
-                  c_wire: float = C_WIRE, dtype=torch.float32) -> torch.Tensor:
+                  c_wire: float = C_WIRE, dtype=torch.float32, c_eff: float = 1.0) -> torch.Tensor:
     """Per-node capacitance in units of ``C_u``, shape ``[1, N]``.
 
     Terminals (3.8): every core edge puts one input gate and one output leg on both of its nodes;
@@ -329,9 +329,19 @@ def c_node_vector(num_nodes: int, src, dst, units: HWUnits, mode: str, *,
     ``>= acc_start`` are crossbar accumulators: ``n_xbar_cols`` legs (twice with ``differential``).
     ``C_par = n_gate*c_gate + n_leg*c_leg + c_wire``.
 
-    ``"uniform"``: the fixed cap pads every node to exactly ``C_u`` (all ones); raises if some
-    ``C_par`` exceeds ``C_u``.  ``"physical"``: one fixed cap per node class (hidden / accumulator),
-    sized so the class-mean node is ``C_u``; nodes differ by their own terminal count.
+    ``c_eff`` (default 1.0) is the model's nominal node capacitance: the legacy scalar
+    divisor, so the node capacitance *budget* is ``c_eff * C_u`` (the physical capacitance
+    of the node is ``budget`` farads, ``C_u = 50 fF`` by default).  The parasitics are
+    compared against that budget and taken out of it: the designed (drawn) cap of a node
+    class is ``c_eff * C_u - <class-mean parasitic>``.  A model with ``c_eff = 9.06``
+    therefore has a total node capacitance of ``9.06 * 50 fF = 453 fF`` and may carry
+    parasitics up to that budget.
+
+    ``"uniform"``: the fixed cap pads every node to exactly ``c_eff * C_u`` (all entries
+    ``c_eff``); raises if some ``C_par`` exceeds the budget.  ``"physical"``: one fixed cap
+    per node class (hidden / accumulator), sized so the class-mean node is ``c_eff * C_u``;
+    nodes differ by their own terminal count (the parasitic deviation is *not* scaled by
+    ``c_eff``: it is an absolute capacitance).
     """
     if mode not in ("uniform", "physical"):
         raise ValueError(f"c_node mode must be 'uniform' or 'physical', got {mode!r}")
@@ -339,7 +349,7 @@ def c_node_vector(num_nodes: int, src, dst, units: HWUnits, mode: str, *,
                                    mesh_src=mesh_src, mesh_dst=mesh_dst, acc_start=acc_start,
                                    n_xbar_cols=n_xbar_cols, xbar_mode=xbar_mode, c_gate=c_gate,
                                    c_leg=c_leg, c_wire=c_wire)
-    return _c_node_from_parasitics(c_par, start, num_nodes, units, mode, dtype)
+    return _c_node_from_parasitics(c_par, start, num_nodes, units, mode, dtype, c_eff=c_eff)
 
 
 def node_parasitics(num_nodes: int, src, dst, *, boundary_dst=(), sense_src=(), mesh_src=(),
@@ -364,22 +374,35 @@ def node_parasitics(num_nodes: int, src, dst, *, boundary_dst=(), sense_src=(), 
     return gates * c_gate + legs * c_leg + c_wire, start
 
 
-def _c_node_from_parasitics(c_par, start, num_nodes, units, mode, dtype):
+def _c_node_from_parasitics(c_par, start, num_nodes, units, mode, dtype, c_eff: float = 1.0):
+    """Per-node capacitance (in units of ``C_u``) from the per-node parasitics.
+
+    ``budget = c_eff * C_u`` is the node capacitance budget of the model: the
+    parasitics are taken out of it, so the designed cap of a node (or of a node
+    class) is ``budget - C_par``.  Raises when a parasitic (uniform) or a
+    class-mean parasitic (physical) does not fit in the budget.
+    """
     cu = float(units.cu)
+    budget = float(c_eff) * cu
     if mode == "uniform":
-        if bool((c_par > cu).any()):
+        if bool((c_par > budget).any()):
             raise ValueError(
                 f"hw_c_node='uniform': node parasitic {float(c_par.max())*1e15:.1f} fF exceeds "
-                f"C_u = {cu*1e15:.1f} fF (fixed cap would be negative)")
-        c = torch.full((num_nodes,), 1.0, dtype=torch.float64)
+                f"the node capacitance budget {budget*1e15:.1f} fF (= c_eff {float(c_eff):g} * C_u "
+                f"= {cu*1e15:.1f} fF); the designed cap would be negative")
+        c = torch.full((num_nodes,), float(c_eff), dtype=torch.float64)
     else:
         c = torch.empty(num_nodes, dtype=torch.float64)
         for lo, hi in ((0, start), (start, num_nodes)):
             if hi <= lo:
                 continue
-            fixed = cu - float(c_par[lo:hi].mean())
+            mean_par = float(c_par[lo:hi].mean())
+            fixed = budget - mean_par
             if fixed < 0:
-                raise ValueError("hw_c_node='physical': class-mean parasitic exceeds C_u")
+                raise ValueError(
+                    f"hw_c_node='physical': class-mean parasitic {mean_par*1e15:.1f} fF exceeds "
+                    f"the node capacitance budget {budget*1e15:.1f} fF (= c_eff {float(c_eff):g} "
+                    f"* C_u = {cu*1e15:.1f} fF); the designed cap would be negative")
             c[lo:hi] = (fixed + c_par[lo:hi]) / cu
     return c.to(dtype).view(1, -1)
 

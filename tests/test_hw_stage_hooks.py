@@ -353,3 +353,71 @@ def test_xbar_signed_and_offset_binary_give_the_same_product(bits):
         with torch.no_grad():
             outs[m] = mg.model_forward(net, x)
     torch.testing.assert_close(outs["signed"], outs["offset_binary"], rtol=1e-9, atol=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# 3.8 per-node capacitance
+# ---------------------------------------------------------------------------
+def _toy_input_state(net, st):
+    torch.manual_seed(11)
+    x = torch.randn(5, st.num_nodes, dtype=D)
+    u = mg.make_inputs(dict(mg.TOY_NET))[:5]
+    return x, u
+
+
+def test_c_node_uniform_reproduces_the_legacy_output_exactly():
+    plain = build_toy(None)
+    hw_net = build_toy(hw_of(hw_c_node="uniform"))
+    hw_net.load_state_dict(plain.state_dict())
+    st = hw_net.core.stages[0]
+    x, u = _toy_input_state(hw_net, st)
+    c = st.node_capacitance(x)
+    assert tuple(c.shape) == (1, st.num_nodes) and bool((c == st.c_eff).all())
+    torch.testing.assert_close(st.rhs(x, u=u), plain.core.stages[0].rhs(x, u=u), rtol=0, atol=0)
+    xin = mg.make_inputs(dict(mg.TOY_NET))
+    plain.eval(), hw_net.eval()
+    with torch.no_grad():
+        torch.testing.assert_close(mg.model_forward(hw_net, xin), mg.model_forward(plain, xin),
+                                   rtol=0, atol=0)
+
+
+def test_c_node_physical_is_class_normalised_and_divides_per_node():
+    plain = build_toy(None)
+    hw = hw_of(hw_c_node="physical")
+    hw_net = build_toy(hw)
+    hw_net.load_state_dict(plain.state_dict())
+    for st, st0 in zip(hw_net.core.stages, plain.core.stages):
+        x, u = _toy_input_state(hw_net, st)
+        c = st.node_capacitance(x)
+        assert tuple(c.shape) == (1, st.num_nodes)
+        assert bool((c > 0).all()) and float(c.std()) > 0.0       # nodes differ
+        # each node class (hidden / crossbar accumulator) has mean C_u
+        a = st._readout_dst_start if st._has_shared_readout else st.num_nodes
+        assert float(c[0, :a].mean()) == pytest.approx(st.c_eff, rel=1e-12)
+        if a < st.num_nodes:
+            assert float(c[0, a:].mean()) == pytest.approx(st.c_eff, rel=1e-12)
+        # within the hidden class, c differs by the node's own terminal count
+        from hw.constraints import C_GATE, C_LEG
+        gates = torch.zeros(st.num_nodes, dtype=D)
+        legs = torch.zeros(st.num_nodes, dtype=D)
+        for idx in (st.src, st.dst, st.boundary_dst):
+            gates.index_add_(0, idx, torch.ones(idx.numel(), dtype=D))
+            legs.index_add_(0, idx, torch.ones(idx.numel(), dtype=D))
+        if st._has_shared_readout:
+            gates.index_add_(0, st.readout_sense_src,
+                             torch.ones(st.readout_sense_src.numel(), dtype=D))
+        c_par = (gates * C_GATE + legs * C_LEG)[:a]
+        want = (c_par - c_par.mean()) / hw.units.cu
+        torch.testing.assert_close(c[0, :a] - c[0, :a].mean(), want, rtol=1e-9, atol=1e-12)
+        assert float(want.abs().max()) > 0.0
+        # rhs is the legacy rhs divided per node
+        torch.testing.assert_close(st.rhs(x, u=u) * c, st0.rhs(x, u=u), rtol=1e-12, atol=1e-12)
+
+
+def test_c_node_vector_is_not_in_the_state_dict():
+    plain = build_toy(None)
+    hw_net = build_toy(hw_of(hw_c_node="physical"))
+    xin = mg.make_inputs(dict(mg.TOY_NET))
+    with torch.no_grad():
+        mg.model_forward(hw_net, xin)
+    assert set(hw_net.state_dict()) == set(plain.state_dict())

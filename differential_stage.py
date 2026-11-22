@@ -33,10 +33,12 @@ from gating.gln import gln_gm_override
 from gating.vca import isat_eff_scale, vca_edge_gain
 from hw.constraints import (
     acc_compliance,
+    c_node_vector,
     compliance_legs,
     vref_map,
     xbar_map,
 )
+from hw.units import HWUnits
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle
     from hw import HWConfig
@@ -700,6 +702,55 @@ output_ode_src: list[int] | None = None,
             return W
         return xbar_map(W, mode=c.hw_xbar_mode, bits=c.hw_xbar_bits,
                         bound=bool(c.hw_xbar_bound))
+
+    def c_node_vector(self, mode: str | None = None, dtype=torch.float64) -> torch.Tensor:
+        """Per-node capacitance ``[1, N]`` in units of ``C_u`` (Phase 3a 3.8).
+
+        Built from this stage's graph: core ``src``/``dst``, boundary
+        destinations, shared-sense sources (+ crossbar accumulators with
+        ``n_sense`` legs each, doubled for ``hw_xbar_mode='differential'``)
+        or the legacy temporal mesh, and the ``HWUnits`` of ``self.hw``.
+        ``mode`` defaults to ``hw_c_node``.
+        """
+        c = self.hw_constraints
+        mode = mode if mode is not None else (None if c is None else c.hw_c_node)
+        units = self._hw_units() or HWUnits()
+        acc_start, n_cols, sense_src, mesh_src, mesh_dst = None, 0, (), (), ()
+        if self._has_shared_readout:
+            acc_start = self._readout_dst_start
+            n_cols = int(self.readout_sense_src.numel())
+            sense_src = self.readout_sense_src.tolist()
+        elif self._has_output_ode and self.output_ode_dst.numel() > 0:
+            mesh_src = self.output_ode_src.tolist()
+            mesh_dst = self.output_ode_dst.tolist()
+            acc_start = int(self.output_ode_dst.min())
+        return c_node_vector(
+            self.num_nodes, self.src.tolist(), self.dst.tolist(), units, mode,
+            boundary_dst=self.boundary_dst.tolist() if self._has_boundary else (),
+            sense_src=sense_src, mesh_src=mesh_src, mesh_dst=mesh_dst,
+            acc_start=acc_start, n_xbar_cols=n_cols,
+            xbar_mode="signed" if c is None else c.hw_xbar_mode, dtype=dtype,
+        )
+
+    def node_capacitance(self, x: torch.Tensor):
+        """The divisor of ``rhs``: the scalar ``c_eff`` (legacy) or, with
+        ``hw_c_node``, the ``[1, N]`` tensor ``c_eff * c_node_vector()``.
+
+        ``c_eff`` is the nominal node capacitance in units of ``C_u`` (1 by
+        default, see ``HWUnits.cu``), so ``"uniform"`` (all ones) divides by
+        exactly ``c_eff`` and reproduces the legacy output bit-for-bit.  The
+        vector is non-trainable and cached per (mode, xbar mode, dtype, device).
+        """
+        c = self.hw_constraints
+        if c is None or c.hw_c_node is None:
+            return self.c_eff
+        key = (c.hw_c_node, c.hw_xbar_mode, x.dtype, x.device, id(self.hw))
+        cache = self.__dict__.get("_c_node_cache")
+        if cache is None or cache[0] != key:
+            vec = (self.c_eff * self.c_node_vector(c.hw_c_node, torch.float64))
+            cache = (key, vec.to(device=x.device, dtype=x.dtype))
+            object.__setattr__(self, "_c_node_cache", cache)
+        return cache[1]
 
     def _hw_vca_bits(self) -> int | None:
         """3.10: the width of the VCA logit DAC (``None`` = no quantisation)."""
@@ -1537,7 +1588,11 @@ output_ode_src: list[int] | None = None,
 
         clip_term = self.clip_term(x)
 
-        return (acc - leak_term - clip_term) / self.c_eff
+        c = self.hw_constraints
+        if c is None or c.hw_c_node is None:
+            return (acc - leak_term - clip_term) / self.c_eff
+        # 3.8: per-node capacitance [1, N] instead of the scalar.
+        return (acc - leak_term - clip_term) / self.node_capacitance(x)
 
     def compile_rhs(self, backend: str = "inductor"):
         """Compile `rhs` with `torch.compile` for kernel fusion.

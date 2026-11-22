@@ -211,7 +211,7 @@ def test_partial_prune_preserves_hardware_edge_params_and_trainability(hw_name):
     for si, stage in enumerate(core.stages):
         lib = stage.cell_lib
         snapshots[si] = {n: (getattr(lib, n).detach().clone(), getattr(lib, n).requires_grad)
-                         for n in ("a_raw", "b_raw", "r_raw") if hasattr(lib, n)}
+                         for n in ("a_raw", "b_raw", "r_raw", "cap_a_raw", "cap_b_raw") if hasattr(lib, n)}
     clip_flags = {n: p.requires_grad for n, p in core.named_parameters()
                   if n.endswith("clip_sharpness_raw")}
     pruned, _ = prune_network(core, edge_threshold=0.01)

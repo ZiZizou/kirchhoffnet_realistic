@@ -251,6 +251,46 @@ Build behavioural Verilog-A for every block, using the decisions from Phase 3 an
    - run `python -m hw.audit` on each hw checkpoint before export.
 
 **Docs.** `docs/hw/phase4_veriloga.md` covers: the module list with port and parameter tables, the unit conversions, the fidelity modes, how to run the exporter and Spectre, the validation results, and known gaps.
+### Task E — make `~/Documents/Narma_experiments` and `~/Documents/DEQ_experiments` self-sufficient
+The user wants each clone to contain everything it needs, with no reliance on other workspaces: `kirchhoffnet_refactor` and its venv, `tron_eq`, `ASPDAC_2026`, `augmented-cvae-ctle`, `improved-zig-*`, or Windows paths. The folder name is `Narma_experiments`; there is no uppercase `NARMA_experiments`. Ask the user before renaming it.
+
+**Read-only audit (session 1, 2026-11-22):**
+- **Git.** Both clones have full history and are not shallow: Narma `narma-experiments` @ `03849d7` (269 commits), DEQ `deq-experiments` @ `ef76c73` (271 commits). Tracked files are clean.
+  - Remotes: `origin` (GitHub) and `local` (→ ~/Documents/kirchhoffnet_refactor).
+  - Both come from the pre-surgery snapshot, so they hold all scripts, docs, tests and notebooks.
+- **No venv inside either clone.** The only requirements files are `requirements_local.txt` and `requirements_all_can.txt`, which are large platform-specific environment snapshots rather than minimal manifests.
+  - With the refactor venv as interpreter, `train_script`, `narma_experiment`, `narma_revised_plan` and `narma_linear_controls` import fine.
+  - On the Narma clone, `deq_solver`/`deq_diagnostics` are missing, because they were deleted in 7b34b60 before the snapshot. On the DEQ clone they import fine (they were restored).
+- **pytest.** `--collect-only` collects 313 items in both clones, then errors: `test_friedman2_small_world.py:5` raises `KeyError 'hidden_family'`, because the module runs a diagnostic print at import time.
+- **DEQ artifacts.** `artifacts/deq/` (~1.8 MB: `model.pt` 43 KB, the run notebook, diagnostics and plots) is on disk but **gitignored**, so a fresh clone won't have it.
+- **NARMA data is synthetic.** `narma_experiment` generates its own streams and needs no data files.
+- **Hardcoded external paths in live code:**
+  - `ctle_dagger_common.py:74-76` and `dagger-mlp-distillation-kirchhoffnet.py:48,51,766-767` point to `/home/annaik/Documents/improved-zig-nf-spline-pytorch-default-v2` (`ctle_conditional_flow.pt` 6.96 MB, `dagger_student_moe.pt` 232 KB), `augmented-cvae-ctle` (a symlink into ASPDAC_2026) and `dagger_output`. The same applies to `dagger-nuance-distillation-kirchhoffnet.py` and the generative-distillation scripts.
+  - The NARMA/post-twin `*_batch.sh` scripts load cluster modules and `source /home/annaik/Documents/tron_eq/venv/bin/activate`.
+  - `spice_failure_check.py:31,240,254,1294` uses `~/Documents/train_ctle` (Ocean templates) and `~/workarea_GF22_FDX_EXT` (Cadence/PDK). These are external EDA tools; leaving them external is acceptable, but make them configurable.
+  - Windows paths: `generate_report.py`, `_count_params.py`, `test_bo_guard.py`.
+  - `test_training.py` points at the ASPDAC_2026 venv and repo.
+  - Historical docs and scratch files contain `C:\Users`, `Y:\Documents\ASPDAC_2026` and `kirchhoffnet_realistic` paths. These are archival.
+- **Not finished:** the full AST import-gap inventory and a tiny DEQ forward pass. Do them first.
+
+**Fix plan, for each clone, committed on its own branch inside its own folder:**
+1. **Own environment.** Create `venv/` inside the clone (`~/.local/bin/uv venv --python 3.12 venv`, gitignored). Add a minimal `requirements.txt` covering every third-party import found by an AST scan: torch, numpy, pandas, scipy, scikit-learn, matplotlib, joblib, networkx, optuna, pytest, torchdiffeq, and torchdeq for DEQ. Install it and verify every module imports in that venv.
+2. **Missing local modules.** On the Narma clone, either restore `deq_solver.py`/`deq_diagnostics.py` from `7b34b60^` (cheap; makes the imports resolve) or guard the imports. List any other local module that doesn't exist, e.g. `utils.model` in `kn_benchmark_friedman2.py`, and fix it or mark it dead.
+3. **Data and assets inside the clone.** Copy, don't symlink, the CTLE data that the dagger/distillation/CTLE scripts need into the clone:
+   - `assets/zig/`: the ZIG v2 dir;
+   - `assets/teachers/`: the MLP teachers `trial_0019` and the v4 `dagger_student_plain.pt`, if any script uses them;
+   - `data/augmented-cvae-ctle/`: the CSVs, ~18 MB;
+   - the canonical npz, if it's used.
+   Commit the small binaries via a `!assets/**` gitignore exception. Keep the larger CSVs ignored but present on disk, or commit them if the user prefers. On the DEQ clone, **commit `artifacts/deq/`** (1.8 MB) so a fresh clone gets it.
+4. **Paths.** Rewrite live absolute paths to repo-relative defaults with environment-variable overrides, e.g. `KNET_DATA_DIR`, `KNET_TEACHER_DIR`, `KNET_OUTPUT_DIR`, `CADENCE_SETUP`, `OCN_TEMPLATE_DIR`. Change the batch scripts to activate `"$REPO/venv"` instead of `tron_eq/venv`. Leave historical docs and scratch files as they are, but add a note that their paths are archival.
+5. **Tests.** Fix the import-time `KeyError` in `test_friedman2_small_world.py` so that `pytest --collect-only` is clean, then run a fast subset in the clone's own venv and record the pass/fail count. Pre-surgery failures are expected; document them rather than fixing them all.
+6. **Remove the `local` remote**, which points at kirchhoffnet_refactor. Keep `origin`.
+7. **Per-clone `README_BRANCH.md`:** what the branch is for, venv setup, the data and assets layout, how to run the main NARMA experiment or the DEQ notebook and script, and the known failing tests.
+8. **Verify isolation.**
+   - `grep` shows zero live references to external workspaces.
+   - Imports, `--help` of the main scripts, one tiny NARMA step and one tiny DEQ forward all run with the clone's venv, with cwd = clone and outputs going to `/tmp`.
+   - A fresh `git clone <clone> /tmp/x` plus a copy of the ignored data dirs also works.
+   - No real training. Tiny smoke steps only, as with the Kaggle rule.
 ## 5. Other findings and open questions (tell the user, or keep in mind)
 - **A/B strictness:** the user asked for maximal realism (task A). Ask before choosing anything less strict than `cap_divider` with 3 bits and rmax 2.
 - **CPU toy validation:** mean held-out MSE relative to the unconstrained model, each at its own best lr, 3 seeds.
@@ -285,6 +325,7 @@ Build behavioural Verilog-A for every block, using the decisions from Phase 3 an
 - **CPU threads:** ssr0 is shared. Many tiny processes with 2 threads each are faster than a few with 12 threads.
 - **Subagent routes (session 1):** kiro/claude-sonnet-5.5 and minimax often died silently. openai-codex/gpt-6-luna and the default route were reliable. Running subagents could not be messaged, so have them commit after each step.
 - **Golden files:** never regenerate them except deliberately (task B), and log every regeneration.
+
 
 
 

@@ -88,7 +88,7 @@ def test_cli(tmp_path):
 
 def test_cli_reads_hw_config_beside_a_hardware_checkpoint(tmp_path):
     """The slurm audit passes no --hw-* flags: it must rebuild the trained hw model
-    (here phase3a_core: ratio_ab adds r_raw, so a legacy build would not load) from
+    (here phase3a_core: cap_divider adds per-edge codes, so a legacy build would not load) from
     the hw_config.json the trial wrote, with --kn-isat-max of the trial."""
     from hw.cli import hw_config_from_args
     import argparse
@@ -98,7 +98,7 @@ def test_cli_reads_hw_config_beside_a_hardware_checkpoint(tmp_path):
     hw = hw_config_from_args(p.parse_args(["--hw-preset", "phase3a_core"]))
     torch.manual_seed(3)
     m = A.load_model(None, hw, arch={"isat_max": 16.0})
-    assert any(k.endswith("r_raw") for k in m.state_dict())
+    assert any(k.endswith("cap_a_raw") for k in m.state_dict())
     ck = tmp_path / "phase_a_best.pt"
     torch.save(m.state_dict(), ck)
     hw.to_json(str(tmp_path / "hw_config.json"))
@@ -111,7 +111,18 @@ def test_cli_reads_hw_config_beside_a_hardware_checkpoint(tmp_path):
     # slope bound + ratio form on: the static core slope and A/B obey the limits
     core = d["edges"]["core"]
     assert core["slope"][1] <= hw.units.slope_max + 1e-6
-    assert core["ratio"][1] <= 4.0 + 1e-6
+    assert core["gain"][0] >= 0.5 - 1e-6 and core["gain"][1] <= 1.0 + 1e-6
+
+
+def test_cap_divider_audit_checks_grid_and_counts_codes():
+    from hw import HWConstraints
+    hw = HWConfig(constraints=HWConstraints(hw_ab_mode="cap_divider", hw_slope_bound=True))
+    model = A.load_model(None, hw)
+    stats = A.edge_stats(model, [[] for _ in model.net.core.stages], hw.units)
+    core = stats["core"]
+    assert core["cap_grid_ok"]
+    assert core["cap_grid_max_error"] < 1e-6
+    assert 1 <= core["cap_grid_n_distinct"] <= 2 ** hw.constraints.hw_ab_bits
 
 
 def test_slurm_scripts_only_pass_existing_flags():

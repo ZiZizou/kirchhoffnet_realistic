@@ -2702,10 +2702,17 @@ class _PhaseACanonicalDataset(Dataset):
         return specs, params, mlp_logits
 
 
-def _phase_a_loaders(canonical: dict, batch_size: int):
+def _phase_a_loaders(canonical: dict, batch_size: int, sample_limit=None):
     train_ds = _PhaseACanonicalDataset(canonical, "train")
     val_ds = _PhaseACanonicalDataset(canonical, "val")
     test_ds = _PhaseACanonicalDataset(canonical, "test")
+    if sample_limit is not None:
+        from torch.utils.data import Subset
+        limit = int(sample_limit)
+        if limit < 1:
+            raise ValueError("sample_limit must be >= 1")
+        train_ds, val_ds, test_ds = (Subset(ds, range(min(limit, len(ds))))
+                                     for ds in (train_ds, val_ds, test_ds))
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True, num_workers=0,
         pin_memory=torch.cuda.is_available(),
@@ -2943,7 +2950,7 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
         )
     student = student.to(DEVICE)
 
-    train_loader, val_loader, test_loader = _phase_a_loaders(canonical, batch_size)
+    train_loader, val_loader, test_loader = _phase_a_loaders(canonical, batch_size, ctx.get("sample_limit"))
     _logger.info(
         f"[phaseA] split sizes: train={len(train_loader.dataset)} "
         f"val={len(val_loader.dataset)} test={len(test_loader.dataset)} "
@@ -2983,6 +2990,22 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
     checkpoint_path = os.path.join(output_dir, "phase_a_last.pt")
     best_path = os.path.join(output_dir, "phase_a_best.pt")
     os.makedirs(output_dir, exist_ok=True)
+    start_epoch = 0
+    resume_path = ctx.get("resume")
+    if resume_path:
+        state = torch.load(resume_path, map_location=DEVICE, weights_only=False)
+        student.load_state_dict(state["model"])
+        optimizer.load_state_dict(state["optimizer"])
+        if "scheduler" in state:
+            scheduler.load_state_dict(state["scheduler"])
+        history = state.get("history", history)
+        best_val_failure = state.get("best_val_failure", best_val_failure)
+        best_state = state.get("best_state")
+        best_val_loss = state.get("best_val_loss", best_val_loss)
+        best_val_loss_state = state.get("best_val_loss_state")
+        no_improve = state.get("no_improve", 0)
+        start_epoch = int(state["epoch"]) + 1
+        _logger.info(f"[phaseA] resumed at epoch {start_epoch}")
 
     evaluator = StudentEvaluator(
         student=student, scaler_X=scaler_X, zig_model=zig_model,
@@ -3019,7 +3042,7 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
             _hw_student._clip_elements, _hw_student._input_elements = c0, i0
         return u
 
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         student.train()
         # Ramped validity weight (1-based epochs): 0 up to ramp start, linear
         # ramp over ramp_epochs, full weight thereafter.  validity_weight=0.0
@@ -3223,8 +3246,10 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
             best_val_loss_state = {k: v.detach().cpu().clone() for k, v in student.state_dict().items()}
         torch.save(
             {"epoch": epoch, "model": student.state_dict(),
-             "optimizer": optimizer.state_dict(), "history": history,
-             "best_val_failure": best_val_failure},
+             "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
+             "history": history, "best_val_failure": best_val_failure,
+             "best_state": best_state, "best_val_loss": best_val_loss,
+             "best_val_loss_state": best_val_loss_state, "no_improve": no_improve},
             checkpoint_path,
         )
         if (epoch + 1) % 10 == 0 or epoch == 0 or epoch == epochs - 1:

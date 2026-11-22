@@ -30,6 +30,8 @@ from config import (
 from hw.constraints import (
     THETA_MAX,
     IsatScale,
+    ab_mode,
+    cap_divider_gain,
     attenuation,
     ic_factor,
     ratio_ab,
@@ -134,10 +136,15 @@ class FreeTanhLibrary(nn.Module):
         # Phase 3b W5: the dead a_raw / b_raw are frozen (requires_grad=False)
         # so they neither count as trainable parameters (BO budget) nor reach
         # the optimizer; they stay in the state_dict for strict loading.
-        if hw is not None and hw.constraints.hw_ratio_ab:
-            self.r_raw = nn.Parameter(torch.zeros(num_edges))
+        mode = ab_mode(None if hw is None else hw.constraints)
+        if mode is not None:
             self.a_raw.requires_grad_(False)
             self.b_raw.requires_grad_(False)
+        if mode == "ratio":
+            self.r_raw = nn.Parameter(torch.zeros(num_edges))
+        elif mode == "cap_divider":
+            self.cap_a_raw = nn.Parameter(torch.zeros(num_edges))
+            self.cap_b_raw = nn.Parameter(torch.zeros(num_edges))
         # Initialize s_raw to small random values so sign() gives ±1, not 0.
         # STE allows gradients to flow; forward needs non-zero sign for tanh path.
         self.s_raw = nn.Parameter(torch.randn(num_edges) * 0.1)
@@ -202,7 +209,7 @@ class FreeTanhLibrary(nn.Module):
         ``r = exp(ln(r_max) tanh(r_raw))``, ``A = 2r/(1+r)``, ``B = 2/(1+r)``.
         """
         c = self.hw_constraints
-        if c is None or not c.hw_ratio_ab:
+        if ab_mode(c) != "ratio":
             return None
         return ratio_ab(self.r_raw)
 
@@ -216,9 +223,16 @@ class FreeTanhLibrary(nn.Module):
         bounded by ``slope_max``).
         """
         c = self.hw_constraints
-        if c is None or not c.hw_ratio_ab:
+        mode = ab_mode(c)
+        if mode is None:
             return (torch.nn.functional.softplus(self.a_raw),
                     torch.nn.functional.softplus(self.b_raw))
+        if mode == "differential":
+            one = torch.ones_like(self.s_raw)
+            return one, one
+        if mode == "cap_divider":
+            return (cap_divider_gain(self.cap_a_raw, c.hw_ab_bits, c.hw_ab_rmax),
+                    cap_divider_gain(self.cap_b_raw, c.hw_ab_bits, c.hw_ab_rmax))
         A, B = ratio_ab(self.r_raw)
         if c.hw_slope_bound:
             m = torch.maximum(A, B)
@@ -310,7 +324,7 @@ class FreeTanhLibrary(nn.Module):
         if isinstance(gm_override, IsatScale):
             isat_scale = gm_override.m
             gm_override = None
-        if c is not None and c.hw_ratio_ab:                          # 3.1
+        if ab_mode(c) is not None:                                    # 3.1
             A, B = self.ab_values()                                 # [E]
             A = A.unsqueeze(0)                                      # [1, E]
             B = B.unsqueeze(0)                                      # [1, E]

@@ -114,6 +114,17 @@ def test_cli_reads_hw_config_beside_a_hardware_checkpoint(tmp_path):
     assert core["gain"][0] >= 0.5 - 1e-6 and core["gain"][1] <= 1.0 + 1e-6
 
 
+def test_cap_divider_audit_checks_grid_and_counts_codes():
+    from hw import HWConstraints
+    hw = HWConfig(constraints=HWConstraints(hw_ab_mode="cap_divider", hw_slope_bound=True))
+    model = A.load_model(None, hw)
+    stats = A.edge_stats(model, [[] for _ in model.net.core.stages], hw.units)
+    core = stats["core"]
+    assert core["cap_grid_ok"]
+    assert core["cap_grid_max_error"] < 1e-6
+    assert 1 <= core["cap_grid_n_distinct"] <= 2 ** hw.constraints.hw_ab_bits
+
+
 def test_slurm_scripts_only_pass_existing_flags():
     """Every --hw*/--zig* flag in scripts/slurm/*.sh exists in the entry parsers."""
     import argparse

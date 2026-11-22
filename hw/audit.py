@@ -186,7 +186,7 @@ def edge_stats(model, recs, units: HWUnits) -> Dict[str, dict]:
                     isat_eff = isat_eff * g_vca
                 ratio = torch.maximum(A / B, B / A)
             a = agg.setdefault(fam, {"n_edges": 0, "n_active": 0, "slope": [], "isat": [],
-                                     "isat_eff": [], "ratio": [], "gain": [], "stages": []})
+                                     "isat_eff": [], "ratio": [], "gain": [], "grid_error": [], "stages": []})
             a["n_edges"] += int(gate.numel())
             a["n_active"] += int(active.sum())
             a["stages"].append(i)
@@ -195,7 +195,15 @@ def edge_stats(model, recs, units: HWUnits) -> Dict[str, dict]:
                 a["isat"].append(isat[active])
                 a["isat_eff"].append(isat_eff[:, active].reshape(-1))
                 a["ratio"].append(ratio[active])
-                a["gain"].append(torch.cat([A[active], B[active]]))
+                active_gains = torch.cat([A[active], B[active]])
+                a["gain"].append(active_gains)
+                if ab_mode(getattr(getattr(st, "hw", None), "constraints", None)) == "cap_divider":
+                    c = st.hw.constraints
+                    lo = 1.0 / float(c.hw_ab_rmax)
+                    span = 1.0 - lo
+                    nlevels = 2 ** int(c.hw_ab_bits)
+                    nearest = lo + torch.round((active_gains - lo) / span * (nlevels - 1)) / (nlevels - 1) * span
+                    a["grid_error"].append((active_gains - nearest).abs())
     out = {}
     for fam, a in agg.items():
         r = {"n_edges": a["n_edges"], "n_active": a["n_active"], "stages": a["stages"]}
@@ -209,6 +217,12 @@ def edge_stats(model, recs, units: HWUnits) -> Dict[str, dict]:
                     r[k + "_frac_out"] = float(((v < ISAT_HW_MIN) | (v > ISAT_HW_MAX)).double().mean())
                 if k == "ratio":
                     r["ratio_frac_over"] = float((v > R_MAX).double().mean())
+        if a["grid_error"]:
+            errors = torch.cat(a["grid_error"]).double()
+            gains = torch.cat(a["gain"]).double()
+            r["cap_grid_max_error"] = float(errors.max())
+            r["cap_grid_n_distinct"] = int(torch.unique(torch.round(gains * 1e7) / 1e7).numel())
+            r["cap_grid_ok"] = bool((errors < 1e-6).all())
         out[fam] = r
     return out
 
@@ -384,8 +398,11 @@ def audit(checkpoint: str, hw: HWConfig, x: torch.Tensor, stiff_rows: int = 64,
         if "ratio" in r:
             if mode == "cap_divider":
                 lo = 1.0 / hw.constraints.hw_ab_rmax
+                grid_ok = r.get("cap_grid_ok", False)
+                n_codes = r.get("cap_grid_n_distinct", 0)
                 rows.append(("A/B cap-divider gains", fam, r["gain"], f"[{lo:g}, 1]",
-                             "STE capacitor DAC", _status(r["gain"][0] >= lo and r["gain"][1] <= 1.0)))
+                             f"{n_codes} distinct codes; max grid error {r.get('cap_grid_max_error', float('inf')):.2g}",
+                             _status(r["gain"][0] >= lo and r["gain"][1] <= 1.0 and grid_ok)))
             elif mode == "differential":
                 rows.append(("A/B differential unity", fam, r["gain"], "A = B = 1",
                              "no per-edge A/B", _status(r["gain"] == (1.0, 1.0))))

@@ -114,3 +114,40 @@ def test_interpreter_has_no_model_imports():
         elif isinstance(node,ast.ImportFrom) and node.module:
             imported.add(node.module.split(".")[0])
     assert not (forbidden & imported), f"forbidden model imports: {sorted(forbidden & imported)}"
+
+
+@pytest.mark.parametrize("preset", ["phase3a_core", "phase3a_core_diff"])
+def test_toy_net_hw_interpreter_roundtrip(tmp_path, preset):
+    """The resolved table must reproduce the actual constrained TOY_NET forward."""
+    import copy
+    import sys
+    from hw import HWConfig, load_preset
+    from tests.golden.make_golden import TOY_NET, make_model, CtleStudent, _build_net, seed_all
+
+    cfg = HWConfig.from_dict(load_preset(preset))
+    spec = copy.deepcopy(TOY_NET)
+    seed_all(20261122)
+    net = _build_net(spec, hw=cfg).double()
+    model = CtleStudent(net, 4, 3, 4.0).double().eval()
+    # Small fixed perturbations ensure gates, signs and capacitor codes are not
+    # left at their symmetric initialization points.
+    gen = torch.Generator().manual_seed(7319)
+    with torch.no_grad():
+        for name, p in sorted(model.named_parameters()):
+            p.add_(0.015 * torch.randn(p.shape, generator=gen, dtype=p.dtype))
+    table = json.loads(json.dumps(spectre_export.build_param_table(model, mode="hw", hw=cfg)))
+    inputs = torch.tensor([[0.08, 0.2, 0.7, 1.4], [0.12, 0.4, 0.9, 1.8],
+                           [0.16, 0.5, 1.1, 2.2]], dtype=torch.float64)
+    captured, hooks = [], []
+    for stage in model.net.core.stages:
+        hooks.append(stage.register_forward_hook(lambda _m, _i, out: captured.append(out[0].detach().clone())))
+    with torch.no_grad():
+        want = model(inputs)
+    for hook in hooks:
+        hook.remove()
+    got = simulate(table, inputs)
+    out_err = (got["logits"] - want).abs().max().item()
+    state_err = max((a - b).abs().max().item() for a, b in zip(got["stage_states"], captured))
+    print(f"{preset}: output max error={out_err:.3g}, final-state max error={state_err:.3g}")
+    assert out_err <= 1e-6, f"{preset} output max error {out_err:.3g}"
+    assert state_err <= 1e-6, f"{preset} state max error {state_err:.3g}"

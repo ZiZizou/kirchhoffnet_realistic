@@ -5,7 +5,7 @@ import torch
 
 from checkpoints import load_paper_checkpoint
 from export import spectre_export
-from export.netlist_interp import simulate
+from export.netlist_interp import simulate, stage_rhs
 
 ROOT = Path(__file__).resolve().parents[1]
 CKPT = ROOT / "assets/baselines/paper_trial_0011/phase_a_best.pt"
@@ -34,3 +34,20 @@ def test_unmapped_state_key_fails(monkeypatch,tmp_path):
     monkeypatch.setattr(spectre_export,"load_paper_checkpoint",lambda *a,**k:Fake())
     with pytest.raises(ValueError,match="unmapped state_dict key"):
         spectre_export.export("ignored",tmp_path)
+
+
+def test_stage_rhs_matches_model_call_path():
+    model=load_paper_checkpoint(CKPT,dtype=torch.float64)
+    table=json.loads(json.dumps(spectre_export.build_param_table(model)))
+    torch.manual_seed(814)
+    u=model.scale_input(torch.rand(5,4,dtype=torch.float64))
+    for stage_idx in (0,3):
+        stage=model.net.core.stages[stage_idx]
+        x_live=torch.randn(5,stage.num_nodes,dtype=torch.float64)
+        x_held=torch.randn(5,stage.num_nodes,dtype=torch.float64)
+        gate=stage.edge_gain("core",u)
+        frozen=stage._compute_i_edge_const(x_held,gate)
+        want=stage.rhs(x_live,u=u,i_edge_const=frozen,vca_gate_core=gate)
+        got=stage_rhs(table,stage_idx,x_live,x_held,u)
+        err=(got-want).abs().max().item()
+        assert err <= 1e-9, f"stage {stage_idx} max absolute error {err:.3g}"

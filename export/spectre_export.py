@@ -74,7 +74,7 @@ def build_param_table(model, mode="legacy") -> dict:
                 "readout_dst_start": int(s._readout_dst_start)},
             "solver": {"method":"heun", "t_span": float(net.core.stage_times[i]), "num_steps":int(net.core.stage_steps[i])},
             "settings": {"c_eff":float(s.c_eff), "x_max":float(s.x_max), "clip_current":float(s.clip_current),
-                "clip_sharpness":sharp, "leak":float(s.leak_constant) if s.leak_mode == "non-programmable" else _softplus(s.raw_leak),
+                "clip_sharpness":sharp, "leak":_tensor(s._effective_leak()),
                 "freeze_read":bool(s.freeze_read), "freeze_boundary":bool(s.freeze_boundary),
                 "freeze_temporal_read":bool(s.freeze_temporal_read), "read_only_source":bool(s.read_only_source),
                 "readout_mode":s.readout_mode, "leak_mode":s.leak_mode},
@@ -104,8 +104,8 @@ def build_param_table(model, mode="legacy") -> dict:
         "readout":{"kind":"output_affine", "gain":_tensor(affine.gain), "bias":_tensor(affine.bias),
             "tanh_gain":_tensor(affine.tanh_gain), "relu_gain":_tensor(affine.relu_gain),
             "relu_threshold":_tensor(affine.relu_threshold),
-            "post_transfer":{"activation":post.activation,"w1":_tensor(post.residual_w1),"w2":_tensor(post.residual_w2),
-                "w3":_tensor(post.residual_w3),"vth":_tensor(post.residual_vth)}}}
+            "post_transfer":{"activation":post.activation,"residual_w1":_tensor(post.residual_w1),"residual_w2":_tensor(post.residual_w2),
+                "residual_w3":_tensor(post.residual_w3),"residual_vth":_tensor(post.residual_vth)}}}
 
 def export(checkpoint, out, mode="legacy", fabric="timemux", specs=16, hw_config=None):
     if mode not in {"legacy", "hw"} or fabric not in {"timemux", "copies"}:

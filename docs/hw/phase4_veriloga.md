@@ -66,7 +66,7 @@ No Verilog-A source changes were needed to compile these modules. Spectre emitte
 
 ## Spectre-versus-reference characterization
 
-`/home/annaik/Documents/kirchhoffnet_refactor/venv/bin/python scripts/spectre/characterize.py` generates PSFASCII DC and transient analyses with 48 parallel test cases. OTA/shunt/rail-clip currents are converted to `Iu`; transfer voltage error and node-cap transient error are in x units. Node-cap leakage is compared against `x0·exp(−leak·t_model/c_eff)` over five RC constants. Rail clipping is evaluated via `DifferentialStage.soft_clip` in Torch at DC points spanning both rails. Transfer is compared with `StageTransfer` from `stage_transfer.py` (including the configured hardware clamp); VCA uses `gating.vca.vca_edge_gain`. OTA, shunt, and GLN values still use copied equations rather than callable framework forward paths. In this checkout, `hw.constraints.cap_divider_gain` is absent, so cap-divider code resolution remains a copied equation rather than a call to that helper.
+`/home/annaik/Documents/kirchhoffnet_refactor/venv/bin/python scripts/spectre/characterize.py` generates PSFASCII DC and transient analyses with 64 test cases. OTA/shunt/rail-clip/boundary-sense currents are converted to `Iu`; transfer voltage error and node-cap transient error are in x units. Node-cap leakage is compared against `x0·exp(−leak·t_model/c_eff)` over five RC constants. Rail clipping is evaluated via `DifferentialStage.soft_clip` in Torch at DC points spanning both rails. Boundary/sense uses the actual `FreeTanhLibrary.forward_tanh` path, with boundary `(u,node)` and sense `(node,Vref)` ordering from `DifferentialStage`. Transfer is compared with `StageTransfer` from `stage_transfer.py` (including the configured hardware clamp); VCA uses `gating.vca.vca_edge_gain`. Core OTA, shunt, and GLN values still use copied equations rather than callable framework forward paths. In this checkout, `hw.constraints.cap_divider_gain` is absent, so cap-divider code resolution remains a copied equation rather than a call to that helper.
 
 | Module / mode | Cases | Maximum absolute error | Maximum relative error |
 |---|---:|---:|---:|
@@ -74,9 +74,9 @@ No Verilog-A source changes were needed to compile these modules. Spectre emitte
 | `ota_edge` hw (differential / cap-divider) | 6 | 5.68e-16 Iu | 8.64e-16 |
 | `shunt` DC | 3 | 2.84e-16 Iu | 1.87e-16 |
 | `node_cap_leak` transient | 4 | 8.71e-6 x | 1.45e-6 |
-| `rail_clip` DC (Torch `DifferentialStage.soft_clip`) | 11 | 1.39e-17 Iu | 1.39e-17 |
+| `rail_clip` DC (Torch `DifferentialStage.soft_clip`) | 11 | 1.39e-17 Iu | 2.78e-16 |
+| `boundary_sense_ota` boundary + sense (Torch `FreeTanhLibrary.forward_tanh`) | 16 | 7.84e-15 Iu | 3.24e-14 |
 | `sample_hold` | — | not measured | not measured |
-| `boundary_sense_ota` | — | not measured | not measured |
 | `crossbar_accumulator` | — | not measured | not measured |
 | `interstage_transfer` HW clamp vs `StageTransfer` | 4 | 5.72e-9 x | 5.33e-10 |
 | `vca_bias` | 2 | 4.44e-16 gain | 4.18e-16 |
@@ -87,8 +87,8 @@ The characterization result JSON and all raw runs are under `.agent_scratch/task
 
 ## Known gaps / release status
 
-- Characterization is partial: node-cap RC transient, sample/hold capture and droop, crossbar accumulation, boundary OTA, rail clip, and phase duration edges against `hw/timemux.py` remain to be simulated and compared. Thus this is not full module equivalence validation.
-- OTA/shunt and GLN copied-formula references, and the VCA callable reference, match Spectre at sampled points to floating-point precision. Transfer now uses the exact piecewise stage rewrite and matches callable `StageTransfer` to 5.72e-9 x maximum absolute error. The OTA and GLN reference paths are not yet calls into the real Torch implementation; cap-divider helper resolution is unavailable in this checkout.
+- Characterization is partial: node-cap RC transient, sample/hold capture and droop, crossbar accumulation, rail clip, and phase duration edges against `hw/timemux.py` remain to be simulated and compared. Thus this is not full module equivalence validation.
+- Boundary/sense OTA uses the real `FreeTanhLibrary.forward_tanh` Torch path and matches 16 Spectre points to 7.84e-15 Iu maximum absolute and 3.24e-14 maximum relative error. Core OTA/shunt/GLN references are copied formulas rather than callable paths. Transfer uses the exact piecewise stage rewrite and matches callable `StageTransfer` to 5.72e-9 x maximum absolute error; cap-divider helper resolution remains unavailable.
 - The canonical A/B modes compile, but per-stage parameter arrays/indexing and complete timemux bank switching are still missing. The exporter and parameter table must drive actual instances consistently.
 - HW OTA compliance is a behavioral leg approximation and still needs comparison against `hw.constraints.leg_factors`/`compliance_legs` (including normalization and 85 °C thermal voltage). The specified Isat ceiling is not enforced inside this primitive.
 - S&H `kT/C` noise and exact acquisition/droop characterization are absent; deterministic injection/droop remain approximate circuit abstractions.

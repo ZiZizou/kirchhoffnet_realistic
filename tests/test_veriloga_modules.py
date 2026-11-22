@@ -72,11 +72,14 @@ def test_spectre_ota_and_shunt_match_analytic_reference():
                             cwd=ROOT, text=True, capture_output=True, timeout=600, check=True)
     report_path = Path(result.stdout.strip().splitlines()[-1])
     report = json.loads(report_path.read_text())
-    assert report["measured_cases"] == 48
+    assert report["measured_cases"] == 64
     assert {r["module"] for r in report["results"]} == {
         "ota_edge", "shunt", "interstage_transfer", "vca_bias", "gln_bias",
-        "node_cap_leak", "rail_clip",
+        "node_cap_leak", "rail_clip", "boundary_sense_ota",
     }
+    boundary_sense = [r for r in report["results"] if r["module"] == "boundary_sense_ota"]
+    assert len(boundary_sense) == 16
+    assert {r["mode"] for r in boundary_sense} == {"boundary", "sense"}
     legacy = [r for r in report["results"] if r["module"] == "ota_edge" and r["mode"] == "legacy"]
     assert len(legacy) == 16
     assert max(r["rel_error"] for r in legacy) <= 1e-6
@@ -93,6 +96,7 @@ def test_spectre_ota_and_shunt_match_analytic_reference():
         "ota_edge": 1e-5, "shunt": 1e-5, "interstage_transfer": 1e-6,
         "vca_bias": 1e-5, "gln_bias": 1e-5,
         "node_cap_leak": 1e-5, "rail_clip": 1e-6,
+        "boundary_sense_ota": 1e-5,
     }
     for module, tolerance in tolerances.items():
         rows = [r for r in report["results"] if r["module"] == module]

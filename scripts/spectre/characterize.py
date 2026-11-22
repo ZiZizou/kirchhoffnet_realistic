@@ -59,6 +59,37 @@ def cases():
         out.append({"module": "interstage_transfer", "mode": "hw_clamp", "x": x,
                     "params": {"w1": 0.8, "w2": 0.4, "w3": 0.2, "vth": 0.1,
                                "x_hard": 5.714, "smooth_width": 1e-5}})
+    # Boundary OTA: ideal input source -> dynamic destination node. Sense OTA:
+    # dynamic source node -> ideal Vref destination. Match DifferentialStage's
+    # normalized source/destination ordering for both families.
+    boundary_points = (
+        (-5.0, 0.2, 1.0, 0.9, 1.1, 0.12, -1.0),
+        (-4.0, -0.3, 0.8, 1.2, 0.7, -0.08, 1.0),
+        (-3.0, 0.5, 1.3, 0.6, 1.4, 0.2, -1.0),
+        (-0.4, 0.1, 0.9, 1.0, 1.0, 0.05, 1.0),
+        (0.0, -0.2, 1.1, 0.7, 1.2, -0.15, -1.0),
+        (1.2, 0.4, 0.7, 1.4, 0.8, 0.1, 1.0),
+        (3.98, 0.1, 1.2, 0.9, 1.1, 0.07, -1.0),
+        (-4.02, -0.1, 0.95, 1.05, 0.95, -0.04, 1.0),
+    )
+    sense_points = (
+        (-5.0, 0.0, 1.0, 0.9, 1.1, 0.12, -1.0),
+        (-4.0, 0.2, 0.8, 1.2, 0.7, -0.08, 1.0),
+        (-2.0, -0.3, 1.3, 0.6, 1.4, 0.2, -1.0),
+        (-0.2, 0.4, 0.9, 1.0, 1.0, 0.05, 1.0),
+        (0.0, -0.1, 1.1, 0.7, 1.2, -0.15, -1.0),
+        (1.5, 0.2, 0.7, 1.4, 0.8, 0.1, 1.0),
+        (3.99, 0.1, 1.2, 0.9, 1.1, 0.07, -1.0),
+        (-4.01, -0.1, 0.95, 1.05, 0.95, -0.04, 1.0),
+    )
+    for role, points in (("boundary", boundary_points), ("sense", sense_points)):
+        for source_x, dest_x, gm, isat, aa, theta, sign in points:
+            out.append({"module": "boundary_sense_ota", "mode": role,
+                        "xs": source_x, "xd": dest_x,
+                        "params": {"gm": gm, "Isat": isat, "A": aa,
+                                   "B": 1.15, "theta": theta, "s": sign,
+                                   "z_gate": 0.83, "x_max": 4.0,
+                                   "gate_width": 0.02}})
     # Rail-clip DC points span both soft rails and the interior.
     for x in (-6.0, -4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 6.0):
         out.append({"module": "rail_clip", "mode": "dc", "x": x,
@@ -73,6 +104,31 @@ def cases():
 def ref_current(case, vs, vd):
     p = case["params"]
     xs, xd = (vs - VCM) / VU, (vd - VCM) / VU
+    if case["module"] == "boundary_sense_ota":
+        # Use the real model core and resolve its raw parameters to the exact
+        # exported OTA values. This is forward_tanh's same normalized src/dst
+        # contract used by boundary_cell_lib (u, node) and sense (node, Vref).
+        import torch
+        from cell_library import FreeTanhLibrary
+        gm_min, gm_max, isat_min, isat_max = 0.01, 2.0, 0.01, 1.5
+        lib = FreeTanhLibrary(1, gm_min=gm_min, gm_max=gm_max,
+                              isat_min=isat_min, isat_max=isat_max,
+                              bias_enabled=True).double()
+        def logit(v):
+            return math.log(v / (1.0 - v))
+        def inv_softplus(v):
+            return math.log(math.expm1(v))
+        with torch.no_grad():
+            lib.a_raw.fill_(inv_softplus(p["A"]))
+            lib.b_raw.fill_(inv_softplus(p["B"]))
+            lib.s_raw.fill_(p["s"])
+            lib.gm_raw.fill_(logit((p["gm"] - gm_min) / (gm_max - gm_min)))
+            lib.isat_raw.fill_(logit((p["Isat"] - isat_min) / (isat_max - isat_min)))
+            lib.theta_raw.fill_(p["theta"])
+        source = torch.tensor([[xs]], dtype=torch.float64)
+        destination = torch.tensor([[xd]], dtype=torch.float64)
+        current = lib.forward_tanh(source, destination, x_max=p["x_max"])
+        return float((current * p["z_gate"])[0, 0].detach()) * IU
     if case["module"] == "shunt":
         gate = p["z_gate"] * p["vca"] if p["vca_gate_shunt"] else p["z_gate"]
         return p["G"] * gate * (xs - xd) * IU
@@ -103,7 +159,7 @@ def ref_current(case, vs, vd):
 
 def ref_value(case, values):
     module = case["module"]
-    if module in ("ota_edge", "shunt"):
+    if module in ("ota_edge", "shunt", "boundary_sense_ota"):
         return ref_current(case, values["src"], values["dst"]), IU, "Iu"
     if module in ("vca_bias", "gln_bias"):
         if module == "vca_bias":
@@ -198,7 +254,7 @@ def run(args):
     lines = ["simulator lang=spectre"] + [f'ahdl_include "{VA / (m + ".va")}"' for m in modules]
     lines.append("Vcm (vcm 0) vsource dc=0.4")
     for i, c in enumerate(cs):
-        if c["module"] in ("ota_edge", "shunt"):
+        if c["module"] in ("ota_edge", "shunt", "boundary_sense_ota"):
             vs, vd = VCM + VU*c["xs"], VCM + VU*c["xd"]
             lines += [f"Vsrc{i} (src{i} 0) vsource dc={vs:.17g}",
                       f"Vbias{i} (bias{i} 0) vsource dc={vd:.17g}",
@@ -266,7 +322,7 @@ def run(args):
     hw_units = __import__("hw.units", fromlist=["HWUnits"]).HWUnits()
     for i,c in enumerate(cs):
         module = c["module"]
-        if module in ("ota_edge", "shunt"):
+        if module in ("ota_edge", "shunt", "boundary_sense_ota"):
             vs, vd = nodes[f"src{i}"], nodes[f"dst{i}"]
             measured = nodes[f"Vbias{i}:p"]
             if module == "ota_edge" and c["params"].get("mode") == 1:
@@ -306,7 +362,7 @@ def run(args):
                      "samples": len(samples), "error_units": "x",
                      "abs_error_model_units": max_error, "rel_error": max_error / max(abs(c["x0"]), 1e-12)})
     report = {"run_dir": str(run_dir), "measured_cases": len(rows), "uncharacterized": [
-        "sample_hold", "boundary_sense_ota", "crossbar_accumulator", "phase_ctrl"], "results": rows}
+        "sample_hold", "crossbar_accumulator", "phase_ctrl"], "results": rows}
     out = run_dir / "characterization.json"
     out.write_text(json.dumps(report, indent=2) + "\n")
     for module in sorted({r["module"] for r in rows}):

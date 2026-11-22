@@ -1,7 +1,6 @@
 {
   "units": {},
   "constraints": {
-    "hw_ratio_ab": true,
     "hw_slope_bound": true,
     "hw_ic_coupling": true,
     "hw_no_alpha": true,
@@ -14,7 +13,10 @@
     "hw_vref_bits": 6,
     "hw_xbar_bound": true,
     "hw_xbar_bits": 5,
-    "hw_xbar_mode": "signed"
+    "hw_xbar_mode": "signed",
+    "hw_ab_mode": "cap_divider",
+    "hw_ab_bits": 3,
+    "hw_ab_rmax": 2.0
   },
   "timemux": {
     "enable": true,

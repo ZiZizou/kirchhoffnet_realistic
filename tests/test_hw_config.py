@@ -219,7 +219,17 @@ def test_cli_flags_override_the_preset():
     cfg = hw_config_from_args(args)
     assert cfg.timemux.enable is True          # from the preset
     assert cfg.timemux.xfer_mode == "no_tanh"  # from the CLI
-    assert cfg.constraints.hw_ratio_ab is True
+    assert cfg.constraints.hw_ab_mode == "cap_divider"
+    assert cfg.constraints.hw_ab_bits == 3 and cfg.constraints.hw_ab_rmax == 2.0
+
+
+def test_new_ab_cli_flags():
+    cfg = hw_config_from_args(_parse([
+        "--hw-ab-mode", "cap_divider", "--hw-ab-bits", "4", "--hw-ab-rmax", "3",
+        "--hw-slope-bound",
+    ]))
+    assert cfg.constraints.hw_ab_mode == "cap_divider"
+    assert cfg.constraints.hw_ab_bits == 4 and cfg.constraints.hw_ab_rmax == 3
 
 
 def test_no_flag_leaves_the_config_off():

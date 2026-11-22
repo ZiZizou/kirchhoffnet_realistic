@@ -286,6 +286,16 @@ Common rules:
 - **Effect:** removes the unbounded slope `gm·A`. A ≠ B gives a common-mode term `(A−B)·x_cm` that a real pair does not have; the ratio form bounds A−B = 2(r−1)/(r+1) to ±1.2 rather than unbounded. Trained readout edges with r outside [1/4, 4] (e.g. A = 2.65 against B = 0.43 is r ≈ 6) are clipped to the bound. Expect a small accuracy cost; measure it before enabling other flags.
 - Flag: `hw_ratio_ab`. Code site: `_tanh_core` (`cell_library.py:344-345`).
 
+#### Realistic A/B modes (Task A)
+
+The OTA pair current is `I = σ(z)·Isat·tanh(gm·(s·(A·x_src − B·x_dst) + θ))`. A and B are input-voltage gains, not transistor W/L: a native single-ended 22FDX differential pair shares gm and therefore has A=B=1. Any asymmetric W/L produces offset, not independent input gain. Unequal A/B requires a passive, switch-reset capacitive divider on each input, with gains no greater than one. The mode resolver treats legacy `hw_ratio_ab=True` as exactly `hw_ab_mode="ratio"`; setting both to ratio is accepted, while setting the boolean with `differential` or `cap_divider` raises a conflict error. `None` retains the legacy unconstrained A/B.
+
+- `ratio`: backward-compatible `r_raw`, A/B ratio parameterisation and optional max-normalisation under the slope bound.
+- `differential`: no A/B trainables; exactly A=B=1. The independent slope attenuation `g` sets the gain; requires `hw_slope_bound`.
+- `cap_divider`: two trainable raw codes per edge, STE-quantised independently; requires `hw_slope_bound`. For N bits, integer code `k=round(sigmoid(raw)·(2^N−1))`, `k∈{0,…,2^N−1}`, maps linearly as `gain=1/r_max+(1−1/r_max)·k/(2^N−1)`. Thus with defaults N=3, r_max=2 the eight gains are `{0.5, 0.5714, 0.6429, 0.7143, 0.7857, 0.8571, 0.9286, 1}`. Forward is quantised; backward uses the sigmoid's smooth derivative (STE).
+
+Defaults 3 bits / r_max=2 provide eight useful matched cap ratios without a large capacitor bank; the modest range limits area and mismatch exposure. The divider adds a switched intermediate node and parasitic capacitance; that node is not an existing fabric state node, so `hw_c_node` cannot represent it correctly (it accounts edge terminals on network nodes only). Treat this local parasitic as part of divider design/settling, not the node-cap budget. Verilog-A mapping is `V(pin)=Vcm+gain·(V(source)−Vcm)`, with the exact code mapping above; `hw.constraints.effective_ab_values(lib)` exposes per-edge effective tensors for export. The paper checkpoint has A/B as high as roughly 11–13, so clipping its gains to r_max=2 is a substantial model change and requires retraining. The presets use cap_divider; the separate `phase3a_core_diff` preset is the native-pair comparison.
+
 ### 3.2 gm·A bound from the subthreshold slope
 
 - **Current code:** `gm = gm_min + (gm_max − gm_min)·σ(gm_raw)` with `gm_max = 4.24197` (`cell_library.py:351-352`), `u = gm·(sgn·(A·Vs − B·Vd) + θ)` (`:357`). Effective slope `gm·A` ≈ 4.2 × A, unbounded because of A.

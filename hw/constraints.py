@@ -52,7 +52,10 @@ GLN_MODES = (None, "tail", "slope")
 # ---------------------------------------------------------------------------
 @dataclass
 class HWConstraints:
-    hw_ratio_ab: bool = False                       # 3.1
+    hw_ratio_ab: bool = False                       # legacy alias for hw_ab_mode='ratio'
+    hw_ab_mode: Optional[str] = None                # 3.1: ratio, differential, cap_divider
+    hw_ab_bits: int = 3
+    hw_ab_rmax: float = 2.0
     hw_slope_bound: bool = False                    # 3.2
     hw_slope_g_min: float = G_MIN                   # 3.2 attenuation floor
     hw_ic_coupling: bool = False                    # 3.3
@@ -80,6 +83,17 @@ class HWConstraints:
         self.validate()
 
     def validate(self) -> None:
+        modes = (None, "ratio", "differential", "cap_divider")
+        if self.hw_ab_mode not in modes:
+            raise ValueError(f"hw_ab_mode must be one of {modes}, got {self.hw_ab_mode!r}")
+        if self.hw_ratio_ab and self.hw_ab_mode not in (None, "ratio"):
+            raise ValueError("hw_ratio_ab=True conflicts with hw_ab_mode other than 'ratio'")
+        if self.hw_ab_mode in ("differential", "cap_divider") and not self.hw_slope_bound:
+            raise ValueError(f"hw_ab_mode={self.hw_ab_mode!r} requires hw_slope_bound=True")
+        if int(self.hw_ab_bits) != self.hw_ab_bits or self.hw_ab_bits < 1:
+            raise ValueError("hw_ab_bits must be an integer >= 1")
+        if self.hw_ab_rmax < 1:
+            raise ValueError("hw_ab_rmax must be >= 1")
         if self.hw_xbar_mode not in XBAR_MODES:
             raise ValueError(f"hw_xbar_mode must be one of {XBAR_MODES}, got {self.hw_xbar_mode!r}")
         if self.hw_c_node not in C_NODE_MODES:
@@ -137,7 +151,7 @@ class HWConstraints:
             float(v) != 0.0 for v in self.hw_mismatch_sigma.values())
 
     def affects_cell(self) -> bool:
-        return bool(self.hw_ratio_ab or self.hw_slope_bound or self.hw_ic_coupling
+        return bool(self.hw_ratio_ab or self.hw_ab_mode is not None or self.hw_slope_bound or self.hw_ic_coupling
                     or self.hw_no_alpha or self.hw_alpha_bwd > 0.0 or self.hw_theta_bound
                     or self.mismatch_active() or self.hw_gln_mode == "tail"
                     or self.hw_compliance)
@@ -164,6 +178,27 @@ def quantize_ste(x: torch.Tensor, bits: Optional[int], lo: float, hi: float) -> 
 # ---------------------------------------------------------------------------
 # 3.1 bounded A/B (ratio form)
 # ---------------------------------------------------------------------------
+def ab_mode(constraints) -> Optional[str]:
+    """Resolve the legacy boolean alias and explicit A/B mode."""
+    if constraints is None:
+        return None
+    return constraints.hw_ab_mode or ("ratio" if constraints.hw_ratio_ab else None)
+
+
+def cap_divider_gain(raw: torch.Tensor, bits: int = 3, r_max: float = 2.0) -> torch.Tensor:
+    """STE cap DAC: integer code k=round(sigmoid(raw)*(2^bits-1)); gain=1/rmax+(1-1/rmax)*k/(2^bits-1)."""
+    levels = 2 ** int(bits) - 1
+    x = torch.sigmoid(raw)
+    code = torch.round(x * levels)
+    q = 1.0 / float(r_max) + (1.0 - 1.0 / float(r_max)) * code / levels
+    return x + (q - x).detach()
+
+
+def effective_ab_values(lib):
+    """Return effective per-edge (A, B) tensors for a cell library in its configured A/B mode."""
+    return lib.ab_values()
+
+
 def ratio_ab(r_raw: torch.Tensor, r_max: float = R_MAX):
     """``r = exp(ln(r_max) tanh(r_raw))``; ``A = 2r/(1+r)``, ``B = 2/(1+r)`` so A + B = 2, A/B = r."""
     r = torch.exp(math.log(r_max) * torch.tanh(r_raw))

@@ -46,7 +46,7 @@ if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
 from . import HWConfig, TimeMuxConfig, hw_config_from_args, hw_or_none, parse_hw_args  # noqa: E402
-from .constraints import ISAT_HW_MAX, R_MAX, STIFFNESS_LIMIT  # noqa: E402
+from .constraints import ISAT_HW_MAX, R_MAX, STIFFNESS_LIMIT, ab_mode  # noqa: E402
 from .units import HWUnits  # noqa: E402
 
 ISAT_HW_MIN = 0.6          # Phase 3a 2.5: internal-pole floor of the OTA bias
@@ -186,7 +186,7 @@ def edge_stats(model, recs, units: HWUnits) -> Dict[str, dict]:
                     isat_eff = isat_eff * g_vca
                 ratio = torch.maximum(A / B, B / A)
             a = agg.setdefault(fam, {"n_edges": 0, "n_active": 0, "slope": [], "isat": [],
-                                     "isat_eff": [], "ratio": [], "stages": []})
+                                     "isat_eff": [], "ratio": [], "gain": [], "stages": []})
             a["n_edges"] += int(gate.numel())
             a["n_active"] += int(active.sum())
             a["stages"].append(i)
@@ -195,10 +195,11 @@ def edge_stats(model, recs, units: HWUnits) -> Dict[str, dict]:
                 a["isat"].append(isat[active])
                 a["isat_eff"].append(isat_eff[:, active].reshape(-1))
                 a["ratio"].append(ratio[active])
+                a["gain"].append(torch.cat([A[active], B[active]]))
     out = {}
     for fam, a in agg.items():
         r = {"n_edges": a["n_edges"], "n_active": a["n_active"], "stages": a["stages"]}
-        for k in ("slope", "isat", "isat_eff", "ratio"):
+        for k in ("slope", "isat", "isat_eff", "ratio", "gain"):
             if a[k]:
                 v = torch.cat(a[k]).double()
                 r[k] = (float(v.min()), float(v.max()))
@@ -378,10 +379,19 @@ def audit(checkpoint: str, hw: HWConfig, x: torch.Tensor, stiff_rows: int = 64,
                 ok = ISAT_HW_MIN <= r[k][0] and r[k][1] <= ISAT_HW_MAX
                 rows.append((f"{lab} range", fam, r[k], f"[{ISAT_HW_MIN:g}, {ISAT_HW_MAX:g}]",
                              f"{100 * r[k + '_frac_out']:.1f}% out", _status(ok)))
+    mode = ab_mode(hw.constraints)
     for fam, r in edges.items():
         if "ratio" in r:
-            rows.append(("A/B ratio max(A/B,B/A)", fam, r["ratio"], f"<= {R_MAX:g}",
-                         f"{100 * r['ratio_frac_over']:.1f}% over", _status(r["ratio"][1] <= R_MAX)))
+            if mode == "cap_divider":
+                lo = 1.0 / hw.constraints.hw_ab_rmax
+                rows.append(("A/B cap-divider gains", fam, r["gain"], f"[{lo:g}, 1]",
+                             "STE capacitor DAC", _status(r["gain"][0] >= lo and r["gain"][1] <= 1.0)))
+            elif mode == "differential":
+                rows.append(("A/B differential unity", fam, r["gain"], "A = B = 1",
+                             "no per-edge A/B", _status(r["gain"] == (1.0, 1.0))))
+            else:
+                rows.append(("A/B ratio max(A/B,B/A)", fam, r["ratio"], f"<= {R_MAX:g}",
+                             f"{100 * r['ratio_frac_over']:.1f}% over", _status(r["ratio"][1] <= R_MAX)))
     return {"rows": rows, "edges": edges, "rails": rails, "stiffness": stiff,
             "n_rows": int(x.shape[0]), "hw_hash": hw.hash(), "hw_off": hw.is_off(),
             "y_finite": bool(torch.isfinite(y).all())}

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import math
 import warnings
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -30,6 +31,9 @@ from cell_library import (
 )
 from gating.gln import gln_gm_override
 from gating.vca import vca_edge_gain
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle
+    from hw import HWConfig
 
 
 __all__ = ["DifferentialStage"]
@@ -194,10 +198,15 @@ output_ode_src: list[int] | None = None,
         vca_gate_shunt: bool = False,
         vca_separate_core_bus: bool = False,
         vca_bias: bool | None = None,
+        hw: "HWConfig | None" = None,
     ) -> None:
         super().__init__()
         self.num_nodes = int(num_nodes)
         self.cell_lib = cell_lib
+        # Hardware configuration (``hw.HWConfig``) or ``None``.  ``None`` keeps
+        # the pre-constraint behaviour bit-for-bit.  Plain attribute (not a
+        # parameter/buffer), so the state_dict is unchanged.
+        self.hw = hw
         self.read_only_source = read_only_source
         self.freeze_read = bool(freeze_read)
         self.freeze_boundary = bool(freeze_boundary)

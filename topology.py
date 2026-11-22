@@ -18,13 +18,16 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass, field
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 
 import torch
 import torch.nn as nn
 
 from config import PRESETS, VCA
 from differential_stage import DifferentialStage
+if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle
+    from hw import HWConfig
+
 from cell_library import (
     FreeTanhLibrary,
     make_cell_library,
@@ -906,6 +909,7 @@ def prune_stage(
             isat_min=old.isat_min,
             isat_max=old.isat_max,
             bias_enabled=old._bias_enabled,
+            hw=getattr(stage, "hw", None),
         )
     else:
         new_lib = stage.cell_lib
@@ -932,6 +936,7 @@ def prune_stage(
         vca_enabled=False,
         vca_rank=VCA["rank"],
         vca_in_dim=0,
+        hw=getattr(stage, "hw", None),
     )
 
     if transfer_params:
@@ -1128,6 +1133,7 @@ def topology_to_stage(
     vca_gate_shunt: bool = False,
     vca_separate_core_bus: bool = False,
     vca_bias: bool | None = None,
+    hw: "HWConfig | None" = None,
 ) -> tuple[DifferentialStage, list[int], dict[int, int]]:
     """Convert a SparseTopology into a DifferentialStage.
 
@@ -1219,6 +1225,7 @@ def topology_to_stage(
             isat_min=cell_lib.isat_min,
             isat_max=cell_lib.isat_max,
             bias_enabled=cell_lib._bias_enabled,
+            hw=hw,
         )
 
     # Shared-sense readout: clone the template sense cell library per stage
@@ -1241,6 +1248,7 @@ def topology_to_stage(
                 isat_min=readout_sense_cell_lib.isat_min,
                 isat_max=readout_sense_cell_lib.isat_max,
                 bias_enabled=readout_sense_cell_lib._bias_enabled,
+                hw=hw,
             )
             if int(readout_senses_per_node) == 2:
                 # Interleaved layout: odd-indexed cells are sense k=1 of
@@ -1266,6 +1274,7 @@ def topology_to_stage(
                 isat_min=cell_lib.isat_min,
                 isat_max=cell_lib.isat_max,
                 bias_enabled=cell_lib._bias_enabled,
+                hw=hw,
             )
 
     stage = DifferentialStage(
@@ -1306,6 +1315,7 @@ def topology_to_stage(
         vca_gate_shunt=vca_gate_shunt,
         vca_separate_core_bus=vca_separate_core_bus,
         vca_bias=vca_bias,
+        hw=hw,
     )
     return stage, active_nodes, id_map
 
@@ -1352,6 +1362,7 @@ def build_net_from_preset(
     gln_rank: int = 2,
     gln_alpha_init: float = 1.0,
     gln_families: str | None = None,
+    hw: "HWConfig | None" = None,
 ):
     """Build a full KirchhoffNetWithIO from a config.PRESETS entry.
 
@@ -1480,6 +1491,7 @@ def build_net_from_preset(
         gln_rank=gln_rank,
         gln_alpha_init=gln_alpha_init,
         gln_families=gln_families,
+        hw=hw,
     )
 
 
@@ -1516,6 +1528,7 @@ def build_net_from_config(
     gln_alpha_init: float = 1.0,
     gln_families: str | None = None,
     boundary_first_stage_only: bool = False,
+    hw: "HWConfig | None" = None,
 ):
     """Build a KirchhoffNetWithIO from a full config dict.
 
@@ -1729,6 +1742,7 @@ def build_net_from_config(
                 isat_min=cell_lib.isat_min,
                 isat_max=cell_lib.isat_max,
                 bias_enabled=cell_lib._bias_enabled,
+                hw=hw,
             )
         else:
             raise ValueError(
@@ -1778,6 +1792,7 @@ def build_net_from_config(
                 gm_min=cell_lib.gm_min, gm_max=cell_lib.gm_max,
                 isat_min=cell_lib.isat_min, isat_max=cell_lib.isat_max,
                 bias_enabled=cell_lib._bias_enabled,
+                hw=hw,
             )
         raise ValueError(
             f"build_net_from_config: unsupported cell_lib type for "
@@ -2012,6 +2027,7 @@ def build_net_from_config(
             vca_gate_shunt=vca_gate_shunt,
             vca_separate_core_bus=vca_separate_core_bus,
             vca_bias=vca_bias_effective,
+            hw=hw,
             x_max=x_max,
             c_eff=c_eff,
             learnable_clip_sharpness=learnable_clip_sharpness,

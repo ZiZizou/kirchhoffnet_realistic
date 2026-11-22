@@ -13,6 +13,8 @@ cell tables) were removed in surgery 5/6; see the ``pre-surgery`` tag.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -25,6 +27,9 @@ from config import (
     TANH_REALISTIC_ISAT_MAX,
     TANH_REALISTIC_ISAT_MIN,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle
+    from hw import HWConfig
 
 
 __all__ = [
@@ -85,6 +90,7 @@ class FreeTanhLibrary(nn.Module):
         isat_min: float | None = None,
         isat_max: float | None = None,
         bias_enabled: bool = False,
+        hw: "HWConfig | None" = None,
     ) -> None:
         super().__init__()
         self.gm_min = float(gm_min if gm_min is not None else TANH_REALISTIC_GM_MIN)
@@ -123,6 +129,19 @@ class FreeTanhLibrary(nn.Module):
         self.g_resistive_raw = nn.Parameter(torch.full((num_edges,), -5.0))
 
         self._beta_softness = float(PHYS["beta_softness"])
+
+        # Hardware configuration (``hw.HWConfig``) or ``None``.
+        # ``None`` => no hardware constraints: every hook below keeps the
+        # pre-constraint behaviour bit-for-bit.  Not a parameter/buffer, so
+        # the state_dict (and the golden checkpoints) are unaffected.
+        self.hw = hw
+
+    # ------------------------------------------------------------------
+    @property
+    def hw_constraints(self):
+        """The ``HWConstraints`` of ``self.hw`` or ``None`` when the hardware layer is off."""
+        hw = getattr(self, "hw", None)
+        return None if hw is None else hw.constraints
 
     def current_gm(self) -> torch.Tensor:
         """Current gm values ``[E]`` from the bounded sigmoid map.
@@ -245,6 +264,7 @@ def make_cell_library(
     gm_max: float | None = None,
     isat_min: float | None = None,
     isat_max: float | None = None,
+    hw: "HWConfig | None" = None,
 ) -> FreeTanhLibrary:
     """Factory: returns a ``FreeTanhLibrary``. Only ``'tanh_free'`` is supported.
 
@@ -253,6 +273,12 @@ def make_cell_library(
     ``TANH_REALISTIC_*``); the constructor validates ``max > min``.
 
     The factory reads ``BIAS_ENABLED`` from ``CELL_LIBRARIES['tanh_free']``.
+
+    ``hw`` is the hardware configuration (``hw.HWConfig``) or ``None``.  It is
+    stored on the library (``lib.hw``) and read by the constraint hooks in
+    :meth:`FreeTanhLibrary._tanh_core`.  ``None`` means "no hardware
+    constraints": the forward pass is bit-identical to the pre-constraint
+    model.  It is not a parameter or a buffer, so the state_dict is unchanged.
 
     When ``num_edges`` is ``None`` (template), the returned library
     is created with ``num_edges=1`` and must be replaced with a per-stage
@@ -272,4 +298,5 @@ def make_cell_library(
         bias_enabled=bias_enabled,
         gm_min=gm_min, gm_max=gm_max,
         isat_min=isat_min, isat_max=isat_max,
+        hw=hw,
     )

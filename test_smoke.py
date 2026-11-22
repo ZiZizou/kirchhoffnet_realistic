@@ -6127,7 +6127,7 @@ def test_seed_everything_deterministic():
     print("\nTest SEED-1: seed_everything yields identical params across calls")
     import random
     import numpy as np
-    from train_ctle import seed_everything
+    from ctle_moe_baseline import seed_everything
     from cell_library import make_cell_library
     from topology import build_net_from_config
     from config import PRESETS
@@ -6166,7 +6166,7 @@ def test_seed_everything_seeds_numpy():
     """seed_everything() also seeds NumPy."""
     print("\nTest SEED-2: seed_everything seeds numpy.random")
     import numpy as np
-    from train_ctle import seed_everything
+    from ctle_moe_baseline import seed_everything
 
     seed_everything(7)
     a1 = np.random.rand(5)
@@ -6183,7 +6183,7 @@ def test_seed_everything_seeds_python_random():
     """seed_everything() also seeds Python's random module."""
     print("\nTest SEED-3: seed_everything seeds Python random")
     import random
-    from train_ctle import seed_everything
+    from ctle_moe_baseline import seed_everything
 
     seed_everything(11)
     a = [random.random() for _ in range(5)]

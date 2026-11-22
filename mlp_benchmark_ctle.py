@@ -2,7 +2,7 @@
 
 Mirrors the role of ``mlp_benchmark.py`` (smooth2d) and
 ``mlp_benchmark_housing.py`` (California Housing) for the CTLE problem that
-``train_ctle.py`` solves via knowledge distillation from a pre-trained
+the former ``train_ctle.py`` solved via knowledge distillation from a pre-trained
 ``RegimeAwareMoE`` teacher.
 
 The CTLE task maps a 4-dim spec vector ``[power, jitter, height, width]``
@@ -10,7 +10,7 @@ to a 7-dim unbounded logit vector ``[fW, current, ind, Rd, Cs, Rs, VDD]``.
 The teacher (loaded from a state-dict checkpoint such as
 ``dagger_student_moe.pt``) labels a synthetic dataset of ``--n-train`` train
 specs and ``--n-val`` val specs sampled from ``SPEC_RANGES``. Targets are
-per-dimension zero-mean/unit-variance normalized (matching train_ctle.py).
+per-dimension zero-mean/unit-variance normalized (matching the former train_ctle.py).
 
 By default (``--q75-input`` on), the raw 4-dim specs are passed through the
 teacher's ``scale_input()`` which applies log10 + StandardScaler/Q75
@@ -59,7 +59,7 @@ from torch.utils.data import DataLoader, TensorDataset
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config import OPTIM
-from train_ctle import (
+from ctle_moe_baseline import (
     PARAM_COLS,
     PARAM_LOG_BOUNDS,
     RegimeAwareMoE,
@@ -459,7 +459,7 @@ def main():
     parser.add_argument("--normalize-targets", dest="normalize_targets",
                         action="store_true", default=True,
                         help="Per-dim zero-mean / unit-variance normalize the teacher "
-                             "logits before training (default: on, matches train_ctle.py).")
+                             "logits before training (default: on, matches the former train_ctle.py).")
     parser.add_argument("--no-normalize-targets", dest="normalize_targets",
                         action="store_false",
                         help="Disable per-dim normalization.")
@@ -514,7 +514,7 @@ def main():
         out_dir = out_dir.with_name(f"{out_dir.name}_{suffix}")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---- load teacher MoE (mirrors train_ctle.py:1510-1551) ----
+    # ---- load teacher MoE (mirrors the former train_ctle.py) ----
     if not args.teacher_path.exists():
         raise FileNotFoundError(f"Teacher checkpoint not found: {args.teacher_path}")
     scaler_path = (

@@ -7,12 +7,39 @@
 > `differential_stage.py`, `topology.py`, `io_mapper.py`, `kirchhoff_net.py`,
 > `stage_transfer.py`, `train_script.py`).
 
-> **Current NARMA research handoff:** for the active causal delay-bank
-> reservoir problem, its measured Phase 5--8 results, constraints, and what an
-> outside proposer should answer, read
-> [`docs/narma-phase8-temporal-diversity-problem-statement.md`](docs/narma-phase8-temporal-diversity-problem-statement.md)
-> alongside this README and the progress summary. The README describes the
-> general machine; the handoff brief defines the current experiment.
+---
+
+## Scope after the Nov 2026 surgery (what is in this checkout)
+
+This checkout (`hw-refactor`) is the **HR-KNet hardware core**: the model of the paper plus
+what the Verilog-A / Cadence refactor needs. Everything else was removed (the code is not lost:
+it lives on the branches named below, see "Repository layout" at the end).
+
+**Kept (and tested by `tests/test_golden.py` + `test_f1_f2.py`, bit-for-bit against pre-surgery goldens)**
+`tanh_free` OTA edge (`cell_library.FreeTanhLibrary`) with resistive shunt; σ(z) edge gates;
+**VCA** (`gating/vca.py`, `DifferentialStage.edge_gain(family, u)`); **GLN rails**
+(`gln_rails.py`, `DifferentialStage.edge_gm_scale(family, ...)`); `freeze_read`
+(`--freeze-read`); shared-sense readout with signed crossbar (plus the temporal OTA mesh readout);
+interstage transfer `residual-relu-tanh`; soft rail clip with learnable sharpness; fixed-step Heun;
+Watts-Strogatz / torus / grid topologies; boundary fan-out; `OutputAffine`; the 3-phase
+schedule with edge pruning and Phase-C retrain (used by the Friedman presets); the CTLE entry points
+(`dagger-nuance-distillation-kirchhoffnet.py`, `fixed-mlp-distillation-kirchhoffnet.py`,
+`kn_bayes_opt.py`, `fixed-distillation-bayes-opt.py`, `ctle_dagger_common.py`, `spice_failure_check.py`)
+and the MLP/tree baselines.
+
+**Removed** (branch that still has it, if any)
+- NARMA stage features: `core_refresh_interval`, `node_activation`, `allow_experimental_cells`, `no_clip`,
+  `allow_boundary_target_overlap`, `vca_use_hidden`, the sequence forward, `make_narma_preset`/`PRESET_NARMA*`,
+  `dynamic_leak`, `TapRails`, all `narma_*` scripts and docs  → `narma-experiments`
+- DEQ solver (`--solver deq`, `deq_solver.py`, diagnostics) → `deq-experiments`
+- Degree budget, persistent drive edges, reference edges, skip-linear connection, node gates (`u_logits`),
+  4-phase schedule (`--schedule four_phase`, `--freeze-mappers`, teacher KD), orphaned sparse-solver losses
+- Legacy cell libraries (everything except `tanh_free`), `SimContext`, analog/Kirchhoff noise, ADC/variation paths,
+  `train_ctle.py`, `kn_benchmark_friedman2.py`, the inert `--kn-moe-*` flags
+- Failure rule unified: `ctle_metrics_config.DEGRADE_REL_THRESHOLD = 0.10` (>= 2 of 4 specs degrade by >= 10%).
+  Guarded by `test_failure_rule.py`.
+
+Tests: `python -m pytest -q` from the repo root runs everything (`pytest.ini`), ~1 min on CPU.
 
 ---
 
@@ -27,7 +54,7 @@ state `x(0)`, integrate KCL current equations with fixed-step Heun through a
 chain of `num_stages` graph stages (with small learned transfers between
 stages), then read a slice of the final state through a learned affine readout
 into `out_dim` logits. Training is direct BPTT through the unrolled Heun steps
-(no adjoint by default; an experimental DEQ fixed-point path exists).
+(no adjoint).
 
 ---
 
@@ -39,7 +66,7 @@ Per node `j`, with effective capacitance `C_eff = 1.0`:
 
 ```
 C_eff * dx_j/dt = Σ_in I_edge - Σ_out I_edge
-                + I_drive(j) + I_boundary(j) + I_temporal(j) + I_ref(j)
+                + I_boundary(j) + I_temporal(j)
                 - leak_j * x_j - clip(x_j)
 ```
 
@@ -65,7 +92,7 @@ C_eff * dx_j/dt = Σ_in I_edge - Σ_out I_edge
 u_e   = gm_e * (s_e * (A_e * Vsrc - B_e * Vdst) + theta_e)
 I_tanh_e = Isat_e * (tanh(u_e) + 0.01 * u_e)     # 0.01 leak slope = gradient floor
 I_res_e  = G_e * (Vsrc - Vdst),  G_e = softplus(g_raw_e)   # resistive shunt, NEVER gated/frozen
-I_e      = gate_e * budget_gate_e * compliance_e * I_tanh_e + <VCA/shunt/GLN terms, §10–§12> + I_res_e
+I_e      = gate_e * compliance_e * I_tanh_e + <VCA/shunt/GLN terms, §10–§12> + I_res_e
 ```
 
 Parameterization per edge (all shape `[E]`):
@@ -106,12 +133,6 @@ x_{n+1} = x_n + dt/2 * (rhs(x_n) + rhs(x_n + dt*rhs(x_n))),  dt = t_span/num_ste
   `t≈1.4, steps=14, dt=0.1`.
 - Distillation/BO adds `--kn-solver-scale s ∈ [0.5, 2.0]`
   (param-count-neutral): per-stage `t *= s`, `steps = round(steps*s)`.
-- `--solver deq` switches to a fixed-point solver
-  (`Phi(x) = x + dt·rhs(x)`, Anderson, `deq_step=0.1`, `leak_floor=0.05`,
-  `f_max_iter=30, f_tol=1e-4`); Heun path uses `leak_floor=0.0`.
-- `--core-refresh-interval k` (NARMA work): recompute the frozen core
-  current every `k` Heun steps (`k ≥ num_steps` = legacy frozen,
-  `k = 1` = fully dynamic).
 
 ---
 
@@ -308,14 +329,10 @@ Plus: `--vca/--vca-core/--vca-separate-core-bus/--vca-gate-shunt/--vca-bias`
 `shared/shared-x2`), `--x-max` (rail), `--t-span/--num-steps` (horizon; per-stage split),
 `--cell-library` (default `tanh_free`), `--hidden-family/--num-hidden/
 --num-stages/--small-world-k/--edge-repeats`, `--interstage-activation`,
-`--skip-linear` (adds `y += Linear(u)`), `--enable-drive`
-(persistent per-node current, needs sparse write modes),
 `--mapper-lr-scale/--struct-lr-scale/--dyn-lr-scale`
 (defaults `0.1/2.0/1.0`; BO reference uses `1.0/4.0/1.0`),
 `--sparsity/--entropy/--device-l2-lambda` regularizers,
-`--gm-max/--isat-max` cell bounds, `--core-refresh-interval`,
-`--enable-ref-edges` (per-node OTA to learned `Vref ∈ [0,x_max]`,
-init `x_max/2`), `--budget*` (degree-budget competition).
+`--gm-max/--isat-max` cell bounds.
 
 ---
 
@@ -430,8 +447,8 @@ def rhs(x, u):
 
 ## 14. Key configs and entry points
 
-- `config.py`: `SOLVER/DEQ/PHYS/REF/OPTIM/TAU/LAMBDAS/PRUNE/SCHEDULE_* /
-  DEGREE_BUDGET/VCA/DRIVE/INIT/CELL_LIBRARIES/PRESETS`.
+- `config.py`: `SOLVER/PHYS/REF/OPTIM/TAU/LAMBDAS/PRUNE/SCHEDULE_THREE_PHASE/
+  VCA/INIT/CELL_LIBRARIES/PRESETS`.
 - `train_script.py`: generic trainer (all flags in §9 + data/schedule/prune
   flags). `kn_bayes_opt.py`: 15-dim TPE over
   topology+solver+optimizer+physics (+CTLE successive-halving).
@@ -479,94 +496,6 @@ shared-sense; post_readout is identity at init — verify epoch-0
 bit-equality when adding it (same for GLN: `Q=0` → `gm=gm0`).
 
 ---
-
-## 16. NARMA experiment architecture (probes are eval-only by default)
-
-This section describes the *apparatus* only — task, twins, drives,
-instruments, entry points. Measured numbers, verdicts, and decisions
-live in `docs/narma-progress-summary.md`; the active brief is the
-handoff linked at the top of this file.
-
-### 16.1 Task and data pipeline (`narma_experiment.py`)
-
-- NARMA-10 recurrence (`narma()`): uniform input `u ∈ [0, 0.5]`,
-  `y[n+1] = 0.3·y[n] + 0.05·y[n]·Σ_{i=0..9} y[n-i] + 1.5·u[n-9]·u[n]
-  + 0.1` (NARMA-20 variant uses `u_max = 0.2`). First `order` samples
-  are generator washout and discarded.
-- Train streams: `_gen_narma_train_streams(order, seed, n_streams, n)`
-  with per-stream seed `seed + b*7919`. Test stream: `_gen_narma_test`
-  = 1000 samples at `seed + 10000` (fresh seed, never trained on).
-- Drive scaling: `scale_input_to_rails` maps `[0, u_max]` to rail volts
-  — bipolar (default) `→ [-x_max, +x_max]` so boundary OTAs sit at
-  mid-rail; `_scale_drive` then applies the E4 drive-scale factor.
-- Baselines in-harness: `RidgeRegressor` (tapped-delay ridge, l2 1e-2),
-  `ESN` (25-node tanh reservoir, spectral radius 0.9, leak 1.0, ridge
-  readout l2 1e-2), `MLPRegressor`, `LSTMRegressor`.
-
-### 16.2 Digital twins (`narma_linear_controls.twin_node_tanh`, `post_twin_gates.py`)
-
-Two standalone maps stand in for fabric dynamics (no stage/cell
-mutation, no training — pure forward simulation + offline ridge fits):
-
-- Discrete twin: `x' = (1-a)·x + a·tanh(W_mix@x + W_in@d)`, `W_mix`
-  Gaussian spectral-radius-normalized, `W_in` Gaussian, 25 nodes.
-- Heun flow twin: `dx/dt = -λ·x + λ·tanh(W@x + W_in@d)` with the drive
-  held constant inside each per-sample window (`t_span = 1.0` per
-  NARMA step, fixed-dt rule `dt ≤ 0.125`). Pinned Gate-1 operating
-  point: radius 1.0, `λT = 1.0`, drive RMS 0.2.
-- Drive harnesses: `taps8` = 8-tap causal delay bank (tap 0 = current
-  input), columns RMS-normalized to the drive scale; `scalar` =
-  single-column `u·scale`. Same streams/seeds across all legs.
-
-### 16.3 Aux-core drive probe (`aux_core_probe.py`)
-
-Strict-feedforward input stage replacing the static tap bank as main
-drive (no main→aux path; fabric integration is gated on a passing
-verdict and never started speculatively):
-
-- Flavors: `echo_state` (8-node ESN, radius 0.95, leak ∈ {0.3, 1.0}),
-  `shift_register` (exact chain `x[t][i] = gain^i·hi·u[t-i]`, gain ∈
-  {0.7, 0.9}, head injection 1.0), `slow_feature` (8 decoupled leaky
-  integrators, τ log-spread over [1, 40]), `residual_distilled` (echo
-  core selected by fit to a target-blind tap-minus-main residual
-  teacher built with offline SVD/ridge only).
-- Legs: `aux_only` (8-wide drive), `aux_scalar` (8 + scalar column),
-  `aux_concat` (8-wide drive, readout over `[main(25); aux(8)]`).
-  Drive-power parity: every leg scaled to drive RMS == input scale.
-- Device-budget accounting per row: `aux_recurrent + aux_fan_in +
-  main_fan_in` vs reference `hidden_dim × n_taps` (200 at default
-  dims). D2 variant: sparse main fan-out (k ∈ {3, 6} nonzeros per
-  drive column, Gate-3 builder reuse). D3 reference: `tapsvd` = SVD
-  top-4 PCs of the tap bank driving the main core at parity.
-- Pre-registered pass/fail verdict rules per flavor (tap-subspace
-  copy flag, void/dead guards, scalar-gain and taps-match paths);
-  see the spec, not this README, for thresholds and outcomes.
-
-### 16.4 Instruments (no new metrics; shared with the twin harness)
-
-Ridge NRMSE/R² (l2 1e-2 + bias, washout 200), washout-corrected
-per-delay memory-capacity curve + total (max delay 20), participation
-ratio of the washed state covariance, Jacobian eigenvalue spectra at
-observed transitions (analytic Heun composition, autograd-checked),
-tanh-engagement guard (median `|W@x + W_in@d|`), in-harness ESN parity
-on identical streams. Probe outputs land in the leg output dir next
-to (never inside) training tables.
-
-### 16.5 Entry points
-
-- `post_twin_gates.py {heun,sparsity,mismatch,w_in,all}` — Heun
-  flow-twin sweep + sparsity/mismatch/W_in gates + buildable-spec
-  emission; `--max-corners` grid cap, `--dt` fixed-dt guard.
-- `aux_core_probe.py {sweep,smoke}` — aux sweep with `--flavors`,
-  `--legs`, `--aux-seeds`, `--data-seed`, `--fanout-kinds`,
-  `--max-corners`.
-- Audits: `audit_post_twin_gates.py`, `audit_twin_standalone.py`,
-  `audit_aux_core.py` (run with `python -B`; all must print their
-  `*_OK` trailer).
-- Specs: `docs/specs/aux-core-probe.md` (aux contract),
-  `docs/specs/twin-probe-spec.md`, `docs/specs/flow-sparse-gates.md`;
-  verdicts/decisions: `docs/narma-progress-summary.md`.
-
 
 ## Repository layout, branches and checkouts (Nov 2026 refactor)
 

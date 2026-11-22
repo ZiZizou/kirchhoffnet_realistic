@@ -2,22 +2,24 @@
 
 > **Version:** Idealized (v6)  
 > **Design target:** Tapeout-plausible analog compute fabric  
-> **Key decisions:** Differential signaling, sparse topology only, cell-library-based edge parameterization (legacy/v15/v2 libraries + simple relu/tanh devices), direct BPTT through Heun integration **or stagewise DEQ equilibrium solver**, three-phase fit-compress-prune schedule (with four-phase readiness-gated variant), STE cell mode, teacher distillation, bidirectional edges, parallel edge repeats, persistent bounded drive, per-dim diagnostics, mapper LR control, DEQ diagnostics suite
+> **Key decisions:** Differential signaling, sparse topology only, cell-library-based edge parameterization (`tanh_free` only after the surgery), direct BPTT through Heun integration **or stagewise DEQ equilibrium solver**, three-phase fit-compress-prune schedule (with four-phase readiness-gated variant), STE cell mode, teacher distillation, bidirectional edges, parallel edge repeats, persistent bounded drive, per-dim diagnostics, mapper LR control, DEQ diagnostics suite
 
 ---
+
+> **After the Nov 2026 surgery** the removed features below (degree budget, persistent drive, DEQ, 4-phase schedule,
+> variation/SimContext, sparse linear solver, legacy cell libraries) are gone from this branch; see README "Scope after the
+> Nov 2026 surgery" and "Repository layout" for what remains and where the removed code lives.
 
 ## Table of Contents
 
 1. [High-Level Overview](#1-high-level-overview)
 2. [Core Design Decisions](#2-core-design-decisions)
-   - 2.20 [Stagewise Deep Equilibrium (DEQ) solver](#220-stagewise-deep-equilibrium-deq-solver-deq-core-prototype)
 3. [System Architecture](#3-system-architecture)
 4. [Module Reference](#4-module-reference)
 5. [Data Flow](#5-data-flow)
 6. [Training Pipeline](#6-training-pipeline)
 7. [Task Presets](#7-task-presets)
 8. [Configuration Reference](#8-configuration-reference)
-9. [Sparse Solver Subsystem](#9-sparse-solver-subsystem)
 10. [Testing](#10-testing)
 11. [File Map](#11-file-map)
 12. [Experimental Results](#12-experimental-results)
@@ -211,42 +213,6 @@ This folds both the Z-cell probability (gm_Z ≈ 0 ⇒ no current) and the edge 
 
 **SimpleEdgeLibrary handling.** Stages using `SimpleEdgeLibrary` have no Z cell — the effective score is just `σ(z_logits)`.
 
-### 2.9 Degree budget / top-k competition (degree-budget-topk plan)
-
-The independent per-edge sigmoid gate (`σ(z_logits)`) cannot break symmetry among redundant edges — 11 edges to the same destination can all sit at gate=0.5 forever. The degree budget adds **explicit competition** via temperature-scaled softmax renormalization:
-
-```
-budget_gate[j] = softmax(z_logits[incoming_to_j] / T) * k
-edge_gate = σ(z_logits) * budget_gate   (layered: independent × competitive)
-```
-
-Each destination node j keeps at most k incoming edges open. Temperature T and budget k are **annealed** from permissive (high k, high T) to restrictive (low k, low T) over the first `anneal_frac` of training. Three axis modes:
-
-| `--budget-axis` | Competition | Budget per |
-|----------------|-------------|------------|
-| `dst` (default) | Incoming edges per destination | Destination |
-| `src` | Outgoing edges per source | Source |
-| `both` | Both directions (product of masks) | Source & Destination |
-
-The budget is fully differentiable (C∞ softmax) → compatible with DEQ implicit differentiation. Config via `config.DEGREE_BUDGET`, CLI via `--budget` and related flags.
-
-Key functions in `topology.py`:
-- `prune_stage(stage, edge_threshold, ...)` — returns `(new_stage, node_remap)`. Handles persistent drive, SimpleEdgeLibrary.
-- `prune_network(core, ...)` — applies `prune_stage` to every stage, reinitializes `StageTransfer` modules, protects driven nodes, returns `(new_core, stage_remaps)`
-
-The `train_script.py` CLI exposes:
-- `--prune` — enable pruning after training
-- `--budget` — enable degree budget top-k competition
-- `--budget-k-start`, `--budget-k-end` — budget annealing range
-- `--budget-temp-start`, `--budget-temp-end` — temperature annealing range
-- `--budget-axis` — competition axis (dst / src / both)
-- `--retrain` / `--no-retrain` — retrain pruned network (default: retrain)
-- `--prune-edge-threshold` — override edge gate threshold
-- `--prune-node-threshold` — override node gate threshold
-- `--prune-nodes-by-gate` / `--no-prune-nodes-by-gate` — deprecated no-op
-- `--retrain-epochs` — retraining epochs
-- `--fresh-init` — skip warm-start, reinitialize pruned network from scratch
-
 ### 2.9 Three-phase training schedule (three-phase-schedule plan)
 
 A generic phased training pipeline that any preset can opt into via `preset["schedule"] = "three_phase"`. Splits the total epoch budget into three phases with independently configured tau annealing and structural regularizer magnitudes:
@@ -287,15 +253,6 @@ Active overrides:
 
 The `temp_c` field of `SimContext` is preserved for API compatibility but **no longer used** by the analog model. `sample_random_context` always returns `VARIATION["temp_c_default"]` (27.0°C) and ignores the `temp_choices` argument. External callers that explicitly pass a non-default `temp_c` value receive a `DeprecationWarning`. The `legacy_temp=True` flag exists temporarily for code migration and also emits a warning.
 
-### 2.12 Variation-aware training (R6.3)
-
-By DEFAULT, training uses a `SimContext()` with no mismatch and no temperature drift, so the optimization sees a clean deterministic forward. To evaluate robustness, pass `--variation` to `train_script.py`, which then samples a fresh `SimContext` per training iteration:
-- `temp_c` — junction temperature (deprecated, always defaults to 27°C)
-- `global_gain_shift` — log-normal global gm drift (σ = 5%)
-- `edge_mismatch` — per-edge per-cell log-normal mismatch (σ = 5%)
-
-Mismatch is held fixed over the full transient but resampled each iteration. At validation time, `edge_mismatch=None` (nominal).
-
 ### 2.13 Training infrastructure
 
 **AMP (mixed precision).** Enabled by default when CUDA is available (`--amp` / `--no-amp`). Uses `torch.cuda.amp.GradScaler` with autocast on forward+loss. The loss is split into task+rail (data-dependent) and structural (parameter-only) components so DataParallel averages only the data-dependent part. `--amp-dtype {float16,bfloat16}` selects the autocast dtype.
@@ -313,88 +270,6 @@ Mismatch is held fixed over the full transient but resampled each iteration. At 
 **Batch-size-aware LR auto-scaling.** The learning rate is computed as `lr = BASE_LR × (batch_size / BASE_BATCH_SIZE)` (Goyal et al., 2017) where `BASE_LR=3e-4` and `BASE_BATCH_SIZE=1024`. At `batch_size=1024`, this gives `lr=3e-4`.
 
 **entropy bonus.** When `LAMBDAS["entropy"] > 0`, an entropy bonus `−Σ w·log(w)` of the softmax distribution over cell types (scaled by τ) is subtracted from the structural loss, encouraging exploration of cell mixtures.
-
-### 2.14 Four-phase training schedule (four-phase-redesign plan)
-
-A four-phase extension of the three-phase schedule that splits Phase B into B1 (cell commitment, no pruning) and B2 (edge pruning, readiness-gated). Adds teacher distillation and straight-through estimator (STE) cell mode for cleaner hardening.
-
-**Availability and activation.** Any preset can opt into the four-phase schedule via `--schedule four_phase` on the CLI. No preset defaults to four_phase — it is always an explicit override. The CTLE distillation script (`train_ctle.py`) always uses four_phase.
-
-**Config entry (`SCHEDULE_FOUR_PHASE` in `config.py`).** Phase fractions default to frac_a=0.3, frac_b1=0.2, frac_b2=0.2, frac_c=0.3 (must sum to 1.0). Tau targets: tau_a=0.6 (fixed), tau_b1_init=0.6→tau_b1_final=0.5, tau_b2_init=0.5→tau_b2_final=0.4, tau_c_init=0.4→tau_c_final=0.1. Tau is continuous at all phase boundaries. Teacher KD weight: lambda_kd=1.0. Warmup within B1/B2: 25% of each phase's epoch window.
-
-| Phase | Epochs | Tau | Regularizers | Cell Mode | Action |
-|-------|--------|-----|-------------|-----------|--------|
-| **A** (fit) | 0–30% | Fixed 0.6 | All zero | Soft | Learn task freely |
-| **B1** (cell commit) | 30–50% | 0.6→0.5 | sparsity=5e-5, power=1e-4 | STE | Commit cells, no pruning |
-| **B2** (edge prune) | 50–70% | 0.5→0.4 | sparsity=5e-5, edge_gate=1e-5, power=1e-5 | STE | Prune edges readiness-gated |
-| **C** (retrain) | 70–100% | 0.4→0.1 | sparsity=1e-5 only | STE | Retrain compact model |
-
----
-
-**Phase A (fit, epochs 0–30%).** Identical to three-phase Phase A: all structural regularizers zeroed, tau=0.6, standard soft cell mixture. The network learns the task freely with no structure pressure. Rail is always active as a safety net.
-
-**Teacher cloning at A→B1 boundary.** At the first epoch of Phase B1, a deep copy of the best Phase A checkpoint (lowest soft validation loss) is frozen as the teacher network. The teacher is kept in eval mode with `requires_grad_(False)` and stays on the device for the remainder of B1+B2. The teacher uses soft cell mode with tau=1.0 — providing a smooth, well-behaved regression target — while the student transitions to STE mode. If training is early-stopped during Phase A (before teacher cloning fires), the four-phase schedule skips pruning and retrain entirely, falling back to a standard save of the best Phase A model.
-
----
-
-**Phase B1 (cell commitment, epochs 30–50%).** Tau anneals from 0.6→0.5. Only the sparsity regularizer (5e-5) and power (1e-4) are active — no edge_gate/node_gate/capacitance. Cell mode switches to **STE** (straight-through estimator). Teacher distillation (`lambda_kd * MSE(y_student, y_teacher)`) is active throughout B1.
-
----
-
-**Phase B2 (edge pruning, epochs 50–70%).** Tau continues from 0.5→0.4. The edge_gate regularizer (1e-5) is added to sparsity and power. This is the first time gates receive gradient pressure. STE cell mode and teacher distillation continue from B1.
-
-**Readiness-gated prune.** Pruning is NOT automatic at the B2→C boundary. Instead, on every validation epoch during B2, a readiness check evaluates four AND-logic conditions over a trailing window (default 10 epochs):
-
-1. **Ratio**: `mean(val_argmax / val_soft) < 1.2` over the window.
-2. **Cell probability**: `mean_max_cell_prob > 0.85`.
-3. **Gate stability**: `std(frac_sigma_z_below_0.1) < 0.02` over the window.
-4. **Improvement**: `|val_argmax improvement rate| < 1e-4`.
-
-All four conditions must be met for the readiness check to return True. On readiness trigger, B2 ends immediately and Phase C begins at the current epoch with the freshly pruned network.
-
-**Checkpoint selection during B1/B2.** In B1 and B2, the best model is tracked by `val_argmax` (hard-cell validation loss) rather than soft validation loss.
-
----
-
-**Phase C (retrain, epochs 70–100%).** At the B2→C boundary (whether readiness-triggered or fallback), auto-pruning removes edges below `prune_edge_threshold=0.05`. Pruning is edge-only (`prune_nodes_by_gate=False`). The compact network is retrained from warm-start with tau annealing 0.4→0.1, only sparsity (1e-5) + rail, STE cell mode continues. Teacher distillation is OFF in Phase C.
-
----
-
-**Teacher distillation details.** The KD loss is `lambda_kd * MSE(y_student, y_teacher)` where `lambda_kd = 1.0`. The teacher forward pass runs under `torch.no_grad()` with `soft` cell mode and `tau=1.0`. The KD loss is a data-side term (DataParallel-averaged) alongside task loss and rail. KD is active only during B1 and B2.
-
----
-
-**Cell mode auto-resolution.** `--cell-mode {soft, ste, auto}`. With `--cell-mode auto` (default), the schedule resolves per-epoch: Phase A → `soft`, Phases B1/B2/C → `ste`.
-
----
-
-**Diagnostic ablation sets.** `--ablation-set`:
-- `reg-only`: tau=1.0 throughout B, gate regularizers left at default, pruning disabled.
-- `tau-only`: structural regularizers zeroed in B, tau anneals normally, pruning disabled.
-- `edge-only`: matches the four-phase defaults (edge-only pruning, edge_threshold=0.05, no node-gate pruning).
-
----
-
-**Key differences from three-phase:**
-| Dimension | Three-phase | Four-phase |
-|-----------|-------------|------------|
-| Phases | A (fit) → B (compress) → C (retrain) | A (fit) → B1 (commit) → B2 (prune) → C (retrain) |
-| Tau | 0.8 → 0.5 → 0.1 | 0.6 → 0.5 → 0.4 → 0.1 |
-| Prune trigger | Automatic at B→C boundary | Readiness-gated (4 AND-condition checks) |
-| Cell mode | Soft throughout | STE in B1/B2/C |
-| Teacher distillation | None | `lambda_kd=1.0` in B1/B2 |
-| B1 regularizers | (merged with B) | sparsity=5e-5, power=1e-4 |
-| B2 regularizers | (merged with B) | sparsity=5e-5 + edge_gate=1e-5 + power=1e-5 |
-
-### 2.15 Persistent bounded drive (persistent-drive plan)
-
-Each stage can receive a bounded drive current pulling driven hidden nodes toward an input-derived target pattern. Controlled via `--persistent-drive` CLI flag (requires `write_mode='fan_out'`). Per-stage `FanOutInputMapper` produces drive targets from input. Drive current is computed as:
-
-```
-I_drive = I_sat · tanh(g · (x_drive − x) / I_sat)
-```
-
-where `g = softplus(raw_drive_g)` is a learnable per-node conductance. Drive scales decay across stages `[1.0, 0.5, 0.25]` (configurable via `DRIVE["drive_scales"]`). Driven nodes are forced open during pruning (protected from gate-based removal). Driven node gates are forced open (masked to 1.0) in `rhs()`.
 
 ### 2.16 Parallel edge repeats
 
@@ -420,64 +295,6 @@ The `_make_dynamic_preset()` function in `train_script.py` builds a fresh preset
 ### 2.19 Per-dim diagnostics (CTLE pipeline)
 
 `train_ctle.py` computes per-dimension MSE, R², and target variance on every validation epoch. Stats are logged to `per_dim_stats.txt` (TSV) and summarized in a 4-subplot figure `per_dim_stats.png`. The `worst_dim` (parameter with highest MSE) is printed to console each epoch. The combined plot includes retrain data when pruning is enabled. Refactored into `_plot_per_dim_diagnostics()`.
-
-### 2.20 Stagewise Deep Equilibrium (DEQ) solver (deq-core-prototype)
-
-The DEQ solver replaces the multi-step Heun rollout with a direct fixed-point solve at each stage. Instead of integrating `dx/dt = f(x)` for 50 steps, the DEQ path solves `f(x*) = 0` using the implicit-function theorem (IFT) to backpropagate:
-
-```
-Phi(x) = x + dt * rhs(x, ...)    (damped fixed-point map)
-x_star = solve_equilibrium(Phi, x0)
-```
-
-**Solver backends.** Two backends are available via `deq_solver.solve_equilibrium()`:
-
-| Backend | Description | Gradients |
-|---------|-------------|-----------|
-| `torchdeq` (default) | Anderson acceleration forward + Anderson IFT backward via `torchdeq.get_deq` | Implicit (no trajectory storage, no gradient chain) |
-| `fixed_point_iter` | Naive fixed-point iteration (fallback when torchdeq unavailable) | Via the explicit unrolled chain (same as BPTT — adequate only for sanity checks) |
-
-**Leak floor contractivity.** Under DEQ, a minimum effective leak (`config.DEQ["leak_floor"]` = 0.05) is added per node via `DifferentialStage.set_leak_floor()` so the diagonal damping dominates cross-coupling edges, guaranteeing the fixed-point map Phi(x) is contractive. The `leak_floor` value is captured by the `phi` closure passed to the solver, ensuring the IFT backward re-evaluates with the same leak floor as the forward solve. After the solve, `set_leak_floor(0.0)` restores the default for any subsequent Heun calls on the same stage.
-
-**fp32 solver (AMP safety).** The solver adapter casts `x0` to float32 and wraps the `deq()` call in `torch.autocast(device_type='cuda', enabled=False)`, so both the Anderson forward iteration and the IFT backward linear solve always run in fp32 regardless of the caller's autocast state. The converged `x_star` is cast back to the stage's parameter dtype for downstream AMP consistency.
-
-**Soft-only cell mode.** `forward_equilibrium` raises `ValueError` if `cell_mode != 'soft'`. STE and hard argmax break implicit differentiation because the argmax step function is not differentiable.
-
-**Synthetic trajectory.** The DEQ path builds a 1-timepoint synthetic trajectory `[B, N, 1]` when `store_trajectory=True`, so downstream regularizers (rail, entropy) that expect a time axis work without a special case.
-
-**Input dependence via persistent drive.** Without persistent drive, the DEQ fixed point `x*` depends only on network parameters — the input `u` enters only through the initial condition `x0`. Persistent bounded drive (`I_drive = I_sat · tanh(g · (x_drive − x) / I_sat)`) adds an input-dependent forcing term to `rhs()`, making `x*` genuinely input-dependent. The `--solver deq` CLI emits a warning if `--persistent-drive` is not also set.
-
-**Diagnostic suite.** The `deq_diagnostics.py` module provides three analysis tools:
-
-1. **`gradient_norm_compare()`** — Compares L1 gradient norms of `z_logits` and `logits` under BPTT (short-horizon Heun) vs DEQ on a single batch with a zero-mean squared-loss. The Kimi-note prediction is that DEQ lifts `z_logits` gradients by 2–4 orders of magnitude by replacing the long gradient chain with a single IFT linear solve.
-
-2. **`estimate_jacobian_cond()`** — Estimates `cond(d(rhs)/dx)` at the equilibrium state using `torch.func.jacrev` on a single batch element. Large condition numbers (>100) indicate the leak floor may need to be raised for better contractivity.
-
-3. **`multistart_uniqueness()`** — Solves DEQ from several random initial guesses (`[-1, 0, 1, 5]`) and reports the maximum pairwise `L_inf` distance. Small values (<1e-3) suggest a unique contractive equilibrium; large values indicate multistability.
-
-These can be invoked post-training via the `--run-deq-diagnostics` CLI flag in `train_script.py`.
-
-**CLI flags (train_script.py):**
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--solver {heun,deq}` | `heun` | Stage-level solver. `deq` enforces soft cell mode and leak floor. |
-| `--deq-backend {auto,torchdeq,fixed_point_iter}` | `auto` | Solver backend (auto → torchdeq if installed). |
-| `--deq-f-max-iter` | 30 | Max forward Anderson iterations. |
-| `--deq-f-tol` | 1e-4 | Relative residual tolerance for forward solve. |
-| `--deq-b-max-iter` | 20 | Max backward (IFT) iterations. |
-| `--deq-step` | 0.1 | Damped step size `dt` for `Phi(x) = x + dt * rhs(x)`. |
-| `--leak-floor` | 0.05 | Minimum per-node leak under DEQ (config default). |
-| `--run-deq-diagnostics` | False | Run gradient-norm compare, Jacobian cond, multistart uniqueness after training. |
-
-**Speed defaults (as of 2026-06-21).** The DEQ solver config was tuned for ~3–4× speedup: `anderson_max_iter=20`, `backward_max_iter=3`, `anderson_m=5→3`, `anderson_tol=1e-4→1e-3`. These are set in `config.DEQ` and are CLI-overridable.
-
-**DEQ audit fixes (2026-06-22):**
-- **C2 (leak_floor threading, HIGH):** `rhs()` now accepts a `leak_floor=None` kwarg. The `phi` closure captures `lf` as a local variable and passes it explicitly to `rhs()`. The IFT backward re-evaluates the same `lf`. The Heun path continues to use `self.leak_floor` (unmodified by DEQ).
-- **H1 (autocast, MEDIUM):** `torch.autocast(device_type='cuda', enabled=False)` restored around deq() call in `_solve_torchdeq` (without `no_grad`, preserving `grad_fn`).
-- **C1 (drive CLI, HIGH):** `--persistent-drive` flag in `train_script.py`, auto-forces `write_mode=fan_out`, passes `enable_drive` to `build_net_from_preset`. WARNING printed when `--solver deq` without `--persistent-drive`.
-
----
 
 ## 3. System Architecture
 
@@ -649,13 +466,6 @@ C_eff · dxⱼ/dt = Σ_{e: dst(e)=j} I_e − Σ_{e: src(e)=j} I_e + I_driveⱼ �
 - `compile_rhs(backend)`: wraps `rhs` with `torch.compile`
 - `_is_simple` / `is_simple_device`: True when using `SimpleEdgeLibrary`
 
-### `sim_context.py`
-**SimContext** — PVT + mismatch container for one forward pass.
-
-- `SimContext(temp_c, global_gain_shift, edge_mismatch)` — dataclass with `.to(device)` method
-- `sample_random_context(num_edges, num_cells, ...)` — factory for training variation injection
-- temp_c is deprecated (RR-C): defaults to `VARIATION["temp_c_default"]` (27.0°C), no longer randomized
-
 ### `stage_transfer.py`
 **StageTransfer** — Width-changing layer between stages. No learnable parameters.
 
@@ -687,25 +497,6 @@ C_eff · dxⱼ/dt = Σ_{e: dst(e)=j} I_e − Σ_{e: src(e)=j} I_e + I_driveⱼ �
   - When all `core.stage_times` are 0, forward is identity (mapper-only ablation)
   - `forward(u, ctx, tau, store_trajectory, cell_mode, solver, deq_cfg)` → `(ŷ, trajectories)`
   - Threads `solver` and `deq_cfg` to each stage's `forward()` call
-
-### `deq_solver.py`
-**DEQ solver adapter** (deq-core-prototype). Wraps `torchdeq.get_deq` with a small, swappable API.
-
-- `solve_equilibrium(phi, x0, cfg)` → `(x_star, info)` — Solve `x* = phi(x*)` starting from `x0`. Backend auto-selected from `cfg['backend']`: `'torchdeq'` (Anderson acceleration with implicit IFT backward) or `'fixed_point_iter'` (naive iteration fallback).
-  - `phi` is the damped fixed-point map `Phi(x) = x + dt * rhs(x)`.
-  - Solver runs in fp32; autocast is disabled around the `deq()` call for AMP safety.
-  - `info` dict contains `nstep` (iterations used) and `rel_residual` (final relative residual).
-- `available_backends()` → `list[str]` — reports which backends are available (torchdeq checked by lazy import).
-- Two internal implementations:
-  - `_solve_torchdeq()`: Uses `torchdeq.get_deq(f_solver='anderson', b_solver='anderson', ...)`. Casts to fp32, wraps `deq()` in `torch.autocast(enabled=False)`, reassembles `info` dict from torchdeq output.
-  - `_solve_fixed_point_iter()`: Simple loop `x ← phi(x)` until `|x_{k+1} - x_k| / |x_k| < tol`. No implicit backward — gradients flow through the unrolled iterations.
-
-### `deq_diagnostics.py`
-**DEQ diagnostics suite** — Post-training analysis tools for equilibrium behaviour.
-
-- `gradient_norm_compare(stage, x0, ctx, tau, cell_mode, x_drive, drive_scale, leak_floor, deq_cfg, bptt_t_span, bptt_num_steps)` → `dict` — Compares L1 gradient norms of `z_logits` and `logits` under short-horizon BPTT vs DEQ on a single batch with a zero-mean squared-loss. Returns keys: `z_logits_heun`, `z_logits_deq`, `logits_heun`, `logits_deq`, `z_logits_ratio`, `logits_ratio`.
-- `estimate_jacobian_cond(stage, x_star, ctx, tau, cell_mode, x_drive, drive_scale, leak_floor)` → `float` — Estimates `cond(d(rhs)/dx)` at the equilibrium using `torch.func.jacrev` on a single batch element. Returns `float('inf')` if singular.
-- `multistart_uniqueness(stage, ctx, tau, cell_mode, x_drive, drive_scale, leak_floor, deq_cfg, starts, batch_shape)` → `dict` — Solves DEQ from several initial guesses and reports `max_pairwise_diff` (L_inf) plus `converged_states`.
 
 ### `train.py`
 **Loss functions, regularizers, tau annealing, training loop, three-phase and four-phase schedules.**
@@ -780,9 +571,6 @@ Outputs per run: `loss_history.txt`, `loss_curve.png`, `model.pt`, `config_snaps
 - `plot_cell_selection(logits)` — heatmap of P(cell | edge)
 - `plot_output_fit(y_pred, y_true)` — scatter + residuals
 - `plot_network(net)` — full pipeline visualization
-
-### `gen_network_images.py`
-**Standalone image generator** — Runs all non-solver presets and saves visualizations to `network_visualization/`.
 
 ### `mlp_benchmark.py`
 **MLP baselines** — MLPRegressor(2→H→1) for smooth2d Franke task, benchmark comparison.
@@ -1252,31 +1040,6 @@ DEGREE_BUDGET = {"enabled": False, "k_start": 8, "k_end": 2, "temp_start": 1.0,
 VARIATION = {"temp_c_default": 27.0, "temp_c_choices": [0.0, 27.0, 75.0],
              "global_gain_shift_std": 0.05, "edge_mismatch_std": 0.05}
 ```
-
----
-
-## 9. Sparse Solver Subsystem (preserved, not in active PRESETS)
-
-The sparse solver benchmark is preserved on disk but **not active in paper v1** (R4.3). Modules:
-
-### `sparse_solver_data.py`
-Generates random sparse symmetric positive-definite matrices with controlled condition number via:
-1. Random sparse symmetric pattern (scipy.sparse.rand)
-2. Diagonal dominance margin (guarantees SPD)
-3. Low-rank perturbation to spread eigenvalues to target condition number
-4. Bounded random solution `x* = x_max · tanh(randn)`, then `b = A @ x*`
-
-### `sparse_solver_topology.py`
-Accumulates matrix sparsity patterns across the training dataset into a fixed union supergraph. Edges appearing in ≥10% of samples become hidden graph edges. Uses `StageTopologyBuilder` to add input/projection edges.
-
-### `sparse_solver_baseline.py`
-Digital solvers for comparison against the analog network:
-- **Jacobi:** `x_{k+1} = D⁻¹(b − R·x_k)`
-- **Conjugate Gradient:** Batched CG with early stopping on convergence
-- `compare_against_baselines(net, val_loader, n)` — runs all three methods on the same validation set and prints per-method statistics
-
-### `sparse_solver_track.py`
-Convergence diagnostic: captures ODE state snapshots during integration and plots 3-panel figure (residual vs time, solution error vs time, final state magnitude distribution).
 
 ---
 

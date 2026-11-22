@@ -28,10 +28,18 @@ def _safe_import(name, filename):
 
 def test_fixed_entry_student_wrapper_forward():
     entry = _safe_import("fixed_mlp_runtime_smoke", "fixed-mlp-distillation-kirchhoffnet.py")
-    args = SimpleNamespace(student_activation="silu", student_width=32,
-                           student_layers=2, student_use_layernorm=False)
-    model = entry.PlainMLPStudent(args, np.full(4, -2, np.float32),
-                                  np.full(4, 2, np.float32)).eval()
+    args = SimpleNamespace(
+        kn_input_rail=4.0, kn_solver_scale=1.0, kn_num_stages=7,
+        kn_num_hidden=11, kn_small_world_k=2, kn_small_world_p=0.2,
+        kn_small_world_seed=1, kn_edge_repeats=2,
+        kn_cell_library="tanh_free", kn_leak_mode="non-programmable",
+        kn_freeze_read=True, kn_interstage_activation="residual-relu-tanh",
+        boundary_fan_out='{"0": [0, 4], "1": [1, 5], "2": [2, 6], "3": [3, 7]}',
+        kn_temporal_readout=True, kn_x_max=4.0, kn_vca=True,
+        kn_vca_rank=3, kn_vca_core=True, kn_vca_gate_shunt=False,
+        kn_vca_separate_core_bus=True, vca_bias=False, hw_resolved=None)
+    model = entry.KirchhoffStudent(
+        args, np.full(4, -2, np.float32), np.full(4, 2, np.float32)).eval()
     with torch.no_grad():
         output = model(torch.ones(8, 4))
     assert output.shape == (8, 7)

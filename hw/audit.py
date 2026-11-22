@@ -67,13 +67,17 @@ FAMILIES = (  # name, cell-lib attr, gate-logit attr, VCA family, GLN family
 # ---------------------------------------------------------------------------
 # loading
 # ---------------------------------------------------------------------------
-def load_model(checkpoint: Optional[str], hw: Optional[HWConfig], dtype=torch.float32):
+def load_model(checkpoint: Optional[str], hw: Optional[HWConfig], dtype=torch.float32,
+               arch: Optional[dict] = None):
     """The paper wrapper rebuilt with ``hw`` (None/off = legacy) and ``checkpoint`` loaded.
 
-    ``checkpoint=None`` returns the freshly initialised (raw) model.
+    ``checkpoint=None`` returns the freshly initialised (raw) model.  ``arch``
+    overrides keys of ``checkpoints.PAPER_CONFIG`` (e.g. ``isat_max=16`` for a
+    hardware retrain: the cell bounds are not stored in the state_dict).
     """
     import checkpoints as ck
     cfg = copy.deepcopy(ck.PAPER_CONFIG)
+    cfg.update(arch or {})
     cfg["build"] = dict(cfg["build"], hw=hw_or_none(hw))
     if checkpoint is None:
         return ck.PaperStudent(cfg).to(dtype=dtype).eval()
@@ -301,17 +305,17 @@ def core_read_gain(model, recs, n_rows: int = 64) -> List[dict]:
 
 
 def sensitivity(checkpoint: Optional[str], x: torch.Tensor, base: Optional[HWConfig] = None,
-                mv: float = 1.0, seed: int = 0) -> dict:
+                mv: float = 1.0, seed: int = 0, arch: Optional[dict] = None) -> dict:
     """Mean |d logits| per mV of droop and per mV of injection, eval mode."""
     torch.manual_seed(seed)
-    legacy = load_model(checkpoint, base)
+    legacy = load_model(checkpoint, base, arch=arch)
     with torch.no_grad():
         y_leg = legacy(x)
     res = {"mv": mv}
 
     def run(**tm):
         torch.manual_seed(seed)          # the raw-init model must be the same draw
-        m = load_model(checkpoint, _tm_hw(base, **tm))
+        m = load_model(checkpoint, _tm_hw(base, **tm), arch=arch)
         with torch.no_grad():
             y = m(x)
         return y, [s.detach() for s in m.net.core.last_stage_outputs], m
@@ -335,8 +339,9 @@ def sensitivity(checkpoint: Optional[str], x: torch.Tensor, base: Optional[HWCon
 # ---------------------------------------------------------------------------
 # report
 # ---------------------------------------------------------------------------
-def audit(checkpoint: str, hw: HWConfig, x: torch.Tensor, stiff_rows: int = 64) -> dict:
-    model = load_model(checkpoint, hw)
+def audit(checkpoint: str, hw: HWConfig, x: torch.Tensor, stiff_rows: int = 64,
+          arch: Optional[dict] = None) -> dict:
+    model = load_model(checkpoint, hw, arch=arch)
     units = hw.units
     y, recs, finals = run_capture(model, x)
     edges = edge_stats(model, recs, units)
@@ -401,20 +406,31 @@ def main(argv=None) -> int:
                     help="also run the probe on the untrained (raw-init) model for contrast")
     ap.add_argument("--json", default=None)
     ap.add_argument("--strict", action="store_true", help="exit 1 when any check FAILs")
+    ap.add_argument("--kn-isat-max", type=float, default=None,
+                    help="cell Isat upper bound the model was trained with (paper 28.69; the "
+                         "hardware retrain uses 16).  Not stored in the checkpoint.")
+    ap.add_argument("--kn-gm-max", type=float, default=None,
+                    help="cell gm upper bound the model was trained with (paper 4.24197)")
     parse_hw_args(ap)
     a = ap.parse_args(argv)
     hw, src = resolve_hw(a, a.checkpoint)
+    arch = {}
+    if a.kn_isat_max is not None:
+        arch["isat_max"] = float(a.kn_isat_max)
+    if a.kn_gm_max is not None:
+        arch["gm_max"] = float(a.kn_gm_max)
     x = canonical_rows(a.n_rows, a.canonical)
     print(f"[audit] checkpoint={a.checkpoint}")
     print(f"[audit] HWConfig from {src}: {'OFF' if hw.is_off() else 'ON'} hash={hw.hash()}")
-    res = audit(a.checkpoint, hw, x, a.stiffness_rows)
+    res = audit(a.checkpoint, hw, x, a.stiffness_rows, arch=arch)
+    res["arch_overrides"] = arch
     print(f"[audit] rows={res['n_rows']} (canonical test split)  outputs finite={res['y_finite']}")
     print(format_table(res["rows"]))
     n_fail = sum(r[5] == "FAIL" for r in res["rows"])
     print(f"[audit] {n_fail} FAIL, {sum(r[5] == 'WARN' for r in res['rows'])} WARN, "
           f"{sum(r[5] == 'PASS' for r in res['rows'])} PASS")
     if a.sensitivity:
-        s = sensitivity(a.checkpoint, x, hw, a.sens_mv)
+        s = sensitivity(a.checkpoint, x, hw, a.sens_mv, arch=arch)
         res["sensitivity"] = s
         print(f"[audit] time-mux S&H sensitivity (eval, kT/C off), {a.sens_mv:g} mV:")
         print(f"  identity (tm on, 0 mV) vs legacy: max|dy| = {s['identity_max_abs']:.3g}")
@@ -426,7 +442,7 @@ def main(argv=None) -> int:
         print("  core-read leverage T*|J_core| (row-sum mean) per stage = "
               + " ".join(f"{r['T_Jcore_rowsum']:.3g}" for r in s["core_read_gain"]))
         if a.sens_raw_init:
-            r0 = sensitivity(None, x, hw, a.sens_mv)
+            r0 = sensitivity(None, x, hw, a.sens_mv, arch=arch)
             res["sensitivity_raw_init"] = r0
             print(f"  raw-init model: inject {r0['inject']['dy_per_mv']:.3g}/mV, droop "
                   f"{r0['droop']['dy_per_mv']:.3g}/mV, droop/inject {r0['droop_over_inject']:.3g}; "

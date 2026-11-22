@@ -19,7 +19,7 @@
 # ("fail if >= 2 of the 4 specs degrade by >= 10 %"), which is the rule the paper
 # run already used (train 7.67 %, val 8.05 %, test 8.15 %).  No threshold flag
 # is passed; set DEGRADE_THR in the environment to run an experiment at another
-# threshold (that flag only exists if workstream W4 adds it).
+# threshold (--zig-degrade-thr, added by workstream W4).
 #
 # There are NO --kn-moe-* flags: the surgery removed them from the argparse.
 set -euo pipefail
@@ -129,12 +129,19 @@ python dagger-nuance-distillation-kirchhoffnet.py --canonical-dataset "$CANONICA
 
 # --------------------------------------------------------------------------
 # 8. post-train hardware audit (hw/audit.py: reload phase_a_best.pt, check the
-#    slope bound, the rail excursion, the Heun stiffness, the code-value
-#    quantisation and the SPICE-export parameter ranges).
-#    hw/audit.py does not exist yet -> the block is a no-op until it lands.
+#    slope bound, the rail excursion, the Heun stiffness, the Isat and A/B
+#    ranges, plus the time-mux droop-vs-injection probe).  No --hw-* flags:
+#    the audit reads $OUT/hw_config.json, which the trial wrote with the fully
+#    resolved config (preset + HW_CONFIG + HW_EXTRA), so the rebuilt model is
+#    the trained one.  --kn-isat-max must match the trial (not in the state_dict).
+#    Also run for HW_PRESET=none (the R0 baseline table).  A failing audit
+#    does not fail the job: training is already done.
 # --------------------------------------------------------------------------
-if [ -f hw/audit.py ] && [ "$HW_PRESET" != "none" ]; then
-  python -m hw.audit --checkpoint "$OUT/phase_a_best.pt" --hw-preset "$HW_PRESET" ${HW_CONFIG:+--hw-config "$HW_CONFIG"}
+if [ -f hw/audit.py ] && [ -f "$OUT/phase_a_best.pt" ]; then
+  python -m hw.audit --checkpoint "$OUT/phase_a_best.pt" --kn-isat-max "$KN_ISAT_MAX" \
+    --kn-gm-max 4.241970e+00 --canonical "$CANONICAL" --sensitivity \
+    --json "$OUT/hw_audit.json" \
+    || echo "WARNING: hw.audit failed (exit $?)" >&2
 fi
 
 echo "DONE ${RUN_TAG} -> ${OUT}"

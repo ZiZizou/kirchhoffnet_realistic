@@ -15,7 +15,7 @@
 # The failure rule is the surgery's single constant DEGRADE_REL_THRESHOLD = 0.10
 # ("fail if >= 2 of the 4 specs degrade by >= 10 %"); no threshold flag is
 # passed.  Set DEGRADE_THR in the environment to run an experiment at another
-# threshold (the flag only exists if workstream W4 adds it).
+# threshold (--zig-degrade-thr, added by workstream W4).
 #
 # There are NO --kn-moe-* flags: the surgery removed them from the argparse.
 set -euo pipefail

@@ -82,7 +82,7 @@ and is the same on every resubmission (`kn_bayes_opt.py` resumes `study.db`).
 | `HW_PRESET` | `phase3a_full` (`none` = baseline) | named preset from `hw/presets/*.json` |
 | `HW_CONFIG` | empty | JSON file overriding the preset keys |
 | `HW_EXTRA` | empty | extra `--hw-*` flags, split on whitespace |
-| `DEGRADE_THR` | empty | **optional** failure-threshold override. Empty = the unified `DEGRADE_REL_THRESHOLD = 0.10`; when set, `--zig-degrade-thr` is passed (that flag only exists if W4 adds it) |
+| `DEGRADE_THR` | empty | **optional** failure-threshold override. Empty = the unified `DEGRADE_REL_THRESHOLD = 0.10`; when set, `--zig-degrade-thr` is passed (added by W4) |
 | `SEED` | `100` | random seed |
 | `RUN_TAG` | `${HW_PRESET}_s${SEED}` | output sub-directory (Phase-A script) |
 | `N_TRIALS` | `30` | BO trials (BO script) |
@@ -147,18 +147,38 @@ All of these exist today (verified with `python kn_bayes_opt.py --help`):
 `--gln-rank`, `--gln-families`, `--param-budget`, `--param-tolerance`,
 `--epochs`, `--n-trials`, `--seed`, `--device`, `--no-seed-trial`, `--output`.
 
-### 5.3 Flags that do **not** exist yet - requires W4 CLI plumbing
+### 5.3 Hardware flags - added by the W4 CLI plumbing (all exist now)
+
+Every `--hw*` / `--zig*` flag the two scripts pass was checked against the
+argparse of its target (`bash -n` on both scripts; each flag grepped against
+the parser; `python kn_bayes_opt.py --help`).
 
 | Flag | Where | Status |
 |---|---|---|
-| `--hw-preset NAME` | both scripts | **does not exist** - to be added by the W4 CLI plumbing (`parse_hw_args` in the dagger script, passthrough in `kn_bayes_opt.py`). Presets are ready in `hw/presets/*.json`. |
-| `--hw-config PATH` | both scripts | **does not exist** - same W4 work. |
-| `--hw-*` individual flags (`--hw-tm`, `--hw-tm-xfer-mode`, `--hw-tm-param-bits`, `--hw-tm-c-hold-ff`, `--hw-mismatch-sigma`, `--hw-power-lambda`, ...) | both scripts (through `HW_EXTRA`) | **do not exist** - same W4 work. |
-| `--zig-degrade-thr T` | both scripts, only when `DEGRADE_THR` is set | **does not exist** - optional override of the unified `DEGRADE_REL_THRESHOLD = 0.10`; the scripts do **not** pass it by default, so the ladder works without it. |
+| `--hw-preset NAME` | both scripts | **exists**. Dagger script: `hw.cli.add_entry_hw_args(_bo_parser)` (= `hw.parse_hw_args` + `--zig-degrade-thr`). `kn_bayes_opt.py`: `parse_hw_args(parser)`. Presets: `hw/presets/{phase3a_core,phase3a_full,phase3b_tm}.json`; `none` = no preset. |
+| `--hw-config PATH` | both scripts | **exists** (same parsers). |
+| `--hw-*` individual flags (`--hw-tm`, `--hw-tm-xfer-mode`, `--hw-tm-param-bits`, `--hw-tm-c-hold-ff`, `--hw-tm-node-quant-bits`, `--hw-mismatch-sigma`, `--hw-power-lambda`, `--hw-slope-bound`, ...) | both scripts (through `HW_EXTRA`) | **exist** (one flag per `HWConstraints` field + the `--hw-tm*` group). Precedence: flag > `--hw-config` > preset > default. |
+| `--zig-degrade-thr T` | both scripts, only when `DEGRADE_THR` is set | **exists** - optional override of the unified `DEGRADE_REL_THRESHOLD = 0.10` (sets `ERROR_THRESHOLD` / `DEGRADE_REL_THRESHOLD` and the Phase-A ctx). The scripts do **not** pass it by default. `kn_bayes_opt.py` accepts it for `--dataset ctle` only. |
 
-Until W4 lands, the hardware scripts will fail at start-up with
-`unrecognized arguments`. The `--hw-*` flags and the `--hw-preset` /
-`--hw-config` flags are the only reason the ladder cannot be submitted today.
+How the flags travel:
+
+* **Dagger script** (`retrain_hw_phase_a.sh`): parsed with `parse_known_args`,
+  but a leftover `--hw-*` / `--zig-*` argument (a typo, or a flag from a newer
+  branch) is a hard error (`SystemExit`, see `hw/cli.py`) instead of being
+  silently dropped. At start-up the script logs the resolved HWConfig JSON and
+  its `hash()` and writes `$OUT/hw_config.json`.
+* **BO driver** (`retrain_hw_bo.sh`): resolves preset + config + flags once into
+  an HWConfig, writes `<run_dir>/hw_config_<hash>.json` and passes that one file
+  to every trial as `--hw-config` (plus `--zig-degrade-thr` when set). The hash
+  is part of the sampling fingerprint only when the config is on (or the
+  threshold is overridden), so a legacy study keeps its fingerprint and a study
+  cannot mix hardware and non-hardware trials.
+* **Audit** (`retrain_hw_phase_a.sh` step 8): `python -m hw.audit --checkpoint
+  $OUT/phase_a_best.pt --kn-isat-max $KN_ISAT_MAX ...` with **no** `--hw-*`
+  flags, so it reads `$OUT/hw_config.json` (the fully resolved config, including
+  `HW_EXTRA`). `--kn-isat-max` must match the trial because the cell bounds are
+  not in the state_dict. The audit table goes to the job log and
+  `$OUT/hw_audit.json`; a failing audit does not fail the job.
 
 ### 5.4 Deliberately absent
 
@@ -176,10 +196,13 @@ Until W4 lands, the hardware scripts will fail at start-up with
   `--kn-gm-max` stays at the paper value for traceability (with
   `hw_slope_bound` it no longer sets the tanh slope, it only bounds the GLN
   `slope` mode).
-* `kn_bayes_opt.py` still needs, for the hardware runs (W4): the
-  `--hw-config`/`--hw-preset` passthrough into the trial command, the
-  `HWConfig.hash()` in the study fingerprint, no `gm_max`/`isat_max` sampling
-  when `hw_slope_bound` is on (`isat_max = 16`), `HWUnits` built per trial from
-  the sampled `ctle_t_span`, and the hardware-aware parameter budget.
-* The post-train audit (`python -m hw.audit ...`) is guarded by
-  `[ -f hw/audit.py ]` and is therefore a no-op until `hw/audit.py` exists.
+* `kn_bayes_opt.py` now has (W4) the hardware passthrough into the trial
+  command and the `HWConfig.hash()` in the study fingerprint. Still open for
+  the hardware BO: no `gm_max`/`isat_max` sampling when `hw_slope_bound` is on
+  (`isat_max = 16`), `HWUnits` built per trial from the sampled `ctle_t_span`,
+  and a hardware-aware parameter budget. With `hw_ratio_ab` the unused
+  `a_raw`/`b_raw` stay trainable next to `r_raw`, so the counted parameters
+  grow (seen on a `housing` trial: 7,170 -> 7,773) and can push an arch over
+  the budget.
+* The post-train audit (`python -m hw.audit ...`) runs after every rung,
+  including `HW_PRESET=none`.

@@ -84,3 +84,49 @@ def test_cli(tmp_path):
     assert d["n_rows"] == 8 and d["hw_off"] is True
     rc = A.main(["--checkpoint", CKPT, "--n-rows", "8", "--stiffness-rows", "4", "--strict"])
     assert rc == 1                                  # the unconstrained paper model fails
+
+
+def test_cli_reads_hw_config_beside_a_hardware_checkpoint(tmp_path):
+    """The slurm audit passes no --hw-* flags: it must rebuild the trained hw model
+    (here phase3a_core: ratio_ab adds r_raw, so a legacy build would not load) from
+    the hw_config.json the trial wrote, with --kn-isat-max of the trial."""
+    from hw.cli import hw_config_from_args
+    import argparse
+    p = argparse.ArgumentParser()
+    from hw import parse_hw_args
+    parse_hw_args(p)
+    hw = hw_config_from_args(p.parse_args(["--hw-preset", "phase3a_core"]))
+    torch.manual_seed(3)
+    m = A.load_model(None, hw, arch={"isat_max": 16.0})
+    assert any(k.endswith("r_raw") for k in m.state_dict())
+    ck = tmp_path / "phase_a_best.pt"
+    torch.save(m.state_dict(), ck)
+    hw.to_json(str(tmp_path / "hw_config.json"))
+    out = tmp_path / "a.json"
+    rc = A.main(["--checkpoint", str(ck), "--kn-isat-max", "16", "--n-rows", "8",
+                 "--stiffness-rows", "4", "--json", str(out)])
+    assert rc == 0
+    d = json.loads(out.read_text())
+    assert d["hw_off"] is False and d["hw_hash"] == hw.hash()
+    # slope bound + ratio form on: the static core slope and A/B obey the limits
+    core = d["edges"]["core"]
+    assert core["slope"][1] <= hw.units.slope_max + 1e-6
+    assert core["ratio"][1] <= 4.0 + 1e-6
+
+
+def test_slurm_scripts_only_pass_existing_flags():
+    """Every --hw*/--zig* flag in scripts/slurm/*.sh exists in the entry parsers."""
+    import argparse
+    import glob
+    import re
+    import subprocess
+    from hw.cli import add_entry_hw_args
+    p = argparse.ArgumentParser()
+    add_entry_hw_args(p)
+    known = {o for a in p._actions for o in a.option_strings}
+    for sh in glob.glob(os.path.join(ROOT, "scripts", "slurm", "*.sh")):
+        assert subprocess.run(["bash", "-n", sh]).returncode == 0, sh
+        txt = open(sh).read()
+        flags = set(re.findall(r"(?<![\w-])(--(?:hw|zig)-[a-z0-9-]*[a-z0-9])", txt))
+        assert flags, sh
+        assert flags <= known, (sh, sorted(flags - known))

@@ -61,7 +61,9 @@ def test_spectre_ota_and_shunt_match_analytic_reference():
     setup = Path.home() / "workarea_GF22_FDX_EXT" / "kit.gf22fdx_ext.v1.0_4.1_stack19_oa.csh"
     if tcsh is None or not setup.is_file():
         pytest.skip("Cadence setup/tcsh is unavailable")
-    probe = subprocess.run([tcsh, "-c", f"source {setup} >& /dev/null; which spectre"],
+    probe_dir = Path("/home/annaik/Documents/kirchhoffnet_refactor/.agent_scratch/taskD2/runs/probe")
+    probe_dir.mkdir(parents=True, exist_ok=True)
+    probe = subprocess.run([tcsh, "-c", f"cd {probe_dir}; source {setup} >& /dev/null; which spectre"],
                            text=True, capture_output=True, timeout=30)
     if probe.returncode or "spectre" not in probe.stdout.lower():
         pytest.skip("Spectre is unavailable")

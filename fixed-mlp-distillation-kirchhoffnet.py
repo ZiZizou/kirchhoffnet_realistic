@@ -31,6 +31,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from cell_library import make_cell_library
+from ctle_metrics_config import DEGRADE_REL_THRESHOLD, MIN_DEGRADED_DIMS
 from config import SOLVER, VCA
 from ctle_dagger_common import (
     COL_MAPPING,
@@ -108,8 +109,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--zig-artifact-dir", default=None,
                         help="Directory containing the HybridHurdle/ZIG files; defaults to the teacher checkpoint directory.")
     parser.add_argument("--zig-validity-threshold", type=float, default=0.5)
-    parser.add_argument("--zig-degrade-threshold", type=float, default=0.20)
-    parser.add_argument("--zig-min-degraded-dims", type=int, default=2)
+    parser.add_argument("--zig-degrade-threshold", type=float, default=DEGRADE_REL_THRESHOLD)
+    parser.add_argument("--zig-min-degraded-dims", type=int, default=MIN_DEGRADED_DIMS)
     parser.add_argument("--isolation-tolerance-pp", type=float, default=3.0,
                         help="Maximum absolute teacher/student failure-rate gap, in percentage points, for PASS.")
 
@@ -443,7 +444,7 @@ def evaluate_with_zig(args: argparse.Namespace, teacher: nn.Module,
         "VALIDITY_THRESHOLD": args.zig_validity_threshold,
         "DEGRADE_REL_THRESHOLD": args.zig_degrade_threshold,
         "MIN_DEGRADED_DIMS": args.zig_min_degraded_dims,
-        "ERROR_THRESHOLD": 0.10,
+        "ERROR_THRESHOLD": DEGRADE_REL_THRESHOLD,
     })
     evaluator_kwargs = dict(
         scaler_X=scaler_x, zig_model=zig,

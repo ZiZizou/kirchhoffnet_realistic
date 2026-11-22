@@ -31,6 +31,8 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from torchdiffeq import odeint_adjoint
 
+from ctle_metrics_config import DEGRADE_REL_THRESHOLD
+
 try:
     import optuna
 except ImportError as exc:
@@ -465,7 +467,7 @@ def phase_a_trial(trial: optuna.Trial, phase: Any, base_ctx: dict[str, Any], can
         "canonical_dataset": canonical, "epochs": args.epochs, "batch_size": batch_size,
         "lr": lr, "weight_decay": wd, "output_dir": str(trial_dir), "grad_clip": 1.0,
         "val_eval_every": args.ctle_eval_every, "earlystop_patience": args.ctle_earlystop_patience,
-        "error_threshold": 0.10, "validity_weight": args.ctle_phase_a_validity_weight,
+        "error_threshold": DEGRADE_REL_THRESHOLD, "validity_weight": args.ctle_phase_a_validity_weight,
         "validity_ramp_start": args.ctle_phase_a_validity_ramp_start,
         "validity_ramp_epochs": args.ctle_phase_a_validity_ramp_epochs,
         "mlp_weight": args.ctle_phase_a_mlp_weight, "fwd_weight": args.ctle_phase_a_fwd_weight,

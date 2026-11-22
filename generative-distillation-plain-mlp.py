@@ -30,6 +30,7 @@ import torch
 
 warnings.filterwarnings("ignore")
 
+from ctle_metrics_config import DEGRADE_REL_THRESHOLD  # noqa: E402
 from ctle_dagger_common import (  # noqa: E402
     PlainMLP, plain_param_count, derive_plain_width,
     PARAM_LOG_BOUNDS, FlowTeacherLabeler,
@@ -276,7 +277,7 @@ def main():
                 "grad_clip": 1.0,
                 "val_eval_every": int(args.earlystop_eval_every or 1),
                 "earlystop_patience": 30,
-                "error_threshold": 0.10,
+                "error_threshold": DEGRADE_REL_THRESHOLD,
                 "validity_weight": float(args.phase_a_validity_weight),
                 "validity_ramp_start": int(args.phase_a_validity_ramp_start),
                 "validity_ramp_epochs": int(args.phase_a_validity_ramp_epochs),

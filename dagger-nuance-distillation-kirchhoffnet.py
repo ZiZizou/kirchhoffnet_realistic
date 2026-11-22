@@ -529,14 +529,13 @@ DAGGER_ITERATIONS     = 10        # max DAgger loop iterations
 EPOCHS_PER_ITER       = 200       # student training epochs per iteration
 BATCH_SIZE            = 256      # DataLoader batch size
 INITIAL_DATASET_CACHE_DIR = None  # optional shared cache for repeated BO trials
-ERROR_THRESHOLD       = 0.10     # 10% relative error per spec dimension → failure
+from ctle_metrics_config import DEGRADE_REL_THRESHOLD, MIN_DEGRADED_DIMS  # noqa: E402
+ERROR_THRESHOLD       = DEGRADE_REL_THRESHOLD   # failure rule: single constant, see ctle_metrics_config.py
 VALIDATION_SIZE       = 2000     # validation specs sampled per evaluation
 BOUNDARY_RATIO        = 0.50     # fraction of val specs from boundary regions
 N_CANDIDATES_PER_SPEC = 3000     # teacher candidates per failed spec (interior)
 N_CANDIDATES_BOUNDARY = 10000    # teacher candidates for boundary specs
 VALIDITY_THRESHOLD    = 0.50     # non-negotiable validity floor for generated designs
-DEGRADE_REL_THRESHOLD = 0.20     # count degradation only at 20%+ relative regression
-MIN_DEGRADED_DIMS     = 2        # fail only when 2+ dimensions degrade meaningfully
 LR_INITIAL            = 1e-3     # AdamW initial learning rate
 LR_DECAY_AFTER_ITER   = 3        # iteration index (0-based) after which LR *= 0.5
 LR_FLOOR             = 1e-4      # minimum LR during decay (was eta_min in scheduler)

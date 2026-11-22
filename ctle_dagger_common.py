@@ -109,18 +109,20 @@ BOUNDARY_ABS_TOLERANCES_RELAXED = {
     'power':  (0.003, 0.0005),
 }
 
+from ctle_metrics_config import DEGRADE_REL_THRESHOLD, MIN_DEGRADED_DIMS  # noqa: E402
+
 HPARAMS_DEFAULTS = {
     'DAGGER_ITERATIONS':     10,
     'EPOCHS_PER_ITER':       200,
     'BATCH_SIZE':            256,
-    'ERROR_THRESHOLD':       0.10,
+    'ERROR_THRESHOLD':       DEGRADE_REL_THRESHOLD,
     'VALIDATION_SIZE':       2000,
     'BOUNDARY_RATIO':        0.50,
     'N_CANDIDATES_PER_SPEC': 3000,
     'N_CANDIDATES_BOUNDARY': 10000,
     'VALIDITY_THRESHOLD':    0.50,
-    'DEGRADE_REL_THRESHOLD': 0.20,
-    'MIN_DEGRADED_DIMS':     2,
+    'DEGRADE_REL_THRESHOLD': DEGRADE_REL_THRESHOLD,
+    'MIN_DEGRADED_DIMS':     MIN_DEGRADED_DIMS,
     'LR_INITIAL':            1e-3,
     'LR_DECAY_AFTER_ITER':   3,
     'LR_FLOOR':              1e-4,
@@ -2288,7 +2290,7 @@ class StudentEvaluator:
                    'is_boundary': is_boundary,
                    'pred_specs': pred_specs,
                    'target_specs': val_specs.copy(),
-                   'dim_fail_rates': (all_errors >= _active_ctx.get('DEGRADE_REL_THRESHOLD', 0.20)).mean(axis=0),
+                   'dim_fail_rates': (all_errors >= _active_ctx.get("DEGRADE_REL_THRESHOLD", DEGRADE_REL_THRESHOLD)).mean(axis=0),
                    'degraded_dims': metric_dict['degraded_dims'],
                    'failure_mask': failure_mask,
                    'invalid_mask': invalid_mask,
@@ -2493,14 +2495,13 @@ def compute_forward_errors(pred_specs, target_specs,
     if boundary_tols is None:
         boundary_tols = BOUNDARY_ABS_TOLERANCES
     # Audit fix (phase-a validity bundle): default_threshold was accepted but
-    # never used — every caller silently got 0.20.  An explicitly passed
-    # threshold now governs the degrade gate; None preserves the legacy
-    # 0.20 default bit-identically for all existing callers.
+    # never used.  An explicitly passed threshold governs the degrade gate;
+    # None uses ctle_metrics_config.DEGRADE_REL_THRESHOLD (10%).
     if default_threshold is None:
-        degrade_thr = _active_ctx.get('DEGRADE_REL_THRESHOLD', 0.20)
+        degrade_thr = _active_ctx.get('DEGRADE_REL_THRESHOLD', DEGRADE_REL_THRESHOLD)
     else:
         degrade_thr = float(default_threshold)
-    min_bad = _active_ctx.get('MIN_DEGRADED_DIMS', 2)
+    min_bad = _active_ctx.get('MIN_DEGRADED_DIMS', MIN_DEGRADED_DIMS)
     pred_p = pred_specs[:, 0]; pred_j = pred_specs[:, 1]
     pred_h = pred_specs[:, 2]; pred_w = pred_specs[:, 3]
     target_p = target_specs[:, 0]; target_j = target_specs[:, 1]
@@ -2540,7 +2541,7 @@ def log_failure_breakdown(metrics, prefix=""):
     if errs.size == 0:
         return
     dim_names = ['power', 'jitter', 'height', 'width']
-    degrade_thr = _active_ctx.get('DEGRADE_REL_THRESHOLD', 0.20)
+    degrade_thr = _active_ctx.get('DEGRADE_REL_THRESHOLD', DEGRADE_REL_THRESHOLD)
     validity_thr = _active_ctx.get('VALIDITY_THRESHOLD', 0.5)
     fail_by_dim = (errs >= degrade_thr).mean(axis=0)
     mean_err = errs.mean(axis=0)
@@ -2553,11 +2554,11 @@ def log_failure_breakdown(metrics, prefix=""):
         )
     if 'degraded_dims' in metrics:
         degraded_dims = np.asarray(metrics['degraded_dims'])
-        fail_mask = np.asarray(metrics.get('failure_mask', degraded_dims >= _active_ctx.get('MIN_DEGRADED_DIMS', 2)))
+        fail_mask = np.asarray(metrics.get('failure_mask', degraded_dims >= _active_ctx.get("MIN_DEGRADED_DIMS", MIN_DEGRADED_DIMS)))
         _logger.info(
             f"{prefix}adaptive: valid_threshold={validity_thr:.2f} "
             f"degrade_threshold={degrade_thr*100:.0f}% "
-            f"min_bad_dims={_active_ctx.get('MIN_DEGRADED_DIMS', 2)} "
+            f"min_bad_dims={_active_ctx.get('MIN_DEGRADED_DIMS', MIN_DEGRADED_DIMS)} "
             f"mean_bad_dims={degraded_dims.mean():.2f} "
             f"failure_rate={fail_mask.mean()*100:.1f}%"
         )
@@ -2837,7 +2838,7 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
         every N epochs; the best-failure checkpoint is the one carried forward.
       - earlystop_patience (int, default 30) — counted in *eval cycles*
         (only epochs that actually run the ZIG eval advance the counter).
-      - error_threshold (float, default 0.10 — passes through to identify_failures)
+      - error_threshold (float, default DEGRADE_REL_THRESHOLD = 0.10 — passes through to identify_failures)
       - validity_weight (float, default 0.0) — weight on the ZIG-validity NLL
         ``-log(p_valid)`` term.  0.0 reproduces the legacy Huber-only path
         bit-identically (the ZIG forward is skipped entirely).
@@ -2878,7 +2879,7 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
     grad_clip = float(ctx.get("grad_clip", 1.0))
     val_eval_every = int(ctx.get("val_eval_every", 1))
     earlystop_patience = int(ctx.get("earlystop_patience", 30))
-    error_threshold = float(ctx.get("error_threshold", 0.10))
+    error_threshold = float(ctx.get("error_threshold", DEGRADE_REL_THRESHOLD))
     validity_weight = float(ctx.get("validity_weight", 0.0))
     validity_ramp_start = int(ctx.get("validity_ramp_start", 10))
     validity_ramp_epochs = int(ctx.get("validity_ramp_epochs", 30))
@@ -3245,7 +3246,7 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
             "boundary_failure_rate": boundary_failure_rate,
             "interior_failure_rate": interior_failure_rate,
             "dim_fail_rates": (
-                np.asarray(metrics["errors"]) >= float(ctx.get("DEGRADE_REL_THRESHOLD", 0.20))
+                np.asarray(metrics["errors"]) >= float(ctx.get("DEGRADE_REL_THRESHOLD", DEGRADE_REL_THRESHOLD))
             ).mean(axis=0).tolist(),
         }
         if mlp_guided:

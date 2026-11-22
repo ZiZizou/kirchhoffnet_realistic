@@ -59,6 +59,8 @@ from typing import Optional, Sequence
 
 import numpy as np
 
+from ctle_metrics_config import DEGRADE_REL_THRESHOLD, MIN_DEGRADED_DIMS
+
 
 # ---------------------------------------------------------------------------
 # Project constants (mirrors ctle_dagger_common / dagger-nuance-distillation).
@@ -259,9 +261,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Skip maestro-history cleanup (only relevant with --enable-ocean).")
 
     # ----- scoring -----
-    p.add_argument("--degrade-thr", type=float, default=0.10,
-                   help="Relative degrade threshold per dim (default 0.10).")
-    p.add_argument("--min-degraded-dims", type=int, default=2,
+    p.add_argument("--degrade-thr", type=float, default=DEGRADE_REL_THRESHOLD,
+                   help="Relative degrade threshold per dim (default: ctle_metrics_config.DEGRADE_REL_THRESHOLD = 0.10).")
+    p.add_argument("--min-degraded-dims", type=int, default=MIN_DEGRADED_DIMS,
                    help="Number of dims that must degrade to count a spec as failure.")
     p.add_argument("--key-map", default=None,
                    help='JSON dict {"power":"power","jitter":"...",...} overriding defaults.')

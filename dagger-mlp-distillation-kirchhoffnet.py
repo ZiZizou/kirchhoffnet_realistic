@@ -522,12 +522,11 @@ DAGGER_ITERATIONS     = 10
 EPOCHS_PER_ITER       = 200
 BATCH_SIZE            = 256
 INITIAL_DATASET_CACHE_DIR_DEFAULT = None
-ERROR_THRESHOLD       = 0.10
+from ctle_metrics_config import DEGRADE_REL_THRESHOLD, MIN_DEGRADED_DIMS  # noqa: E402
+ERROR_THRESHOLD       = DEGRADE_REL_THRESHOLD   # failure rule: single constant, see ctle_metrics_config.py
 VALIDATION_SIZE       = 2000
 BOUNDARY_RATIO        = 0.50
 VALIDITY_THRESHOLD    = 0.50
-DEGRADE_REL_THRESHOLD = 0.20
-MIN_DEGRADED_DIMS     = 2
 LR_INITIAL            = 1e-3
 LR_DECAY_AFTER_ITER   = 3
 LR_FLOOR              = 1e-4

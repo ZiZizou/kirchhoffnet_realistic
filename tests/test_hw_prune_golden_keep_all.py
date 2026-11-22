@@ -25,6 +25,10 @@ def test_golden_builder_keep_all_pruning_preserves_params_and_forward(spec):
             family: sum(p.numel() for name, p in old_core.named_parameters() if family in name)
             for family in ("boundary", "output_ode", "readout_sense", "vca", "gln")
         }
+        if spec is mg.FRIEDMAN2_NET:
+            assert old_families["boundary"] > 0 and old_families["output_ode"] > 0
+        else:
+            assert old_families["boundary"] > 0 and old_families["readout_sense"] > 0
 
         pruned, _ = prune_network(old_core, edge_threshold=-1.0)
         new_count = sum(p.numel() for p in pruned.parameters())

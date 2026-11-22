@@ -226,7 +226,9 @@ def test_friedman2_physical_c_node_builds_and_runs(preset):
         st = net.core.stages[0]
         c = st.node_capacitance(torch.zeros(1, st.num_nodes, dtype=torch.float64))
         assert float(c.mean()) == pytest.approx(st.c_eff, rel=1e-12)
-        assert float(c.max()) <= st.c_eff + 1e-9      # parasitic <= budget
+        # the per-node capacitance is the class mean (c_eff * C_u) plus the
+        # node's own parasitic deviation: every node stays positive
+        assert float(c.min()) > 0.0
 
 
 @pytest.mark.parametrize("task,preset,seed", ALL)

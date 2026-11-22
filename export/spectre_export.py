@@ -65,9 +65,15 @@ def build_param_table(model, mode="legacy", hw=None) -> dict:
     if mode not in {"legacy", "hw"}:
         raise ValueError("mode must be legacy|hw")
     net = model.net
+    from hw.constraints import net_hw
+    built_hw = net_hw(net)
+    if hw is not None and not getattr(hw, "is_off", lambda: False)():
+        if built_hw is None:
+            raise ValueError("hw config was supplied, but the model was not built with that HWConfig; export cannot retrofit flags")
+        if hasattr(hw, "to_dict") and hasattr(built_hw, "to_dict") and hw.to_dict() != built_hw.to_dict():
+            raise ValueError("supplied HWConfig differs from the config used to build the model")
     if hw is None:
-        from hw.constraints import net_hw
-        hw = net_hw(net)
+        hw = built_hw
     if mode == "hw" and hw is not None:
         hw.validate() if hasattr(hw, "validate") else hw.constraints.validate()
     constraints = getattr(hw, "constraints", hw)

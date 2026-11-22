@@ -17,6 +17,96 @@ def _tensor(v):
         return v.detach().cpu().tolist()
     return v
 
+def _sigmoid(x):
+    return torch.sigmoid(x.detach()).cpu().tolist()
+
+def _softplus(x):
+    return torch.nn.functional.softplus(x.detach()).cpu().tolist()
+
+def _cell_table(lib):
+    A, B = lib.ab_values()
+    theta = lib.theta_values()
+    return {
+        "A": _tensor(A), "B": _tensor(B),
+        "sign": _tensor(torch.sign(lib.s_raw)),
+        "gm": _tensor(lib.gm_eff_values()), "isat": _tensor(lib.isat_values()),
+        "theta": _tensor(torch.zeros_like(lib.s_raw) if theta is None else theta),
+        "conductance": _tensor(torch.nn.functional.softplus(lib.g_resistive_raw)),
+        "gm_min": float(lib.gm_min), "gm_max": float(lib.gm_max),
+        "isat_min": float(lib.isat_min), "isat_max": float(lib.isat_max),
+        "alpha": float(lib.ALPHA), "beta_softness": float(lib._beta_softness),
+        "has_bias": theta is not None, "has_resistive": hasattr(lib, "resistive_current"),
+    }
+
+def build_param_table(model, mode="legacy") -> dict:
+    """Return a JSON-ready, resolved behavioral description of a loaded network."""
+    if mode not in {"legacy", "hw"}:
+        raise ValueError("mode must be legacy|hw")
+    net = model.net
+    stages = []
+    for i, s in enumerate(net.core.stages):
+        n = int(s.num_nodes)
+        sharp = s.clip_sharpness()
+        sharp = float(sharp.detach().cpu()) if isinstance(sharp, torch.Tensor) else float(sharp)
+        gln = net.gln_rails
+        gln_table = None
+        if gln is not None:
+            gln_table = {"a": _tensor(gln.a), "c": _tensor(gln.c),
+                         "alpha": _tensor(torch.nn.functional.softplus(gln.alpha_raw) + 1e-6),
+                         "gm_min": gln.gm_min, "gm_max": gln.gm_max,
+                         "families": {name: {"W": _tensor(m.weight())} for name,m in gln.families.items()}}
+        vca = {"enabled": bool(s.vca_enabled), "core_enabled": bool(s._vca_core_enabled),
+               "separate_core_bus": bool(s.vca_separate_core_bus), "gate_shunt": bool(s.vca_gate_shunt),
+               "W": _tensor(s.vca_W) if s.vca_W is not None else None,
+               "W_core": _tensor(s.vca_W_core) if s.vca_W_core is not None else None,
+               "v_core": _tensor(s.vca_v_core) if s.vca_v_core is not None else None,
+               "v_boundary": _tensor(s.vca_v_boundary) if s.vca_v_boundary is not None else None,
+               "v_readout": _tensor(s.vca_v_readout) if s.vca_v_readout is not None else None,
+               "b_core": _tensor(s.vca_b_core) if s.vca_b_core is not None else None,
+               "b_boundary": _tensor(s.vca_b_boundary) if s.vca_b_boundary is not None else None,
+               "b_readout": _tensor(s.vca_b_readout) if s.vca_b_readout is not None else None}
+        stages.append({
+            "index": i, "num_nodes": n,
+            "topology": {"src": _tensor(s.src), "dst": _tensor(s.dst),
+                "boundary_src": _tensor(s.boundary_src), "boundary_dst": _tensor(s.boundary_dst),
+                "output_ode_src": _tensor(s.output_ode_src), "output_ode_dst": _tensor(s.output_ode_dst),
+                "readout_sense_src": _tensor(s.readout_sense_src),
+                "readout_dst_start": int(s._readout_dst_start)},
+            "solver": {"method":"heun", "t_span": float(net.core.stage_times[i]), "num_steps":int(net.core.stage_steps[i])},
+            "settings": {"c_eff":float(s.c_eff), "x_max":float(s.x_max), "clip_current":float(s.clip_current),
+                "clip_sharpness":sharp, "leak":float(s.leak_constant) if s.leak_mode == "non-programmable" else _softplus(s.raw_leak),
+                "freeze_read":bool(s.freeze_read), "freeze_boundary":bool(s.freeze_boundary),
+                "freeze_temporal_read":bool(s.freeze_temporal_read), "read_only_source":bool(s.read_only_source),
+                "readout_mode":s.readout_mode, "leak_mode":s.leak_mode},
+            "cells":{"core":_cell_table(s.cell_lib), "boundary":_cell_table(s.boundary_cell_lib) if s.boundary_cell_lib else None,
+                "readout":_cell_table(s.readout_sense_cell_lib) if s.readout_sense_cell_lib else None,
+                "output_ode":_cell_table(s.output_ode_cell_lib) if s.output_ode_cell_lib else None},
+            "gates":{"core":_sigmoid(s.z_logits), "boundary":_sigmoid(s.boundary_z_logits) if s.boundary_z_logits is not None else [],
+                "readout":_sigmoid(s.readout_sense_z_logits) if s.readout_sense_z_logits is not None else [],
+                "output_ode":_sigmoid(s.output_ode_z_logits) if s.output_ode_z_logits is not None else []},
+            "readout":{"crossbar_W":_tensor(s.crossbar_weights()), "vref":_tensor(s.sense_vref())},
+            "vca":vca, "gln":gln_table})
+    transfers=[]
+    for t in net.core.transfers:
+        transfers.append({"in_nodes":t.in_nodes,"out_nodes":t.out_nodes,"activation":t.activation,
+            "residual_w1":_tensor(t.residual_w1) if t.residual_w1 is not None else None,
+            "residual_w2":_tensor(t.residual_w2) if t.residual_w2 is not None else None,
+            "residual_w3":_tensor(t.residual_w3) if t.residual_w3 is not None else None,
+            "residual_vth":_tensor(t.residual_vth) if t.residual_vth is not None else None})
+    post=net.post_readout_transfer
+    affine=net.output_mapper
+    return {"schema":"kirchhoffnet-resolved-params-v1", "mode":mode,
+        "input":{"kind":"log10_minmax", "log_min":_tensor(model.input_log_min), "log_max":_tensor(model.input_log_max),
+            "input_rail":float(model.input_rail), "initial_state":"zeros", "boundary_enabled":bool(net.enable_boundary)},
+        "topology":{"stages":len(stages), "hidden_nodes":int(net.hid_count), "readout_start":int(net.read_start),
+            "readout_count":int(net.read_dim), "write_idx":net.write_idx, "read_idx":net.read_idx},
+        "stages":stages, "transfers":transfers,
+        "readout":{"kind":"output_affine", "gain":_tensor(affine.gain), "bias":_tensor(affine.bias),
+            "tanh_gain":_tensor(affine.tanh_gain), "relu_gain":_tensor(affine.relu_gain),
+            "relu_threshold":_tensor(affine.relu_threshold),
+            "post_transfer":{"activation":post.activation,"w1":_tensor(post.residual_w1),"w2":_tensor(post.residual_w2),
+                "w3":_tensor(post.residual_w3),"vth":_tensor(post.residual_vth)}}}
+
 def export(checkpoint, out, mode="legacy", fabric="timemux", specs=16, hw_config=None):
     if mode not in {"legacy", "hw"} or fabric not in {"timemux", "copies"}:
         raise ValueError("mode must be legacy|hw and fabric timemux|copies")
@@ -44,8 +134,9 @@ def export(checkpoint, out, mode="legacy", fabric="timemux", specs=16, hw_config
     params = {"format":"hrknet-spectre-params-v1", "mode":mode, "fabric":fabric,
       "specs":int(specs), "units":{"Vu_V":units.vu,"Cu_F":units.cu,"Tu_s":units.tu,
       "Iu_A":units.iu,"Gu_S":units.gu,"Vcm_V":units.vcm,"x_hard":units.x_hard},
-      "solver":{"name":"heun", "t_span":4.660583, "num_steps":256},
+      "solver":{"name":"heun", "t_span":float(sum(model.net.core.stage_times)), "num_steps":int(sum(model.net.core.stage_steps))},
       "interstage_transfer":"instantaneous stage-boundary rewrite", "hw_config":hw_config,
+      "resolved":build_param_table(model, mode),
       "state_dict":entries, "mapping":{"mapped_parameter_keys":mapped,"topology_keys":topology,
       "digital_offchip_keys":[k for k,v in entries.items() if v["kind"]=="digital_offchip"]}}
     out=Path(out); out.mkdir(parents=True,exist_ok=True)

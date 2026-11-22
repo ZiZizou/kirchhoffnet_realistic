@@ -3334,8 +3334,12 @@ def main():
         # remapping.  ``stage_remaps[0]`` maps first-stage compact ids,
         # ``stage_remaps[-1]`` maps last-stage compact ids.
         preset_cfg = PRESETS[args.problem]
-        pruned_first_n = pruned_core.stages[0].num_nodes
-        pruned_last_n = pruned_core.stages[-1].num_nodes
+        # The ODE output accumulator nodes are part of each core stage's
+        # full state width, but are not input-written/read-hidden nodes.
+        # Keep them in the wrapper's dedicated temporal-readout tail.
+        output_ode_count = int(raw_net.output_ode_count)
+        pruned_first_n = pruned_core.stages[0].num_nodes - output_ode_count
+        pruned_last_n = pruned_core.stages[-1].num_nodes - output_ode_count
         in_dim = preset_cfg["stages"][0]["num_inputs"]
         out_dim = preset_cfg.get("out_dim", 1)
         stage0_remap = stage_remaps[0]
@@ -3439,7 +3443,9 @@ def main():
             final_hid_count=pruned_last_n,
             final_proj_count=0,
             write_idx=pruned_write_idx if effective_write_mode in ("one_to_one", "sparse_proj") else None,
-            read_idx=pruned_read_idx if effective_read_mode == "sparse" else None)
+            read_idx=pruned_read_idx if effective_read_mode == "sparse" else None,
+            enable_temporal_readout=raw_net.enable_temporal_readout,
+            output_ode_count=output_ode_count)
         pruned_net.to(device)
         # Re-apply --no-resistive-shunt: prune_stage constructs fresh
         # DifferentialStage + FreeTanhLibrary objects (topology.py:1288),

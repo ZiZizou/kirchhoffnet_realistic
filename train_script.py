@@ -114,19 +114,6 @@ from io_mapper import (
     RobustInputMapper,
     SparseInputMapper)
 
-# Monkey-patch _compute_regularizers to handle DataParallel wrapping
-# (train.py is read-only on Kaggle; DataParallel strips module internals)
-import train as _train_module
-_orig_compute_regularizers = _train_module._compute_regularizers
-# Patch _compute_regularizers to handle DataParallel wrapping
-
-def _dp_safe_compute_regularizers(net, trajs, lambdas):
-    # Unwrap DataParallel so regularizer code reaches the base KirchhoffNetWithIO stages.
-    if isinstance(net, torch.nn.DataParallel):
-        net = net.module
-    return _orig_compute_regularizers(net, trajs, lambdas)
-
-_train_module._compute_regularizers = _dp_safe_compute_regularizers
 from visualize import (
     plot_stage_graph,
     plot_trajectories,

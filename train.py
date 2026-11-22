@@ -315,6 +315,9 @@ def _compute_regularizers(
     Returns ``(loss_edge_gate, loss_rail, loss_tanh_sat,
     loss_sparsity, loss_entropy)``.
     """
+    # Unwrap DataParallel so the regularizers reach the base KirchhoffNetWithIO stages.
+    if isinstance(net, torch.nn.DataParallel):
+        net = net.module
     stages = net.core.stages if isinstance(net, KirchhoffNetWithIO) else net.stages
     loss_edge_gate = loss_rail = loss_tanh_sat = trajs[0].new_zeros(())
     loss_sparsity = loss_entropy = trajs[0].new_zeros(())

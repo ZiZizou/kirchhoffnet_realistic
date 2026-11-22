@@ -190,8 +190,11 @@ def cap_divider_gain(raw: torch.Tensor, bits: int = 3, r_max: float = 2.0) -> to
     levels = 2 ** int(bits) - 1
     x = torch.sigmoid(raw)
     code = torch.round(x * levels)
-    q = 1.0 / float(r_max) + (1.0 - 1.0 / float(r_max)) * code / levels
-    return x + (q - x).detach()
+    lo = 1.0 / float(r_max)
+    span = 1.0 - lo
+    q = lo + span * code / levels
+    g = lo + span * x
+    return g + (q - g).detach()
 
 
 def effective_ab_values(lib):

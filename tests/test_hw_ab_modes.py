@@ -15,7 +15,11 @@ def test_cap_divider_levels_range_and_ste_gradient():
     assert torch.allclose(torch.sort(torch.unique(gain)).values,
                           torch.tensor([.5, .5714286, .6428571, .7142857, .7857143, .8571429, .9285714, 1.]))
     gain.sum().backward()
-    assert raw.grad is not None and bool((raw.grad > 0).all())
+    expected_grad = (1.0 - 1.0 / 2.0) * probs * (1.0 - probs)
+    torch.testing.assert_close(raw.grad, expected_grad)
+    # The STE forward remains the same eight uniformly spaced capacitor codes.
+    assert torch.allclose(torch.sort(torch.unique(gain)).values,
+                          torch.tensor([.5, .5714286, .6428571, .7142857, .7857143, .8571429, .9285714, 1.]))
 
 
 def test_differential_exact_unity_and_dead_legacy_params():

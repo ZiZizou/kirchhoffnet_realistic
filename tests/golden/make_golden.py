@@ -559,16 +559,71 @@ def golden_path(name: str) -> str:
     return os.path.join(DATA_DIR, f"{name}.pt")
 
 
+# --------------------------------------------------------------------------
+# post-surgery refresh (--refresh)
+# --------------------------------------------------------------------------
+# The golden files in data/ were generated BEFORE the surgery (tag
+# ``pre-surgery``) and still carry the surgery-removed keys (``u_logits``,
+# ``_drive_idx``, ``ref_dst``, ``_drive_mask``).  The model built at HEAD has
+# no such keys any more, so the *init* of those goldens can no longer be
+# reproduced by :func:`_initial_sd`: the seeded parameter noise is drawn per
+# parameter in sorted-name order, so dropping one parameter shifts the whole
+# noise stream and yields a DIFFERENT network.  ``--refresh`` therefore keeps
+# the SAVED ``state_dict`` of an existing golden file and recomputes only the
+# numeric outputs (forward, stage states, loss, gradients, trajectory) with
+# it -- the very code path tests/test_golden.py uses -- so the golden keeps
+# guarding the SAME model and the old-vs-new difference is exactly the
+# intended change.
+SURGERY_REMOVED_KEY_SUFFIXES = ("u_logits", "_drive_idx", "ref_dst", "_drive_mask")
+
+
+def ignored_keys() -> tuple:
+    # state_dict key suffixes the HEAD model no longer has (dropped by the surgery).
+    return tuple(f"*{k}" for k in SURGERY_REMOVED_KEY_SUFFIXES)
+
+
+def refresh_one(name: str) -> dict:
+    # Recompute the numeric outputs of an existing golden, keeping its weights.
+    path = golden_path(name)
+    rec = torch.load(path, map_location="cpu", weights_only=False)
+    spec = rec["spec"]
+    cur = build_cases().get(name)
+    if cur is not None and cur != spec:
+        raise SystemExit(f"{name}: the stored spec differs from build_cases()")
+    sd = rec["state_dict"]
+    ign = ignored_keys()
+    res = run_case(spec, golden_sd=sd, ignored=ign)
+    rec["inputs"] = res["inputs"]
+    rec["target"] = res["target"]
+    rec["y"] = res["y"]
+    rec["stage_states"] = res["stage_states"]
+    rec["loss"] = res["loss"]
+    rec["grads"] = res["grads"]
+    # ``no_grad_names`` is NOT refreshed: it documents the saved (pre-surgery)
+    # state_dict, whose surgery-removed parameters had no gradient.
+    if "traj" in rec:
+        tr = run_trajectory(spec, sd, ignored=ign)
+        rec["traj"] = {"losses": tr["losses"], "final_sd": tr["final_sd"],
+                       "X": tr["X"], "Y": tr["Y"],
+                       "steps": TRAJ_STEPS, "bs": TRAJ_BS, "lr": TRAJ_LR}
+    rec.setdefault("meta", {})["git_head"] = _git_head()
+    rec["meta"]["n_threads"] = torch.get_num_threads()
+    return rec
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", nargs="*", default=None)
+    ap.add_argument("--refresh", action="store_true",
+                    help="recompute the numeric outputs of the selected goldens, "
+                         "keeping their saved state_dict (post-surgery refresh)")
     a = ap.parse_args()
     os.makedirs(DATA_DIR, exist_ok=True)
     cases = build_cases()
     for name, spec in cases.items():
         if a.only and name not in a.only:
             continue
-        rec = make_one(name, spec)
+        rec = refresh_one(name) if a.refresh else make_one(name, spec)
         torch.save(rec, golden_path(name))
         print(f"{name:28s} params={rec['n_params']:6d} loss={float(rec['loss']):.12g} "
               f"size={os.path.getsize(golden_path(name))/1024:.0f} KiB"

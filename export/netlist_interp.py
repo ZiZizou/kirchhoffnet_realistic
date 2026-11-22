@@ -76,6 +76,37 @@ def _cell(cell, src, dst, u, family, stage):
     G = _t(cell["conductance"],ref)
     return cur + G * (src - dst)
 
+def _leg_factors(xn, units):
+    vu, ut = float(units["vu"]), float(units["u_t"])
+    hard, lam, k = float(units["x_hard"]), float(units["lambda_v"]), float(units["compliance_k"])
+    scale = vu / ut
+    y0 = hard * scale
+    c0 = 1.0 - math.exp(-float(torch.nn.functional.softplus(torch.tensor(y0, dtype=xn.dtype), beta=k)))
+    top = (1.0-lam*vu*xn).clamp_min(0.0) * (1.0-torch.exp(-torch.nn.functional.softplus((hard-xn)*scale, beta=k))) / c0
+    bot = (1.0+lam*vu*xn).clamp_min(0.0) * (1.0-torch.exp(-torch.nn.functional.softplus((hard+xn)*scale, beta=k))) / c0
+    return top, bot
+
+def _legs(cell, src, dst, u, family, stage):
+    gm = _gln_gm(stage, family, cell, u) if family in ("boundary", "readout") else _t(cell["gm"],src)
+    if gm is None: gm = _t(cell["gm"],src)
+    isat = _t(cell["isat"],src)
+    gln = stage.get("gln")
+    if gln is not None and gln.get("mode") == "tail" and u is not None and family in gln.get("families", {}):
+        rails = torch.tanh(_t(gln["alpha"],u) * (u @ _t(gln["a"],u).T + _t(gln["c"],u)))
+        delta = rails @ _t(gln["families"][family]["W"],u).T
+        isat = isat.unsqueeze(0) * torch.exp(torch.clamp(delta, -float(gln["delta_max"]), float(gln["delta_max"])))
+    z = (_t(cell["sign"],src) * (_t(cell["A"],src)*src-_t(cell["B"],src)*dst) + _t(cell["theta"],src))*gm
+    t=torch.tanh(z)
+    return 0.5*isat*(1+t), 0.5*isat*(1-t)
+
+def _compliant_destination(ip, ineg, x, units):
+    ft, fb = _leg_factors(x, units)
+    return ip*ft-ineg*fb
+
+def _compliant_source(ip, ineg, x, units):
+    ft, fb = _leg_factors(x, units)
+    return ineg*ft-ip*fb
+
 def _scatter(acc, indices, values):
     tmp = torch.zeros_like(acc, dtype=torch.float32)
     tmp.index_add_(1, torch.as_tensor(indices, dtype=torch.long, device=acc.device), values.float())
@@ -93,13 +124,25 @@ def stage_rhs(table, stage_idx, x_live, x_held, u_inputs):
     core_vca = _gain(u,st["vca"],"core")
     held = x_held if x_held is not None and settings["freeze_read"] else x
     cs, cd = held[:,top["src"]], held[:,top["dst"]]
-    core_i = _cell(core_cell,cs,cd,u,"core",st) - _t(core_cell["conductance"],x) * (cs-cd)
-    core_i = core_i * core_gate.unsqueeze(0)
-    if core_vca is not None: core_i = core_i * core_vca
+    units = resolved.get("units", {})
+    compliance = bool(resolved.get("hw_flags", {}).get("hw_compliance", False))
     edge_acc = torch.zeros_like(x,dtype=torch.float32)
-    edge_acc.index_add_(1,torch.as_tensor(top["dst"],dtype=torch.long,device=x.device),core_i.float())
-    if not settings["read_only_source"]:
-        edge_acc.index_add_(1,torch.as_tensor(top["src"],dtype=torch.long,device=x.device),-core_i.float())
+    if compliance:
+        ip, inn = _legs(core_cell,cs,cd,u,"core",st)
+        ip, inn = ip*core_gate.unsqueeze(0), inn*core_gate.unsqueeze(0)
+        if core_vca is not None: ip, inn = ip*core_vca, inn*core_vca
+        into_d = _compliant_destination(ip,inn,x[:,top["dst"]],units)
+        edge_acc.index_add_(1,torch.as_tensor(top["dst"],dtype=torch.long,device=x.device),into_d.float())
+        if not settings["read_only_source"]:
+            into_s = _compliant_source(ip,inn,x[:,top["src"]],units)
+            edge_acc.index_add_(1,torch.as_tensor(top["src"],dtype=torch.long,device=x.device),into_s.float())
+    else:
+        core_i = _cell(core_cell,cs,cd,u,"core",st) - _t(core_cell["conductance"],x) * (cs-cd)
+        core_i = core_i * core_gate.unsqueeze(0)
+        if core_vca is not None: core_i = core_i * core_vca
+        edge_acc.index_add_(1,torch.as_tensor(top["dst"],dtype=torch.long,device=x.device),core_i.float())
+        if not settings["read_only_source"]:
+            edge_acc.index_add_(1,torch.as_tensor(top["src"],dtype=torch.long,device=x.device),-core_i.float())
     acc = edge_acc
     # Core shunt is dynamic even when the nonlinear cell currents are held.
     cs, cd = x[:,top["src"]], x[:,top["dst"]]
@@ -115,11 +158,16 @@ def stage_rhs(table, stage_idx, x_live, x_held, u_inputs):
         src = u[:,top["boundary_src"]]
         dst = x[:,top["boundary_dst"]]
         cell=st["cells"]["boundary"]
-        cur=_cell(cell,src,dst,u,"boundary",st)
         gate=_t(st["gates"]["boundary"],x).unsqueeze(0)
         vg=_gain(u,st["vca"],"boundary")
-        cur=cur*gate
-        if vg is not None: cur=cur*vg
+        if compliance:
+            ip,inn=_legs(cell,src,dst,u,"boundary",st)
+            ip,inn=ip*gate,inn*gate
+            if vg is not None: ip,inn=ip*vg,inn*vg
+            cur=_compliant_destination(ip,inn,dst,units)+_t(cell["conductance"],x)*(src-dst)*gate
+        else:
+            cur=_cell(cell,src,dst,u,"boundary",st)*gate
+            if vg is not None: cur=cur*vg
         acc=(acc.float()+_scatter(x,top["boundary_dst"],cur)).to(dtype=x.dtype)
 
     # The paper checkpoint uses shared-sense crossbar readout.
@@ -127,13 +175,23 @@ def stage_rhs(table, stage_idx, x_live, x_held, u_inputs):
         src=x[:,top["readout_sense_src"]]
         dst=_t(st["readout"]["vref"],x).reshape(1,1).expand_as(src)
         cell=st["cells"]["readout"]
-        cur=_cell(cell,src,dst,u,"readout",st)
         gate=_t(st["gates"]["readout"],x).unsqueeze(0)
         vg=_gain(u,st["vca"],"readout")
-        cur=cur*gate
-        if vg is not None: cur=cur*vg
+        if compliance:
+            ip,inn=_legs(cell,src,dst,u,"readout",st)
+            ip,inn=ip*gate,inn*gate
+            if vg is not None: ip,inn=ip*vg,inn*vg
+            cur=_compliant_destination(ip,inn,dst,units)+_t(cell["conductance"],x)*(src-dst)*gate
+        else:
+            cur=_cell(cell,src,dst,u,"readout",st)*gate
+            if vg is not None: cur=cur*vg
         W=_t(st["readout"]["crossbar_W"],x)
         i_acc=cur.float() @ W.float().T
+        if compliance:
+            acc_start=int(top["readout_dst_start"])
+            acc_x=x[:,acc_start:acc_start+i_acc.shape[1]]
+            ft,fb=_leg_factors(acc_x,units)
+            i_acc=torch.where(i_acc>=0,i_acc*ft,i_acc*fb)
         dst_start=int(top["readout_dst_start"])
         acc_f32=acc.float().clone()
         acc_f32[:,dst_start:dst_start+i_acc.shape[1]] += i_acc
@@ -144,7 +202,7 @@ def stage_rhs(table, stage_idx, x_live, x_held, u_inputs):
     if leak.ndim==0: leak=leak.expand(x.shape[1])
     x_max=float(settings["x_max"])
     sharp=float(settings["clip_sharpness"])
-    clip=float(settings["clip_current"])*(torch.sigmoid((x-x_max)/sharp)-torch.sigmoid((-x-x_max)/sharp))
+    clip=(torch.zeros_like(x) if compliance else float(settings["clip_current"])*(torch.sigmoid((x-x_max)/sharp)-torch.sigmoid((-x-x_max)/sharp)))
     divisor = _t(settings["c_node"],x) if settings.get("c_node") is not None else float(settings["c_eff"])
     return (acc.to(dtype=x.dtype)-leak.unsqueeze(0)*x-clip)/divisor
 

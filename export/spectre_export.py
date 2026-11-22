@@ -89,7 +89,6 @@ def build_param_table(model, mode="legacy", hw=None) -> dict:
         if constraints.hw_vca_bits is not None:
             raise ValueError("export does not support hw_vca_bits: quantized VCA logits are not resolved")
         refused = {
-            "hw_compliance": constraints.hw_compliance,
             "hw_isat_eff_clamp": constraints.hw_isat_eff_clamp,
         }
         active = [name for name, enabled in refused.items() if enabled]
@@ -172,7 +171,7 @@ def build_param_table(model, mode="legacy", hw=None) -> dict:
     post=net.post_readout_transfer
     affine=net.output_mapper
     return {"schema":"kirchhoffnet-resolved-params-v1", "mode":mode, "hw_flags":hw_flags,
-        "units":{"x_hard":float(units.x_hard)},
+        "units":{"x_hard":float(units.x_hard), "vu":float(units.vu), "u_t":float(units.u_t), "lambda_v":0.15, "compliance_k":2000.0},
         "input":{"kind":"log10_minmax", "log_min":_tensor(model.input_log_min), "log_max":_tensor(model.input_log_max),
             "input_rail":float(model.input_rail), "initial_state":"zeros", "boundary_enabled":bool(net.enable_boundary)},
         "topology":{"stages":len(stages), "hidden_nodes":int(net.hid_count), "readout_start":int(net.read_start),

@@ -101,6 +101,8 @@ from optuna.samplers import TPESampler
 from optuna.pruners import NopPruner, SuccessiveHalvingPruner
 
 import bo_param_sampling as bps
+from hw import hw_config_from_args
+from hw.cli import add_degrade_thr_arg, hw_passthrough_argv
 
 
 def _preset_use_robust(problem: str) -> bool:
@@ -943,7 +945,30 @@ def main() -> None:
                              "from a single trial run, then exit before BO starts.")
     parser.add_argument("--ctle-objective", choices=["validation", "test"], default="validation",
                         help="CTLE BO objective source (default: validation; fixes the test-leakage bug).")
+    # Phase 3b 2.2: the hardware model, passed through verbatim to every
+    # trial subprocess (train_script.py and the CTLE dagger/Phase-A script).
+    parser.add_argument("--hw-config", default=None, metavar="PATH",
+                        help="HWConfig JSON (units/constraints/timemux) passed to every "
+                             "trial as --hw-config.  Its HWConfig.hash() is part of the "
+                             "sampling fingerprint.")
+    parser.add_argument("--hw-preset", default=None, metavar="NAME",
+                        help="hw/presets/<NAME>.json passed to every trial as --hw-preset "
+                             "(--hw-config overrides it).  Part of the sampling fingerprint.")
+    add_degrade_thr_arg(parser)  # --zig-degrade-thr (CTLE trials only)
     args = parser.parse_args()
+
+    # Resolve the HWConfig once: a missing preset / bad JSON key fails here,
+    # before any trial is launched.  Off (all-default) = legacy trials.
+    hw_cfg = hw_config_from_args(args)
+    if args.zig_degrade_thr is not None:
+        if args.dataset != "ctle":
+            raise ValueError("--zig-degrade-thr only applies to --dataset ctle")
+        if not args.zig_degrade_thr > 0.0:
+            raise ValueError("--zig-degrade-thr must be > 0")
+    hw_argv_ctle = hw_passthrough_argv(args)
+    hw_argv_train = hw_passthrough_argv(args, include_degrade_thr=False)
+    print(f"[hw] HWConfig {'OFF (legacy)' if hw_cfg.is_off() else 'ON'} "
+          f"hash={hw_cfg.hash()} trial passthrough={hw_argv_ctle}", flush=True)
 
     if args.param_budget is not None and args.param_budget < 1:
         raise ValueError("--param-budget must be >= 1")
@@ -997,6 +1022,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     run_dir = out_dir / f"{args.dataset}_knet_e{args.epochs}"
     run_dir.mkdir(parents=True, exist_ok=True)
+    hw_cfg.to_json(str(run_dir / "hw_config.json"))
 
     study_name = args.study_name or f"{args.dataset}_knet_e{args.epochs}"
     storage = f"sqlite:///{run_dir / (study_name + '.db')}"
@@ -1224,6 +1250,12 @@ def main() -> None:
             bool(args.gln_rails), int(args.gln_B), int(args.gln_rank),
             str(args.gln_families),
         ],
+        # Phase 3b 2.2: a study must not mix hardware and non-hardware
+        # trials.  The keys are added only when set, so a legacy (hw off,
+        # no threshold override) study keeps its old fingerprint and resumes.
+        **({"hw_config_hash": hw_cfg.hash()} if not hw_cfg.is_off() else {}),
+        **({"zig_degrade_thr": float(args.zig_degrade_thr)}
+           if args.zig_degrade_thr is not None else {}),
     })
 
     # study_was_resumed was captured next to db_path above (pre-create state).
@@ -1477,6 +1509,10 @@ def main() -> None:
                     output=trial_dir, device=device,
                     boundary_fan_out=seed_boundary_map, t_span=t_span, seed=args.seed,
                 )
+            # Phase 3b 2.2: hardware model + optional threshold override
+            # (rides the preflight copy below too, so the param count is the
+            # hardware build's).
+            cmd += hw_argv_ctle
             # seed-trial attrs
             if is_seed_trial:
                 trial.set_user_attr("seed_trial", True)
@@ -1793,6 +1829,8 @@ def main() -> None:
             gln_rank=int(args.gln_rank),
             gln_families=str(args.gln_families),
         )
+        # Phase 3b 2.2: hardware model (train_script.py has no ZIG threshold).
+        cmd += hw_argv_train
         if is_seed_trial:
             trial.set_user_attr("seed_trial", True)
             trial.set_user_attr("start_point",

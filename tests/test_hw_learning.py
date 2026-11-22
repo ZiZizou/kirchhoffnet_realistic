@@ -247,8 +247,12 @@ def test_finite_and_learns(task, preset, seed):
 @pytest.mark.parametrize("task,preset,seed", [a for a in ALL if a[1] != "none"])
 def test_post_train_invariants(task, preset, seed):
     r = run(task, preset, seed)
+    hw = preset_hw(preset, task)
     assert r["slope_max_seen"] <= r["slope_limit"] * (1 + 1e-9), r["slope_by_family"]
-    assert r["rail_max_abs"] <= r["rail_limit"], r["rail_max_abs"]
+    # Rail compliance is only guaranteed by presets that actually enable the
+    # compliance cell/clip. Core-only intentionally leaves this unconstrained.
+    if hw is not None and hw.constraints.hw_compliance:
+        assert r["rail_max_abs"] <= r["rail_limit"], r["rail_max_abs"]
     assert r["max_dt_rho"] <= r["stiffness_limit"], r["max_dt_rho"]
     for k, q in r["quant"].items():
         assert q["off_grid"] <= 1e-6, (k, q)

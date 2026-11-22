@@ -28,7 +28,6 @@ from config import (
     TANH_REALISTIC_ISAT_MIN,
 )
 from hw.constraints import (
-    G_MIN,
     THETA_MAX,
     IsatScale,
     attenuation,
@@ -269,10 +268,11 @@ class FreeTanhLibrary(nn.Module):
         still holds for the GLN-gated families too.
         """
         units = self.hw.units
-        g = attenuation(self.gm_raw, G_MIN)                       # [E]
+        g_min = c.hw_slope_g_min
+        g = attenuation(self.gm_raw, g_min)                       # [E]
         if gm_override is not None:
             rel = gm_override / self.current_gm()                 # [B, E] or [1, E]
-            g = torch.clamp(g.unsqueeze(0) * rel, G_MIN, 1.0)
+            g = torch.clamp(g.unsqueeze(0) * rel, g_min, 1.0)
         f_ic = None
         if c.hw_ic_coupling:
             f_ic = ic_factor(self.isat_values(), units)

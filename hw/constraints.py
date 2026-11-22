@@ -54,6 +54,7 @@ GLN_MODES = (None, "tail", "slope")
 class HWConstraints:
     hw_ratio_ab: bool = False                       # 3.1
     hw_slope_bound: bool = False                    # 3.2
+    hw_slope_g_min: float = G_MIN                   # 3.2 attenuation floor
     hw_ic_coupling: bool = False                    # 3.3
     hw_compliance: bool = False                     # 3.4
     hw_clamp_transfer: bool = False                 # 3.4
@@ -94,6 +95,8 @@ class HWConstraints:
                              "with f active)")
         if self.hw_alpha_bwd < 0 or self.hw_power_lambda < 0:
             raise ValueError("hw_alpha_bwd and hw_power_lambda must be >= 0")
+        if not 0.0 <= self.hw_slope_g_min < 1.0:
+            raise ValueError("hw_slope_g_min must be in [0, 1)")
         if self.hw_gln_delta_max <= 0:
             raise ValueError("hw_gln_delta_max must be > 0")
         if self.hw_mismatch_sigma is not None:

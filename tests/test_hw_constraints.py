@@ -46,6 +46,11 @@ def test_ratio_ab_identity_and_grad():
 # ---------------------------------------------------------------------------
 # 3.2 slope bound / 3.3 IC
 # ---------------------------------------------------------------------------
+def test_slope_floor_defaults_to_previous_hardware_value():
+    assert HWConfig().constraints.hw_slope_g_min == C.G_MIN
+    assert C.HWConstraints(hw_slope_bound=True).hw_slope_g_min == 1.0 / 16.0
+
+
 def test_slope_bound_invariant():
     g_raw = _rand(1000, seed=1)
     A = torch.nn.functional.softplus(_rand(1000, seed=2, lo=-8, hi=8))
@@ -381,6 +386,7 @@ def test_flag_names_and_defaults_are_3a_3_11():
         "hw_power_lambda": 0.0, "hw_mismatch_sigma": None, "hw_mismatch_eval": False,
         "hw_vca_bits": None, "hw_isat_eff_clamp": False, "hw_gln_mode": None,
         "hw_gln_delta_max": math.log(4.0), "hw_check_stiffness": False,
+        "hw_slope_g_min": 1.0 / 16.0,
     }
     assert c.to_dict() == want
     assert c.is_off()

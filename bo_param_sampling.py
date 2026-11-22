@@ -222,7 +222,8 @@ def _knet_param_count_cached(num_hidden: int, num_stages: int,
                              learnable_clip: bool = False,
                              gln_on: bool = False, gln_B: int = 4,
                              gln_rank: int = 2,
-                             gln_families: str = "boundary,readout") -> int:
+                             gln_families: str = "boundary,readout",
+                             hw_json: str | None = None) -> int:
     """Exact KNet trainable-param count by building the net (no training).
 
     The count depends on hidden, stages, k, rank AND fanout for the generic
@@ -244,12 +245,21 @@ def _knet_param_count_cached(num_hidden: int, num_stages: int,
     ``"shared_sense"`` + 1 (one sense per hidden node + dense crossbar), or
     ``"shared_sense"`` + 2 (two senses per node). The accumulator tail is
     always enabled (``enable_temporal_readout=True``) in every mode.
+
+    ``hw_json`` (Phase 3b W5) is the canonical JSON of the study's
+    ``HWConfig`` (``None`` = hardware model off).  The net is then built with
+    that config, so the count is the one the trials really train: under
+    ``hw_ratio_ab`` the frozen ``a_raw``/``b_raw`` drop out and ``r_raw``
+    counts.  It is part of the cache key.
     """
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
     from cell_library import make_cell_library
     from topology import build_net_from_config
     from config import SOLVER
+    from hw import HWConfig, hw_or_none
+
+    hw = hw_or_none(HWConfig.from_json(hw_json)) if hw_json else None
 
     if dagger:
         # CTLE dagger harness (dagger-nuance-distillation-kirchhoffnet.py /
@@ -300,6 +310,7 @@ def _knet_param_count_cached(num_hidden: int, num_stages: int,
         gln_B=int(gln_B),
         gln_rank=int(gln_rank),
         gln_families=str(gln_families),
+        hw=hw,
     )
     # F1/F2: the build above already counts the per-stage clip_sharpness_raw
     # scalars and the shared GLN module when the flags are on; the flags are
@@ -315,15 +326,33 @@ def knet_param_count(num_hidden: int, num_stages: int, small_world_k: int,
                      readout_senses: int = 1, learnable_clip: bool = False,
                      gln_on: bool = False, gln_B: int = 4,
                      gln_rank: int = 2,
-                     gln_families: str = "boundary,readout") -> int:
-    """Public wrapper around the cached build-based KNet count."""
+                     gln_families: str = "boundary,readout",
+                     hw=None) -> int:
+    """Public wrapper around the cached build-based KNet count.
+
+    ``hw``: an ``HWConfig``, its JSON string, or ``None`` (off).  Only the
+    trainable parameters are counted (``requires_grad``).
+    """
     return _knet_param_count_cached(
         int(num_hidden), int(num_stages), int(small_world_k), int(vca_rank),
         int(in_dim), int(out_dim), int(fanout_count), bool(use_robust_input),
         int(moe_num_experts), int(moe_gate_rank), bool(dagger),
         readout_mode, int(readout_senses), bool(learnable_clip),
         bool(gln_on), int(gln_B), int(gln_rank), str(gln_families),
+        _hw_key(hw),
     )
+
+
+def _hw_key(hw) -> str | None:
+    """Canonical, hashable form of an HWConfig (None when off)."""
+    if hw is None:
+        return None
+    if isinstance(hw, str):
+        from hw import HWConfig
+        hw = HWConfig.from_json(hw)
+    if hw.is_off():
+        return None
+    return hw.to_json(indent=None)
 
 
 _knet_feasible_cache: dict[tuple, list[tuple]] = {}
@@ -346,7 +375,8 @@ def knet_feasible_arches(*, soft_limit: int, in_dim: int, out_dim: int,
                          gln_families: str = "boundary,readout",
                          moe_experts_choices: tuple[int, ...] = (),
                          moe_gate_rank_choices: tuple[int, ...] = (),
-                         require_moe: bool = False) -> list[tuple]:
+                         require_moe: bool = False,
+                         hw=None) -> list[tuple]:
     """All feasible KNet tuples with build-count <= soft_limit, cached.
 
     Generic path tuples: ``(hidden, stages, k, rank, fanout_count)``.
@@ -358,8 +388,10 @@ def knet_feasible_arches(*, soft_limit: int, in_dim: int, out_dim: int,
 
     ``readout_mode`` / ``readout_senses`` are fixed per-study constants
     (not sampled dims), forwarded into every ``knet_param_count`` call.
+    ``hw`` (HWConfig / JSON / None) is forwarded too (Phase 3b W5).
     """
-    key = (soft_limit, in_dim, out_dim, hidden_range, stages_range,
+    hw_key = _hw_key(hw)
+    key = (hw_key, soft_limit, in_dim, out_dim, hidden_range, stages_range,
            k_choices, rank_range, fanout_choices, use_robust_input,
            dagger, readout_mode, int(readout_senses), bool(learnable_clip),
            bool(gln_on), int(gln_B), int(gln_rank), str(gln_families),
@@ -399,7 +431,8 @@ def knet_feasible_arches(*, soft_limit: int, in_dim: int, out_dim: int,
                                             learnable_clip=learnable_clip,
                                             gln_on=gln_on, gln_B=gln_B,
                                             gln_rank=gln_rank,
-                                            gln_families=gln_families)
+                                            gln_families=gln_families,
+                                            hw=hw_key)
                                     except Exception:
                                         continue
                                     if p <= soft_limit:
@@ -421,7 +454,8 @@ def knet_feasible_arches(*, soft_limit: int, in_dim: int, out_dim: int,
                                     learnable_clip=learnable_clip,
                                     gln_on=gln_on, gln_B=gln_B,
                                     gln_rank=gln_rank,
-                                    gln_families=gln_families)
+                                    gln_families=gln_families,
+                                    hw=hw_key)
                             except Exception:
                                 continue
                             if p <= soft_limit:

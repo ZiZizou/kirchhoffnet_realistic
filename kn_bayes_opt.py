@@ -1178,6 +1178,9 @@ def main() -> None:
                 gln_B=int(args.gln_B),
                 gln_rank=int(args.gln_rank),
                 gln_families=str(args.gln_families),
+                # Phase 3b W5: count what the trials train (hw_ratio_ab
+                # freezes a_raw/b_raw and adds r_raw)
+                hw=hw_cfg,
             )
             bps.require_feasible(knet_ctle_feasible, "CTLE KNet", soft_limit)
             knet_generic_feasible = []
@@ -1199,6 +1202,9 @@ def main() -> None:
                 gln_B=int(args.gln_B),
                 gln_rank=int(args.gln_rank),
                 gln_families=str(args.gln_families),
+                # Phase 3b W5: count what the trials train (hw_ratio_ab
+                # freezes a_raw/b_raw and adds r_raw)
+                hw=hw_cfg,
             )
             bps.require_feasible(knet_generic_feasible, "KNet", soft_limit)
             knet_ctle_feasible = []

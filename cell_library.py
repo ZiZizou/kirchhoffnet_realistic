@@ -132,8 +132,13 @@ class FreeTanhLibrary(nn.Module):
         # the module but are unused).  ``r_raw = 0`` -> ``A = B = 1``.  The
         # parameter exists ONLY when the flag is on, so the flags-off
         # state_dict stays byte-identical to the pre-constraint one.
+        # Phase 3b W5: the dead a_raw / b_raw are frozen (requires_grad=False)
+        # so they neither count as trainable parameters (BO budget) nor reach
+        # the optimizer; they stay in the state_dict for strict loading.
         if hw is not None and hw.constraints.hw_ratio_ab:
             self.r_raw = nn.Parameter(torch.zeros(num_edges))
+            self.a_raw.requires_grad_(False)
+            self.b_raw.requires_grad_(False)
         # Initialize s_raw to small random values so sign() gives ±1, not 0.
         # STE allows gradients to flow; forward needs non-zero sign for tanh path.
         self.s_raw = nn.Parameter(torch.randn(num_edges) * 0.1)

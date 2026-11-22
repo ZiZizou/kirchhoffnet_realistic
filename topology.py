@@ -954,6 +954,11 @@ def prune_stage(
                     new_stage.cell_lib.theta_raw.data.copy_(
                         stage.cell_lib.theta_raw.data[edge_idx_old].cpu()
                     )
+                # 3.1 hw_ratio_ab: the live ratio parameter must survive pruning
+                if hasattr(new_stage.cell_lib, "r_raw") and hasattr(stage.cell_lib, "r_raw"):
+                    new_stage.cell_lib.r_raw.data.copy_(
+                        stage.cell_lib.r_raw.data[edge_idx_old].cpu()
+                    )
             old_z_logits = stage.z_logits.data[edge_idx_old].cpu()
             new_stage.z_logits.data.copy_(old_z_logits)
         with torch.no_grad():

@@ -3603,6 +3603,8 @@ def main():
                 if should_log_retrain_grads:
                     retrain_raw = pruned_net.module if isinstance(pruned_net, torch.nn.DataParallel) else pruned_net
                     retrain_param_snapshots = {name: p.data.detach().clone() for name, p in retrain_raw.named_parameters()}
+                tot = 0.0
+                nb = 0
                 for batch in retrain_train_loader:
                     retrain_optimizer.zero_grad()
                     u_b, tgt_b = batch

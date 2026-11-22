@@ -68,7 +68,7 @@ fi
 # 4. KNet BO, Phase-A MLP-guided (C-full)
 /home/annaik/Documents/kirchhoffnet_realistic/ENV/bin/python /home/annaik/Documents/kirchhoffnet_realistic/dagger-nuance-distillation-kirchhoffnet.py --canonical-dataset "$CANONICAL" \
   --phase-a-epochs 300 --kn-num-stages 6 --kn-num-hidden 12 --kn-small-world-k 4 --kn-small-world-p 0.200000 --kn-vca-rank 2 \
-  --kn-x-max 4.000000 --kn-gm-max 1.351251e+00 --kn-isat-max 1.364811e+01 --kn-moe-num-experts 3 --kn-moe-gate-rank 2 --kn-moe-top-k 1 \
+  --kn-x-max 4.000000 --kn-gm-max 1.351251e+00 --kn-isat-max 1.364811e+01 \
   --kn-mapper-lr-scale 1.0 --kn-struct-lr-scale 4.0 --kn-dyn-lr-scale 1.0 --lr 6.002040e-03 --weight-decay 7.893409e-04 --batch-size 512 --earlystop-eval-every 5 \
   --phase-a-validity-weight 0.300000 --phase-a-validity-ramp-start 10 --phase-a-validity-ramp-epochs 30 --phase-a-mlp-weight "$MLP_W" --phase-a-fwd-weight "$FWD_W" --phase-a-power-weight "$PWR_W" \
   --phase-a-power-norm train_mean --kn-readout shared-x2 --output /home/annaik/Documents/kirchhoffnet_realistic/outputs/manual_knet_distillation_mix_trials/trial_0005 \

@@ -184,12 +184,13 @@ SMALL_WORLD_P_FIXED = 0.2
 STEPS_PER_T_SPAN = 10.0
 SPARSITY_LAMBDA_FIXED = 0.0
 ENTROPY_LAMBDA_FIXED = 1e-6
-# Pinned CTLE MoE labels (no expert architecture in KNet): the KNet student
-# harness has no MoE code (no consumer for --kn-moe-*) and the BO param
+# Pinned CTLE MoE labels (no expert architecture in KNet): the BO param
 # counter ignores these dims, so sampling them would waste trials on a flat
 # manifold. Pinned to singletons matching the START_POINTS ctle anchor
-# (experts=3, gate_rank=2); they ride the feasible tuple + trial argv as
-# inert schema labels only and can never change the built architecture.
+# (experts=3, gate_rank=2). They are kept ONLY as the last two slots of the
+# CTLE feasible-arch tuple / stored ``kn_arch_tuple`` user attr (so existing
+# studies and the sampler index mapping stay valid); they are no longer
+# forwarded to the trial command line (the --kn-moe-* flags were removed).
 CTLE_MOE_NUM_EXPERTS_PINNED = 3
 CTLE_MOE_GATE_RANK_PINNED = 2
 
@@ -541,9 +542,6 @@ def _build_dagger_command(
     kn_small_world_k: int,
     kn_small_world_p: float,
     kn_vca_rank: int,
-    kn_moe_num_experts: int,
-    kn_moe_gate_rank: int,
-    kn_moe_top_k: int,
     kn_x_max: float,
     lr: float,
     weight_decay: float,
@@ -573,12 +571,6 @@ def _build_dagger_command(
         "--kn-small-world-k", str(kn_small_world_k),
         "--kn-small-world-p", f"{kn_small_world_p:.6f}",
         "--kn-vca-rank", str(kn_vca_rank),
-        # --kn-moe-* are inert schema labels: the harness has no MoE
-        # consumer (silently ignored via parse_known_args). Forwarded only
-        # so trial logs stay comparable with earlier studies.
-        "--kn-moe-num-experts", str(kn_moe_num_experts),
-        "--kn-moe-gate-rank", str(kn_moe_gate_rank),
-        "--kn-moe-top-k", str(kn_moe_top_k),
         "--kn-x-max", f"{kn_x_max:.6f}",
         "--boundary-fan-out", json.dumps(boundary_fan_out),
         "--lr", f"{lr:.6e}",
@@ -936,10 +928,6 @@ def main() -> None:
     parser.add_argument("--ctle-initial-dataset-cache-dir", type=Path, default=None,
                         help="Shared cache for CTLE initial teacher labels. Defaults to "
                              "<output>/ctle_initial_dataset_cache.")
-    parser.add_argument("--ctle-moe-top-k", type=int, choices=[1, 2], default=1,
-                        help="Hard-WTA CTLE inference candidates retained for the "
-                             "ZIG feasibility selector (default: 1; 2 never averages "
-                             "parameter vectors).")
     # Canonical Phase-A mode (plan canonical-ctle-unify).  When --ctle-phase-a is
     # set, every BO trial runs the static-data, Huber-only Phase-A training mode
     # (no DAgger, no relabeling, no surrogate-through terms).  --ctle-objective
@@ -1345,8 +1333,7 @@ def main() -> None:
                 num_stages = sp["num_stages"]
                 t_span = sp["t_span"]
                 vca_rank = sp.get("vca_rank", 2)
-                # Pinned MoE labels (match CTLE_MOE_*_PINNED; inert, no
-                # architectural effect).
+                # Pinned MoE labels (match CTLE_MOE_*_PINNED); tuple slots only.
                 moe_num_experts = sp.get("moe_num_experts", CTLE_MOE_NUM_EXPERTS_PINNED)
                 moe_gate_rank = sp.get("moe_gate_rank", CTLE_MOE_GATE_RANK_PINNED)
                 lr = sp["lr"]
@@ -1431,12 +1418,6 @@ def main() -> None:
                     "--kn-x-max", f"{x_max:.6f}",
                     "--kn-gm-max", f"{gm_max:.6e}",
                     "--kn-isat-max", f"{isat_max:.6e}",
-                    # --kn-moe-*: pinned inert labels (see
-                    # CTLE_MOE_*_PINNED); forwarded for log comparability
-                    # only, ignored by the harness.
-                    "--kn-moe-num-experts", str(moe_num_experts),
-                    "--kn-moe-gate-rank", str(moe_gate_rank),
-                    "--kn-moe-top-k", str(args.ctle_moe_top_k),
                     "--kn-mapper-lr-scale", str(KN_DEFAULT_MAPPER_LR_SCALE),
                     "--kn-struct-lr-scale", str(KN_DEFAULT_STRUCT_LR_SCALE),
                     "--kn-dyn-lr-scale", str(KN_DEFAULT_DYN_LR_SCALE),
@@ -1489,9 +1470,6 @@ def main() -> None:
                     kn_num_stages=num_stages, kn_num_hidden=num_hidden,
                     kn_small_world_k=small_world_k, kn_small_world_p=small_world_p,
                     kn_vca_rank=vca_rank, kn_x_max=x_max,
-                    kn_moe_num_experts=moe_num_experts,
-                    kn_moe_gate_rank=moe_gate_rank,
-                    kn_moe_top_k=args.ctle_moe_top_k,
                     lr=lr, weight_decay=weight_decay, batch_size=batch_size,
                     fanout_count=fanout_count,
                     earlystop_eval_every=args.ctle_earlystop_eval_every,

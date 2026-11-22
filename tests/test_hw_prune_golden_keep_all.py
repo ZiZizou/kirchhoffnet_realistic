@@ -20,10 +20,10 @@ def test_golden_builder_keep_all_pruning_preserves_params_and_forward(spec):
         with torch.no_grad():
             before = mg.model_forward(net, x)
         old_core = net.core
-        old_count = sum(p.numel() for p in old_core.parameters())
+        old_count = sum(p.numel() for p in net.parameters())
         old_families = {
-            family: sum(p.numel() for name, p in old_core.named_parameters() if family in name)
-            for family in ("boundary", "output_ode", "readout_sense", "vca", "gln")
+            family: sum(p.numel() for name, p in net.named_parameters() if family in name)
+            for family in ("boundary", "output_ode", "readout_sense", "vca", "gln_rails")
         }
         if spec is mg.FRIEDMAN2_NET:
             assert old_families["boundary"] > 0 and old_families["output_ode"] > 0
@@ -31,12 +31,12 @@ def test_golden_builder_keep_all_pruning_preserves_params_and_forward(spec):
             assert old_families["boundary"] > 0 and old_families["readout_sense"] > 0
 
         pruned, _ = prune_network(old_core, edge_threshold=-1.0)
-        new_count = sum(p.numel() for p in pruned.parameters())
+        net.core = pruned
+        new_count = sum(p.numel() for p in net.parameters())
         new_families = {
-            family: sum(p.numel() for name, p in pruned.named_parameters() if family in name)
+            family: sum(p.numel() for name, p in net.named_parameters() if family in name)
             for family in old_families
         }
-        net.core = pruned
         with torch.no_grad():
             after = mg.model_forward(net, x)
 

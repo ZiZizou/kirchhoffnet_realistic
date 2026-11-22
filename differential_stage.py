@@ -76,7 +76,7 @@ class DifferentialStage(nn.Module):
             (0.0486, matching ``softplus(raw_leak_init)``). Ignored when
             ``leak_mode="programmable"``.
         freeze_read: When ``True``, edge currents (cell_lib output, edge gate,
-            budget gate, and KCL scatter-add) are computed **once** at the
+            and KCL scatter-add) are computed **once** at the
             start of the stage from the initial state ``x0`` and held constant
             throughout all Heun sub-iterations. Leak, clip, and drive
             current still read the evolving ``x`` at each step. Default
@@ -330,17 +330,6 @@ output_ode_src: list[int] | None = None,
         # compatibility with existing checkpoints — the optimizer still has
         # it as a no-op parameter and its state_dict entry persists.
         self.u_logits = nn.Parameter(torch.full((num_nodes,), u_init))
-
-        # Degree budget / top-k competition (degree-budget-topk plan).
-        # Each destination (or source) keeps a fraction ``budget_frac`` of
-        # its incoming edges open via temperature-scaled softmax
-        # renormalization of z_logits scores (per-group k_eff).
-        # budget_frac=0 disables the budget entirely (byte-identical rhs).
-        # budget_axis: "dst" (per-destination), "src" (per-source), "both".
-        self.budget_frac: float = 0.0
-        self.budget_temperature: float = 1.0
-        self.budget_axis: str = "dst"
-        self.budget_enabled: bool = False
 
         # Parallel resistive shunt (FreeTanhLibrary): if the cell library
         # exposes a ``resistive_current(x_src, x_dst)`` method, route an
@@ -702,43 +691,6 @@ output_ode_src: list[int] | None = None,
     def num_edges(self) -> int:
         return int(self.src.numel())
 
-    def set_budget_frac(self, frac: float, temperature: float) -> None:
-        """Set the degree-budget fraction for this stage.
-
-        Each destination (or source) node keeps a fraction ``frac`` of its
-        incoming edges open via temperature-scaled softmax renormalization of
-        z_logits scores. The effective per-group budget is computed as
-        ``k_eff = max(1, round(count * frac))`` where ``count`` is the
-        number of incident edges for that group.
-
-        - ``frac <= 0`` disables the budget entirely (no overhead in
-          ``rhs``). Used in Phase C retrain.
-        - ``frac >= 1.0`` means no restriction (every group keeps all its
-          incident edges; budget_gate = 1.0).
-        - ``0 < frac < 1`` activates per-group competition proportional to
-          each group's size — nodes with many incoming edges (e.g. proj
-          nodes with 25) keep the same fraction as nodes with few (e.g.
-          edge hidden with 4), unlike the prior absolute-``k`` mechanism
-          which over-pruned high-degree nodes.
-
-        ``temperature`` controls sharpness of competition (smaller = sharper,
-        approaches hard top-``k_eff``).
-
-        The budget gate is layered on top of the existing sigmoid gate:
-        ``edge_gate = sigmoid(z_logits) * budget_gate``.
-
-        Called once per epoch by the training loop. Captured by attribute
-        (not closure).
-        """
-        self.budget_frac = float(frac)
-        self.budget_temperature = float(temperature)
-        self.budget_enabled = (self.budget_frac > 0.0)
-        if self.budget_frac < 0.0 or self.budget_frac > 1.0:
-            warnings.warn(
-                f"set_budget_frac: frac={self.budget_frac} is outside [0, 1]. "
-                f"frac<0 disables budget; frac>1 is a no-op (all ones).",
-            )
-
     def _effective_leak(self, num_nodes: int | None = None) -> torch.Tensor:
         """Return the per-node effective leak.
 
@@ -750,117 +702,6 @@ output_ode_src: list[int] | None = None,
         if self.leak_mode == "programmable":
             return F.softplus(self.raw_leak)
         return torch.full((num_nodes,), self.leak_constant, dtype=torch.float32)
-
-    def _compute_budget_gate(self) -> torch.Tensor:
-        """Compute the per-destination (or per-source) competitive budget gate.
-
-        For each group node (destination by default), gather the indices of
-        incident edges and apply temperature-scaled softmax over their
-        z_logits scores. The effective per-group budget is
-        ``k_eff = max(1, round(count * frac))`` (a fraction of the group's
-        actual incident edge count), so every node type receives a uniform
-        proportion of its incoming connections regardless of absolute
-        degree. The softmax is scaled to a total budget of ``k_eff`` and
-        clamped per-edge to [0, 1]. Groups with ``count <= k_eff`` incident
-        edges receive an all-ones mask (no competition needed).
-
-        Fully differentiable (C-infinity) so it is compatible with autograd
-        implicit differentiation. No STE, no hard threshold.
-
-        Returns a tensor of shape ``[E]`` with values in ``[0, 1]``.
-
-        For ``budget_axis="both"`` the per-destination and per-source masks
-        are multiplied. Empty groups (no edges) produce a 1.0 contribution
-        that does not affect the product.
-        """
-        if not self.budget_enabled or self.budget_frac <= 0.0:
-            return torch.ones(
-                self.z_logits.shape, device=self.z_logits.device,
-                dtype=self.z_logits.dtype,
-            )
-        scores = self.z_logits
-        frac = float(self.budget_frac)
-        T = float(self.budget_temperature)
-        if T <= 0.0:
-            T = 1e-6  # avoid div-by-zero; effectively hard
-
-        gate = torch.ones(
-            scores.shape, device=scores.device, dtype=scores.dtype,
-        )
-
-        if self.budget_axis in ("dst", "both"):
-            gate = gate * self._budget_group_mask(scores, self.dst, frac, T)
-
-        if self.budget_axis in ("src", "both"):
-            gate = gate * self._budget_group_mask(scores, self.src, frac, T)
-
-        return gate
-
-    def _budget_group_mask(
-        self,
-        scores: torch.Tensor,
-        group: torch.Tensor,
-        frac: float,
-        T: float,
-    ) -> torch.Tensor:
-        """Build a [E] gate for a single axis (dst or src).
-
-        For each unique group value, compute the per-group effective budget
-        ``k_eff = max(1, round(count * frac))`` and the per-edge gate
-        ``clamp(softmax(scores / T) * k_eff, max=1.0)``. Groups with
-        ``count <= k_eff`` incident edges are all 1.0 (no competition).
-
-        Fully vectorized via scatter operations (no Python loop) for
-        performance under torch.compile and large graphs.
-        """
-        n_groups = self.num_nodes  # group is always self.src/self.dst, max = N-1
-        logits = scores.float() / T
-
-        # Per-group max for numerical stability (like F.softmax internally)
-        group_max = torch.full(
-            (n_groups,), -torch.inf, device=logits.device, dtype=logits.dtype,
-        )
-        group_max.scatter_reduce_(
-            0, group.long().contiguous(), logits.contiguous(),
-            reduce='amax', include_self=True,
-        )
-        shifted = logits - group_max[group]
-
-        exp_shifted = torch.exp(shifted)  # [E], stable
-
-        # Per-group denominator
-        group_sum = torch.zeros(
-            n_groups, device=logits.device, dtype=logits.dtype,
-        )
-        group_sum.index_add_(0, group.long(), exp_shifted)
-
-        softmaxed = exp_shifted / group_sum[group].clamp(min=1e-30)
-
-        # Per-group edge count
-        count = torch.zeros(
-            n_groups, dtype=torch.long, device=logits.device,
-        )
-        count.index_add_(
-            0, group.long(),
-            torch.ones_like(group, dtype=torch.long),
-        )
-
-        # Per-group effective budget: max(1, round(count * frac))
-        # frac is in [0, 1] so count*frac is in [0, count].
-        # max(1, ...) ensures isolated single-edge groups still get a
-        # competitive budget of 1 even when frac=0.
-        k_per_group = torch.clamp(
-            (count.float() * frac).round(), min=1.0,
-        ).long()
-        k_eff = k_per_group[group].float()  # [E]
-
-        needs_budget = count[group].float() > k_eff
-        gate = torch.where(
-            needs_budget,
-            torch.clamp(softmaxed * k_eff, max=1.0),
-            torch.ones_like(softmaxed),
-        )
-        return gate
 
     def drive_current(
         self, x: torch.Tensor, x_drive: torch.Tensor | None, drive_scale: float
@@ -1081,7 +922,7 @@ output_ode_src: list[int] | None = None,
 
         Recomputes the cell library (or ``forward_tanh`` when a parallel resistive shunt
         exists — so the resistive term stays dynamic in ``rhs``), folds in the
-        per-edge gate, optional budget gate, and core VCA gate, and returns
+        per-edge gate, and core VCA gate, and returns
         the ``[batch, num_nodes]`` KCL accumulator in ``x_src_state``'s dtype.
 
         Args:
@@ -1104,8 +945,6 @@ output_ode_src: list[int] | None = None,
                 x_src=x_src0, x_dst=x_dst0, x_max=self.x_max,
             )
         edge_mask = torch.sigmoid(self.z_logits)
-        if self.budget_enabled:
-            edge_mask = edge_mask * self._compute_budget_gate()
         i_edge = i_edge * edge_mask.unsqueeze(0)
         if gate_core_cached is not None:
             i_edge = i_edge * gate_core_cached
@@ -1158,7 +997,7 @@ output_ode_src: list[int] | None = None,
           zero current.
 
         When ``i_edge_const`` is provided (the ``freeze_read=True`` path), the
-        cell_lib evaluation, edge gate, budget gate, and KCL scatter-add are
+        cell_lib evaluation, edge gate, and KCL scatter-add are
         skipped — the provided ``[batch, num_nodes]`` tensor is used directly
         as the KCL contribution. Leak, clip, and drive current are still
         computed from the current ``x``.
@@ -1223,17 +1062,8 @@ output_ode_src: list[int] | None = None,
 
         # Edge gate: multiply each edge's current by its gate. Computed once
         # here and reused for both the tanh current and the resistive shunt
-        # (when applicable), avoiding redundant sigmoid + budget_gate calls.
+        # (when applicable), avoiding a redundant sigmoid call.
         edge_mask = torch.sigmoid(self.z_logits)  # [E]
-        # Degree budget / top-k competition (degree-budget-topk plan).
-        # Budget gate is layered on top of the sigmoid gate: independent
-        # per-edge gate * competitive per-destination (or per-source) mask.
-        # When budget is disabled (budget_frac=0) the budget gate is all-ones
-        # and this multiplication is a no-op.
-        if self.budget_enabled:
-            budget_gate = self._compute_budget_gate()  # [E]
-            edge_mask = edge_mask * budget_gate
-
         if i_edge_const is None:
             i_edge = self.cell_lib(
                 x_src=x_src,
@@ -1270,7 +1100,7 @@ output_ode_src: list[int] | None = None,
 
         # Parallel resistive shunt (FreeTanhLibrary): always uses evolving
         # voltages, bypassing ``freeze_read``. Gated by the same edge_mask /
-        # budget_gate as the tanh current so it can be pruned away.
+        # edge_mask as the tanh current.
         if self._has_resistive:
             i_res = self.cell_lib.resistive_current(x_src, x_dst)
             i_res = i_res * edge_mask.unsqueeze(0)              # [B, E]
@@ -1563,8 +1393,8 @@ output_ode_src: list[int] | None = None,
         # receives the gate via the explicit kwarg below).
         self._gate_core_cached = gate_core_cached
 
-        # freeze_read: precompute edge currents (cell_lib + edge gate + budget
-        # gate + core VCA gate + KCL scatter-add) once from x0 and hold them
+        # freeze_read: precompute edge currents (cell_lib + edge gate +
+        # core VCA gate + KCL scatter-add) once from x0 and hold them
         # constant across all sub-steps. Leak, clip, drive, and boundary-edge
         # currents still read the current x (boundary terminals are fixed but
         # the dynamic target node voltage evolves, so the OTA current is

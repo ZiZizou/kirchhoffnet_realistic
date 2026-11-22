@@ -262,28 +262,6 @@ SOLVER = {
     "num_steps": 70,
 }
 
-# Degree budget / fraction competition (degree-budget-topk plan).
-# Each destination (or source) node keeps a fraction of its incoming
-# edges open via temperature-scaled softmax renormalization of z_logits
-# scores. The effective per-group budget is
-#   k_eff = max(1, round(count * frac))
-# so every node type (interior hidden, edge hidden, proj, etc.) receives a
-# uniform proportion of its incoming connections regardless of absolute
-# degree. Budget frac and temperature T are annealed from permissive to
-# restrictive over anneal_frac of training. The budget gate is LAYERED on
-# top of the sigmoid gate: edge_gate = sigmoid(z_logits) * budget_gate.
-# CLI override via --budget, --budget-frac-start, --budget-frac-end,
-# --budget-temp-start, --budget-temp-end, --budget-axis.
-DEGREE_BUDGET = {
-    "enabled": False,           # master switch; --budget CLI enables
-    "frac_start": 1.0,          # initial budget fraction (1.0 = no restriction)
-    "frac_end": 0.8,           # final budget fraction (75% retention at prune)
-    "temperature_start": 1.0,   # initial softmax temperature
-    "temperature_end": 0.2,     # final temperature (sharper competition)
-    "axis": "dst",              # "dst" | "src" | "both"
-    "anneal_frac": 0.8,         # fraction of total epochs over which to anneal
-}
-
 # Low-rank input-driven VCA (Voltage-Controlled Amplifier) gating.
 # Applied to boundary, temporal-readout, and (with --vca-core) core
 # edges. VCA gate per edge is

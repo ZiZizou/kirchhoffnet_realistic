@@ -81,7 +81,6 @@ from config import (
     SCHEDULE_FOUR_PHASE,
     SOLVER,
     TAU,
-    DEGREE_BUDGET,
     VCA,
     make_smooth2d_grid_preset,
     make_housing_grid_preset)
@@ -103,8 +102,7 @@ from train import (
     four_phase_tau,
     four_phase_lambdas,
     four_phase_kd_active,
-    budget_frac_for_epoch,
-    budget_temperature_for_epoch)
+    )
 from io_mapper import (
     FanOutInputMapper,
     InputMapper,
@@ -2105,39 +2103,6 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "softplus(raw_leak_init=-3.0)). Ignored when --leak "
              "programmable.")
 
-    # --- Degree budget / fraction edge competition (degree-budget-topk plan) ---
-    parser.add_argument(
-        "--budget", action="store_true", default=False,
-        dest="budget",
-        help="Enable degree-budget edge competition. Each destination "
-             "(or source) node keeps a fraction of its incoming edges open "
-             "via temperature-scaled softmax renormalization of z_logits. "
-             "Replaces the L1 edge_gate pressure with explicit competition.")
-    parser.add_argument(
-        "--budget-frac-start", type=float, default=None,
-        dest="budget_frac_start",
-        help="Initial budget fraction per group (permissive, 1.0 = no "
-             "restriction). Default: 1.0.")
-    parser.add_argument(
-        "--budget-frac-end", type=float, default=None,
-        dest="budget_frac_end",
-        help="Final budget fraction per group (restrictive, 0.0 = disables "
-             "budget, 0.75 = keep 75%% of edges). Default: 0.75.")
-    parser.add_argument(
-        "--budget-temp-start", type=float, default=None,
-        dest="budget_temp_start",
-        help="Initial softmax temperature (soft). Default: 1.0.")
-    parser.add_argument(
-        "--budget-temp-end", type=float, default=None,
-        dest="budget_temp_end",
-        help="Final softmax temperature (sharp, approaches hard top-k_eff). "
-             "Default: 0.1.")
-    parser.add_argument(
-        "--budget-axis", choices=["dst", "src", "both"], default=None,
-        dest="budget_axis",
-        help="Competition axis: 'dst' (per-destination, default), 'src' "
-             "(per-source), or 'both' (multiplicative).")
-
     # --- Read-only source: decouple read (voltage sense) from write (current injection) ---
     parser.add_argument(
         "--read-only-source", action="store_true", default=False,
@@ -2229,8 +2194,8 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
         "--no-edge-gates", action="store_true", default=False,
         dest="no_edge_gates",
         help="Remove edge gating: freeze z_logits to +10 (sigmoid~1) so "
-             "all edges are permanently on. Disables edge_gate regularizer, "
-             "budget gate, and gate-based pruning.")
+             "all edges are permanently on. Disables edge_gate regularizer "
+             "and gate-based pruning.")
 
 # ----------------------------------------------------------------
 # Pruning helpers (PIT): transferable I/O mapper reconstruction.
@@ -2636,60 +2601,6 @@ def main():
             f"[train] WARNING: --freeze-mappers ignored for schedule_mode={schedule_mode} "
             f"(only supported for four_phase)"
         )
-    # Degree budget / fraction competition (degree-budget-topk plan).
-    # Resolve effective config: CLI override > config default.
-    budget_enabled = bool(getattr(args, "budget", False)) or bool(
-        DEGREE_BUDGET.get("enabled", False)
-    )
-    budget_frac_start = float(
-        args.budget_frac_start if args.budget_frac_start is not None
-        else DEGREE_BUDGET["frac_start"]
-    )
-    budget_frac_end = float(
-        args.budget_frac_end if args.budget_frac_end is not None
-        else DEGREE_BUDGET["frac_end"]
-    )
-    budget_temp_start = float(
-        args.budget_temp_start if args.budget_temp_start is not None
-        else DEGREE_BUDGET["temperature_start"]
-    )
-    budget_temp_end = float(
-        args.budget_temp_end if args.budget_temp_end is not None
-        else DEGREE_BUDGET["temperature_end"]
-    )
-    budget_axis = (
-        args.budget_axis if args.budget_axis is not None
-        else DEGREE_BUDGET["axis"]
-    )
-    budget_anneal_frac = float(DEGREE_BUDGET["anneal_frac"])
-    if budget_enabled:
-        if not (0.0 <= budget_frac_end <= 1.0):
-            print(
-                f"[train] WARNING: budget_frac_end={budget_frac_end} must be in [0,1], "
-                f"clamping to [0,1]"
-            )
-            budget_frac_end = max(0.0, min(1.0, budget_frac_end))
-        if not (0.0 <= budget_frac_start <= 1.0):
-            print(
-                f"[train] WARNING: budget_frac_start={budget_frac_start} must be in [0,1], "
-                f"clamping to [0,1]"
-            )
-            budget_frac_start = max(0.0, min(1.0, budget_frac_start))
-        print(
-            f"[train] budget=enabled axis={budget_axis} "
-            f"frac: {budget_frac_start:.2f}->{budget_frac_end:.2f} "
-            f"temp: {budget_temp_start:.2f}->{budget_temp_end:.2f} "
-            f"anneal_frac={budget_anneal_frac}"
-        )
-        edge_gate_lambda = float(lambdas.get("edge_gate", 0.0))
-        if edge_gate_lambda > 0.0:
-            print(
-                f"[train] WARNING: budget enabled but edge_gate lambda={edge_gate_lambda} > 0. "
-                f"The edge_gate regularizer (L1 on σ(z_logits)) may fight the budget. "
-                f"Consider setting edge_gate to 0 in the preset's lambdas override."
-            )
-    if args.no_edge_gates:
-        budget_enabled = False
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if args.device is not None:
         device = args.device
@@ -2972,8 +2883,6 @@ def main():
             if hasattr(stage, 'z_logits') and stage.z_logits is not None:
                 stage.z_logits.data.fill_(10.0)
                 stage.z_logits.requires_grad_(False)
-            if getattr(stage, 'budget_enabled', False):
-                stage.budget_enabled = False
             if hasattr(stage, 'boundary_z_logits') and stage.boundary_z_logits is not None:
                 stage.boundary_z_logits.data.fill_(10.0)
                 stage.boundary_z_logits.requires_grad_(False)
@@ -3328,20 +3237,6 @@ def main():
         if stop_training:
             break
         net.train()
-
-        # Degree budget / fraction competition (degree-budget-topk plan).
-        # Recompute frac and temperature for this epoch and push to all
-        # stages. Done once per epoch (global schedule), the per-batch
-        # budget gate is recomputed inside rhs() from the stage's current
-        # budget_frac / budget_temperature.
-        if budget_enabled:
-            _b_frac = budget_frac_for_epoch(
-                epoch, ab_total, budget_frac_start, budget_frac_end, budget_anneal_frac)
-            _b_T = budget_temperature_for_epoch(
-                epoch, ab_total, budget_temp_start, budget_temp_end, budget_anneal_frac)
-            for _stage in raw_net.core.stages:
-                _stage.set_budget_frac(_b_frac, _b_T)
-                _stage.budget_axis = budget_axis
 
         if schedule_mode == "four_phase":
             tau = four_phase_tau(epoch, epochs)
@@ -4002,14 +3897,6 @@ def main():
             _log_gpu_mem("retrain_epoch_0_start")
             for repoch in range(c_epochs):
                 pruned_net.train()
-                # Degree budget (degree-budget-topk plan): in Phase C the
-                # budget is disabled (frac=0.0) — the compact network is
-                # already pruned, so per-edge competition has no work.
-                if budget_enabled:
-                    for _stage in pruned_net.core.stages:
-                        # Disable it for phase C retrain; the compact network is already pruned.
-                        _stage.set_budget_frac(0.0, budget_temp_end)
-                        _stage.budget_axis = budget_axis
                 if schedule_mode == "three_phase":
                     global_epoch = b_end + repoch
                     tau_r = three_phase_tau(global_epoch, epochs)

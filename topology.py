@@ -801,13 +801,6 @@ def prune_stage(
         )
 
     z = stage.edge_gates().detach().cpu()
-    # When budget was enabled during training, combine sigmoid * budget gate
-    # as the effective edge mask. Budget-losers with still-positive sigmoid
-    # should not survive pruning — their effective contribution is ≈ 0.
-    _budget_enabled = getattr(stage, 'budget_enabled', False)
-    if _budget_enabled:
-        _bg = stage._compute_budget_gate().detach().cpu()
-        z = z * _bg
     eff_score = z  # gate alone determines activity (no Z cell)
 
     keep_edge = eff_score > edge_threshold
@@ -1011,15 +1004,6 @@ def prune_stage(
                         stage.cell_lib.theta_raw.data[edge_idx_old].cpu()
                     )
             old_z_logits = stage.z_logits.data[edge_idx_old].cpu()
-            if _budget_enabled:
-                # Rescale z_logits so that σ(z_new) = σ(z_old) * budget_gate_old.
-                # This folds the budget attenuation into the surviving edge
-                # gates so that when budget is disabled at Phase C start the
-                # effective edge mask is identical to the budget-on regime.
-                _bg_surv = _bg[edge_idx_old]
-                combined = torch.sigmoid(old_z_logits) * _bg_surv
-                combined = torch.clamp(combined, min=1e-6, max=1.0 - 1e-6)
-                old_z_logits = torch.logit(combined)
             new_stage.z_logits.data.copy_(old_z_logits)
         with torch.no_grad():
             if hasattr(stage, 'raw_leak') and hasattr(new_stage, 'raw_leak'):
@@ -1048,11 +1032,6 @@ def prune_stage(
                     new_stage.raw_vref.data.copy_(stage.raw_vref.data.cpu())
                 if hasattr(new_stage, "ref_z_logits") and hasattr(stage, "ref_z_logits"):
                     old_ref_z = stage.ref_z_logits.data[node_idx_old].cpu()
-                    if getattr(stage, "budget_enabled", False):
-                        _bg = stage._compute_budget_gate().detach().cpu()
-                        combined = torch.sigmoid(old_ref_z) * _bg[node_idx_old]
-                        combined = combined.clamp(1e-6, 1.0 - 1e-6)
-                        old_ref_z = torch.logit(combined)
                     new_stage.ref_z_logits.data.copy_(old_ref_z)
                 # Transfer per-node ref_cell_lib parameters (one ref edge per node).
                 if hasattr(new_stage, "ref_cell_lib") and new_stage.ref_cell_lib is not None \

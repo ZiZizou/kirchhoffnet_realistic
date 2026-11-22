@@ -258,6 +258,47 @@ def test_c_node_uniform_raises_when_parasitic_exceeds_cu():
         C.c_node_vector(3, [0], [1], U, "nope")
 
 
+def test_c_node_budget_scales_with_c_eff():
+    """The node capacitance budget is ``c_eff * C_u`` (3.8 + W5 step 1).
+
+    The parasitics are compared against, and taken out of, that budget: the
+    class-mean node capacitance is ``c_eff * C_u`` and the per-node parasitic
+    deviation is NOT scaled by ``c_eff`` (a parasitic is an absolute
+    capacitance, not a multiple of the unit capacitance).
+    """
+    g = _paper_like_graph()
+    kw = dict(boundary_dst=g["boundary_dst"], sense_src=g["sense_src"], acc_start=g["acc_start"],
+              n_xbar_cols=22)
+    cpar, _start = C.node_parasitics(g["num_nodes"], g["src"], g["dst"], **kw)
+    c_eff = 9.06
+    c = C.c_node_vector(g["num_nodes"], g["src"], g["dst"], U, "physical", c_eff=c_eff,
+                        dtype=torch.float64, **kw)
+    assert float(c[0, :11].mean()) == pytest.approx(c_eff, rel=1e-9)
+    assert float(c[0, 11:].mean()) == pytest.approx(c_eff, rel=1e-9)
+    want = (cpar[:11] - cpar[:11].mean()) / U.cu
+    got = c[0, :11].double() - c[0, :11].mean().double()
+    torch.testing.assert_close(got, want, rtol=1e-9, atol=1e-12)
+    # "uniform": every node carries exactly c_eff * C_u
+    cu_all = C.c_node_vector(g["num_nodes"], g["src"], g["dst"], U, "uniform", c_eff=c_eff,
+                            dtype=torch.float64, **kw)
+    assert torch.allclose(cu_all, torch.full_like(cu_all, float(c_eff)))
+
+
+def test_c_node_parasitic_check_uses_the_c_eff_budget():
+    """A parasitic above ``C_u`` but below ``c_eff * C_u`` is accepted."""
+    g = _paper_like_graph()
+    kw = dict(boundary_dst=g["boundary_dst"], sense_src=g["sense_src"], acc_start=g["acc_start"],
+              n_xbar_cols=52)          # 52 legs -> 56 fF of parasitic on the accumulator
+    with pytest.raises(ValueError, match="node capacitance budget"):
+        C.c_node_vector(g["num_nodes"], g["src"], g["dst"], U, "physical", **kw)
+    with pytest.raises(ValueError, match="node capacitance budget"):
+        C.c_node_vector(g["num_nodes"], g["src"], g["dst"], U, "uniform", **kw)
+    for mode in ("physical", "uniform"):
+        c = C.c_node_vector(g["num_nodes"], g["src"], g["dst"], U, mode, c_eff=9.06,
+                            dtype=torch.float64, **kw)
+        assert float(c.mean()) == pytest.approx(9.06, rel=1e-9)
+
+
 # ---------------------------------------------------------------------------
 # power
 # ---------------------------------------------------------------------------

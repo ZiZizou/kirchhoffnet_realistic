@@ -714,6 +714,11 @@ output_ode_src: list[int] | None = None,
         ``n_sense`` legs each, doubled for ``hw_xbar_mode='differential'``)
         or the legacy temporal mesh, and the ``HWUnits`` of ``self.hw``.
         ``mode`` defaults to ``hw_c_node``.
+
+        The node capacitance budget is ``c_eff * C_u`` (the legacy scalar
+        divisor ``c_eff`` times the unit capacitance): the parasitics are
+        taken out of that budget, so a model with ``c_eff = 9.06`` has a
+        total node capacitance of ``9.06 * C_u``.
         """
         c = self.hw_constraints
         mode = mode if mode is not None else (None if c is None else c.hw_c_node)
@@ -732,25 +737,30 @@ output_ode_src: list[int] | None = None,
             boundary_dst=self.boundary_dst.tolist() if self._has_boundary else (),
             sense_src=sense_src, mesh_src=mesh_src, mesh_dst=mesh_dst,
             acc_start=acc_start, n_xbar_cols=n_cols,
-            xbar_mode="signed" if c is None else c.hw_xbar_mode, dtype=dtype,
+            xbar_mode="signed" if c is None else c.hw_xbar_mode,
+            c_eff=float(self.c_eff), dtype=dtype,
         )
 
     def node_capacitance(self, x: torch.Tensor):
         """The divisor of ``rhs``: the scalar ``c_eff`` (legacy) or, with
-        ``hw_c_node``, the ``[1, N]`` tensor ``c_eff * c_node_vector()``.
+        ``hw_c_node``, the ``[1, N]`` tensor of the per-node capacitance.
 
         ``c_eff`` is the nominal node capacitance in units of ``C_u`` (1 by
-        default, see ``HWUnits.cu``), so ``"uniform"`` (all ones) divides by
-        exactly ``c_eff`` and reproduces the legacy output bit-for-bit.  The
-        vector is non-trainable and cached per (mode, xbar mode, dtype, device).
+        default, see ``HWUnits.cu``), so the legacy path divides by ``c_eff``
+        and every node physically carries ``c_eff * C_u``.  With ``hw_c_node``
+        the per-node capacitance is ``c_eff * C_u`` (the class mean) plus that
+        node's own parasitic deviation, so ``"uniform"`` (all nodes equal)
+        divides by exactly ``c_eff`` and reproduces the legacy output
+        bit-for-bit.  The vector is non-trainable and cached per
+        (mode, xbar mode, c_eff, dtype, device).
         """
         c = self.hw_constraints
         if c is None or c.hw_c_node is None:
             return self.c_eff
-        key = (c.hw_c_node, c.hw_xbar_mode, x.dtype, x.device, id(self.hw))
+        key = (c.hw_c_node, c.hw_xbar_mode, float(self.c_eff), x.dtype, x.device, id(self.hw))
         cache = self.__dict__.get("_c_node_cache")
         if cache is None or cache[0] != key:
-            vec = (self.c_eff * self.c_node_vector(c.hw_c_node, torch.float64))
+            vec = self.c_node_vector(c.hw_c_node, torch.float64)
             cache = (key, vec.to(device=x.device, dtype=x.dtype))
             object.__setattr__(self, "_c_node_cache", cache)
         return cache[1]

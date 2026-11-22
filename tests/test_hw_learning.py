@@ -60,32 +60,18 @@ LEARN_RATIO_MAX = 0.25
 SEED_SPREAD_MAX = 2.0
 R2_MIN = 0.8
 OUT = os.environ.get("HW_LEARN_OUT")
-# Parameters that legitimately get no gradient under a flag (criterion 1):
-# with hw_compliance the soft clip term is zero (the leg roll-off is the rail),
-# so the learnable clip sharpness is unused.
-DOCUMENTED_DEAD = {"hw_compliance": ("clip_sharpness_raw",)}
-
-
-# FRIEDMAN2_NET cannot be built with hw_c_node="physical" (3.8): its legacy
-# ota_mesh accumulator node carries 16 mesh gate+leg terminals = 52 fF of
-# parasitic > C_u = 50 fF, and _c_node_from_parasitics compares against C_u
-# (it does not scale the target by the net's c_eff = 9.06).  These two runs
-# therefore drop ONLY hw_c_node; test_friedman2_physical_c_node_is_unbuildable
-# pins the limitation so it cannot disappear silently.
-PRESET_OVERRIDES = {
-    ("friedman2", "phase3a_full"): {"hw_c_node": None},
-    ("friedman2", "phase3b_tm"): {"hw_c_node": None},
-}
+# Parameters that legitimately get no gradient under a flag (criterion 1).
+# Under hw_compliance the soft clip term is zero (the leg roll-off is the rail),
+# so the learnable clip sharpness is dead: it is FROZEN (requires_grad=False,
+# Phase 3b W5 step 2), so it is not a trainable parameter at all and never
+# shows up in ``no_grad_params`` (which only lists trainable parameters).
+DOCUMENTED_DEAD: dict[str, tuple[str, ...]] = {}
 
 
 def preset_hw(name: str, task: str | None = None):
     if name == "none":
         return None
-    d = load_preset(name)
-    over = PRESET_OVERRIDES.get((task, name))
-    if over:
-        d = dict(d, constraints=dict(d.get("constraints") or {}, **over))
-    return hw_or_none(HWConfig.from_dict(d))
+    return hw_or_none(HWConfig.from_dict(load_preset(name)))
 
 
 def task_data(spec):
@@ -183,7 +169,7 @@ def _train(task: str, preset: str, seed: int) -> dict:
     quant = quant_check(net, hw)
     return {
         "task": task, "preset": preset, "seed": seed, "steps": STEPS, "lr": LR,
-        "overrides": PRESET_OVERRIDES.get((task, preset), {}),
+        "overrides": {},
         "n_params": sum(p.numel() for _, p in params),
         "initial_loss": losses[0], "final_loss": final_train,
         "last_step_loss": losses[-1], "learn_ratio": final_train / losses[0],
@@ -222,14 +208,25 @@ ALL = [(t, p, s) for t in TASKS for p in PRESETS for s in SEEDS]
 
 
 @pytest.mark.parametrize("preset", ["phase3a_full", "phase3b_tm"])
-def test_friedman2_physical_c_node_is_unbuildable(preset):
-    """Documents the PRESET_OVERRIDES limitation (see the comment there)."""
+def test_friedman2_physical_c_node_builds_and_runs(preset):
+    """FRIEDMAN2 (c_eff = 9.06) builds and runs with hw_c_node='physical'.
+
+    Its ota_mesh accumulator carries 16 mesh gate+leg terminals = 52 fF of
+    parasitic.  The node capacitance budget is ``c_eff * C_u = 453 fF``, so
+    the parasitic fits (the old code compared it against C_u = 50 fF and
+    wrongly rejected the net).
+    """
     hw = hw_or_none(HWConfig.from_dict(load_preset(preset)))
     spec = TASKS["friedman2"]
     with mg.f64():
         net = mg._build_net(spec, hw=hw).double()
-        with pytest.raises(ValueError, match="parasitic exceeds C_u"):
-            mg.model_forward(net, task_data(spec)[0][:4])
+        x = task_data(spec)[0][:4]
+        y = mg.model_forward(net, x)
+        assert torch.isfinite(y).all()
+        st = net.core.stages[0]
+        c = st.node_capacitance(torch.zeros(1, st.num_nodes, dtype=torch.float64))
+        assert float(c.mean()) == pytest.approx(st.c_eff, rel=1e-12)
+        assert float(c.max()) <= st.c_eff + 1e-9      # parasitic <= budget
 
 
 @pytest.mark.parametrize("task,preset,seed", ALL)

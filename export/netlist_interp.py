@@ -256,7 +256,7 @@ def _timemux_transfer(x, t, cfg, clamp_x_hard=None):
     return finish(w1*x + w2*torch.tanh(x) + w3*torch.relu(x-vth))
 
 def _timemux_boundary(x, cfg, units, boundary_idx, noise=None):
-    if noise is not None:
+    if cfg.get("ktc", True) and noise is not None:
         x = x + _t(noise, x) * float(units.get("ktc_rms_units", 0.0))
     vu = float(units["vu"])
     if cfg.get("inject_mv", 0.0):

@@ -707,6 +707,99 @@ def validate_topology_degrees(
                 )
 
 
+# ---------------------------------------------------------------------------
+# prune helpers: specialised (stage-owned) cell families
+# ---------------------------------------------------------------------------
+# Per-edge raw parameters of a ``FreeTanhLibrary``.  ``r_raw`` only exists
+# under ``hw_ratio_ab`` and ``theta_raw`` only under ``bias_enabled``; the
+# copy helper skips the ones that are absent on either side.
+_EDGE_RAW_PARAM_NAMES = (
+    "a_raw",
+    "b_raw",
+    "s_raw",
+    "gm_raw",
+    "isat_raw",
+    "theta_raw",
+    "g_resistive_raw",
+    "r_raw",
+)
+
+
+def _copy_edge_raws(dst_lib, src_lib, keep_idx=None) -> None:
+    """Copy the per-edge raw parameters of ``src_lib`` into ``dst_lib``.
+
+    ``keep_idx`` selects a subset of the source edges (in order); ``None``
+    copies every edge (both libraries must then have the same size).  The
+    copy is value-exact: the rebuilt library must behave like the original
+    one on the surviving edges.
+    """
+    if dst_lib is None or src_lib is None:
+        return
+    with torch.no_grad():
+        for name in _EDGE_RAW_PARAM_NAMES:
+            dst_p = getattr(dst_lib, name, None)
+            src_p = getattr(src_lib, name, None)
+            if dst_p is None or src_p is None:
+                continue
+            if keep_idx is None:
+                if int(dst_p.numel()) != int(src_p.numel()):
+                    continue
+                dst_p.data.copy_(src_p.data.detach().cpu())
+            else:
+                dst_p.data.copy_(src_p.data.detach().cpu()[keep_idx])
+
+
+def _clone_family_lib(old, num_edges: int):
+    """Build a fresh cell library with ``old``'s configuration but ``num_edges`` edges.
+
+    Used when a specialised family loses edges (its target node was pruned):
+    the family must be re-sized, and the surviving edges' raw parameters are
+    copied over by the caller.
+    """
+    if not isinstance(old, FreeTanhLibrary):
+        raise ValueError(
+            f"prune: unsupported cell library type for a specialised family: "
+            f"{type(old).__name__}"
+        )
+    return FreeTanhLibrary(
+        num_edges=int(num_edges),
+        gm_min=old.gm_min,
+        gm_max=old.gm_max,
+        isat_min=old.isat_min,
+        isat_max=old.isat_max,
+        bias_enabled=old._bias_enabled,
+        hw=getattr(old, "hw", None),
+        mismatch=getattr(old, "mismatch", None),
+        family=getattr(old, "family", "core"),
+    )
+
+
+def _copy_transfer_params(dst_tr, src_tr) -> None:
+    """Copy the overlapping parameters of an interstage ``StageTransfer``.
+
+    The residual parameters are per-output-node vectors and the mixing
+    matrices are ``(out x out)``.  Copying the overlap keeps a trained
+    transfer bit-for-bit when the prune does not change the width, and keeps
+    the surviving rows when it does.
+    """
+    with torch.no_grad():
+        for name in ("residual_w1", "residual_w2", "residual_w3", "residual_vth"):
+            src_p = getattr(src_tr, name, None)
+            dst_p = getattr(dst_tr, name, None)
+            if src_p is None or dst_p is None:
+                continue
+            n = min(int(src_p.numel()), int(dst_p.numel()))
+            dst_p.data[:n].copy_(src_p.data[:n].detach().cpu())
+        for name in ("mix_w1", "mix_w2", "mix_u1", "mix_v1", "mix_u2", "mix_v2"):
+            src_p = getattr(src_tr, name, None)
+            dst_p = getattr(dst_tr, name, None)
+            if src_p is None or dst_p is None:
+                continue
+            r = min(int(src_p.shape[0]), int(dst_p.shape[0]))
+            c = min(int(src_p.shape[1]), int(dst_p.shape[1]))
+            dst_p.data[:r, :c].copy_(src_p.data[:r, :c].detach().cpu())
+
+
 def prune_stage(
     stage,
     edge_threshold: float = 0.01,
@@ -715,7 +808,7 @@ def prune_stage(
     read_idx: list[int] | None = None,
     protected_nodes: set[int] | None = None,
     min_read_nodes: int = 1,
-    leak_mode: str = "programmable",
+    leak_mode: str | None = None,
     leak_constant: float | None = None,
     freeze_read: bool | None = None,
     freeze_boundary: bool | None = None,
@@ -740,6 +833,18 @@ def prune_stage(
       - Re-filter edges for surviving nodes.
       - If fewer than ``min_read_nodes`` read nodes survive, raise an error.
 
+    The stage-owned SPECIALISED families are carried over to the rebuilt
+    stage (W8b): the boundary fan-out OTA bank (``boundary_src/dst``,
+    ``boundary_cell_lib``, ``boundary_z_logits``), the output-ODE readout
+    mesh (``output_ode_src/dst``, ``output_ode_cell_lib``,
+    ``output_ode_z_logits``) and the output-ODE accumulator nodes at the
+    tail of the state vector.  Their per-edge parameters are copied
+    value-exactly, and the VCA projections / per-edge taps (``vca_W``,
+    ``vca_W_core``, ``vca_v_boundary``, ``vca_v_readout``, ``vca_v_core``)
+    are carried over as well (the core taps are re-indexed to the surviving
+    core edges).  A family edge whose node died is dropped and its cell
+    library re-sized; the remaining edges keep their exact parameters.
+
     Args:
         stage: Trained DifferentialStage with z_logits.
         edge_threshold: Joint Z+gate threshold for edges.
@@ -755,6 +860,11 @@ def prune_stage(
             survive pruning. Use for write targets that must remain alive.
         min_read_nodes: Minimum number of read_idx nodes that must survive
             after pruning. If fewer survive, raises ValueError. Default 1.
+        leak_mode: Leak mode of the rebuilt stage. ``None`` (default)
+            inherits the original stage's leak mode (the rebuilt stage must
+            not silently switch a fixed leak to a learnable one).
+        leak_constant: Fixed leak value for ``leak_mode="non-programmable"``.
+            ``None`` inherits the original stage's constant.
     Returns:
         A tuple ``(new_stage, node_remap)`` where:
           - ``new_stage`` is a new DifferentialStage with filtered src/dst,
@@ -796,6 +906,37 @@ def prune_stage(
     src_old = stage.src.detach().cpu()
     dst_old = stage.dst.detach().cpu()
 
+    # ----- specialised families owned by the stage -----
+    has_boundary = bool(getattr(stage, "_has_boundary", False))
+    has_output_ode = bool(getattr(stage, "_has_output_ode", False))
+    boundary_src_old = (
+        stage.boundary_src.detach().cpu().tolist() if has_boundary else []
+    )
+    boundary_dst_old = (
+        stage.boundary_dst.detach().cpu().tolist() if has_boundary else []
+    )
+    out_src_old = (
+        stage.output_ode_src.detach().cpu().tolist() if has_output_ode else []
+    )
+    out_dst_old = (
+        stage.output_ode_dst.detach().cpu().tolist() if has_output_ode else []
+    )
+
+    # The output-ODE accumulator nodes live at the TAIL of the state vector
+    # and are NOT part of the core graph (they are charged by the readout
+    # mesh).  They must survive the prune -- otherwise the readout tail
+    # disappears and the state width changes -- and they must stay at the
+    # tail of the rebuilt state vector.
+    acc_start = int(stage.num_nodes)
+    if has_output_ode and out_dst_old:
+        core_max = -1
+        if src_old.numel():
+            core_max = max(core_max, int(src_old.max().item()))
+        if dst_old.numel():
+            core_max = max(core_max, int(dst_old.max().item()))
+        acc_start = max(min(out_dst_old), core_max + 1)
+    acc_count = int(stage.num_nodes) - acc_start
+
     # ----- protected nodes: forced to survive -----
     # Input-side guard: write targets must never be pruned, regardless of
     # their gate value. Applied before the connectivity backstop so they
@@ -811,6 +952,13 @@ def prune_stage(
         keep_edge_tmp = keep_edge & keep_node[src_old] & keep_node[dst_old]
         surv_src = src_old[keep_edge_tmp].tolist()
         surv_dst = dst_old[keep_edge_tmp].tolist()
+        # The readout mesh (core node -> output-ODE accumulator) is part of
+        # the connectivity graph: the accumulator tail is charged by it and
+        # must stay reachable from the write nodes.
+        for s, d in zip(out_src_old, out_dst_old):
+            if bool(keep_node[s]) and bool(keep_node[d]):
+                surv_src.append(int(s))
+                surv_dst.append(int(d))
 
         # BFS from write_idx; verify read_idx reachable
         _, dists = _bfs_undirected(stage.num_nodes, surv_src, surv_dst, list(write_idx))
@@ -861,6 +1009,11 @@ def prune_stage(
                 has_incident[int(idx)] = True
         keep_node = keep_node & has_incident
 
+    # The output-ODE accumulator tail is never pruned: it is the readout
+    # target of the temporal mesh and the state width must not change.
+    if acc_count > 0:
+        keep_node[acc_start:] = True
+
     # ----- min_read_nodes guard -----
     # After dead-island purge, count surviving read nodes. If fewer than
     # min_read_nodes survive, abort the prune (readout would be empty).
@@ -874,8 +1027,17 @@ def prune_stage(
             )
 
     # Build node ID remapping: old_global -> new_compact.
+    # The core nodes are compacted first; the accumulator tail keeps its
+    # tail position (the readout reads the LAST state entries).
     new_ids = torch.full((stage.num_nodes,), -1, dtype=torch.long)
-    new_ids[keep_node] = torch.arange(int(keep_node.sum().item()))
+    alive_core = torch.nonzero(keep_node[:acc_start], as_tuple=True)[0]
+    num_core_new = int(alive_core.numel())
+    new_ids[alive_core] = torch.arange(num_core_new, dtype=torch.long)
+    if acc_count > 0:
+        new_ids[acc_start:] = torch.arange(
+            num_core_new, num_core_new + acc_count, dtype=torch.long
+        )
+    num_nodes_new = num_core_new + acc_count
 
     # Re-filter edges: keep only edges where both endpoints survive
     edge_mask = keep_edge & keep_node[src_old] & keep_node[dst_old]
@@ -890,78 +1052,203 @@ def prune_stage(
 
     new_src = new_ids[src_old[edge_mask]].tolist()
     new_dst = new_ids[dst_old[edge_mask]].tolist()
+    edge_idx_old = torch.nonzero(edge_mask, as_tuple=True)[0]
 
-    num_nodes_new = int(keep_node.sum().item())
     node_idx_old = torch.nonzero(keep_node, as_tuple=True)[0]
     node_remap: dict[int, int] = {
         int(old_id): int(new_id)
         for old_id, new_id in zip(
             node_idx_old.tolist(),
-            new_ids[keep_node].tolist(),
+            new_ids[node_idx_old].tolist(),
         )
     }
 
+    # ----- specialised family edges (boundary bank / readout mesh) -----
+    # A family edge dies with its node; the surviving edges keep their exact
+    # parameters (the cell library is re-sized only when the family shrank).
+    b_keep = [
+        i for i, d in enumerate(boundary_dst_old) if bool(keep_node[int(d)])
+    ]
+    o_keep = [
+        i for i, (s, d) in enumerate(zip(out_src_old, out_dst_old))
+        if bool(keep_node[int(s)]) and bool(keep_node[int(d)])
+    ]
+
     is_free_tanh = isinstance(stage.cell_lib, FreeTanhLibrary)
-    if is_free_tanh:
-        old = stage.cell_lib
-        new_lib = FreeTanhLibrary(
-            num_edges=len(new_src),
-            gm_min=old.gm_min,
-            gm_max=old.gm_max,
-            isat_min=old.isat_min,
-            isat_max=old.isat_max,
-            bias_enabled=old._bias_enabled,
-            hw=getattr(stage, "hw", None),
-            mismatch=getattr(old, "mismatch", None),
-            family=getattr(old, "family", "core"),
+
+    # Leak mode: the rebuilt stage must not silently switch a fixed leak to
+    # a learnable one (that would add a per-node parameter and change the
+    # dynamics).
+    eff_leak_mode = (
+        str(leak_mode) if leak_mode is not None
+        else str(getattr(stage, "leak_mode", "programmable"))
+    )
+    if eff_leak_mode == "non-programmable":
+        eff_leak_constant = (
+            leak_constant if leak_constant is not None
+            else getattr(stage, "leak_constant", None)
         )
     else:
-        new_lib = stage.cell_lib
+        eff_leak_constant = leak_constant
 
-    new_stage = DifferentialStage(
-        num_nodes=num_nodes_new,
-        src=new_src,
-        dst=new_dst,
-        cell_lib=new_lib,
-        c_eff=stage.c_eff,
-        x_max=stage.x_max,
-        clip_current=stage.clip_current,
-        clip_softness=stage.clip_softness,
-        learnable_clip_sharpness=getattr(stage, "_learnable_clip_sharpness", False),
-        clip_sharpness_init=getattr(stage, "clip_sharpness_init", None),
-        clip_sharpness_min=getattr(stage, "clip_sharpness_min", None),
-        clip_sharpness_max=getattr(stage, "clip_sharpness_max", None),
-        leak_mode=leak_mode,
-        leak_constant=leak_constant,
-        freeze_read=stage.freeze_read if freeze_read is None else freeze_read,
-        freeze_boundary=stage.freeze_boundary if freeze_boundary is None else freeze_boundary,
-        freeze_temporal_read=stage.freeze_temporal_read if freeze_temporal_read is None else freeze_temporal_read,
-        boundary_cell_lib=stage.boundary_cell_lib,
-        vca_enabled=False,
-        vca_rank=VCA["rank"],
-        vca_in_dim=0,
-        hw=getattr(stage, "hw", None),
+    # The rebuilt stage must have the SAME floating-point dtype as the
+    # original: its parameters are created with the ambient default dtype,
+    # which is not necessarily the dtype of the model being pruned (the
+    # golden builder runs inside a float64 context, the pruner does not).
+    ref_dtype = stage.z_logits.dtype
+    prev_default_dtype = torch.get_default_dtype()
+    _pin_default_dtype = (
+        ref_dtype in (torch.float32, torch.float64)
+        and ref_dtype != prev_default_dtype
     )
+    if _pin_default_dtype:
+        torch.set_default_dtype(ref_dtype)
+    try:
+        # ----- boundary fan-out family -----
+        new_boundary_src = [int(boundary_src_old[i]) for i in b_keep]
+        new_boundary_dst = [int(new_ids[int(boundary_dst_old[i])]) for i in b_keep]
+        if has_boundary and b_keep:
+            if len(b_keep) == len(boundary_src_old):
+                # Same size: reuse the original library object so the
+                # per-stage sharing structure and the exact parameter values
+                # are preserved.
+                new_boundary_lib = stage.boundary_cell_lib
+            else:
+                new_boundary_lib = _clone_family_lib(
+                    stage.boundary_cell_lib, len(b_keep)
+                )
+                if transfer_params:
+                    _copy_edge_raws(
+                        new_boundary_lib, stage.boundary_cell_lib, b_keep
+                    )
+        else:
+            new_boundary_lib = None
+            new_boundary_src = None
+            new_boundary_dst = None
+
+        # ----- output-ODE (readout mesh) family -----
+        new_out_src = [int(new_ids[int(out_src_old[i])]) for i in o_keep]
+        new_out_dst = [int(new_ids[int(out_dst_old[i])]) for i in o_keep]
+        if has_output_ode and o_keep:
+            if len(o_keep) == len(out_src_old):
+                new_out_lib = stage.output_ode_cell_lib
+            else:
+                new_out_lib = _clone_family_lib(
+                    stage.output_ode_cell_lib, len(o_keep)
+                )
+                if transfer_params:
+                    _copy_edge_raws(
+                        new_out_lib, stage.output_ode_cell_lib, o_keep
+                    )
+        else:
+            new_out_lib = None
+            new_out_src = None
+            new_out_dst = None
+
+        if is_free_tanh:
+            old = stage.cell_lib
+            new_lib = FreeTanhLibrary(
+                num_edges=len(new_src),
+                gm_min=old.gm_min,
+                gm_max=old.gm_max,
+                isat_min=old.isat_min,
+                isat_max=old.isat_max,
+                bias_enabled=old._bias_enabled,
+                hw=getattr(stage, "hw", None),
+                mismatch=getattr(old, "mismatch", None),
+                family=getattr(old, "family", "core"),
+            )
+        else:
+            new_lib = stage.cell_lib
+
+        new_stage = DifferentialStage(
+            num_nodes=num_nodes_new,
+            src=new_src,
+            dst=new_dst,
+            cell_lib=new_lib,
+            c_eff=stage.c_eff,
+            x_max=stage.x_max,
+            clip_current=stage.clip_current,
+            clip_softness=stage.clip_softness,
+            learnable_clip_sharpness=getattr(stage, "_learnable_clip_sharpness", False),
+            clip_sharpness_init=getattr(stage, "clip_sharpness_init", None),
+            clip_sharpness_min=getattr(stage, "clip_sharpness_min", None),
+            clip_sharpness_max=getattr(stage, "clip_sharpness_max", None),
+            leak_mode=eff_leak_mode,
+            leak_constant=eff_leak_constant,
+            read_only_source=bool(getattr(stage, "read_only_source", False)),
+            freeze_read=stage.freeze_read if freeze_read is None else freeze_read,
+            freeze_boundary=stage.freeze_boundary if freeze_boundary is None else freeze_boundary,
+            freeze_temporal_read=stage.freeze_temporal_read if freeze_temporal_read is None else freeze_temporal_read,
+            boundary_src=new_boundary_src,
+            boundary_dst=new_boundary_dst,
+            boundary_cell_lib=new_boundary_lib,
+            output_ode_src=new_out_src,
+            output_ode_dst=new_out_dst,
+            output_ode_cell_lib=new_out_lib,
+            readout_mode=str(getattr(stage, "readout_mode", "ota_mesh")),
+            readout_senses_per_node=int(getattr(stage, "readout_senses_per_node", 1)),
+            vca_enabled=bool(getattr(stage, "vca_enabled", False)),
+            vca_rank=int(getattr(stage, "vca_rank", VCA["rank"])),
+            vca_in_dim=int(getattr(stage, "_vca_in_dim", 0)),
+            vca_core_enabled=bool(getattr(stage, "_vca_core_enabled", False)),
+            vca_gate_shunt=bool(getattr(stage, "vca_gate_shunt", False)),
+            vca_separate_core_bus=bool(getattr(stage, "vca_separate_core_bus", False)),
+            vca_bias=bool(getattr(stage, "_vca_bias_enabled", VCA.get("bias", False))),
+            hw=getattr(stage, "hw", None),
+        )
+    finally:
+        if _pin_default_dtype:
+            torch.set_default_dtype(prev_default_dtype)
 
     if transfer_params:
         with torch.no_grad():
-            edge_idx_old = torch.nonzero(edge_mask, as_tuple=True)[0]
             if is_free_tanh:
-                for name in ("a_raw", "b_raw", "s_raw", "gm_raw", "isat_raw"):
-                    new_stage.cell_lib.get_parameter(name).data.copy_(
-                        stage.cell_lib.get_parameter(name).data[edge_idx_old].cpu()
-                    )
-                if hasattr(new_stage.cell_lib, "theta_raw") and hasattr(stage.cell_lib, "theta_raw"):
-                    new_stage.cell_lib.theta_raw.data.copy_(
-                        stage.cell_lib.theta_raw.data[edge_idx_old].cpu()
-                    )
-                # 3.1 hw_ratio_ab: the live ratio parameter must survive pruning
-                if hasattr(new_stage.cell_lib, "r_raw") and hasattr(stage.cell_lib, "r_raw"):
-                    new_stage.cell_lib.r_raw.data.copy_(
-                        stage.cell_lib.r_raw.data[edge_idx_old].cpu()
-                    )
-            old_z_logits = stage.z_logits.data[edge_idx_old].cpu()
-            new_stage.z_logits.data.copy_(old_z_logits)
+                # Every per-edge core parameter (a/b/s/gm/isat/theta/
+                # g_resistive/r_raw) is re-indexed to the surviving edges.
+                _copy_edge_raws(new_stage.cell_lib, stage.cell_lib, edge_idx_old)
+            new_stage.z_logits.data.copy_(
+                stage.z_logits.data[edge_idx_old].cpu()
+            )
+            # Family gate logits (they gate the boundary / readout currents).
+            if (new_stage.boundary_z_logits is not None
+                    and stage.boundary_z_logits is not None):
+                new_stage.boundary_z_logits.data.copy_(
+                    stage.boundary_z_logits.data[b_keep].cpu()
+                )
+            if (new_stage.output_ode_z_logits is not None
+                    and stage.output_ode_z_logits is not None):
+                new_stage.output_ode_z_logits.data.copy_(
+                    stage.output_ode_z_logits.data[o_keep].cpu()
+                )
+            # VCA: shared input projections + per-edge taps.
+            for name in ("vca_W", "vca_W_core"):
+                src_p = getattr(stage, name, None)
+                dst_p = getattr(new_stage, name, None)
+                if src_p is None or dst_p is None:
+                    continue
+                if tuple(dst_p.shape) != tuple(src_p.shape):
+                    continue
+                dst_p.data.copy_(src_p.data.detach().cpu())
+            for name, keep in (
+                ("vca_v_core", edge_idx_old),
+                ("vca_b_core", edge_idx_old),
+                ("vca_v_boundary", b_keep),
+                ("vca_b_boundary", b_keep),
+                ("vca_v_readout", o_keep),
+                ("vca_b_readout", o_keep),
+            ):
+                src_p = getattr(stage, name, None)
+                dst_p = getattr(new_stage, name, None)
+                if src_p is None or dst_p is None:
+                    continue
+                # The per-edge taps are re-indexed: the row count changes
+                # with the family / core edge count, the rest must match.
+                if tuple(dst_p.shape[1:]) != tuple(src_p.shape[1:]):
+                    continue
+                if int(dst_p.shape[0]) != len(keep):
+                    continue
+                dst_p.data.copy_(src_p.data.detach().cpu()[keep])
         with torch.no_grad():
             if hasattr(stage, 'raw_leak') and hasattr(new_stage, 'raw_leak'):
                 new_stage.raw_leak.data.copy_(stage.raw_leak.data[node_idx_old].cpu())
@@ -1055,12 +1342,18 @@ def prune_network(
     new_transfers = []
     from stage_transfer import StageTransfer
     for i in range(len(new_stages) - 1):
-        activation = getattr(net.transfers[i], 'activation', 'none')
-        residual_rank = getattr(net.transfers[i], 'residual_rank', -1)
-        new_transfers.append(StageTransfer(new_widths[i], new_widths[i + 1],
-                                           activation=activation,
-                                           residual_rank=residual_rank,
-                                           hw=getattr(net.transfers[i], "hw", None)))
+        old_transfer = net.transfers[i]
+        activation = getattr(old_transfer, 'activation', 'none')
+        residual_rank = getattr(old_transfer, 'residual_rank', -1)
+        new_transfer = StageTransfer(new_widths[i], new_widths[i + 1],
+                                     activation=activation,
+                                     residual_rank=residual_rank,
+                                     hw=getattr(old_transfer, "hw", None))
+        # A rebuilt transfer starts from its init; copy the trained
+        # parameters of the surviving rows so the pruned core keeps the
+        # pre-prune interstage behaviour.
+        _copy_transfer_params(new_transfer, old_transfer)
+        new_transfers.append(new_transfer)
 
     return KirchhoffNet(
         stages=new_stages,

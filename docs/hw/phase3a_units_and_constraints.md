@@ -478,7 +478,8 @@ Defaults 3 bits / r_max=2 provide eight useful matched cap ratios without a larg
 
 | Flag | Default | Section | Replaces / touches |
 |---|---|---|---|
-| `hw_ratio_ab` | False | 3.1 | `cell_library.py:344-345` |
+| `hw_ratio_ab` | False | 3.1 | legacy alias for `hw_ab_mode="ratio"` |
+| `hw_ab_mode`, `hw_ab_bits`, `hw_ab_rmax` | None, 3, 2.0 | 3.1 | ratio / differential / cap-divider input gain |
 | `hw_slope_bound` | False | 3.2 | `cell_library.py:351-352`, `:357` |
 | `hw_ic_coupling` | False | 3.3 | `cell_library.py:351-355` |
 | `hw_compliance` | False | 3.4 | `cell_library.py:399-401`, `differential_stage.py:1376-1386`, `:1508-1514`, `:1768` |

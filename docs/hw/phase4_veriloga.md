@@ -66,15 +66,15 @@ No Verilog-A source changes were needed to compile these modules. Spectre emitte
 
 ## Spectre-versus-reference characterization
 
-`/home/annaik/Documents/kirchhoffnet_refactor/venv/bin/python scripts/spectre/characterize.py` generates one PSFASCII DC deck with 33 parallel test cases. OTA/shunt currents are converted to `Iu`; transfer voltage error is converted back to x units. The legacy OTA set covers both signs, nonzero theta, saturation, the 0.01·u floor, and the compliance boundary; hardware cases include differential and two cap-divider code pairs. Transfer is now compared with `StageTransfer` from `stage_transfer.py` (including the configured hardware clamp); VCA uses `gating.vca.vca_edge_gain`. OTA, shunt, and GLN values still use copied equations rather than callable framework forward paths. In this checkout, `hw.constraints.cap_divider_gain` is absent, so cap-divider code resolution remains a copied equation rather than a call to that helper. This matrix remains DC-only and does not cover all modules.
+`/home/annaik/Documents/kirchhoffnet_refactor/venv/bin/python scripts/spectre/characterize.py` generates PSFASCII DC and transient analyses with 48 parallel test cases. OTA/shunt/rail-clip currents are converted to `Iu`; transfer voltage error and node-cap transient error are in x units. Node-cap leakage is compared against `x0·exp(−leak·t_model/c_eff)` over five RC constants. Rail clipping is evaluated via `DifferentialStage.soft_clip` in Torch at DC points spanning both rails. Transfer is compared with `StageTransfer` from `stage_transfer.py` (including the configured hardware clamp); VCA uses `gating.vca.vca_edge_gain`. OTA, shunt, and GLN values still use copied equations rather than callable framework forward paths. In this checkout, `hw.constraints.cap_divider_gain` is absent, so cap-divider code resolution remains a copied equation rather than a call to that helper.
 
 | Module / mode | Cases | Maximum absolute error | Maximum relative error |
 |---|---:|---:|---:|
 | `ota_edge` legacy | 16 | 8.52e-16 Iu | 8.36e-15 |
 | `ota_edge` hw (differential / cap-divider) | 6 | 5.68e-16 Iu | 8.64e-16 |
 | `shunt` DC | 3 | 2.84e-16 Iu | 1.87e-16 |
-| `node_cap_leak` | — | not measured | not measured |
-| `rail_clip` | — | not measured | not measured |
+| `node_cap_leak` transient | 4 | 8.71e-6 x | 1.45e-6 |
+| `rail_clip` DC (Torch `DifferentialStage.soft_clip`) | 11 | 1.39e-17 Iu | 1.39e-17 |
 | `sample_hold` | — | not measured | not measured |
 | `boundary_sense_ota` | — | not measured | not measured |
 | `crossbar_accumulator` | — | not measured | not measured |

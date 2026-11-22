@@ -20,12 +20,15 @@ MODULE_PARAMS = {
 
 
 def test_all_modules_exist_and_include_shared_constants():
-    for module in MODULE_PARAMS:
-        path = VA / f"{module}.va"
-        assert path.is_file(), f"missing {path.name}"
+    expected_files = {f"{module}.va" for module in MODULE_PARAMS}
+    assert {path.name for path in VA.glob("*.va")} == expected_files
+    assert (VA / "hrknet_constants.vams").is_file()
+    for path in VA.glob("*.va"):
         text = path.read_text()
         assert '`include "hrknet_constants.vams"' in text, path.name
-        assert re.search(rf"\bmodule\s+{module}\s*\(", text), path.name
+    for module in MODULE_PARAMS:
+        text = (VA / f"{module}.va").read_text()
+        assert re.search(rf"\bmodule\s+{module}\s*\(", text), module
 
 
 def test_exporter_parameter_contract_is_declared():

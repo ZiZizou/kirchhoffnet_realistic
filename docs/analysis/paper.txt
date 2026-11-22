@@ -1,0 +1,506 @@
+    HR-KNet: A hardware-realistic analog accelerator
+               and design framework
+
+   Abstract—Data-center AI systems increasingly depend on high-
+                                                                                              Analog Circuits                                 Analog Circuits
+speed wireline links, making transceiver bandwidth, adaptation,
+and energy efficiency central to AI infrastructure. This paper pro-
+poses Hardware-Realistic KNet (HR-KNet) for analog control of
+                                                                                (a)
+high-performance wireline transceivers, illustrating the reciprocal
+
+
+
+
+                                                                                              DAC
+
+
+
+                                                                                                             ADC
+
+
+
+
+                                                                                                                                               DAC
+
+
+
+                                                                                                                                                              ADC
+relationship of AI for chips and chips for AI. HR-KNet computes
+                                                                                                                            Fast &
+directly on voltages through Kirchhoff-current-law-governed ODE                                                             Efficient
+dynamics, but prior formulations leave connectivity, device limits,                         Digital Optimizer                             Analog Optimizer
+and circuit interfaces idealized. We address these gaps with a
+sparse Watts-Strogatz fabric, bounded differential-OTA edges with               Transmitter       Receiver
+                                                                                                                                        RX CDR
+shunts and rail-compliance protection, explicit sparse input and                 Bitstream          (RX)
+accumulator readout paths, and a Bayesian optimization frame-
+
+
+
+
+                                                                                                                                                                      DES
+work that searches topology, solver, and device parameters while                                    CTLE            VGA            FFE/DFE                  Slicer
+distilling a digital teacher. We evaluate the resulting controller on              Channel
+programmable-CTLE inverse design for 56–112 Gb/s PAM-4 links.                   (b)
+At matched parameter budgets, HR-KNet improves standard                                                     Aout                                Ain
+regression benchmarks. On CTLE, it reduces Cadence-verified                       Aout                Ain          Aout                 Ain          Aout            Ain
+failure rate from 51.0% for a digital mixture-of-experts (MoE)
+                                                                                      DAC
+
+
+
+                                                                                                    ADC
+
+
+
+
+                                                                                                                      DAC
+
+
+
+                                                                                                                                    ADC
+baseline to 40.5%, while reducing surrogate failure. These results                                                                                      Proposed
+                                                                                            DSP                              NN                            KN
+show how a bounded analog neural fabric can support learned
+transceiver tuning without a data converter in the modeled control
+path.
+   Index Terms—analog neural network, HR-KNet, KirchhoffNet,
+                                                                                      Slow                            Fast                             Fast
+wireline SerDes, CTLE equalization, ADCless acceleration,                             Costly Converters               Costly Converters                Converter-less
+Bayesian optimization
+                                                                        Fig. 1. (a) Converter tax: sensor through ADC, digital MLP, and DAC
+                       I. I NTRODUCTION                                 to actuator (left) vs. through the analog HR-KNet fabric (right); shaded
+                                                                        ADC/DAC highlight conversion interfaces and their associated area/power cost.
+   Data-center AI workloads depend on moving increasingly               (b) Wireline receiver: front-end CTLE/DFE chain with the adaptation loop
+large volumes of data between compute, memory, and network-             closed through the control fabric.
+ing devices. In this setting, the wireline transceiver is part of the
+compute system: its equalization, adaptation, and control loops
+determine how quickly and efficiently data can cross the link.          conversion. Learning in circuit physics has been demonstrated
+High-speed wireline SerDes is therefore our motivating vehicle.         in decentralized resistor networks [4], and neural adaptation
+At 56–112 Gb/s PAM-4, ADC-plus-DSP receivers are common,                can converge in fewer iterations than LMS/RLS on the same
+but the converters, clocking, and datapath impose substantial           task [5]. End-to-end analog ODE acceleration provides the
+area and power costs before any neural equalizer is added [1]–          precedent; our focus is a bounded, sparse, searchable controller
+[3] (Fig. 1).                                                           for wireline transceivers [6]–[8].
+   This bottleneck exposes a mismatch between the task and the             KirchhoffNet [9] computes by evolving a graph of voltage
+usual solution. Programmable-CTLE tuning is naturally a low-            nodes under Kirchhoff’s current law, a hardware specialization
+dimensional analog control problem—measured specifications              of a Neural ODE [10]. Its original formulation, however,
+enter, and bias codes and trims leave—yet digital multilayer            assumes unbounded devices, dense all-to-all wiring, and unit
+perceptrons (MLPs) bring dense matrix multiplications, un-              capacitances. A realizable OTA fabric must instead accom-
+bounded activations, and all-to-all connectivity. On an analog          modate saturation, limited routing, and finite rails. Figure 2
+chip, those assumptions cost power, area, and routability; on-          contrasts the idealized and proposed OTA-plus-shunt edge; the
+chip data converters add a further tax for moving between               governing equations follow below.
+voltage-domain signals and digital adaptation (Fig. 1). An                 This paper presents the HR-KNet framework for high-speed
+analog fabric that computes directly on voltages can therefore          transceiver tuning; its contributions resolve the connectivity,
+close the control loop without placing a converter in the critical      device-boundedness, interface, and optimization gaps left by
+path.                                                                   prior analog neural-network and idealized KirchhoffNet ap-
+   Fig. 1(b) contrasts the proposed converter-less loop with            proaches:
+LMS/RLS and neural equalizers, which both operate after                    •   Routing-aware sparse computation: a Watts–Strogatz
+                                         Vout                                                                                    A. KirchhoffNet Background
+                                                                                                              V3
+                        V6                                         V8
+                                                                                                                                    KirchhoffNet (KNet) is an analog-inspired Neural ODE:
+          V5                                     V7                                                                              a sparse graph of voltage nodes joined by programmable
+                                    V4                                                             Rleak             CCeﬀ
+                                                                                                                        3        OTA-like edge devices, where fixed-step integration of the
+                                                              V3
+                  V1                            V2                                                                               KCL equations is the computation—no dense digital matrix
+        (a)                        Vin1     Vin2                                                                                 multiplies in the core. A forward pass has three phases—
+                                                                                                                                 write (u to V (0)), evolve (integrate through graph stages with
+                             I12                                              I12+                            I12-               learned interstage transfers), read (affine readout to logits,
+                                                                                                Rout
+                                                                        V1                                             V2        i.e. pre-activation outputs)—trained by direct backpropagation
+             V1             Rout                        V2                                  -          +
+                                                                                                OTA                              through the unrolled integrator (no adjoint [12]). Fig. 3 shows
+                  Continuous time operation                                                 +          -                         a four-stage instantiation with stage-varying edge parameters
+                  causes moving target                                                                                           and continuous Vout accumulation.
+         (b)      drift and gradient collapse                        (c)                    Csampling
+
+
+                            VDD                                                                                                  B. Proposed HR-KNet
+         I-            I+                                                                                                           HR-KNet retains the voltage-state interpretation of the orig-
+         -          +               I-                                     Se Swap
+                                                                                                                            I+
+              OTA                                                          polarity                                              inal model but changes the assumptions that prevent direct
+          +         -                                 Vsrc              WA      WB                     Vdst                      hardware use. Its state evolution is bounded, its graph is sparse,
+         Vsrc Vdst                                                                                                               and its input and output paths are explicit circuit structures.
+                                                                                                                                 The following subsections introduce these features in the same
+                                                             Vbias                   Isat
+                                                                        gm                                                       order as a physical signal traverses the fabric: node dynamics,
+                            VSS
+         (d)                                                                                                                     then the sparse analog fabric (edge devices, topology, and I/O
+                                                                                                                                 interfaces with the interstage transfer), followed by frozen-
+Fig. 2. Hardware interpretation of HR-KNet. (a) Voltage-node graph; (b)                                                          current stabilization.
+idealized branch with charge-sharing parasitics; (c) proposed OTA plus shunt
+Rout edge; (d) differential OTA with gm /Isat controls, width ratios WA /WB ,
+and polarity se .                                                                                                                C. Node dynamics and Heun stepping
+                                                                                                                                   Each node is a leaky, rail-confined integrator whose KCL
+                                                                                                                                 balance is its dynamics—the standard nodal view of circuit
+     small-world fabric [11] (k=4, p=0.2) replaces dense all-
+                                                                                                                                 dynamics [13], with unit capacitance to ground:
+     to-all wiring, reducing core edges from O(n2 ) to O(nk)
+     while preserving short mixing paths.                                                                                                     dVj   X        X          Vj
+                                                                                                                                       Ceff       =     Ie −     Ie −         − Iclip (Vj ).   (1)
+   • Circuit-realistic dynamics: each edge is a differential                                                                                   dt                     Rleak,j
+                                                                                                                                                    e→j      j→e
+     OTA with bounded gm /Isat , a linear shunt, pruning
+     and voltage-controlled-amplifier (VCA) gates, and rail-                                                                        Boundedness without killing gradients rests on two choices: a
+     compliance shutoff; soft rails and sparse boundary/accu-                                                                    fixed leak (0.0486 in all reported runs; a programmable softplus
+     mulator interfaces provide bounded state evolution.                                                                         variant exists, saving one parameter per node when fixed) and
+   • Physical interfaces: sparse boundary fan-out and accu-                                                                      a differentiable soft clip. A hard clamp is avoided because its
+     mulator readout map the fabric to a transceiver control                                                                     nondifferentiable kinks would disrupt gradient-based training;
+     circuit without a converter in the loop.                                                                                    the soft clip instead confines node voltages to ±Vmax (here σ
+   • Search and validation: a frozen digital teacher and                                                                         denotes the logistic sigmoid function):
+     Bayesian optimization jointly tune topology, solver hori-                                                                                                                        
+     zon, and device bounds at matched parameter budgets,                                                                                                  Vj − Vmax           −Vj − Vmax
+                                                                                                                                    Iclip (Vj ) = 0.05 σ                −σ                    ,
+     and the resulting controller is evaluated on programmable-                                                                                               0.02                0.02
+     CTLE inverse design and Cadence circuit simulations.                                                                                                                                     (2)
+                                                                                                                                 with Vmax = 3.0 by default (4.0 in the CTLE/distillation runs;
+                                                                                                                                 searched in [0.5, 8.0] during Bayesian optimization).
+     II. K IRCHHOFF N ET BACKGROUND AND P ROPOSED                                                                                   where f is the right-hand side of (1). Integration is fixed-
+                         HR-KN ET                                                                                                step Heun (predictor–corrector) throughout (tspan =7.0, 70 steps
+   The methodology follows the signal path of the intended                                                                       with ∆t=0.1, split over stages; parameter-count-neutral solver-
+transceiver controller. We first define the voltage-state dynamics                                                               scale s∈[0.5, 2.0]).
+and its numerical integrator, then describe the sparse ana-
+                                                                                                                                 D. Sparse analog fabric: edges, topology, and I/O interfaces
+log fabric—edge devices, routable topology, and input/output
+interfaces—as one unit. We next cover the frozen-current                                                                            The core fabric is a routing-aware structure: bounded OTA
+stabilization used across those families. Finally, we introduce                                                                  edges wired in a sparse small-world topology, with explicit
+the optional mechanisms used by the CTLE search—input-                                                                           sparse input (boundary fan-out) and accumulator (temporal
+conditioned transconductance and VCA gating—before de-                                                                           readout, optionally shared-sense) interfaces. The paragraphs
+scribing how the resulting model is trained and evaluated.                                                                       below detail each part in signal-flow order.
+                 State Update
+
+                                           Applied independently to all nodes     between consecutive stages.              Output Affine Transform
+                                                                                                                               (Linear + Bias)
+
+
+
+
+                                                                                                                               Input-Driven Modulation
+
+                                                                                                                                Inputs    Shared Rails
+
+                                                                                                                                   GLN trims     ,
+                                                                                                                                   VCA trims
+                                                                                                                                 per edge, per stage
+               Stage 1 Modulation       Stage 2 Modulation         Stage 3 Modulation           Stage 4 Modulation
+                                                                                                                                (Details in Section II.F)
+                        and                      and                        and                          and
+                 (per edge vectors)       (per edge vectors)         (per edge vectors)           (per edge vectors)
+                                                                                                                                Time
+
+
+Fig. 3. Four-stage unrolled HR-KNet signal path. Same nodes and connections each stage; colors mark stage-specific parameters. Vin1 /Vin2 inject, Vout feeds
+the affine readout. Red callout: per-node interstage transfer. Dashed boxes with side arrows: per-stage modulation blocks returning gm /Isat to their stage.
+
+
+
+     a) Edge OTA devices.: Each directed edge is modeled as                         and each selected pair is an independent OTA with its own gate
+one differential OTA in parallel with a linear resistor rather than                 and VCA tap injecting Iboundary = σ(z) gvca (u) IOTA (ui , Vj ).
+an idealized nonlinearity. Figure 2(d) identifies the physical                         Each stage appends zero-initialized accumulator nodes driven
+terminals and controls; the following equations specify the                         by one-way hidden→accumulator OTAs (source read-only),
+implemented current law, which is not intended to be read                           evolving with leak and clip. Figure 4(a) makes the one-
+quantitatively from the schematic. The OTA branch (saturating                       OTA-per-hidden/output connection explicit. Readout uses only
+hyperbolic-tangent (tanh) cell [14]) is:                                            accumulator voltages through an identity-initialized affine map
+                                                                                   with linear, tanh, and rectified-linear-unit (ReLU) branches,
+            ue = gm,e se (Ae Vsrc − Be Vdst ) + θe ,             (3)
+                                                                                    followed by an identity-initialized residual transfer; all stages
+                                                                                    share one width.
+                                                   
+             Itanh,e = Isat,e tanh(ue ) + 0.01 ue ,              (4)
+                                                                                         d) Reduced shared-sense readout.: Rather than one OTA
+           Ie = gvca,e σ(ze ) Itanh,e + Ge (Vsrc − Vdst ).                 (5)      per hidden-node/output pair, shared-sense readout measures
+   Every free parameter in the edge law maps to a transistor                        each hidden voltage once against Vref and uses a crossbar W
+geometry or bias. The visible controls in Fig. 2(d) are the                         to sum the resulting currents into leaky accumulators. Thus,
+width ratios Ae , Be , polarity se , tail-bias gm,e , and saturation                               Vout,k =
+                                                                                                             X
+                                                                                                                 Wkj sense(Vj , Vref ).           (6)
+control Isat,e ; the law additionally carries an optional offset θe ,                                                  j
+shunt conductance Ge , and structural gate σ(ze ). The 0.01 ue
+term in (4) preserves a gradient floor in saturation, and a rail-                   The local sense cell includes the nonlinear response, optional
+compliance gate shuts off only the OTA branch near the rails,                       pruning, and input-dependent gain; the crossbar performs only
+leaving the shunt active—so each node remains a leaky low-                          current-domain mixing. For 25 hidden nodes and 7 outputs, this
+pass filter driven by its sparse neighborhood.                                      reduces active OTAs from 175 to 25. The simulator uses the
+     b) Sparse small-world topology.: To reduce interconnect                        ideal signed map iacc = W is ; a resistive implementation uses
+count, we replace dense all-to-all wiring with a Watts–Strogatz                     differential columns. A two-sense variant trades extra sense
+small-world graph (k = 4, p = 0.2, seed 1; one directed edge                        cells for a wider operating range.
+per pair, two devices per graph edge, e.g. ≈ 50 graph edges →                             e) Interstage transfer.: Between stages each node trans-
+100 core edges per stage at n = 25), cutting core edges from                        forms as Vstart = W1 Vend +W2 tanh(Vend )+W3 ReLU(Vend −
+O(n2 ) to O(nk) while keeping high clustering with short paths.                     Vth ), identity at init (W1 = 1, rest 0); driven nodes pass through
+Structural gates σ(ze ) (init 0.5, the logistic-sigmoid max-slope                   unchanged.
+point) scale every edge current.
+     c) Boundary fan-out (write) and temporal readout (read).:                      E. Freeze Read
+Inputs enter without an explicit data converter in the modeled                         For each stage, Freeze Read computes the tanh-branch
+path: in boundary mode the mapper is bypassed (V0 = 0)                              current—including σ(ze ) and VCA gates—once from the entry
+and ideal-voltage terminals drive hidden nodes directly through                     state V0 and holds it across Heun substeps; shunt, leak, clip,
+sparse boundary OTAs. These input nodes are held constant                           and drive currents remain live. All reported runs freeze core and
+throughout the evolve phase: they are driven nodes clamped to                       readout families but not shunts. This removes stiff nonlinear
+the input values, not dynamic states integrated by the ODE. The                     feedback while retaining a resistive path, and mirrors the
+two input symbols and their incoming edges in Fig. 3 show this                      sampled inter-layer transfer of an MLP: the driving layer is
+write path schematically. Each input drives a disjoint hidden set,                  fixed while the receiving layer settles. A fully live bounded
+   (a) Mesh:       OTAs           (b) Shared-Sense Comparators +                  Two-Stage     + Vout -
+                                                                                                                           VDD
+                                                                                    CTLE
+                                                  : Resistive Crossbar                                                           ind            ind
+                                                                                              Vout_p   Vout_n
+                                                         R   R
+                                                                                    Stage 1   CTLE Core                          RD             RD
+
+                                                         R   R                                Vin_p    Vin_n            Vout_n                         Vout_p
+
+                                                                                                                         Vin_p                         Vin_n
+                                                                                                                                        RS
+                                                         R   R                                Vout_p   Vout_n
+
+                                                                                    Stage 2   CTLE Core
+         Costly OTAs                KCL at the column:
+                                                                                              Vin_p    Vin_n                            CS
+                                                                                                                             Icurrent           Icurrent
+
+Fig. 4. Readout comparison. (a) Temporal mesh: one OTA per hidden/output                                                   VSS
+                                                                                                + Vin -
+pair (h×d devices). (b) Shared-sense: one sense OTA per hidden node vs.
+Vref ; a passive resistor crossbar W sums sense currents by KCL into leaky     Fig. 5. Differential CTLE stage used in the Spectre runs (the 2-stage link
+accumulators (Cacc , Rleak ), so the summation is current-domain rather than   repeats this stage with the same global knobs). The 7 regressed targets map onto
+a voltage divider (∼ dout fewer OTAs; ≈ 7× at h=25; single-ended toy of        the circuit as: differential-pair width fW , tail bias current, peaking inductor
+the ideal signed map, whose resistive build would use differential columns).   ind, load resistor Rd , degeneration capacitor Cs and resistor Rs , and supply
+                                                                               VDD . The 4 input specs (power, jitter, eye height/width) are measured at the
+                                                                               stage-2 output.
+fabric instead chases a moving, saturating drive and can lose
+gradients.
+                                                                               The clamp ceiling is the searchable gmax ; the core (a, c, α) and
+F. Optional input-conditioned gain: VCA and GLN rails                          per-family mixes are tied across stages.
+   Both auxiliary mechanisms below follow one pattern: a                            c) Circuit implementation.: The shared projection is eval-
+shared input projection, a per-edge tap, and a monotonic gain                  uated once per stage entry; each edge requires one scalar tap,
+that equals 1.0 at initialization and multiplies a single edge                 and the shared bank is amortized across edges. The behavioral
+parameter. Each evaluates once per sample (at stage entry) and                 model captures these gains as multiplicative trims around
+folds into the frozen current, so neither adds per-substep analog              identity, with the Cadence-verified CTLE result using both
+dynamics; shunts are never gated. They are strictly optional:                  paths. Detailed settling, mismatch, noise, and PVT validation
+both stay OFF for the synthetic benchmarks and switch on only                  remain implementation work.
+for the 7-target CTLE task. Together they form dual trims of
+the two OTA degrees of freedom—VCA scales edge currents                        III. P ROPOSED F RAMEWORK FOR H IGH -S PEED DATA -L INK
+via Isat , GLN trims edge transconductances via gm .                                             T RANSCEIVER T UNING
+     a) Voltage-controlled amplifier (VCA): input-gated edge                      The circuit fabric above supplies a circuit-aware compute
+currents.: A zero-initialized shared projection W ∈ Ri×r                       primitive; this section connects it to the transceiver-tuning
+mixes the inputs to inmix ; each edge taps it through a diff-                  problem. The key design choice is to separate supervision from
+pair-style 2σ gate:                                                            deployment: a searched digital teacher supplies stable target
+                                                                               settings during development, while the deployed HR-KNet
+                gvca,e = 2 σ(inmix ve + be ) ∈ (0, 2),                   (7)   student must map measured link specifications to bounded
+which multiplies the full OTA branch current, acting as an                     device controls without a data converter in the modeled for-
+effective saturation current:                                                  ward path. Demonstrating MLP-to-HR-KNet distillation in this
+                                                                               setting establishes a reusable training path: future analog tasks
+                       Isat,eff,e = gvca,e Isat,e .                      (8)   can reuse strong digital teachers instead of training the bounded
+Zero-init (W =0, be =0) forces inmix =0 and hence gain 1.0                     fabric from scratch.
+at epoch 0 (identical to VCA off): nominal tail current until                  A. Digital Teacher: Searched Plain MLP
+training unbalances the array. Separate core buses are optional.
+      b) Gated-linear-network (GLN) rails: input-trimmed                           The CTLE pipeline is anchored by a searched digital teacher:
+transconductances.: The GLN path instead trims gm from the                     a single-head plain MLP mapping 4 specifications (power,
+input, via B = 4 shared tanh rails mixed per edge in log space                 jitter, eye height, eye width) to 7 physical device parameters
+through a factorized tap (rank 2) [15]:                                        (differential pair width fW , bias current, inductance, Rd , Cs ,
+                                                                              Rs , VDD ; see Fig. 5 for where each lands on the CTLE). A
+                  zb = tanh αb (ab · u + cb ) ,              (9)               mixture-of-experts (MoE) MLP (also optimized via Bayesian
+                                                                               Optimization over the same number of trials as HR-KNet) is
+with αb = softplus(rawα,b ) > 0, a ∼ N (0, 0.012 ), c = 0.
+                                                                               kept alongside purely as a digital baseline (Table II), not as a
+Only boundary and readout-sense families are gated (core and
+                                                                               teacher.
+shunts never touched). Since Q = 0 at init, gm,e = gm0,e
+                                                                                   Architecture. The teacher maps 4 CTLE specifications
+exactly with nonzero step-0 gradients (P ̸= 0, a ̸= 0), and
+                                                                               through knet log/min-max scaling into a shared sigmoid-linear-
+          trims its transconductance through its own gain factor
+each edge P
+                                                                               unit (SiLU) trunk (L layers of width W ) followed by a single
+ggln,e = e b We,b zb :
+                                                                              affine head (W → 7); outputs pass through fixed log10 bounds
+            gm,e = clamp gm0,e ggln,e , gmin , gmax .       (10)               into physical parameters.
+   Search. Teacher architectures are optimized with: 20 trials (2                 Direct Dataset Regression               MLP Teacher Distillation
+workers, seed 100) under a 25k-parameter budget, with a 0.25
+penalty on the Bayesian-optimization objective past budget.
+                                                                                    Outputs / Specs                                  Evaluate
+Each trial runs 8 Dataset Aggregation (DAgger) iterations of                                               Model Under Test
+                                                                                                               (KNet)
+100 epochs against frozen upstream flow-teacher labels on the
+                                                                          Calculate Objective                                      Candidate Proposal
+specs, minimizing Huber (robust-regression) loss on the teacher
+                                                                                                                                    Topology:
+labels. The best-validation trial (5% failure rate) is frozen as                                         Bayesian Optimizer
+                                                                                                                                    Solver:
+                                                                                                        (GP Surrogate Model)
+the production teacher that labels the fixed canonical split                                                                        Bounds:
+
+consumed downstream.                                                                                   y
+
+                                                                                      Feedback                                       Propose
+B. Analog Student Training by Teacher Distillation
+                                                                                                      Parameter Task/Network
+   The underlying collection contains 83,344 simulated two-                  Search Configurations     Budget       Type
+stage-CTLE records. The teacher is trained with flow-
+augmented data; downstream comparisons use a fixed 20,000-
+                                                                      Fig. 6. Bayesian-optimization loop: propose topology, solver, and device
+specification canonical set with a 16,000/2,000/2,000 train/val-      settings; train the candidate HR-KNet via distillation or direct targets; return
+idation/test split. A single frozen digital teacher labels each row   loss plus budget penalty. CTLE uses distillation, synthetic benchmarks use
+once, so student trials never touch the simulator, relabel data,      direct regression.
+or refit labels. Both models use identical bounded-logit output
+bounds.                                                               a teacher or directly on regression targets, and returns loss plus
+   Each trial minimizes the distillation loss                         budget penalty. The MLP search tunes depth, learning rate,
+                       1 X
+                           B                                          weight decay, batch size, and activation, keeping the budget
+                                           2
+                L=         s(ub ) − t(ub ) 2 ,                (11)    exact by solving for width. The HR-KNet search jointly tunes
+                      7B
+                          b=1                                         fabric topology (width, depth, connectivity, fan-out), solver
+where s(ub ) and t(ub ) are the student and frozen-teacher logits     horizon, optimizer settings, voltage rails, device bounds, and
+for spec row ub and B is the batch size. The best-by-validation       regularization, sampling the architecture knobs as one feasible
+weights are kept for final scoring.                                   in-budget tuple.
+   Failure follows one fixed forward rule: a design fails when        A. Synthetic Regression Benchmarks
+at least two of the four specifications degrade by ≥ 20% in              Synthetic benchmarks use direct regression: each candidate
+the bad direction—higher power or jitter, lower eye height or         trains 400 fixed epochs with Huber loss on raw targets (no
+width—relative to target. The surrogate rate scores forward-          teacher). Optimization ran under a ≈ 7,000-parameter cap on
+model predictions with this rule; the Cadence rate scores             Friedman1 and Friedman2 (≈ 10,000 for Franke’s function),
+Spectre-simulated specs. The forward surrogate is a zero-             with 50 trials per benchmark. Shared-sense readout and GLN
+inflated-gamma (ZIG) model from device parameters to the              rails stay OFF here. No quantity is tied to SI units or quantized
+four specifications, holding ≈ 8% prediction error per metric         to feasible device levels yet—Ceff , tspan , gm , conductances, and
+on held-out data.                                                     Isat are all continuous—identically for the MLP baselines, so
+   A physics-based failure-rate comparison of teacher and stu-        gaps reflect architecture. The cap binds as an upper bound only:
+dent is computed post-training and never enters the gradients,        the Friedman-2 HR-KNet winner uses just 1,069 parameters yet
+making this a clean distillation baseline. The search wrapper         still beats the 6,763-parameter MLP (optimizing the time span
+uses those metrics only to rank configurations, not to train them.    of operation and VCA parameter). Sparsity pays: the small-
+The student’s ability to match its MLP teacher on the surrogate       world fabric matches MLP expressivity at roughly one-sixth
+metrics confirms that the bounded analog fabric absorbs digital       the parameters. The strongest trees trail both: LightGBM on
+knowledge, opening further applications where a digital model         Friedman-1 (RMSE 0.5395 vs. HR-KNet 0.1406) and Franke
+already exists but analog deployment is preferred for power,          (0.0059 vs. HR-KNet 0.0018), with even the best tree baseline
+area, or converter-less operation.                                    on Friedman-2 at RMSE 8.9546 vs. HR-KNet 1.2718 (Table
+                IV. E XPERIMENTAL R ESULTS                            I). Budget-matched trees trail by wide margins, confirming
+                                                                      these benchmarks reward the smooth nonlinearities both neural
+   We evaluate the complete framework in two stages. First,           fabrics provide. Fig. 7(b)–(d) shows the best-found trajectories:
+matched-budget experiments on standard regression tasks test          despite searching a higher-dimensional space (topology, solver,
+whether the hardware-aware HR-KNet dynamics retain useful             and device bounds for HR-KNet vs. depth, learning rate, weight
+modeling capacity. Second, the programmable-CTLE study                decay, batch size, and activation for the MLP). The extra
+tests the intended system-level outcome: whether the distilled        search dimensions (topology, solver, device bounds) thus pay
+analog controller can produce valid transceiver settings and          for themselves rather than diluting the search.
+open the eye in a held-out Cadence circuit simulation.
+   The same Bayesian-optimization framework (Fig. 6) is used          B. CTLE Inverse Design
+for both stages. It proposes topology, solver, and device set-          The CTLE study searches the same space on a prior-biased
+tings, trains the candidate HR-KNet either via distillation from      manifold under a ≈ 7,000-parameter cap, with 30 trials of 300
+                                                                                                             TABLE II
+                                                                                  D ISTILLATION RESULTS : SURROGATE FAILURE R ATE OVER 2,000
+                                                                               HELD - OUT SPECS ; C ADENCE FAILURE R ATE OVER 200 HELD - OUT SPECS
+
+
+                                                                              Model                   Epochs Params Surrogate FR (%) Cadence FR (%)
+                                                                              MoE MLP                    300         6,820           8.70%               51.00% (0.510)
+                                                                              HR-KNet                    300         5,649           8.15%               40.50% (0.405)
+
+                                                                                          (a) Large Eye-Opening Spec: AC Response      (b) Large Eye-Opening Spec: NRZ Eye
+
+
+
+
+                                                                               Mag(dB))
+                                                                                            (c) Medium Eye-Opening Spec: NRZ Eye       (d) Large Eye-Opening Spec: PAM4 Eye
+
+
+
+
+Fig. 7. BO trajectories (best value vs. trial): (a) CTLE inverse design (30
+trials); (b) Friedman-1, (c) Friedman-2, (d) Franke (50 trials each).
+
+
+                               TABLE I
+   B ENCHMARK RMSE AT MATCHED BUDGETS ( MODELS TRAINED WITH
+ H UBER LOSS ). N EURAL NETS TRAIN 400 FIXED EPOCHS ; TREE BOOSTING           Fig. 8.     Cadence evidence on held-out stage-2 targets: (a) AC re-
+ROUNDS ( DEPTH 6, SEED 0) ARE SET PER PROBLEM SO TOTAL SPLIT NODES            sponse and (b) 56-Gb/s NRZ eye for a wide-eye/low-jitter target; (c) 56-
+         LAND AT OR UNDER THE NEURAL PARAMETER COUNT.                         Gb/s NRZ eye for a lower-power, higher-jitter target; and (d) 28-Gbaud
+                                                                              PAM4 eye for the wide-eye target. All eyes use PN32 LFSR drive over
+      Problem          Model       Rounds/Eps.    Params     RMSE             20 ns (1,120 NRZ UIs or 560 PAM4 symbols). The wide-eye target is
+                                                                              (P, J, H, W ) = (17.64 mW, 9.23%, 59.07%, 90.79%); the lower-power
+                       HR-KNet          400         7,267     0.1406          target is (0.472 mW, 18.20%, 61.45%, 81.83%), where J, H, and W are
+                       MLP              400         6,821     0.1743          percentages of total UI. See Table II for aggregate rates.
+      Friedman-1       LightGBM         120         7,103     0.5395
+                       XGBoost          120         7,298     0.5252
+                       CatBoost         120         7,560     0.5901                                       TABLE III
+                                                                                      P ROGRAMMED CTLE AC METRICS FOR THE HELD - OUT TARGETS IN
+                       HR-KNet          400         1,069    1.2718
+                                                                                                             F IG . 8.
+                       MLP              400         6,763    1.4310
+      Friedman-2       CatBoost         120         7,560    8.9546
+                       LightGBM         120         7,273   10.2043                          Target                             Controller fpeak Gpeak f3dB
+                       XGBoost          120         7,346   11.2684                                                                        (GHz)  (dB) (GHz)
+
+                     HR-KNet            400         8,088     0.0018                         Wide-eye/low-jitter                HR-KNet     33.11        9.56     49.13
+                     MLP                400        9,937      0.0036                                                            MoE MLP     35.96        8.00     54.83
+      Franke’s Func. LightGBM           186        9,396      0.0059                         Lower-power/higher-jitter HR-KNet              25.12      18.89      38.00
+                     CatBoost           160        10,080     0.0144                                                   MoE MLP              28.84      19.64      40.23
+                     XGBoost            160         1,100     0.1020
+
+
+                                                                              81.83% UI width and 18.20% UI jitter. Table III quantifies
+epochs. Unlike the synthetic benchmarks, this task distills the
+                                                                              the distinct programmed responses. On these held-out cases,
+frozen PlainMLP checkpoint of Sec. III-B using the logit mean-
+                                                                              HR-KNet-queried parameters open visibly larger eyes than the
+squared error (MSE) of (11) plus AdamW weight decay; failure
+                                                                              MoE baseline while preserving height and width.
+rate is used only after training to rank trials. This task enables
+the shared-sense readout and gated-linear-network (GLN) rails.                                                          V. C ONCLUSION
+The distilled HR-KNet student outperforms the MoE baseline                       We presented HR-KNet, a hardware-realistic KirchhoffNet
+at matched budgets on both surrogate and Cadence failure                      redesign with a routing-aware Watts–Strogatz analog fabric
+rates (Table II and Fig. 8, with BO trajectory in Fig. 7(a)):                 (k=4, p=0.2), bounded differential OTAs, soft-rail clamping,
+the bounded fabric surpasses a larger digital baseline while                  and sparse boundary fan-out. Joint topology-horizon optimiza-
+compressing the 25k-parameter teacher’s knowledge into ∼5.6k                  tion via a frozen digital teacher enables HR-KNet to match or
+parameters. This distillation chain also compresses infor-                    beat MLPs and tree baselines. On a 4→7 CTLE inverse-design
+mation aggressively: the ∼1M-parameter generative flow                        task, it reduces Cadence-verified failure rates from 51.0% to
+model supervises the 25k-parameter teacher, which in turn                     40.5% while matching eye metrics at fewer parameters. These
+trains the ∼7k-parameter HR-KNet student.                                     results establish a circuit-aware analog-control architecture and
+   Fig. 8 makes the aggregate gap concrete under competing                    a supervise-then-distill framework; layout, noise, and PVT
+specifications: the wide-eye target demands 90.79% UI width                   validation remain necessary before hardware implementation.
+at 9.23% UI jitter, whereas the lower-power target permits
+                               R EFERENCES
+ [1] B. Murmann, “Trends in low-power, digitally assisted A/D conversion,”
+     IEICE Trans. Electron., vol. E93-C, pp. 718–727, 2010, and B. Murmann,
+     “ADC performance survey 1997–2024,” [Online]. Available: https://gith
+     ub.com/bmurmann/ADC-survey.
+ [2] P. Upadhyaya et al., “A 161-mw 56-gb/s ADC-based discrete multitone
+     wireline receiver data-path in 14-nm FinFET,” IEEE J. Solid-State Cir-
+     cuits, vol. 55, no. 1, pp. 38–54, 2020.
+ [3] Y. Krupnik, Y. Perelman et al., “112-gb/s PAM-4 ADC-based SERDES
+     receiver with resonant AFE for long-reach channels,” IEEE J. Solid-State
+     Circuits, vol. 56, no. 4, pp. 1077–1088, 2021.
+ [4] S. Dillavou, M. Stern, A. J. Liu, and D. J. Durian, “Demonstration of
+     decentralized physics-driven learning,” Phys. Rev. Applied, vol. 18, no. 1,
+     p. 014040, 2022.
+ [5] L. Zhang, J. Jie, and L. Mingche, “Adaptive parallel decision deep neural
+     network for high-speed equalization,” Opt. Express, vol. 31, no. 13, pp.
+     22 001–22 011, 2023.
+ [6] S. Zheng, Z. Gao, F.-K. Sun, D. S. Boning, R. Rohrer, B. Yu, and M. D. F.
+     Wong, “KirchhoffNet: End-to-end analog circuit acceleration for ODE-
+     based neural networks,” IEEE Transactions on Computer-Aided Design
+     of Integrated Circuits and Systems, vol. 45, no. 9, pp. 4408–4421, 2026.
+ [7] J. Kendall, R. Pantone, K. Manickavasagam, Y. Bengio, and B. Scellier,
+     “Training end-to-end analog neural networks with equilibrium propaga-
+     tion,” arXiv:2006.01981 [cs.LG], 2020.
+ [8] J. Kendall, “A gradient estimator for time-varying electrical networks with
+     non-linear dissipation,” arXiv:2103.05636, 2021.
+ [9] Z. Gao, F.-K. Sun, R. Rohrer, and D. S. Boning, “KirchhoffNet: A
+     scalable ultra fast analog neural network,” arXiv:2310.15872 [cs.LG],
+     2024.
+[10] R. T. Q. Chen, Y. Rubanova, J. Bettencourt, and D. Duvenaud, “Neu-
+     ral ordinary differential equations,” in Advances in Neural Information
+     Processing Systems, vol. 31, 2018.
+[11] D. J. Watts and S. H. Strogatz, “Collective dynamics of ’small-world’
+     networks,” Nature, vol. 393, no. 6684, pp. 440–442, 1998.
+[12] J. Li, D. Ahsanullah, Z. Gao, and R. Rohrer, “Circuit theory of time
+     domain adjoint sensitivity,” IEEE Trans. Comput.-Aided Design Integr.
+     Circuits Syst., vol. 42, no. 7, pp. 2303–2316, 2023.
+[13] C. A. Desoer and E. S. Kuh, Basic Circuit Theory. New York, NY,
+     USA: McGraw-Hill, 1969.
+[14] F. M. Shakiba and M. Zhou, “Novel analog implementation of a hy-
+     perbolic tangent neuron in artificial neural networks,” IEEE Trans. Ind.
+     Electron., vol. 68, no. 11, pp. 10 856–10 867, 2021.
+[15] Z. Liu, Y. Wang, S. Vaidya, F. Ruehle, J. Halverson, M. Soljačić,
+     T. Y. Hou, and M. Tegmark, “KAN: Kolmogorov-Arnold networks,”
+     arXiv:2404.19756 [cs.LG], 2024.
+

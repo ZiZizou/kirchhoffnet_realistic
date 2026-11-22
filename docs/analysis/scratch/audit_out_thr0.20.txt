@@ -1,0 +1,88 @@
+## RAW PARAMETER STATS (per stage)
+### stage 0
+- core (E=56): gm min 0.07746 | med 0.1268 | max 0.179; Isat min 0.07746 | med 0.1268 | max 0.179; A min 0.6931 | med 0.6931 | max 0.6931; B min 0.6931 | med 0.6931 | max 0.6931; gm*A min 0.05369 | med 0.08788 | max 0.124; gm*B min 0.05369 | med 0.08788 | max 0.124; theta min -0.7313 | med -0.2068 | max 0.7078; |gm*theta| min 0.0008472 | med 0.05597 | max 0.1299; G_shunt min 0.001907 | med 0.003548 | max 0.005839; gate sigma(z) min 0.4935 | med 0.6314 | max 0.7115; small-signal Isat*gm*A min 0.0042 | med 0.01125 | max 0.02243; s=+1 frac 0.50; gate<0.1: 0, gate>0.9: 0; gm at ceiling(>9.9): 0, Isat >9.9: 0, gm<0.1: 10
+- boundary (E=8): gm min 0.07796 | med 0.09978 | max 0.3484; Isat min 0.07797 | med 0.09981 | max 0.3506; A min 0.6854 | med 0.8455 | max 1.425; B min 0.2794 | med 0.8645 | max 1.111; gm*A min 0.05343 | med 0.08453 | max 0.3767; gm*B min 0.06237 | med 0.08174 | max 0.2695; theta min -0.6608 | med -0.09406 | max 0.337; |gm*theta| min 0.001569 | med 0.0136 | max 0.2302; G_shunt min 0.005265 | med 0.006945 | max 0.01975; gate sigma(z) min 0.4815 | med 0.5307 | max 0.8054; small-signal Isat*gm*A min 0.004208 | med 0.008554 | max 0.1334; s=+1 frac 0.50; gate<0.1: 0, gate>0.9: 0; gm at ceiling(>9.9): 0, Isat >9.9: 0, gm<0.1: 4
+- readout(output_ode) (E=98): gm min 0.08163 | med 0.09712 | max 0.1293; Isat min 0.08163 | med 0.09712 | max 0.1294; A min 0.2473 | med 0.7933 | max 1.492; B min 0.4807 | med 0.8239 | max 1.201; gm*A min 0.02855 | med 0.07548 | max 0.1493; gm*B min 0.04872 | med 0.08015 | max 0.1457; theta min -0.3949 | med -0.1595 | max 0.1167; |gm*theta| min 0.005087 | med 0.01617 | max 0.05107; G_shunt min 0.002851 | med 0.004963 | max 0.01485; gate sigma(z) min 0.5085 | med 0.5662 | max 0.6541; small-signal Isat*gm*A min 0.002796 | med 0.007395 | max 0.01865; s=+1 frac 0.18; gate<0.1: 0, gate>0.9: 0; gm at ceiling(>9.9): 0, Isat >9.9: 0, gm<0.1: 61
+- leak (fixed non-programmable): 0.0486; clip softness 0.02, clip_current 0.05, x_max 4.0
+### stage 1
+- core (E=56): gm min 0.08338 | med 0.1347 | max 0.202; Isat min 0.08338 | med 0.1347 | max 0.2025; A min 0.5573 | med 0.9738 | max 2.348; B min 0.4876 | med 0.926 | max 1.431; gm*A min 0.04779 | med 0.1348 | max 0.4741; gm*B min 0.04881 | med 0.1078 | max 0.2795; theta min -0.6141 | med 0.09941 | max 0.5838; |gm*theta| min 0.002267 | med 0.0283 | max 0.1162; G_shunt min 0.001639 | med 0.003859 | max 0.006573; gate sigma(z) min 0.5153 | med 0.6402 | max 0.7314; small-signal Isat*gm*A min 0.004138 | med 0.01823 | max 0.09697; s=+1 frac 0.09; gate<0.1: 0, gate>0.9: 0; gm at ceiling(>9.9): 0, Isat >9.9: 0, gm<0.1: 12
+- boundary (E=8): gm min 0.07796 | med 0.09978 | max 0.3484; Isat min 0.07797 | med 0.09981 | max 0.3506; A min 0.6854 | med 0.8455 | max 1.425; B min 0.2794 | med 0.8645 | max 1.111; gm*A min 0.05343 | med 0.08453 | max 0.3767; gm*B min 0.06237 | med 0.08174 | max 0.2695; theta min -0.6608 | med -0.09406 | max 0.337; |gm*theta| min 0.001569 | med 0.0136 | max 0.2302; G_shunt min 0.005265 | med 0.006945 | max 0.01975; gate sigma(z) min 0.4743 | med 0.5213 | max 0.7856; small-signal Isat*gm*A min 0.004208 | med 0.008554 | max 0.1334; s=+1 frac 0.50; gate<0.1: 0, gate>0.9: 0; gm at ceiling(>9.9): 0, Isat >9.9: 0, gm<0.1: 4
+- readout(output_ode) (E=98): gm min 0.07826 | med 0.09885 | max 0.2315; Isat min 0.07826 | med 0.09885 | max 0.2348; A min 0.2941 | med 0.6581 | max 1.993; B min 0.4715 | med 0.837 | max 1.246; gm*A min 0.02979 | med 0.06554 | max 0.4615; gm*B min 0.05093 | med 0.08162 | max 0.1805; theta min -0.3626 | med -0.1372 | max 0.2316; |gm*theta| min 0.001371 | med 0.01804 | max 0.05841; G_shunt min 0.002422 | med 0.004839 | max 0.02618; gate sigma(z) min 0.4969 | med 0.577 | max 0.7464; small-signal Isat*gm*A min 0.002646 | med 0.006562 | max 0.1094; s=+1 frac 0.18; gate<0.1: 0, gate>0.9: 0; gm at ceiling(>9.9): 0, Isat >9.9: 0, gm<0.1: 52
+- leak (fixed non-programmable): 0.0486; clip softness 0.02, clip_current 0.05, x_max 4.0
+### stage 2
+- core (E=56): gm min 0.07707 | med 0.1174 | max 0.255; Isat min 0.07707 | med 0.1176 | max 0.2957; A min 0.4916 | med 0.9051 | max 1.792; B min 0.3628 | med 0.8259 | max 1.236; gm*A min 0.05022 | med 0.1008 | max 0.4525; gm*B min 0.04042 | med 0.09757 | max 0.2945; theta min -0.1719 | med 0.1108 | max 0.3921; |gm*theta| min 0.0004818 | med 0.01434 | max 0.07678; G_shunt min 0.001797 | med 0.003777 | max 0.006601; gate sigma(z) min 0.4596 | med 0.5848 | max 0.7825; small-signal Isat*gm*A min 0.004467 | med 0.01077 | max 0.1347; s=+1 frac 0.12; gate<0.1: 0, gate>0.9: 0; gm at ceiling(>9.9): 0, Isat >9.9: 0, gm<0.1: 16
+- boundary (E=8): gm min 0.07796 | med 0.09978 | max 0.3484; Isat min 0.07797 | med 0.09981 | max 0.3506; A min 0.6854 | med 0.8455 | max 1.425; B min 0.2794 | med 0.8645 | max 1.111; gm*A min 0.05343 | med 0.08453 | max 0.3767; gm*B min 0.06237 | med 0.08174 | max 0.2695; theta min -0.6608 | med -0.09406 | max 0.337; |gm*theta| min 0.001569 | med 0.0136 | max 0.2302; G_shunt min 0.005265 | med 0.006945 | max 0.01975; gate sigma(z) min 0.4713 | med 0.5157 | max 0.7563; small-signal Isat*gm*A min 0.004208 | med 0.008554 | max 0.1334; s=+1 frac 0.50; gate<0.1: 0, gate>0.9: 0; gm at ceiling(>9.9): 0, Isat >9.9: 0, gm<0.1: 4
+- readout(output_ode) (E=98): gm min 0.06601 | med 0.1026 | max 0.2386; Isat min 0.06598 | med 0.1025 | max 0.2415; A min 0.305 | med 0.6795 | max 1.548; B min 0.4446 | med 0.8498 | max 1.16; gm*A min 0.02014 | med 0.069 | max 0.3594; gm*B min 0.0496 | med 0.08769 | max 0.2164; theta min -0.3409 | med -0.147 | max 0.2258; |gm*theta| min 0.00166 | med 0.01623 | max 0.07543; G_shunt min 0.002407 | med 0.004865 | max 0.01599; gate sigma(z) min 0.4694 | med 0.5939 | max 0.768; small-signal Isat*gm*A min 0.001342 | med 0.007447 | max 0.08765; s=+1 frac 0.20; gate<0.1: 0, gate>0.9: 0; gm at ceiling(>9.9): 0, Isat >9.9: 0, gm<0.1: 45
+- leak (fixed non-programmable): 0.0486; clip softness 0.02, clip_current 0.05, x_max 4.0
+### stage 3
+- core (E=56): gm min 0.07932 | med 0.1253 | max 0.3271; Isat min 0.07932 | med 0.1269 | max 0.3934; A min 0.5406 | med 0.9337 | max 1.517; B min 0.428 | med 0.8408 | max 1.639; gm*A min 0.05319 | med 0.1181 | max 0.344; gm*B min 0.05262 | med 0.0976 | max 0.5361; theta min -0.4367 | med 0.01944 | max 0.7304; |gm*theta| min 0.0001186 | med 0.01292 | max 0.1111; G_shunt min 0.002279 | med 0.004145 | max 0.01271; gate sigma(z) min 0.3926 | med 0.6153 | max 0.8273; small-signal Isat*gm*A min 0.004303 | med 0.01513 | max 0.09173; s=+1 frac 0.07; gate<0.1: 0, gate>0.9: 0; gm at ceiling(>9.9): 0, Isat >9.9: 0, gm<0.1: 15
+- boundary (E=8): gm min 0.07796 | med 0.09978 | max 0.3484; Isat min 0.07797 | med 0.09981 | max 0.3506; A min 0.6854 | med 0.8455 | max 1.425; B min 0.2794 | med 0.8645 | max 1.111; gm*A min 0.05343 | med 0.08453 | max 0.3767; gm*B min 0.06237 | med 0.08174 | max 0.2695; theta min -0.6608 | med -0.09406 | max 0.337; |gm*theta| min 0.001569 | med 0.0136 | max 0.2302; G_shunt min 0.005265 | med 0.006945 | max 0.01975; gate sigma(z) min 0.4751 | med 0.5303 | max 0.8189; small-signal Isat*gm*A min 0.004208 | med 0.008554 | max 0.1334; s=+1 frac 0.50; gate<0.1: 0, gate>0.9: 0; gm at ceiling(>9.9): 0, Isat >9.9: 0, gm<0.1: 4
+- readout(output_ode) (E=98): gm min 0.05878 | med 0.11 | max 0.2404; Isat min 0.05847 | med 0.11 | max 0.2364; A min 0.258 | med 0.669 | max 2.653; B min 0.4348 | med 0.8504 | max 1.294; gm*A min 0.01949 | med 0.07518 | max 0.5264; gm*B min 0.04874 | med 0.09329 | max 0.1869; theta min -0.2995 | med -0.1874 | max 0.2276; |gm*theta| min 0.0004147 | med 0.01858 | max 0.04751; G_shunt min 0.002331 | med 0.004625 | max 0.01872; gate sigma(z) min 0.4027 | med 0.6012 | max 0.7746; small-signal Isat*gm*A min 0.001416 | med 0.008011 | max 0.1225; s=+1 frac 0.19; gate<0.1: 0, gate>0.9: 0; gm at ceiling(>9.9): 0, Isat >9.9: 0, gm<0.1: 30
+- leak (fixed non-programmable): 0.0486; clip softness 0.02, clip_current 0.05, x_max 4.0
+### interstage transfers
+- transfer0: w1 min 0.6191 | med 1.283 | max 1.982; w2 min -0.3805 | med 0.2835 | max 0.9788; w3 min -0.3713 | med -0.1619 | max 0.608; vth min -0.6294 | med -0.198 | max 0.02527
+- transfer1: w1 min 0.9819 | med 1.282 | max 2.07; w2 min -0.0149 | med 0.2766 | max 1.051; w3 min -0.3495 | med -0.1237 | max 0.6605; vth min -0.5612 | med -0.1758 | max -0.05736
+- transfer2: w1 min 0.715 | med 1.34 | max 1.771; w2 min -0.2709 | med 0.3172 | max 0.8615; w3 min -0.2945 | med -0.1168 | max 0.762; vth min -0.3651 | med -0.1402 | max 0.3602
+- post_readout: w1 min 1.106 | med 1.298 | max 1.453; w2 min 0.06089 | med 0.2401 | max 0.3374; w3 min -0.6256 | med -0.006005 | max 0.2456; vth min -0.1093 | med 0 | max 0.1553
+### output_mapper: gain min 1.1 | med 1.374 | max 1.54 | bias min -0.2051 | med -0.0941 | max 0.05582 | tanh_gain min 0.06723 | med 0.2945 | max 0.3701 | relu_gain min -0.3828 | med -0.153 | max 0.3465 | relu_thr min -0.2263 | med -0.1839 | max 0.01808
+### VCA weights: vca_W |max| [1.117, 1.109, 1.246, 0.943] vca_W_core |max| [0.849, 0.941, 1.095, 1.028]
+
+## SCALED INPUT (to net, rail 4): min/med/max per dim ['min -0.8302 | med -0.08189 | max 0.7744', 'min -0.9091 | med 0.6119 | max 0.9075', 'min 0.05414 | med 0.7414 | max 0.8946', 'min -0.002109 | med 0.8435 | max 0.9091']
+
+## NODE VOLTAGES over 256 test rows (x_max=4)
+- stage 0: max|V| hidden 0.353 (p99 0.190), output-ODE nodes 0.162; rows with any |V|>4: 0/256; final-state max|V| 0.353; x0 max|V| 0.000
+- stage 1: max|V| hidden 1.260 (p99 0.717), output-ODE nodes 0.536; rows with any |V|>4: 0/256; final-state max|V| 1.260; x0 max|V| 0.661
+- stage 2: max|V| hidden 3.373 (p99 2.851), output-ODE nodes 1.311; rows with any |V|>4: 0/256; final-state max|V| 3.373; x0 max|V| 2.654
+- stage 3: max|V| hidden 5.348 (p99 4.272), output-ODE nodes 3.156; rows with any |V|>4: 165/256; final-state max|V| 5.348; x0 max|V| 4.940
+- transfer0 (interstage): max|in| 0.353  max|out| 0.661
+- transfer1 (interstage): max|in| 1.260  max|out| 2.654
+- transfer2 (interstage): max|in| 3.373  max|out| 4.940
+- transfer3 (post-readout): max|in| 5.179  max|out| 7.645
+
+## DEVICE OPERATING POINT (|u|=arg of tanh, V at OTA terminals; counts over all Heun calls)
+- s0.core: max|u| 0.13; frac|u|>2 0.000; frac|u|>3 0.000; max|V_term| 0.00; frac V_term>4 0.0000
+- s0.rd: max|u| 0.11; frac|u|>2 0.000; frac|u|>3 0.000; max|V_term| 0.35; frac V_term>4 0.0000
+- s1.core: max|u| 0.39; frac|u|>2 0.000; frac|u|>3 0.000; max|V_term| 0.66; frac V_term>4 0.0000
+- s1.rd: max|u| 0.22; frac|u|>2 0.000; frac|u|>3 0.000; max|V_term| 1.26; frac V_term>4 0.0000
+- s2.core: max|u| 1.27; frac|u|>2 0.000; frac|u|>3 0.000; max|V_term| 2.65; frac V_term>4 0.0000
+- s2.rd: max|u| 0.82; frac|u|>2 0.000; frac|u|>3 0.000; max|V_term| 3.37; frac V_term>4 0.0000
+- s3.bnd: max|u| 0.69; frac|u|>2 0.000; frac|u|>3 0.000; max|V_term| 5.35; frac V_term>4 0.0045
+- s3.core: max|u| 1.98; frac|u|>2 0.000; frac|u|>3 0.000; max|V_term| 4.94; frac V_term>4 0.0214
+- s3.rd: max|u| 0.96; frac|u|>2 0.000; frac|u|>3 0.000; max|V_term| 5.35; frac V_term>4 0.0104
+
+## VCA GAIN 2*sigmoid((u@W)@v.T) over 256 rows
+- stage0 boundary: gain min 0.4147 | med 1 | max 1.796; per-edge swing over inputs (max-min) med 0.437 max 1.381; edges with gain<0.5 or >1.5 anywhere: 4/8
+- stage0 readout: gain min 0.506 | med 1.013 | max 1.705; per-edge swing over inputs (max-min) med 0.636 max 1.200; edges with gain<0.5 or >1.5 anywhere: 17/98
+- stage0 core: gain min 0.2743 | med 1.008 | max 1.932; per-edge swing over inputs (max-min) med 1.096 max 1.658; edges with gain<0.5 or >1.5 anywhere: 46/56
+- stage1 boundary: gain min 0.5994 | med 1.112 | max 1.882; per-edge swing over inputs (max-min) med 0.517 max 1.206; edges with gain<0.5 or >1.5 anywhere: 3/8
+- stage1 readout: gain min 0.01795 | med 1.109 | max 1.961; per-edge swing over inputs (max-min) med 0.610 max 1.498; edges with gain<0.5 or >1.5 anywhere: 49/98
+- stage1 core: gain min 0.2527 | med 1.265 | max 1.996; per-edge swing over inputs (max-min) med 1.055 max 1.743; edges with gain<0.5 or >1.5 anywhere: 45/56
+- stage2 boundary: gain min 0.2756 | med 1.081 | max 1.926; per-edge swing over inputs (max-min) med 0.436 max 1.650; edges with gain<0.5 or >1.5 anywhere: 3/8
+- stage2 readout: gain min 0.1858 | med 1.089 | max 1.916; per-edge swing over inputs (max-min) med 0.639 max 1.624; edges with gain<0.5 or >1.5 anywhere: 38/98
+- stage2 core: gain min 0.01081 | med 1.23 | max 2; per-edge swing over inputs (max-min) med 1.310 max 1.974; edges with gain<0.5 or >1.5 anywhere: 47/56
+- stage3 boundary: gain min 0.6265 | med 1.298 | max 1.983; per-edge swing over inputs (max-min) med 0.361 max 0.909; edges with gain<0.5 or >1.5 anywhere: 3/8
+- stage3 readout: gain min 0.06314 | med 1.366 | max 1.997; per-edge swing over inputs (max-min) med 0.600 max 0.909; edges with gain<0.5 or >1.5 anywhere: 66/98
+- stage3 core: gain min 0.002409 | med 1.022 | max 2; per-edge swing over inputs (max-min) med 1.565 max 1.998; edges with gain<0.5 or >1.5 anywhere: 44/56
+
+## FAILURE RATE (ZIG forward model, test split n=1117)
+- saved masks: teacher 6.8935%, student 9.0421%
+- forward all 1117 rows: 0.5s
+- rebuilt model, 1x Heun: failure 9.0421%; identical to saved student mask on 100.0000% rows; 1x: logit MSE vs saved-student 1.492e-13; vs teacher 1.164e-03; max|dlogit| 3.815e-06; log10-param MAE vs saved-student 0.0000
+
+## SOLVER FIDELITY (same stage t_span=1.75 each, total 7.0; baseline 18 steps/stage)
+- 2x steps (36/stage) n=1117, 1s: logit MSE vs saved-student 1.306e-08; vs teacher 1.165e-03; max|dlogit| 1.721e-03; log10-param MAE vs saved-student 0.0000; vs 1x-Heun: max|dlogit| 1.719e-03, mean 3.716e-05, log10-param MAE 0.0000, max 0.0018; failure 9.0421% (1x 9.0421%); mask flips 0/1117
+- 5x steps (90/stage) n=1117, 2s: logit MSE vs saved-student 1.879e-08; vs teacher 1.165e-03; max|dlogit| 2.207e-03; log10-param MAE vs saved-student 0.0000; vs 1x-Heun: max|dlogit| 2.206e-03, mean 4.485e-05, log10-param MAE 0.0000, max 0.0022; failure 9.1316% (1x 9.0421%); mask flips 1/1117
+- 10x steps (180/stage) n=1117, 4s: logit MSE vs saved-student 1.970e-08; vs teacher 1.165e-03; max|dlogit| 2.270e-03; log10-param MAE vs saved-student 0.0000; vs 1x-Heun: max|dlogit| 2.269e-03, mean 4.599e-05, log10-param MAE 0.0000, max 0.0023; failure 9.1316% (1x 9.0421%); mask flips 1/1117
+- 40x steps (720/stage) n=256, 7s: logit MSE vs saved-student 2.990e-08; vs teacher 3.130e-03; max|dlogit| 2.292e-03; log10-param MAE vs saved-student 0.0000; vs 1x-Heun: max|dlogit| 2.291e-03, mean 5.401e-05, log10-param MAE 0.0000, max 0.0019
+- 0.5x steps (9/stage): vs 1x max|dlogit| 7.215e-03; failure 9.1316%
+
+## ABLATIONS (no retraining); GLN rails: NOT PRESENT in this checkpoint (no gln keys, stage.gln_rails=None)
+- VCA core gain=1: logit MSE vs saved-student 9.712e-02; vs teacher 9.916e-02; max|dlogit| 2.609e+00; log10-param MAE vs saved-student 0.0680; failure 85.8550% (baseline 9.0421%, teacher 6.8935%)
+- VCA boundary gain=1: logit MSE vs saved-student 2.338e-02; vs teacher 2.465e-02; max|dlogit| 2.142e+00; log10-param MAE vs saved-student 0.0156; failure 14.5927% (baseline 9.0421%, teacher 6.8935%)
+- VCA readout gain=1: logit MSE vs saved-student 1.590e-01; vs teacher 1.607e-01; max|dlogit| 3.741e+00; log10-param MAE vs saved-student 0.0680; failure 59.7135% (baseline 9.0421%, teacher 6.8935%)
+- VCA ALL gains=1: logit MSE vs saved-student 3.171e-01; vs teacher 3.196e-01; max|dlogit| 5.023e+00; log10-param MAE vs saved-student 0.1006; failure 99.2838% (baseline 9.0421%, teacher 6.8935%)
+- freeze_read=False (core OTAs live, not sampled at stage entry): logit MSE vs saved-student 1.327e-02; vs teacher 1.424e-02; max|dlogit| 6.618e-01; log10-param MAE vs saved-student 0.0296; failure 26.6786%
+- freeze_read=False, 10x steps (n=256): logit MSE vs saved-student 1.320e-02; vs teacher 1.405e-02; max|dlogit| 6.613e-01; log10-param MAE vs saved-student 0.0296
+- all resistive shunts G->0: logit MSE vs saved-student 3.591e-01; vs teacher 3.604e-01; max|dlogit| 1.860e+00; log10-param MAE vs saved-student 0.1363; failure 69.5613%
+- edges with gate<0.1 hard-pruned: logit MSE vs saved-student 1.492e-13; vs teacher 1.164e-03; max|dlogit| 3.815e-06; log10-param MAE vs saved-student 0.0000; failure 9.0421%
+- all edge gates hardened to {0,1} (>0.5->1): logit MSE vs saved-student 2.731e+00; vs teacher 2.729e+00; max|dlogit| 5.064e+00; log10-param MAE vs saved-student 0.3115; failure 94.2704%

@@ -1,0 +1,255 @@
+
+# ===== CELL 0 STREAM =====
+Collecting torchdeq
+  Downloading torchdeq-0.1.0-py3-none-any.whl.metadata (6.3 kB)
+Requirement already satisfied: numpy in /usr/local/lib/python3.12/dist-packages (2.4.6)
+Requirement already satisfied: matplotlib in /usr/local/lib/python3.12/dist-packages (3.10.0)
+Requirement already satisfied: joblib in /usr/local/lib/python3.12/dist-packages (1.5.3)
+Requirement already satisfied: torch in /usr/local/lib/python3.12/dist-packages (2.10.0+cu128)
+Collecting torchdiffeq
+  Downloading torchdiffeq-0.2.5-py3-none-any.whl.metadata (440 bytes)
+Requirement already satisfied: optuna in /usr/local/lib/python3.12/dist-packages (4.8.0)
+Requirement already satisfied: contourpy>=1.0.1 in /usr/local/lib/python3.12/dist-packages (from matplotlib) (1.3.3)
+Requirement already satisfied: cycler>=0.10 in /usr/local/lib/python3.12/dist-packages (from matplotlib) (0.12.1)
+Requirement already satisfied: fonttools>=4.22.0 in /usr/local/lib/python3.12/dist-packages (from matplotlib) (4.62.1)
+Requirement already satisfied: kiwisolver>=1.3.1 in /usr/local/lib/python3.12/dist-packages (from matplotlib) (1.5.0)
+Requirement already satisfied: packaging>=20.0 in /usr/local/lib/python3.12/dist-packages (from matplotlib) (26.2)
+Requirement already satisfied: pillow>=8 in /usr/local/lib/python3.12/dist-packages (from matplotlib) (11.3.0)
+Requirement already satisfied: pyparsing>=2.3.1 in /usr/local/lib/python3.12/dist-packages (from matplotlib) (3.3.2)
+Requirement already satisfied: python-dateutil>=2.7 in /usr/local/lib/python3.12/dist-packages (from matplotlib) (2.9.0.post0)
+Requirement already satisfied: filelock in /usr/local/lib/python3.12/dist-packages (from torch) (3.25.2)
+Requirement already satisfied: typing-extensions>=4.10.0 in /usr/local/lib/python3.12/dist-packages (from torch) (4.15.0)
+Requirement already satisfied: setuptools in /usr/local/lib/python3.12/dist-packages (from torch) (75.2.0)
+Requirement already satisfied: sympy>=1.13.3 in /usr/local/lib/python3.12/dist-packages (from torch) (1.14.0)
+Requirement already satisfied: networkx>=2.5.1 in /usr/local/lib/python3.12/dist-packages (from torch) (3.6.1)
+Requirement already satisfied: jinja2 in /usr/local/lib/python3.12/dist-packages (from torch) (3.1.6)
+Requirement already satisfied: fsspec>=0.8.5 in /usr/local/lib/python3.12/dist-packages (from torch) (2025.3.0)
+Collecting cuda-bindings==12.9.4 (from torch)
+  Downloading cuda_bindings-12.9.4-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl.metadata (2.6 kB)
+Requirement already satisfied: nvidia-cuda-nvrtc-cu12==12.8.93 in /usr/local/lib/python3.12/dist-packages (from torch) (12.8.93)
+Requirement already satisfied: nvidia-cuda-runtime-cu12==12.8.90 in /usr/local/lib/python3.12/dist-packages (from torch) (12.8.90)
+Requirement already satisfied: nvidia-cuda-cupti-cu12==12.8.90 in /usr/local/lib/python3.12/dist-packages (from torch) (12.8.90)
+Requirement already satisfied: nvidia-cudnn-cu12==9.10.2.21 in /usr/local/lib/python3.12/dist-packages (from torch) (9.10.2.21)
+Requirement already satisfied: nvidia-cublas-cu12==12.8.4.1 in /usr/local/lib/python3.12/dist-packages (from torch) (12.8.4.1)
+Requirement already satisfied: nvidia-cufft-cu12==11.3.3.83 in /usr/local/lib/python3.12/dist-packages (from torch) (11.3.3.83)
+Requirement already satisfied: nvidia-curand-cu12==10.3.9.90 in /usr/local/lib/python3.12/dist-packages (from torch) (10.3.9.90)
+Requirement already satisfied: nvidia-cusolver-cu12==11.7.3.90 in /usr/local/lib/python3.12/dist-packages (from torch) (11.7.3.90)
+Requirement already satisfied: nvidia-cusparse-cu12==12.5.8.93 in /usr/local/lib/python3.12/dist-packages (from torch) (12.5.8.93)
+Requirement already satisfied: nvidia-cusparselt-cu12==0.7.1 in /usr/local/lib/python3.12/dist-packages (from torch) (0.7.1)
+Requirement already satisfied: nvidia-nccl-cu12==2.27.5 in /usr/local/lib/python3.12/dist-packages (from torch) (2.27.5)
+Requirement already satisfied: nvidia-nvshmem-cu12==3.4.5 in /usr/local/lib/python3.12/dist-packages (from torch) (3.4.5)
+Requirement already satisfied: nvidia-nvtx-cu12==12.8.90 in /usr/local/lib/python3.12/dist-packages (from torch) (12.8.90)
+Requirement already satisfied: nvidia-nvjitlink-cu12==12.8.93 in /usr/local/lib/python3.12/dist-packages (from torch) (12.8.93)
+Requirement already satisfied: nvidia-cufile-cu12==1.13.1.3 in /usr/local/lib/python3.12/dist-packages (from torch) (1.13.1.3)
+Requirement already satisfied: triton==3.6.0 in /usr/local/lib/python3.12/dist-packages (from torch) (3.6.0)
+Requirement already satisfied: cuda-pathfinder~=1.1 in /usr/local/lib/python3.12/dist-packages (from cuda-bindings==12.9.4->torch) (1.5.4)
+Requirement already satisfied: scipy>=1.4.0 in /usr/local/lib/python3.12/dist-packages (from torchdiffeq) (1.16.3)
+Requirement already satisfied: alembic>=1.5.0 in /usr/local/lib/python3.12/dist-packages (from optuna) (1.18.4)
+Requirement already satisfied: colorlog in /usr/local/lib/python3.12/dist-packages (from optuna) (6.10.1)
+Requirement already satisfied: sqlalchemy>=1.4.2 in /usr/local/lib/python3.12/dist-packages (from optuna) (2.0.49)
+Requirement already satisfied: tqdm in /usr/local/lib/python3.12/dist-packages (from optuna) (4.67.3)
+Requirement already satisfied: PyYAML in /usr/local/lib/python3.12/dist-packages (from optuna) (6.0.3)
+Requirement already satisfied: Mako in /usr/local/lib/python3.12/dist-packages (from alembic>=1.5.0->optuna) (1.3.10)
+Requirement already satisfied: six>=1.5 in /usr/local/lib/python3.12/dist-packages (from python-dateutil>=2.7->matplotlib) (1.17.0)
+Requirement already satisfied: greenlet>=1 in /usr/local/lib/python3.12/dist-packages (from sqlalchemy>=1.4.2->optuna) (3.4.0)
+Requirement already satisfied: mpmath<1.4,>=1.1.0 in /usr/local/lib/python3.12/dist-packages (from sympy>=1.13.3->torch) (1.3.0)
+Requirement already satisfied: MarkupSafe>=2.0 in /usr/local/lib/python3.12/dist-packages (from jinja2->torch) (3.0.3)
+Downloading torchdeq-0.1.0-py3-none-any.whl (45 kB)
+[2K   [90m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m [32m45.0/45.0 kB[0m [31m593.5 kB/s[0m eta [36m0:00:00[0m
+[?25hDownloading cuda_bindings-12.9.4-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl (12.2 MB)
+[2K   [90m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m [32m12.2/12.2 MB[0m [31m47.7 MB/s[0m eta [36m0:00:00[0m
+[?25hDownloading torchdiffeq-0.2.5-py3-none-any.whl (32 kB)
+Installing collected packages: cuda-bindings, torchdiffeq, torchdeq
+  Attempting uninstall: cuda-bindings
+    Found existing installation: cuda-bindings 13.2.0
+    Uninstalling cuda-bindings-13.2.0:
+      Successfully uninstalled cuda-bindings-13.2.0
+[31mERROR: pip's dependency resolver does not currently take into account all the packages that are installed. This behaviour is the source of the following dependency conflicts.
+dask-cuda 26.2.0 requires cuda-core==0.3.*, but you have cuda-core 1.0.1 which is incompatible.
+dask-cuda 26.2.0 requires numba-cuda<0.23.0,>=0.22.1, but you have numba-cuda 0.30.2 which is incompatible.
+distributed-ucxx-cu12 0.48.0 requires numba-cuda[cu12]<0.23.0,>=0.22.1, but you have numba-cuda 0.30.2 which is incompatible.
+cuml-cu12 26.2.0 requires numba<0.62.0,>=0.60.0, but you have numba 0.65.1 which is incompatible.
+cuml-cu12 26.2.0 requires numba-cuda[cu12]<0.23.0,>=0.22.1, but you have numba-cuda 0.30.2 which is incompatible.
+ucxx-cu12 0.48.0 requires numba-cuda[cu12]<0.23.0,>=0.22.1, but you have numba-cuda 0.30.2 which is incompatible.
+cudf-cu12 26.2.1 requires numba<0.62.0,>=0.60.0, but you have numba 0.65.1 which is incompatible.
+cudf-cu12 26.2.1 requires numba-cuda[cu12]<0.23.0,>=0.22.2, but you have numba-cuda 0.30.2 which is incompatible.[0m[31m
+[0mSuccessfully installed cuda-bindings-12.9.4 torchdeq-0.1.0 torchdiffeq-0.2.5
+
+
+# ===== CELL 2 STREAM =====
+Cloning into 'kirchhoffnet_realistic'...
+
+
+# ===== CELL 4 STREAM =====
+['kirchhoffnet_realistic', '__notebook__.ipynb']
+
+
+# ===== CELL 5 STREAM =====
+Overwriting /kaggle/working/kirchhoffnet_realistic/config.py
+
+
+# ===== CELL 9 STREAM =====
+2026-09-02 05:36:43,021 [INFO] Fixed MLP -> KNet distillation; device=cuda, seed=100
+05:36:43 [INFO] [MLP-TEACHER] Loaded PlainMLP teacher from /kaggle/input/models/awekill/improved-zig-nf-spline/pytorch/default/4/dagger_student_plain.pt: W=48 L=3 act=SiLU LN=False input_preprocessing=knet
+2026-09-02 05:36:44,002 [INFO] Fixed data: train=8928 val=1116 test=1117; teacher labels generated once
+2026-09-02 05:36:44,024 [INFO] Trainable parameters: 6775
+2026-09-02 05:36:44,025 [INFO]   input_mapper         :              0
+  output_mapper        :             35
+  drive_mappers        :              0
+  stage_0:
+    cell_lib:                       392
+    z_logits:                        56
+    u_logits:                        21
+    boundary_cell_lib:                        56
+    boundary_z_logits:                         8
+    output_ode_cell_lib:                       686
+    output_ode_z_logits:                        98
+    vca_W   :                        16
+    vca_v   :                       324
+    ── stage total: 1657
+  stage_1:
+    cell_lib:                       392
+    z_logits:                        56
+    u_logits:                        21
+    boundary_z_logits:                         8
+    output_ode_cell_lib:                       686
+    output_ode_z_logits:                        98
+    vca_W   :                        16
+    vca_v   :                       324
+    ── stage total: 1601
+  stage_2:
+    cell_lib:                       392
+    z_logits:                        56
+    u_logits:                        21
+    boundary_z_logits:                         8
+    output_ode_cell_lib:                       686
+    output_ode_z_logits:                        98
+    vca_W   :                        16
+    vca_v   :                       324
+    ── stage total: 1601
+  stage_3:
+    cell_lib:                       392
+    z_logits:                        56
+    u_logits:                        21
+    boundary_z_logits:                         8
+    output_ode_cell_lib:                       686
+    output_ode_z_logits:                        98
+    vca_W   :                        16
+    vca_v   :                       324
+    ── stage total: 1601
+  ─────────────────────────────────────
+  total:                  6775
+2026-09-02 05:37:25,563 [INFO] epoch    1/110 train_logit_mse=2.7212916 val_logit_mse=2.5984082 val_log_param_mae=1.1551250
+2026-09-02 05:38:01,382 [INFO] epoch    2/110 train_logit_mse=2.5693131 val_logit_mse=2.4017082 val_log_param_mae=1.0608832
+2026-09-02 05:38:37,465 [INFO] epoch    3/110 train_logit_mse=2.3087992 val_logit_mse=2.0736560 val_log_param_mae=0.9056794
+2026-09-02 05:39:12,732 [INFO] epoch    4/110 train_logit_mse=1.8851512 val_logit_mse=1.5396634 val_log_param_mae=0.6358660
+2026-09-02 05:39:48,249 [INFO] epoch    5/110 train_logit_mse=1.2301671 val_logit_mse=0.8110671 val_log_param_mae=0.2627780
+2026-09-02 05:40:23,561 [INFO] epoch    6/110 train_logit_mse=0.5715452 val_logit_mse=0.3756334 val_log_param_mae=0.1262800
+2026-09-02 05:40:58,850 [INFO] epoch    7/110 train_logit_mse=0.3667965 val_logit_mse=0.3485976 val_log_param_mae=0.1112861
+2026-09-02 05:41:34,148 [INFO] epoch    8/110 train_logit_mse=0.3595851 val_logit_mse=0.3446747 val_log_param_mae=0.1095971
+2026-09-02 05:42:09,114 [INFO] epoch    9/110 train_logit_mse=0.3564868 val_logit_mse=0.3422090 val_log_param_mae=0.1099916
+2026-09-02 05:42:44,440 [INFO] epoch   10/110 train_logit_mse=0.3525503 val_logit_mse=0.3379235 val_log_param_mae=0.1097119
+2026-09-02 05:43:19,744 [INFO] epoch   11/110 train_logit_mse=0.3466321 val_logit_mse=0.3315133 val_log_param_mae=0.1094336
+2026-09-02 05:43:55,006 [INFO] epoch   12/110 train_logit_mse=0.3366174 val_logit_mse=0.3190819 val_log_param_mae=0.1074777
+2026-09-02 05:44:30,582 [INFO] epoch   13/110 train_logit_mse=0.3178924 val_logit_mse=0.2969508 val_log_param_mae=0.1028152
+2026-09-02 05:45:05,829 [INFO] epoch   14/110 train_logit_mse=0.2888313 val_logit_mse=0.2653248 val_log_param_mae=0.0987055
+2026-09-02 05:45:41,534 [INFO] epoch   15/110 train_logit_mse=0.2535506 val_logit_mse=0.2270856 val_log_param_mae=0.0922237
+2026-09-02 05:46:16,705 [INFO] epoch   16/110 train_logit_mse=0.2203837 val_logit_mse=0.1972658 val_log_param_mae=0.0870788
+2026-09-02 05:46:51,868 [INFO] epoch   17/110 train_logit_mse=0.1902410 val_logit_mse=0.1680557 val_log_param_mae=0.0781529
+2026-09-02 05:47:26,793 [INFO] epoch   18/110 train_logit_mse=0.1618959 val_logit_mse=0.1435180 val_log_param_mae=0.0717830
+2026-09-02 05:48:02,033 [INFO] epoch   19/110 train_logit_mse=0.1403974 val_logit_mse=0.1261061 val_log_param_mae=0.0666399
+2026-09-02 05:48:37,178 [INFO] epoch   20/110 train_logit_mse=0.1256278 val_logit_mse=0.1145112 val_log_param_mae=0.0632718
+2026-09-02 05:49:12,389 [INFO] epoch   21/110 train_logit_mse=0.1137444 val_logit_mse=0.1038678 val_log_param_mae=0.0591008
+2026-09-02 05:49:47,672 [INFO] epoch   22/110 train_logit_mse=0.0991675 val_logit_mse=0.0870704 val_log_param_mae=0.0528106
+2026-09-02 05:50:22,882 [INFO] epoch   23/110 train_logit_mse=0.0756810 val_logit_mse=0.0616367 val_log_param_mae=0.0453950
+2026-09-02 05:50:58,026 [INFO] epoch   24/110 train_logit_mse=0.0455766 val_logit_mse=0.0329659 val_log_param_mae=0.0427995
+2026-09-02 05:51:33,146 [INFO] epoch   25/110 train_logit_mse=0.0231608 val_logit_mse=0.0184751 val_log_param_mae=0.0413192
+2026-09-02 05:52:08,481 [INFO] epoch   26/110 train_logit_mse=0.0148421 val_logit_mse=0.0143587 val_log_param_mae=0.0349146
+2026-09-02 05:52:43,537 [INFO] epoch   27/110 train_logit_mse=0.0123557 val_logit_mse=0.0124798 val_log_param_mae=0.0324888
+2026-09-02 05:53:18,887 [INFO] epoch   28/110 train_logit_mse=0.0111445 val_logit_mse=0.0112662 val_log_param_mae=0.0287424
+2026-09-02 05:53:54,145 [INFO] epoch   29/110 train_logit_mse=0.0100671 val_logit_mse=0.0104250 val_log_param_mae=0.0266290
+2026-09-02 05:54:29,239 [INFO] epoch   30/110 train_logit_mse=0.0093181 val_logit_mse=0.0097376 val_log_param_mae=0.0261658
+2026-09-02 05:55:04,827 [INFO] epoch   31/110 train_logit_mse=0.0086682 val_logit_mse=0.0090196 val_log_param_mae=0.0246721
+2026-09-02 05:55:40,087 [INFO] epoch   32/110 train_logit_mse=0.0081278 val_logit_mse=0.0084951 val_log_param_mae=0.0237050
+2026-09-02 05:56:15,426 [INFO] epoch   33/110 train_logit_mse=0.0076008 val_logit_mse=0.0079602 val_log_param_mae=0.0230005
+2026-09-02 05:56:50,924 [INFO] epoch   34/110 train_logit_mse=0.0071936 val_logit_mse=0.0075397 val_log_param_mae=0.0221773
+2026-09-02 05:57:26,279 [INFO] epoch   35/110 train_logit_mse=0.0068298 val_logit_mse=0.0071737 val_log_param_mae=0.0216664
+2026-09-02 05:58:01,582 [INFO] epoch   36/110 train_logit_mse=0.0064859 val_logit_mse=0.0068438 val_log_param_mae=0.0211598
+2026-09-02 05:58:37,059 [INFO] epoch   37/110 train_logit_mse=0.0061699 val_logit_mse=0.0065709 val_log_param_mae=0.0208823
+2026-09-02 05:59:12,428 [INFO] epoch   38/110 train_logit_mse=0.0058981 val_logit_mse=0.0062141 val_log_param_mae=0.0201082
+2026-09-02 05:59:47,867 [INFO] epoch   39/110 train_logit_mse=0.0056195 val_logit_mse=0.0059221 val_log_param_mae=0.0201420
+2026-09-02 06:00:23,347 [INFO] epoch   40/110 train_logit_mse=0.0053758 val_logit_mse=0.0056562 val_log_param_mae=0.0192517
+2026-09-02 06:00:58,592 [INFO] epoch   41/110 train_logit_mse=0.0051295 val_logit_mse=0.0055022 val_log_param_mae=0.0190692
+2026-09-02 06:01:34,035 [INFO] epoch   42/110 train_logit_mse=0.0049171 val_logit_mse=0.0052324 val_log_param_mae=0.0187662
+2026-09-02 06:02:09,242 [INFO] epoch   43/110 train_logit_mse=0.0046919 val_logit_mse=0.0049712 val_log_param_mae=0.0181940
+2026-09-02 06:02:44,462 [INFO] epoch   44/110 train_logit_mse=0.0044899 val_logit_mse=0.0048237 val_log_param_mae=0.0182195
+2026-09-02 06:03:19,602 [INFO] epoch   45/110 train_logit_mse=0.0042806 val_logit_mse=0.0045685 val_log_param_mae=0.0176395
+2026-09-02 06:03:54,806 [INFO] epoch   46/110 train_logit_mse=0.0041302 val_logit_mse=0.0044797 val_log_param_mae=0.0176451
+2026-09-02 06:04:29,817 [INFO] epoch   47/110 train_logit_mse=0.0040074 val_logit_mse=0.0042753 val_log_param_mae=0.0176921
+2026-09-02 06:05:04,963 [INFO] epoch   48/110 train_logit_mse=0.0038116 val_logit_mse=0.0041122 val_log_param_mae=0.0175721
+2026-09-02 06:05:40,106 [INFO] epoch   49/110 train_logit_mse=0.0036435 val_logit_mse=0.0039091 val_log_param_mae=0.0170753
+2026-09-02 06:06:15,284 [INFO] epoch   50/110 train_logit_mse=0.0035021 val_logit_mse=0.0037620 val_log_param_mae=0.0164949
+2026-09-02 06:06:50,263 [INFO] epoch   51/110 train_logit_mse=0.0033695 val_logit_mse=0.0036191 val_log_param_mae=0.0164298
+2026-09-02 06:07:25,597 [INFO] epoch   52/110 train_logit_mse=0.0032524 val_logit_mse=0.0034899 val_log_param_mae=0.0162578
+2026-09-02 06:08:00,768 [INFO] epoch   53/110 train_logit_mse=0.0031374 val_logit_mse=0.0033817 val_log_param_mae=0.0160009
+2026-09-02 06:08:36,133 [INFO] epoch   54/110 train_logit_mse=0.0030416 val_logit_mse=0.0033006 val_log_param_mae=0.0157496
+2026-09-02 06:09:11,579 [INFO] epoch   55/110 train_logit_mse=0.0029418 val_logit_mse=0.0031721 val_log_param_mae=0.0154995
+2026-09-02 06:09:46,877 [INFO] epoch   56/110 train_logit_mse=0.0028468 val_logit_mse=0.0030759 val_log_param_mae=0.0152750
+2026-09-02 06:10:22,389 [INFO] epoch   57/110 train_logit_mse=0.0027829 val_logit_mse=0.0029876 val_log_param_mae=0.0150374
+2026-09-02 06:10:57,794 [INFO] epoch   58/110 train_logit_mse=0.0027054 val_logit_mse=0.0029403 val_log_param_mae=0.0149661
+2026-09-02 06:11:33,091 [INFO] epoch   59/110 train_logit_mse=0.0026380 val_logit_mse=0.0028986 val_log_param_mae=0.0149726
+2026-09-02 06:12:08,320 [INFO] epoch   60/110 train_logit_mse=0.0026080 val_logit_mse=0.0027828 val_log_param_mae=0.0145764
+2026-09-02 06:12:43,524 [INFO] epoch   61/110 train_logit_mse=0.0025158 val_logit_mse=0.0027330 val_log_param_mae=0.0143246
+2026-09-02 06:13:18,732 [INFO] epoch   62/110 train_logit_mse=0.0024462 val_logit_mse=0.0026581 val_log_param_mae=0.0141218
+2026-09-02 06:13:54,046 [INFO] epoch   63/110 train_logit_mse=0.0023906 val_logit_mse=0.0026135 val_log_param_mae=0.0141837
+2026-09-02 06:14:29,308 [INFO] epoch   64/110 train_logit_mse=0.0023397 val_logit_mse=0.0025391 val_log_param_mae=0.0138381
+2026-09-02 06:15:04,525 [INFO] epoch   65/110 train_logit_mse=0.0022883 val_logit_mse=0.0025386 val_log_param_mae=0.0137295
+2026-09-02 06:15:39,608 [INFO] epoch   66/110 train_logit_mse=0.0022558 val_logit_mse=0.0025183 val_log_param_mae=0.0139457
+2026-09-02 06:16:14,762 [INFO] epoch   67/110 train_logit_mse=0.0021967 val_logit_mse=0.0023939 val_log_param_mae=0.0132744
+2026-09-02 06:16:50,029 [INFO] epoch   68/110 train_logit_mse=0.0021353 val_logit_mse=0.0023707 val_log_param_mae=0.0131905
+2026-09-02 06:17:25,297 [INFO] epoch   69/110 train_logit_mse=0.0020873 val_logit_mse=0.0023152 val_log_param_mae=0.0130359
+2026-09-02 06:18:00,659 [INFO] epoch   70/110 train_logit_mse=0.0020516 val_logit_mse=0.0022610 val_log_param_mae=0.0128174
+2026-09-02 06:18:36,024 [INFO] epoch   71/110 train_logit_mse=0.0019893 val_logit_mse=0.0021943 val_log_param_mae=0.0126290
+2026-09-02 06:19:11,715 [INFO] epoch   72/110 train_logit_mse=0.0019449 val_logit_mse=0.0021530 val_log_param_mae=0.0125309
+2026-09-02 06:19:47,275 [INFO] epoch   73/110 train_logit_mse=0.0019086 val_logit_mse=0.0021123 val_log_param_mae=0.0123131
+2026-09-02 06:20:22,843 [INFO] epoch   74/110 train_logit_mse=0.0018606 val_logit_mse=0.0020542 val_log_param_mae=0.0122542
+2026-09-02 06:20:58,750 [INFO] epoch   75/110 train_logit_mse=0.0018167 val_logit_mse=0.0020089 val_log_param_mae=0.0119815
+2026-09-02 06:21:34,432 [INFO] epoch   76/110 train_logit_mse=0.0017719 val_logit_mse=0.0019489 val_log_param_mae=0.0119236
+2026-09-02 06:22:09,931 [INFO] epoch   77/110 train_logit_mse=0.0017445 val_logit_mse=0.0019834 val_log_param_mae=0.0120839
+2026-09-02 06:22:45,502 [INFO] epoch   78/110 train_logit_mse=0.0016876 val_logit_mse=0.0018678 val_log_param_mae=0.0114532
+2026-09-02 06:23:21,134 [INFO] epoch   79/110 train_logit_mse=0.0016357 val_logit_mse=0.0018135 val_log_param_mae=0.0112258
+2026-09-02 06:23:56,643 [INFO] epoch   80/110 train_logit_mse=0.0015912 val_logit_mse=0.0018008 val_log_param_mae=0.0113535
+2026-09-02 06:24:32,247 [INFO] epoch   81/110 train_logit_mse=0.0015472 val_logit_mse=0.0017178 val_log_param_mae=0.0110208
+2026-09-02 06:25:07,985 [INFO] epoch   82/110 train_logit_mse=0.0015106 val_logit_mse=0.0016813 val_log_param_mae=0.0108769
+2026-09-02 06:25:43,404 [INFO] epoch   83/110 train_logit_mse=0.0014730 val_logit_mse=0.0016304 val_log_param_mae=0.0106946
+2026-09-02 06:26:19,274 [INFO] epoch   84/110 train_logit_mse=0.0014320 val_logit_mse=0.0015980 val_log_param_mae=0.0105608
+2026-09-02 06:26:55,107 [INFO] epoch   85/110 train_logit_mse=0.0013993 val_logit_mse=0.0015541 val_log_param_mae=0.0105548
+2026-09-02 06:27:30,765 [INFO] epoch   86/110 train_logit_mse=0.0013620 val_logit_mse=0.0014887 val_log_param_mae=0.0102340
+2026-09-02 06:28:05,913 [INFO] epoch   87/110 train_logit_mse=0.0013203 val_logit_mse=0.0014588 val_log_param_mae=0.0101065
+2026-09-02 06:28:41,064 [INFO] epoch   88/110 train_logit_mse=0.0012885 val_logit_mse=0.0014236 val_log_param_mae=0.0101634
+2026-09-02 06:29:16,136 [INFO] epoch   89/110 train_logit_mse=0.0012525 val_logit_mse=0.0013706 val_log_param_mae=0.0099680
+2026-09-02 06:29:51,299 [INFO] epoch   90/110 train_logit_mse=0.0012269 val_logit_mse=0.0014067 val_log_param_mae=0.0153667
+2026-09-02 06:30:26,438 [INFO] epoch   91/110 train_logit_mse=0.0012082 val_logit_mse=0.0013293 val_log_param_mae=0.0130940
+2026-09-02 06:31:01,695 [INFO] epoch   92/110 train_logit_mse=0.0011654 val_logit_mse=0.0012651 val_log_param_mae=0.0110856
+2026-09-02 06:31:37,191 [INFO] epoch   93/110 train_logit_mse=0.0011287 val_logit_mse=0.0012549 val_log_param_mae=0.0114440
+2026-09-02 06:32:12,750 [INFO] epoch   94/110 train_logit_mse=0.0010874 val_logit_mse=0.0011562 val_log_param_mae=0.0093995
+2026-09-02 06:32:48,290 [INFO] epoch   95/110 train_logit_mse=0.0010452 val_logit_mse=0.0011865 val_log_param_mae=0.0113262
+2026-09-02 06:33:23,914 [INFO] epoch   96/110 train_logit_mse=0.0010143 val_logit_mse=0.0011066 val_log_param_mae=0.0090436
+2026-09-02 06:33:59,360 [INFO] epoch   97/110 train_logit_mse=0.0009716 val_logit_mse=0.0010509 val_log_param_mae=0.0089815
+2026-09-02 06:34:34,930 [INFO] epoch   98/110 train_logit_mse=0.0009470 val_logit_mse=0.0010263 val_log_param_mae=0.0088895
+2026-09-02 06:35:10,385 [INFO] epoch   99/110 train_logit_mse=0.0009189 val_logit_mse=0.0009849 val_log_param_mae=0.0086898
+2026-09-02 06:35:45,934 [INFO] epoch  100/110 train_logit_mse=0.0008883 val_logit_mse=0.0009683 val_log_param_mae=0.0085155
+2026-09-02 06:36:21,796 [INFO] epoch  101/110 train_logit_mse=0.0008591 val_logit_mse=0.0009274 val_log_param_mae=0.0083789
+2026-09-02 06:36:57,150 [INFO] epoch  102/110 train_logit_mse=0.0008345 val_logit_mse=0.0008975 val_log_param_mae=0.0082915
+2026-09-02 06:37:32,893 [INFO] epoch  103/110 train_logit_mse=0.0008075 val_logit_mse=0.0008634 val_log_param_mae=0.0083953
+2026-09-02 06:38:08,628 [INFO] epoch  104/110 train_logit_mse=0.0007890 val_logit_mse=0.0008457 val_log_param_mae=0.0081192
+2026-09-02 06:38:44,366 [INFO] epoch  105/110 train_logit_mse=0.0007726 val_logit_mse=0.0008206 val_log_param_mae=0.0080118
+2026-09-02 06:39:20,452 [INFO] epoch  106/110 train_logit_mse=0.0007467 val_logit_mse=0.0007970 val_log_param_mae=0.0079032
+2026-09-02 06:39:56,263 [INFO] epoch  107/110 train_logit_mse=0.0007303 val_logit_mse=0.0007822 val_log_param_mae=0.0078382
+2026-09-02 06:40:31,903 [INFO] epoch  108/110 train_logit_mse=0.0007131 val_logit_mse=0.0007770 val_log_param_mae=0.0078583
+2026-09-02 06:41:07,643 [INFO] epoch  109/110 train_logit_mse=0.0006947 val_logit_mse=0.0007403 val_log_param_mae=0.0076626
+2026-09-02 06:41:43,478 [INFO] epoch  110/110 train_logit_mse=0.0006804 val_logit_mse=0.0007298 val_log_param_mae=0.0077183
+06:41:49 [INFO] [MLP-TEACHER] Loaded PlainMLP teacher from /kaggle/input/models/awekill/improved-zig-nf-spline/pytorch/default/4/dagger_student_plain.pt: W=48 L=3 act=SiLU LN=False input_preprocessing=knet
+2026-09-02 06:41:50,224 [INFO] Best frozen-teacher agreement: val={'logit_mse': 0.0007297580845222922, 'log_param_mae': 0.007718305006676677} test={'logit_mse': 0.001164460413930727, 'log_param_mae': 0.007564424172525958}
+2026-09-02 06:41:50,224 [INFO] ZIG isolation verdict: PASS | teacher failure=6.89% student failure=9.04% gap=2.15 pp (tolerance 3.00 pp)
+

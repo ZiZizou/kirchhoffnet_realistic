@@ -10,7 +10,6 @@ from export.netlist_interp import simulate
 ROOT = Path(__file__).resolve().parents[1]
 CKPT = ROOT / "assets/baselines/paper_trial_0011/phase_a_best.pt"
 
-@pytest.mark.slow
 def test_paper_legacy_interpreter_matches_forward(tmp_path):
     model=load_paper_checkpoint(CKPT,dtype=torch.float64)
     spec=torch.tensor([[0.6,0.8,1.0,1.2],[1.2,0.9,0.7,1.1]],dtype=torch.float64)

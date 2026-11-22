@@ -28,6 +28,8 @@ from config import (
 from cell_library import (
     FreeTanhLibrary,
 )
+from gating.gln import gln_gm_override
+from gating.vca import vca_edge_gain
 
 
 __all__ = ["DifferentialStage"]
@@ -619,49 +621,51 @@ output_ode_src: list[int] | None = None,
             return F.softplus(self.raw_leak)
         return torch.full((num_nodes,), self.leak_constant, dtype=torch.float32)
 
-    def _compute_vca_gate(
-        self,
-        u: torch.Tensor,
-        v_e: torch.Tensor,
-        bias: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Low-rank VCA gate for one edge set.
+    def edge_gain(self, family: str, u: torch.Tensor | None) -> torch.Tensor | None:
+        """VCA interface: per-edge gain ``2*sigmoid((u @ W) @ v_e.T [+ b])`` ``[B, E]``.
 
-        Computes ``2 * sigma( (u @ W) @ v_e.T )`` of shape ``[batch, E]``
-        where ``W`` is the shared input projection ``(in_dim, rank)``,
-        ``v_e`` is the per-edge embedding ``(E, rank)``, and ``u`` is the
-        input feature batch ``(batch, in_dim)``.
-
-        The 2-sigma gain range puts the identity (``gate = 1.0``) at the
-        center of the dynamic range, so the optimizer can amplify or
-        attenuate edge currents symmetrically. With ``vca_W`` zero-init
-        (identity-at-init contract), ``u @ W = 0`` so the gate is
-        exactly ``1.0`` at epoch 0 regardless of ``v_e``.
-
-        Caller is responsible for ensuring ``vca_enabled=True``,
-        ``u`` is not None and has the expected in_dim, and that the
-        shared projection ``self.vca_W`` and per-edge ``v_e`` have been
-        built (consistent shapes).
+        ``family`` is ``"core"`` (uses ``vca_W_core`` when the separate core bus is on),
+        ``"boundary"`` or ``"readout"`` (temporal-readout mesh or shared-sense OTAs).
+        Returns ``None`` when VCA does not gate the family (or ``u`` is absent), so
+        callers do ``if g is not None: i = i * g``. The gain is exactly 1 at init
+        (``vca_W`` is zero-initialised).
         """
-        u_proj = u @ self.vca_W              # [batch, rank]
-        vca_logits = u_proj @ v_e.T          # [batch, E]
-        if bias is not None:
-            vca_logits = vca_logits + bias
-        return 2.0 * torch.sigmoid(vca_logits)
+        if not self.vca_enabled or u is None:
+            return None
+        if family == "core":
+            if not self._vca_core_enabled or self.vca_v_core is None:
+                return None
+            W = self.vca_W_core if self.vca_separate_core_bus else self.vca_W
+            return vca_edge_gain(u, W, self.vca_v_core, self.vca_b_core)
+        if family == "boundary":
+            v_e, bias = self.vca_v_boundary, self.vca_b_boundary
+        elif family == "readout":
+            v_e, bias = self.vca_v_readout, self.vca_b_readout
+        else:
+            raise ValueError(f"edge_gain: unknown family {family!r}")
+        if v_e is None:
+            return None
+        return vca_edge_gain(u, self.vca_W, v_e, bias)
 
-    def _compute_core_gate(self, u: torch.Tensor) -> torch.Tensor:
-        """Core VCA gate ``2 * sigma((u @ W_bus) @ v_c.T)``, shape ``[batch, E_core]``.
+    def _gln_rails_z(self, u: torch.Tensor | None) -> torch.Tensor | None:
+        """GLN rail activations ``[B, n_rails]`` for input ``u`` (``None`` when GLN is off)."""
+        rails = getattr(self, "gln_rails", None)
+        if rails is None or u is None:
+            return None
+        return rails.rails(u)
 
-        Uses ``vca_W_core`` when the separate-core-bus ablation is active,
-        otherwise the shared ``vca_W``. Caller ensures ``vca_enabled=True``,
-        ``self._vca_core_enabled=True`` and ``u`` is not None.
-        """
-        W = self.vca_W_core if self.vca_separate_core_bus else self.vca_W
-        u_proj = u @ W                       # [batch, rank]
-        vca_logits = u_proj @ self.vca_v_core.T  # [batch, E_core]
-        if self.vca_b_core is not None:
-            vca_logits = vca_logits + self.vca_b_core
-        return 2.0 * torch.sigmoid(vca_logits)
+    def edge_gm_scale(self, family: str, cell_lib, gln_z: torch.Tensor | None) -> torch.Tensor | None:
+        """GLN interface: input-conditioned gm ``[B, E]`` for ``family`` (``"boundary"`` or
+        ``"readout"``), or ``None`` when GLN does not gate it (use the cell's static gm)."""
+        return gln_gm_override(getattr(self, "gln_rails", None), family, cell_lib, gln_z)
+
+    def _ota_current(self, cell_lib, x_src, x_dst, gm) -> torch.Tensor:
+        """Full OTA current (tanh + resistive shunt); GLN gm enters inside the tanh only."""
+        if gm is None:
+            return cell_lib(x_src=x_src, x_dst=x_dst, x_max=self.x_max)
+        return cell_lib.forward_tanh(
+            x_src=x_src, x_dst=x_dst, x_max=self.x_max, gm_override=gm,
+        ) + cell_lib.resistive_current(x_src, x_dst)
 
     def _compute_frozen_boundary(self, u: torch.Tensor, x0: torch.Tensor) -> torch.Tensor | None:
         """Precompute the frozen boundary-fan-out tanh KCL contribution.
@@ -685,15 +689,11 @@ output_ode_src: list[int] | None = None,
         u_src0 = u[:, self.boundary_src]
         x_dst0 = x0[:, self.boundary_dst]
         cell_lib = self.boundary_cell_lib
-        gln_rails = getattr(self, "gln_rails", None)
-        if gln_rails is not None and "boundary" in gln_rails.families:
-            # GLN (F2): fold the input-conditioned gm modulation into the
-            # frozen tensor exactly like the dynamic path (tanh with
-            # modulated gm; resistive shunt stays dynamic in rhs). Rails are
-            # computed once here (u is constant for the whole stage entry).
-            gm0_b = cell_lib.current_gm()
-            gln_z = gln_rails.rails(u)
-            gm_b = gln_rails.modulate_gm_z(gm0_b, gln_z, "boundary")
+        # GLN (F2): fold the input-conditioned gm modulation into the frozen
+        # tensor exactly like the dynamic path (tanh with modulated gm;
+        # resistive shunt stays dynamic in rhs).
+        gm_b = self.edge_gm_scale("boundary", cell_lib, self._gln_rails_z(u))
+        if gm_b is not None:
             i_edge = cell_lib.forward_tanh(
                 x_src=u_src0, x_dst=x_dst0, x_max=self.x_max,
                 gm_override=gm_b,
@@ -708,8 +708,9 @@ output_ode_src: list[int] | None = None,
             )
         b_mask = torch.sigmoid(self.boundary_z_logits)  # [Eb]
         i_edge = i_edge * b_mask.unsqueeze(0)
-        if self.vca_enabled and self.vca_v_boundary is not None:
-            i_edge = i_edge * self._compute_vca_gate(u, self.vca_v_boundary, self.vca_b_boundary)
+        _g = self.edge_gain("boundary", u)
+        if _g is not None:
+            i_edge = i_edge * _g
         acc_b = torch.zeros_like(x0, dtype=torch.float32)
         acc_b.index_add_(1, self.boundary_dst, i_edge.float())
         return acc_b.to(dtype=x0.dtype)
@@ -754,8 +755,9 @@ output_ode_src: list[int] | None = None,
             )
         o_mask = torch.sigmoid(self.output_ode_z_logits)  # [Eo]
         i_edge = i_edge * o_mask.unsqueeze(0)
-        if self.vca_enabled and self.vca_v_readout is not None and u is not None:
-            i_edge = i_edge * self._compute_vca_gate(u, self.vca_v_readout, self.vca_b_readout)
+        _g = self.edge_gain("readout", u)
+        if _g is not None:
+            i_edge = i_edge * _g
         acc_o = torch.zeros_like(x0, dtype=torch.float32)
         acc_o.index_add_(1, self.output_ode_dst, i_edge.float())
         return acc_o.to(dtype=x0.dtype)
@@ -788,14 +790,10 @@ output_ode_src: list[int] | None = None,
         # FreeTanh ``x_dst`` argument so the cell is reused exactly.
         vref = torch.sigmoid(self.raw_vref_sense) * self.x_max
         x_dst0 = vref.to(x0.dtype).view(1, 1).expand_as(x_src0)
-        gln_rails = getattr(self, "gln_rails", None)
-        if gln_rails is not None and u is not None and "readout" in gln_rails.families:
-            # GLN (F2): fold the input-conditioned sense-gm modulation into
-            # the frozen per-sense currents (crossbar W stays untouched).
-            # Rails computed once (u constant per stage entry).
-            gm0_s = cell_lib.current_gm()
-            gln_z = gln_rails.rails(u)
-            gm_s = gln_rails.modulate_gm_z(gm0_s, gln_z, "readout")
+        # GLN (F2): fold the input-conditioned sense-gm modulation into the
+        # frozen per-sense currents (crossbar W stays untouched).
+        gm_s = self.edge_gm_scale("readout", cell_lib, self._gln_rails_z(u))
+        if gm_s is not None:
             i_edge = cell_lib.forward_tanh(
                 x_src=x_src0, x_dst=x_dst0, x_max=self.x_max,
                 gm_override=gm_s,
@@ -810,10 +808,9 @@ output_ode_src: list[int] | None = None,
             )
         sense_mask = torch.sigmoid(self.readout_sense_z_logits)  # [n_sense]
         i_edge = i_edge * sense_mask.unsqueeze(0)
-        if self.vca_enabled and self.vca_v_readout is not None and u is not None:
-            i_edge = i_edge * self._compute_vca_gate(
-                u, self.vca_v_readout, self.vca_b_readout,
-            )
+        _g = self.edge_gain("readout", u)
+        if _g is not None:
+            i_edge = i_edge * _g
         return i_edge.to(dtype=x0.dtype)  # [B, n_sense]
 
     def _compute_i_edge_const(
@@ -949,10 +946,7 @@ output_ode_src: list[int] | None = None,
         # them for every gated family below. GLN modulates gm *inside* the
         # tanh argument; VCA (when on) multiplies the resulting current
         # *outside*, so both compose without double-applying.
-        gln_z = None
-        gln_rails = getattr(self, "gln_rails", None)
-        if gln_rails is not None and u is not None:
-            gln_z = gln_rails.rails(u)  # [B, n_rails]
+        gln_z = self._gln_rails_z(u)  # [B, n_rails] or None
 
         # Edge gate: multiply each edge's current by its gate. Computed once
         # here and reused for both the tanh current and the resistive shunt
@@ -1025,26 +1019,14 @@ output_ode_src: list[int] | None = None,
                 # Dynamic path: full cell forward (tanh + resistive shunt).
                 # GLN (F2): modulate the family's gm with the shared rails
                 # (gm inside tanh arg); the resistive shunt is never gated.
-                if gln_z is not None and "boundary" in gln_rails.families:
-                    gm0_b = self.boundary_cell_lib.current_gm()        # [Eb]
-                    gm_b = gln_rails.modulate_gm_z(
-                        gm0_b, gln_z, "boundary",
-                    )                                                  # [B, Eb]
-                    i_boundary = self.boundary_cell_lib.forward_tanh(
-                        x_src=u_src, x_dst=x_dst_b, x_max=self.x_max,
-                        gm_override=gm_b,
-                    ) + self.boundary_cell_lib.resistive_current(
-                        u_src, x_dst_b,
-                    )
-                else:
-                    i_boundary = self.boundary_cell_lib(
-                        x_src=u_src, x_dst=x_dst_b, x_max=self.x_max,
-                    )
+                i_boundary = self._ota_current(
+                    self.boundary_cell_lib, u_src, x_dst_b,
+                    self.edge_gm_scale("boundary", self.boundary_cell_lib, gln_z),
+                )
                 i_boundary = i_boundary * boundary_mask.unsqueeze(0)   # [B, Eb]
-                if self.vca_enabled and self.vca_v_boundary is not None:
-                    i_boundary = i_boundary * self._compute_vca_gate(
-                        u, self.vca_v_boundary, self.vca_b_boundary,
-                    )  # [B, Eb]
+                _g = self.edge_gain("boundary", u)
+                if _g is not None:
+                    i_boundary = i_boundary * _g
                 i_boundary_f32 = i_boundary.float()
                 # Clone when freeze_read is active so we don't mutate the shared
                 # ``acc`` (= i_edge_const) tensor.
@@ -1068,10 +1050,9 @@ output_ode_src: list[int] | None = None,
                         u_src, x_dst_b,
                     )  # [B, Eb]
                     i_res_b = i_res_b * boundary_mask.unsqueeze(0)
-                    if self.vca_enabled and self.vca_v_boundary is not None:
-                        i_res_b = i_res_b * self._compute_vca_gate(
-                            u, self.vca_v_boundary, self.vca_b_boundary,
-                        )  # [B, Eb]
+                    _g = self.edge_gain("boundary", u)
+                    if _g is not None:
+                        i_res_b = i_res_b * _g
                     acc_b_res = torch.zeros_like(x, dtype=torch.float32)
                     acc_b_res.index_add_(1, self.boundary_dst, i_res_b.float())
                     # NOTE: no source drain — boundary terminals are fixed.
@@ -1093,10 +1074,9 @@ output_ode_src: list[int] | None = None,
                     x_src=x_src_o, x_dst=x_dst_o, x_max=self.x_max,
                 )
                 i_out = i_out * out_mask.unsqueeze(0)  # [B, Eo]
-                if self.vca_enabled and self.vca_v_readout is not None and u is not None:
-                    i_out = i_out * self._compute_vca_gate(
-                        u, self.vca_v_readout, self.vca_b_readout,
-                    )  # [B, Eo]
+                _g = self.edge_gain("readout", u)
+                if _g is not None:
+                    i_out = i_out * _g
                 i_out_f32 = i_out.float()
                 if i_edge_const is not None:
                     acc = acc.clone()
@@ -1118,10 +1098,9 @@ output_ode_src: list[int] | None = None,
                         x_src_o, x_dst_o,
                     )  # [B, Eo]
                     i_res_o = i_res_o * out_mask.unsqueeze(0)
-                    if self.vca_enabled and self.vca_v_readout is not None and u is not None:
-                        i_res_o = i_res_o * self._compute_vca_gate(
-                            u, self.vca_v_readout, self.vca_b_readout,
-                        )  # [B, Eo]
+                    _g = self.edge_gain("readout", u)
+                    if _g is not None:
+                        i_res_o = i_res_o * _g
                     acc_out_res = torch.zeros_like(x, dtype=torch.float32)
                     acc_out_res.index_add_(1, self.output_ode_dst, i_res_o.float())
                     # NOTE: no source drain on output_ode_src.
@@ -1146,26 +1125,14 @@ output_ode_src: list[int] | None = None,
                 # Dynamic path: full cell forward (tanh + resistive shunt).
                 # GLN (F2): modulate the sense OTA gm with the shared rails
                 # (one gm per sense; the crossbar W is never touched by GLN).
-                if gln_z is not None and "readout" in gln_rails.families:
-                    gm0_s = self.readout_sense_cell_lib.current_gm()  # [n_sense]
-                    gm_s = gln_rails.modulate_gm_z(
-                        gm0_s, gln_z, "readout",
-                    )                                                  # [B, n_sense]
-                    i_s = self.readout_sense_cell_lib.forward_tanh(
-                        x_src=x_j, x_dst=x_dst_s, x_max=self.x_max,
-                        gm_override=gm_s,
-                    ) + self.readout_sense_cell_lib.resistive_current(
-                        x_j, x_dst_s,
-                    )
-                else:
-                    i_s = self.readout_sense_cell_lib(
-                        x_src=x_j, x_dst=x_dst_s, x_max=self.x_max,
-                    )
+                i_s = self._ota_current(
+                    self.readout_sense_cell_lib, x_j, x_dst_s,
+                    self.edge_gm_scale("readout", self.readout_sense_cell_lib, gln_z),
+                )
                 i_s = i_s * sense_mask.unsqueeze(0)        # [B, n_sense]
-                if self.vca_enabled and self.vca_v_readout is not None and u is not None:
-                    i_s = i_s * self._compute_vca_gate(
-                        u, self.vca_v_readout, self.vca_b_readout,
-                    )  # [B, n_sense]
+                _g = self.edge_gain("readout", u)
+                if _g is not None:
+                    i_s = i_s * _g
             else:
                 # Frozen-tanh path (freeze_temporal_read=True): the tanh cell
                 # contribution (sense gate + VCA gate already folded in at
@@ -1187,10 +1154,9 @@ output_ode_src: list[int] | None = None,
             if i_readout_const is not None and self._sense_has_resistive:
                 i_res_s = self.readout_sense_cell_lib.resistive_current(x_j, x_dst_s)
                 i_res_s = i_res_s * sense_mask.unsqueeze(0)
-                if self.vca_enabled and self.vca_v_readout is not None and u is not None:
-                    i_res_s = i_res_s * self._compute_vca_gate(
-                        u, self.vca_v_readout, self.vca_b_readout,
-                    )  # [B, n_sense]
+                _g = self.edge_gain("readout", u)
+                if _g is not None:
+                    i_res_s = i_res_s * _g
                 i_res_acc = (i_res_s.float() @ W.float().T)  # [B, d_out]
                 acc_f32 = acc.float()
                 acc_f32[:, dst_slice] = (
@@ -1253,9 +1219,7 @@ output_ode_src: list[int] | None = None,
         # per sample). Hoisted out of the Heun loop to avoid recomputing
         # the matmul per substep (zero extra cost in the freeze_read path
         # — gate folds into i_edge_const).
-        gate_core_cached = None
-        if self._vca_core_enabled and u is not None and self.vca_v_core is not None:
-            gate_core_cached = self._compute_core_gate(u)
+        gate_core_cached = self.edge_gain("core", u)
         # Diagnostic attribute (not read inside compiled rhs — rhs
         # receives the gate via the explicit kwarg below).
         self._gate_core_cached = gate_core_cached

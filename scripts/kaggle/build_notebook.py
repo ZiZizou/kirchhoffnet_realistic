@@ -17,7 +17,7 @@ RUNG = os.getenv("KNB_RUNG", "R0")
 EPOCHS = int(os.getenv("KNB_EPOCHS", "300"))
 SEED = int(os.getenv("KNB_SEED", "100"))
 LR = float(os.getenv("KNB_LR", "0.007069359" if RUNG == "R0" else "0.03"))
-STEPS_PER_STAGE = int(os.getenv("KNB_STEPS_PER_STAGE", "24"))  # 4x paper six-step setting on HW rungs
+STEPS_PER_STAGE = int(os.getenv("KNB_STEPS_PER_STAGE", "40"))  # 4x paper's 10 steps/stage on HW rungs
 DATA_ROOT = os.getenv("KNB_DATA_ROOT", "/kaggle/input")
 OUT_DIR = os.getenv("KNB_OUT_DIR", "/kaggle/working/out")
 RESUME = os.getenv("KNB_RESUME", "")

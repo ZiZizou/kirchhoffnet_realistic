@@ -25,6 +25,7 @@ import torch.nn as nn
 
 from config import PRESETS, VCA
 from differential_stage import DifferentialStage
+from hw.constraints import MISMATCH_SEED, MismatchState
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle
     from hw import HWConfig
 
@@ -910,6 +911,8 @@ def prune_stage(
             isat_max=old.isat_max,
             bias_enabled=old._bias_enabled,
             hw=getattr(stage, "hw", None),
+            mismatch=getattr(old, "mismatch", None),
+            family=getattr(old, "family", "core"),
         )
     else:
         new_lib = stage.cell_lib
@@ -1047,6 +1050,7 @@ def prune_network(
         transfers=new_transfers,
         stage_times=list(net.stage_times),
         stage_steps=list(net.stage_steps),
+        mismatch=getattr(net, "mismatch", None),
     ), stage_remaps
 
 
@@ -1134,6 +1138,7 @@ def topology_to_stage(
     vca_separate_core_bus: bool = False,
     vca_bias: bool | None = None,
     hw: "HWConfig | None" = None,
+    mismatch=None,
 ) -> tuple[DifferentialStage, list[int], dict[int, int]]:
     """Convert a SparseTopology into a DifferentialStage.
 
@@ -1226,6 +1231,8 @@ def topology_to_stage(
             isat_max=cell_lib.isat_max,
             bias_enabled=cell_lib._bias_enabled,
             hw=hw,
+            mismatch=mismatch,
+            family="core",
         )
 
     # Shared-sense readout: clone the template sense cell library per stage
@@ -1249,6 +1256,8 @@ def topology_to_stage(
                 isat_max=readout_sense_cell_lib.isat_max,
                 bias_enabled=readout_sense_cell_lib._bias_enabled,
                 hw=hw,
+                mismatch=mismatch,
+                family="sense",
             )
             if int(readout_senses_per_node) == 2:
                 # Interleaved layout: odd-indexed cells are sense k=1 of
@@ -1275,6 +1284,8 @@ def topology_to_stage(
                 isat_max=cell_lib.isat_max,
                 bias_enabled=cell_lib._bias_enabled,
                 hw=hw,
+                mismatch=mismatch,
+                family="output_ode",
             )
 
     stage = DifferentialStage(
@@ -1594,6 +1605,15 @@ def build_net_from_config(
     ``grouped_readout``.
 
     """
+    # 3.9 mismatch: ONE draw state for the whole network (the physical fabric
+    # is shared by the stages, so the same slot gets the same epsilon in every
+    # stage).  ``new_batch()`` is called by KirchhoffNet.forward -> one fresh
+    # set of draws per batch.
+    mismatch = None
+    if hw is not None and hw.constraints.mismatch_active():
+        mismatch = MismatchState(hw.constraints.hw_mismatch_sigma,
+                                 eval_on=hw.constraints.hw_mismatch_eval,
+                                 seed=MISMATCH_SEED)
     if leak_mode is None:
         leak_mode = cfg.get("leak_mode", "programmable")
     if leak_constant is None:
@@ -1743,6 +1763,8 @@ def build_net_from_config(
                 isat_max=cell_lib.isat_max,
                 bias_enabled=cell_lib._bias_enabled,
                 hw=hw,
+                mismatch=mismatch,
+                family="boundary",
             )
         else:
             raise ValueError(
@@ -1785,7 +1807,7 @@ def build_net_from_config(
     # Local helper: fresh cell library of the same concrete type/config as
     # the core ``cell_lib``, sized ``n`` (identical to the boundary/
     # output_ode clone ladders used elsewhere in this function).
-    def _readout_lib_clone(n: int):
+    def _readout_lib_clone(n: int, family: str):
         if isinstance(cell_lib, FreeTanhLibrary):
             return FreeTanhLibrary(
                 num_edges=n,
@@ -1793,6 +1815,8 @@ def build_net_from_config(
                 isat_min=cell_lib.isat_min, isat_max=cell_lib.isat_max,
                 bias_enabled=cell_lib._bias_enabled,
                 hw=hw,
+                mismatch=mismatch,
+                family=family,
             )
         raise ValueError(
             f"build_net_from_config: unsupported cell_lib type for "
@@ -1843,7 +1867,7 @@ def build_net_from_config(
                 int(out_dim), s * n_first_hid,
             )
             readout_sense_cell_lib = _readout_lib_clone(
-                s * n_first_hid
+                s * n_first_hid, "sense"
             )
         else:
             # ota_mesh (legacy temporal readout): ``out_dim`` output ODE
@@ -1863,7 +1887,9 @@ def build_net_from_config(
             # Fresh cell library for the mesh readout edges. Same
             # type/config as the core cell_lib so readout OTAs behave
             # identically to core edges.
-            output_ode_cell_lib = _readout_lib_clone(len(output_ode_src))
+            output_ode_cell_lib = _readout_lib_clone(
+                len(output_ode_src), "output_ode"
+            )
 
     # Resolve write_idx and input mapper.
     fan_out_map = None
@@ -2003,6 +2029,7 @@ def build_net_from_config(
             _b_src, _b_dst, _b_lib = None, None, None
         stage, active_nodes, id_map = topology_to_stage(
             topo, cell_lib=cell_lib,
+            mismatch=mismatch,
             leak_mode=leak_mode, leak_constant=leak_constant,
             read_only_source=read_only_source,
             freeze_read=freeze_read,
@@ -2066,6 +2093,7 @@ def build_net_from_config(
         transfers=transfers,
         stage_times=stage_times,
         stage_steps=stage_steps,
+        mismatch=mismatch,
     )
 
     grouped_cfg = cfg.get("grouped_readout")

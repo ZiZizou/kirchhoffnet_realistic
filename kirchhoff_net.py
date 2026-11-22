@@ -92,6 +92,7 @@ class KirchhoffNet(nn.Module):
         transfers: list[StageTransfer],
         stage_times: list[float],
         stage_steps: list[int],
+        mismatch=None,
     ) -> None:
         super().__init__()
         if len(stages) != len(stage_times) or len(stages) != len(stage_steps):
@@ -108,6 +109,9 @@ class KirchhoffNet(nn.Module):
         self.transfers = nn.ModuleList(transfers)
         self.stage_times = [float(t) for t in stage_times]
         self.stage_steps = [int(n) for n in stage_steps]
+        # 3.9 mismatch state (shared by every stage: one physical fabric).
+        # Plain attribute (not a parameter/buffer), so the state_dict is unchanged.
+        self.mismatch = mismatch
 
         offset = 0
         self._edge_offsets = [offset]
@@ -125,6 +129,10 @@ class KirchhoffNet(nn.Module):
         x = initial_state if initial_state is not None else x0
         all_trajs = []
         stage_outputs = []
+        if self.mismatch is not None:
+            # 3.9: one fresh set of per-slot mismatch draws per batch; every
+            # stage of this forward then sees the same epsilons.
+            self.mismatch.new_batch()
         for i, stage in enumerate(self.stages):
             x, traj = stage(
                 x0=x,

@@ -40,6 +40,7 @@ from hw.constraints import (
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle
     from hw import HWConfig
+    from hw.constraints import MismatchState
 
 
 __all__ = [
@@ -101,6 +102,8 @@ class FreeTanhLibrary(nn.Module):
         isat_max: float | None = None,
         bias_enabled: bool = False,
         hw: "HWConfig | None" = None,
+        mismatch: "MismatchState | None" = None,
+        family: str = "core",
     ) -> None:
         super().__init__()
         self.gm_min = float(gm_min if gm_min is not None else TANH_REALISTIC_GM_MIN)
@@ -152,6 +155,12 @@ class FreeTanhLibrary(nn.Module):
         # pre-constraint behaviour bit-for-bit.  Not a parameter/buffer, so
         # the state_dict (and the golden checkpoints) are unaffected.
         self.hw = hw
+        # 3.9 mismatch: the shared per-slot draw state (one physical fabric,
+        # so every stage sees the same epsilon for the same slot) and the
+        # edge family this library belongs to ("core", "boundary", "sense",
+        # "output_ode").  ``None`` => no mismatch.
+        self.mismatch = mismatch
+        self.family = str(family)
 
     # ------------------------------------------------------------------
     @property
@@ -231,6 +240,19 @@ class FreeTanhLibrary(nn.Module):
             return theta_bound(self.theta_raw, THETA_MAX)
         return self.theta_raw
 
+    def _mismatch_factor(self, name: str, n: int, ref: torch.Tensor):
+        """The 3.9 mismatch factor of ``name`` for the first ``n`` slots (or ``None``).
+
+        Multiplicative for ``isat`` / ``a`` / ``b`` / ``g`` (``exp(sigma eps)``),
+        additive for ``theta`` (``sigma eps``).  ``None`` when the mismatch is
+        off, when that sigma is 0, or in eval mode without ``hw_mismatch_eval``.
+        """
+        mm = self.mismatch
+        if mm is None:
+            return None
+        return mm.get(self.family, name, n, dtype=ref.dtype, device=ref.device,
+                      training=self.training)
+
     def _gm_hw(self, c, gm_override: torch.Tensor | None) -> torch.Tensor:
         """The hardware slope of 3.2 / 3.3: ``gm_eff = s_max * f_IC(Isat) * g``.
 
@@ -282,6 +304,14 @@ class FreeTanhLibrary(nn.Module):
         else:
             A = torch.nn.functional.softplus(self.a_raw).unsqueeze(0)        # [1, E]
             B = torch.nn.functional.softplus(self.b_raw).unsqueeze(0)        # [1, E]
+        if self.mismatch is not None:                                     # 3.9
+            n_edges = A.shape[-1]
+            f_a = self._mismatch_factor("a", n_edges, A)
+            if f_a is not None:
+                A = A * f_a
+            f_b = self._mismatch_factor("b", n_edges, B)
+            if f_b is not None:
+                B = B * f_b
         s = torch.sign(self.s_raw)                                       # [E]
         s_ste = s + self.s_raw - self.s_raw.detach()                     # STE: [E]
         if c is not None and (c.hw_slope_bound or c.hw_ic_coupling):      # 3.2 / 3.3
@@ -294,10 +324,18 @@ class FreeTanhLibrary(nn.Module):
             gm = gm.unsqueeze(0)                                         # [1, E]
         sig_isat = torch.sigmoid(self.isat_raw)
         isat = (self.isat_min + (self.isat_max - self.isat_min) * sig_isat).clamp_min(1e-6)  # [E]
+        if self.mismatch is not None:                                     # 3.9
+            f_i = self._mismatch_factor("isat", isat.shape[-1], isat)
+            if f_i is not None:
+                isat = isat * f_i
         if c is not None and c.hw_theta_bound and self._bias_enabled:     # 3.6
             theta = theta_bound(self.theta_raw, THETA_MAX).unsqueeze(0)
         else:
             theta = self.theta_raw.unsqueeze(0) if self._bias_enabled else 0.0
+        if self.mismatch is not None and self._bias_enabled:              # 3.9
+            f_t = self._mismatch_factor("theta", theta.shape[-1], theta)
+            if f_t is not None:
+                theta = theta + f_t
         u = (s_ste.unsqueeze(0) * (A * x_src - B * x_dst) + theta) * gm
         if c is not None and (c.hw_no_alpha or c.hw_alpha_bwd > 0.0):      # 3.5
             t = tanh_ste(u, c.hw_alpha_bwd)                              # forward: tanh(u)
@@ -339,6 +377,10 @@ class FreeTanhLibrary(nn.Module):
         to bypass ``--freeze-read``).
         """
         G = torch.nn.functional.softplus(self.g_resistive_raw).unsqueeze(0)  # [1, E]
+        if self.mismatch is not None:                                     # 3.9
+            f_g = self._mismatch_factor("g", G.shape[-1], G)
+            if f_g is not None:
+                G = G * f_g
         return G * (x_src - x_dst)
 
     def forward(
@@ -375,6 +417,8 @@ def make_cell_library(
     isat_min: float | None = None,
     isat_max: float | None = None,
     hw: "HWConfig | None" = None,
+    mismatch: "MismatchState | None" = None,
+    family: str = "core",
 ) -> FreeTanhLibrary:
     """Factory: returns a ``FreeTanhLibrary``. Only ``'tanh_free'`` is supported.
 
@@ -409,4 +453,6 @@ def make_cell_library(
         gm_min=gm_min, gm_max=gm_max,
         isat_min=isat_min, isat_max=isat_max,
         hw=hw,
+        mismatch=mismatch,
+        family=family,
     )

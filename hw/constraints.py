@@ -38,6 +38,7 @@ STIFFNESS_LIMIT = 2.0    # 3.3  Heun is unstable above dt*lambda = 2
 
 MISMATCH_DEFAULT = {"isat": 0.05, "g": 0.10, "a": 0.01, "b": 0.01, "theta": 0.1}
 MISMATCH_KEYS = tuple(MISMATCH_DEFAULT)
+MISMATCH_SEED = 0            # default seed of the per-slot mismatch draws (reproducible)
 
 XBAR_MODES = ("signed", "offset_binary", "differential")
 C_NODE_MODES = (None, "uniform", "physical")

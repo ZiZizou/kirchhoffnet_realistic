@@ -5,6 +5,7 @@ invariant of the flag holds.  The toy network is the one of
 ``tests/golden/make_golden.py`` (``TOY_NET``).
 """
 
+import math
 import os
 import sys
 
@@ -18,7 +19,13 @@ sys.path.insert(0, os.path.dirname(HERE))
 import make_golden as mg  # noqa: E402
 from cell_library import FreeTanhLibrary, make_cell_library  # noqa: E402
 from hw import HWConfig  # noqa: E402
-from hw.constraints import HWConstraints, THETA_MAX  # noqa: E402
+from hw.constraints import (  # noqa: E402
+    HWConstraints,
+    MISMATCH_DEFAULT,
+    MismatchState,
+    THETA_MAX,
+    mismatch_draw,
+)
 from topology import build_net_from_config  # noqa: E402
 
 D = torch.float64
@@ -185,6 +192,78 @@ def test_alpha_bwd_keeps_the_forward_value_and_floors_the_gradient():
                    * (1.0 - torch.tanh(u) ** 2 + alpha)
                    * gm * s_ste.unsqueeze(0) * A)
     torch.testing.assert_close(x_src.grad, expect_grad, rtol=1e-9, atol=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# 3.9 mismatch
+# ---------------------------------------------------------------------------
+def test_mismatch_changes_the_training_forward_but_not_the_eval_one():
+    sig = dict(MISMATCH_DEFAULT)
+    spec = dict(mg.TOY_NET)
+    x = mg.make_inputs(spec)
+
+    plain = build_toy(None, spec)
+    plain.train()
+    with torch.no_grad():
+        y_plain = mg.model_forward(plain, x)
+
+    noisy = build_toy(hw_of(hw_mismatch_sigma=sig), spec)
+    noisy.train()
+    with torch.no_grad():
+        y_train = mg.model_forward(noisy, x)
+    assert float((y_train - y_plain).abs().max()) > 0.0
+
+    noisy.eval()
+    with torch.no_grad():
+        y_eval = mg.model_forward(noisy, x)
+    torch.testing.assert_close(y_eval, y_plain, rtol=0, atol=0)
+
+    noisy_eval = build_toy(hw_of(hw_mismatch_sigma=sig, hw_mismatch_eval=True), spec)
+    noisy_eval.eval()
+    with torch.no_grad():
+        y_eval_on = mg.model_forward(noisy_eval, x)
+    assert float((y_eval_on - y_plain).abs().max()) > 0.0
+
+
+def test_mismatch_is_the_same_for_the_same_slot_in_every_stage():
+    sig = dict(MISMATCH_DEFAULT)
+    net = build_toy(hw_of(hw_mismatch_sigma=sig))
+    net.train()
+    spec = dict(mg.TOY_NET)
+    with torch.no_grad():
+        mg.model_forward(net, mg.make_inputs(spec))     # one forward -> one draw set
+
+    ref = torch.zeros(4, dtype=D)
+    f0 = net.core.stages[0].cell_lib._mismatch_factor("isat", 4, ref)
+    f1 = net.core.stages[1].cell_lib._mismatch_factor("isat", 4, ref)
+    assert f0 is not None and f1 is not None
+    torch.testing.assert_close(f1, f0, rtol=0, atol=0)
+
+
+def test_mismatch_multiplier_mean_matches_the_lognormal():
+    sigma = 0.05
+    g = torch.Generator().manual_seed(7)
+    m = mismatch_draw((1000,), sigma, g)
+    assert abs(float(m.mean()) - math.exp(sigma ** 2 / 2.0)) <= 0.01 * math.exp(sigma ** 2 / 2.0)
+
+
+def test_mismatch_state_is_off_in_eval_and_shared_by_the_stages():
+    st = MismatchState(dict(MISMATCH_DEFAULT), eval_on=False, seed=0)
+    assert st.enabled(training=True) and not st.enabled(training=False)
+    st2 = MismatchState(dict(MISMATCH_DEFAULT), eval_on=True, seed=0)
+    assert st2.enabled(training=False)
+    f1 = st.get("core", "isat", 4)
+    f2 = st.get("core", "isat", 4)
+    torch.testing.assert_close(f2, f1, rtol=0, atol=0)
+    st.new_batch()
+    f3 = st.get("core", "isat", 4)
+    assert not torch.equal(f3, f1)
+
+
+def test_mismatch_forward_backward_is_finite():
+    y, grads, _ = toy_forward_backward(hw_of(hw_mismatch_sigma=dict(MISMATCH_DEFAULT)))
+    assert torch.isfinite(y).all()
+    assert all(torch.isfinite(g).all() for g in grads.values() if g is not None)
 
 
 # ---------------------------------------------------------------------------

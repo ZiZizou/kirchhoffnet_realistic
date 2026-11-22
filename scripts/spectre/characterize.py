@@ -2,9 +2,9 @@
 """Cell-level Spectre characterization against the analytic/PyTorch contract.
 
 All Cadence-generated files are placed in .agent_scratch/taskD2/runs.  The
-current measured cases focus on the OTA and shunt current primitives; modules
-not listed in CASES are explicitly reported as uncharacterized rather than
-silently treated as passing.
+measured cases cover OTA, shunt, transfer, VCA, and GLN DC primitives; modules
+not measured are explicitly reported as uncharacterized rather than silently
+being treated as passing.
 """
 from __future__ import annotations
 
@@ -46,6 +46,16 @@ def cases():
         out.append({"module": "shunt", "mode": "dc", "xs": xs, "xd": xd,
                     "params": {"G": 0.75, "z_gate": 0.8, "vca": 1.1,
                                "vca_gate_shunt": 1}})
+    for vector in ((0.1, -0.2, 0.3, -0.4), (-1.0, 0.5, 0.25, 0.75)):
+        weights = (0.3, -0.2, 0.15, 0.1)
+        out.append({"module": "vca_bias", "mode": "input_vector", "u": vector,
+                    "weights": weights, "bias": 0.05})
+        out.append({"module": "gln_bias", "mode": "tail_trim", "u": vector,
+                    "weights": weights, "bias": 0.1, "delta_max": math.log(4.0)})
+    for x in (-2.0, 0.2, 1.5, 6.0):
+        out.append({"module": "interstage_transfer", "mode": "hw_clamp", "x": x,
+                    "params": {"w1": 0.8, "w2": 0.4, "w3": 0.2, "vth": 0.1,
+                               "x_hard": 5.714, "smooth_width": 1e-5}})
     return out
 
 
@@ -80,6 +90,23 @@ def ref_current(case, vs, vd):
     return p["Isat"] * gate * (math.tanh(u) + 0.01 * u) * IU
 
 
+def ref_value(case, values):
+    module = case["module"]
+    if module in ("ota_edge", "shunt"):
+        return ref_current(case, values["src"], values["dst"]), IU, "Iu"
+    if module in ("vca_bias", "gln_bias"):
+        z = case["bias"] + sum(w*u for w,u in zip(case["weights"], case["u"]))
+        if module == "vca_bias":
+            return 2.0 / (1.0 + math.exp(-z)), 1.0, "gain"
+        return math.exp(max(-case["delta_max"], min(case["delta_max"], z))), 1.0, "trim"
+    p = case["params"]
+    x = case["x"]
+    relu = max(x-p["vth"], 0.0)  # exact torch/ReLU reference; VA uses a smooth approximation.
+    y = p["w1"]*x+p["w2"]*math.tanh(x)+p["w3"]*relu
+    y = max(-p["x_hard"], min(p["x_hard"], y))
+    return VCM+VU*y, VU, "x"
+
+
 def psf_nodes(path):
     text = path.read_text(errors="replace")
     vals = {}
@@ -104,17 +131,38 @@ def run(args):
     run_dir = RUN_ROOT / f"characterize_{time.strftime('%Y%m%d_%H%M%S')}"
     run_dir.mkdir()
     cs = cases()
-    lines = ["simulator lang=spectre", f'ahdl_include "{VA / "ota_edge.va"}"',
-             f'ahdl_include "{VA / "shunt.va"}"',
-             "Vcm (vcm 0) vsource dc=0.4"]
+    modules = sorted({c["module"] for c in cs})
+    lines = ["simulator lang=spectre"] + [f'ahdl_include "{VA / (m + ".va")}"' for m in modules]
+    lines.append("Vcm (vcm 0) vsource dc=0.4")
     for i, c in enumerate(cs):
-        vs, vd = VCM + VU*c["xs"], VCM + VU*c["xd"]
-        vb = VCM + VU*c["xd"]
-        lines += [f"Vsrc{i} (src{i} 0) vsource dc={vs:.17g}",
-                  f"Vbias{i} (bias{i} 0) vsource dc={vb:.17g}",
-                  f"Rload{i} (dst{i} bias{i}) resistor r=1meg",
-                  f"Xdut{i} (src{i} dst{i}) {c['module']} " + " ".join(
-                      f"{k}={str(v).lower() if isinstance(v, bool) else v}" for k,v in c["params"].items())]
+        if c["module"] in ("ota_edge", "shunt"):
+            vs, vd = VCM + VU*c["xs"], VCM + VU*c["xd"]
+            lines += [f"Vsrc{i} (src{i} 0) vsource dc={vs:.17g}",
+                      f"Vbias{i} (bias{i} 0) vsource dc={vd:.17g}",
+                      f"Rload{i} (dst{i} bias{i}) resistor r=1meg",
+                      f"Xdut{i} (src{i} dst{i}) {c['module']} " + " ".join(
+                          f"{k}={v}" for k,v in c["params"].items())]
+        elif c["module"] in ("vca_bias", "gln_bias"):
+            ports = []
+            for j, u in enumerate(c["u"]):
+                node = f"u{j}_{i}"
+                ports.append(node)
+                lines.append(f"Vu{j}_{i} ({node} 0) vsource dc={u:.17g}")
+            output = f"out{i}"
+            ports.append(output)
+            params = {f"w{j}": w for j,w in enumerate(c["weights"])}
+            params.update({"bias": c["bias"]})
+            if c["module"] == "gln_bias":
+                params["delta_max"] = c["delta_max"]
+            lines.append(f"Xdut{i} ({' '.join(ports)}) {c['module']} " +
+                         " ".join(f"{k}={v}" for k,v in params.items()))
+        else:
+            vin, en, output = f"in{i}", f"en{i}", f"out{i}"
+            lines += [f"Vin{i} ({vin} 0) vsource dc={VCM+VU*c['x']:.17g}",
+                      f"Ven{i} ({en} 0) vsource dc=1.0",
+                      f"Rout{i} ({output} vcm) resistor r=1e12",
+                      f"Xdut{i} ({vin} {output} {en}) interstage_transfer " +
+                      " ".join(f"{k}={v}" for k,v in c["params"].items())]
     lines += ["saveOptions options save=all", "dcOp dc"]
     deck = run_dir / "characterize.scs"
     deck.write_text("\n".join(lines) + "\n")
@@ -136,26 +184,35 @@ def run(args):
     nodes = psf_nodes(raw)
     rows = []
     for i,c in enumerate(cs):
-        vs, vd, vb = nodes[f"src{i}"], nodes[f"dst{i}"], nodes[f"bias{i}"]
-        measured = nodes[f"Vbias{i}:p"]
-        if c["module"] == "ota_edge" and c["params"].get("mode") == 1:
-            measured = -measured  # HW has an independent sink/source leg at dst.
-        expected = ref_current(c, vs, vd)
-        abs_err = abs(measured - expected) / IU
-        rel_err = abs(measured - expected) / max(abs(expected), IU * 1e-12)
-        rows.append({"module": c["module"], "mode": c["mode"], "abs_error_model_units": abs_err,
-                     "rel_error": rel_err, "measured_model_units": measured/IU,
-                     "reference_model_units": expected/IU})
+        module = c["module"]
+        if module in ("ota_edge", "shunt"):
+            vs, vd = nodes[f"src{i}"], nodes[f"dst{i}"]
+            measured = nodes[f"Vbias{i}:p"]
+            if module == "ota_edge" and c["params"].get("mode") == 1:
+                measured = -measured  # HW has an independent sink/source leg at dst.
+            values = {"src": vs, "dst": vd}
+        elif module in ("vca_bias", "gln_bias"):
+            measured = nodes[f"out{i}"]
+            values = {}
+        else:
+            measured = nodes[f"out{i}"]
+            values = {}
+        expected, scale, units = ref_value(c, values)
+        abs_err = abs(measured - expected) / scale
+        rel_err = abs(measured - expected) / max(abs(expected), scale * 1e-12)
+        rows.append({"module": module, "mode": c["mode"], "error_units": units,
+                     "abs_error_model_units": abs_err, "rel_error": rel_err,
+                     "measured_model_units": measured/scale,
+                     "reference_model_units": expected/scale})
     report = {"run_dir": str(run_dir), "measured_cases": len(rows), "uncharacterized": [
         "node_cap_leak", "rail_clip", "sample_hold", "boundary_sense_ota",
-        "crossbar_accumulator", "interstage_transfer", "vca_bias", "gln_bias", "phase_ctrl"],
-        "results": rows}
+        "crossbar_accumulator", "phase_ctrl"], "results": rows}
     out = run_dir / "characterization.json"
     out.write_text(json.dumps(report, indent=2) + "\n")
-    for module in ("ota_edge", "shunt"):
+    for module in sorted({r["module"] for r in rows}):
         r = [x for x in rows if x["module"] == module]
-        print(f"{module}: {len(r)} cases; max abs={max(x['abs_error_model_units'] for x in r):.6g} Iu, "
-              f"max rel={max(x['rel_error'] for x in r):.6g}")
+        print(f"{module}: {len(r)} cases; max abs={max(x['abs_error_model_units'] for x in r):.6g} "
+              f"{r[0]['error_units']}, max rel={max(x['rel_error'] for x in r):.6g}")
     print(out)
     return out
 

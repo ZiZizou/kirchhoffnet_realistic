@@ -98,6 +98,14 @@ def cases():
     for x0 in (-4.0, -1.0, 2.0, 6.0):
         out.append({"module": "node_cap_leak", "mode": "tran", "x0": x0,
                     "params": {"c_eff": 1.0, "g_leak": 0.0486}})
+    # Sample/hold deterministic capture: known normalized input, acquisition followed by hold.
+    out.append({"module": "sample_hold", "mode": "tran", "x0": 1.25,
+                "params": {"inject_v": 0.0014, "inject_gain_err": 0.08,
+                           "droop_v": 0.0007, "droop_time": 50e-9, "droop_tau": 1e99}})
+    # Two complete phase boundaries, with deliberately distinct durations.
+    out.append({"module": "phase_ctrl", "mode": "tran", "stages": 3,
+                "params": {"stages": 3, "t_hold": 2e-9, "t_transfer": 3e-9,
+                           "t_switch": 4e-9, "t_evolve": 5e-9}})
     # Four sense currents x three outputs; use the production quantizer for W.
     import torch
     from hw.constraints import xbar_map, acc_compliance
@@ -238,11 +246,11 @@ def ref_value(case, values):
     return VCM+VU*y, VU, "x"
 
 
-def psf_waveforms(path):
+def psf_waveforms(path, wanted=None):
     traces = {}
     time_value = None
     in_value = False
-    for line in path.read_text(errors="replace").splitlines():
+    for line in path.open(encoding="utf-8", errors="replace"):
         if line.strip() == "VALUE":
             in_value = True
             continue
@@ -251,13 +259,22 @@ def psf_waveforms(path):
             continue
         if not in_value:
             continue
-        m = re.match(r'"([^"]+)"\s+([-+0-9.eE]+)', line.strip())
-        if not m:
+        if '"' not in line:
             continue
-        name, value = m.group(1), float(m.group(2))
+        start = line.find('"') + 1
+        end = line.find('"', start)
+        if end < 0:
+            continue
+        name = line[start:end]
+        if name != "time" and wanted is not None and name not in wanted:
+            continue
+        try:
+            value = float(line[end+1:].strip().split()[0])
+        except (ValueError, IndexError):
+            continue
         if name == "time":
             time_value = value
-        else:
+        elif wanted is None or name in wanted:
             traces.setdefault(name, []).append((time_value, value))
     return traces
 
@@ -321,6 +338,18 @@ def run(args):
             lines += [f"Xdut{i} ({node}) node_cap_leak " + " ".join(
                           f"{k}={v}" for k,v in c["params"].items()),
                       f"ic {node}={VCM+VU*c['x0']:.17g}"]
+        elif c["module"] == "sample_hold":
+            inp, clk, output = f"sh_in{i}", f"sh_clk{i}", f"sh_out{i}"
+            lines += [f"Vsh_in{i} ({inp} 0) vsource dc={VCM+VU*c['x0']:.17g}",
+                      f"Vsh_clk{i} ({clk} 0) vsource type=pulse val0=0 val1=1 rise=10p fall=10p width=20n period=80n",
+                      f"Csh{i} ({output} 0) capacitor c=1e-18 ic={VCM:.17g}",
+                      f"Xdut{i} ({inp} {output} {clk}) sample_hold " + " ".join(
+                          f"{k}={v}" for k,v in c["params"].items())]
+        elif c["module"] == "phase_ctrl":
+            clk, phase, stage = f"pc_clk{i}", f"pc_phase{i}", f"pc_stage{i}"
+            lines += [f"Vpc_clk{i} ({clk} 0) vsource type=pulse val0=0 val1=1 rise=10p fall=10p width=1n period=30n",
+                      f"Xdut{i} ({clk} {phase} {stage}) phase_ctrl " + " ".join(
+                          f"{k}={v}" for k,v in c["params"].items())]
         elif c["module"] == "crossbar_accumulator":
             ports = []
             for k, current in enumerate(c["currents"]):
@@ -344,12 +373,12 @@ def run(args):
                       f"Xdut{i} ({vin} {output} {en}) interstage_transfer " +
                       " ".join(f"{k}={v}" for k,v in c["params"].items())]
     lines += ["saveOptions options save=all", "dcOp dc"]
-    if any(c["module"] == "node_cap_leak" for c in cs):
+    if any(c["module"] in ("node_cap_leak", "sample_hold", "phase_ctrl") for c in cs):
         from hw.units import HWUnits
         units = HWUnits()
         tau = units.cu / (0.0486 * units.gu)
         lines += ["simulatorOptions options reltol=1e-8 vabstol=1e-12 iabstol=1e-18",
-                  f"tran tran stop={5*tau:.17g} maxstep={tau/200:.17g} errpreset=conservative"]
+                  f"tran tran stop={max(5*tau,60e-9):.17g} maxstep={min(tau/200,20e-12):.17g} errpreset=conservative"]
     deck = run_dir / "characterize.scs"
     deck.write_text("\n".join(lines) + "\n")
     command = (f"cd {run_dir}; source {SETUP} >& /dev/null; "
@@ -369,7 +398,11 @@ def run(args):
     raw = run_dir / "characterize.raw" / "dcOp.dc"
     nodes = psf_nodes(raw)
     rows = []
-    traces = psf_waveforms(run_dir / "characterize.raw" / "tran.tran.tran")
+    wanted_traces = {f"leak{i}" for i,c in enumerate(cs) if c["module"] == "node_cap_leak"}
+    wanted_traces.update(f"sh_out{i}" for i,c in enumerate(cs) if c["module"] == "sample_hold")
+    wanted_traces.update(f"pc_phase{i}" for i,c in enumerate(cs) if c["module"] == "phase_ctrl")
+    wanted_traces.update(f"pc_stage{i}" for i,c in enumerate(cs) if c["module"] == "phase_ctrl")
+    traces = psf_waveforms(run_dir / "characterize.raw" / "tran.tran.tran", wanted_traces)
     hw_units = __import__("hw.units", fromlist=["HWUnits"]).HWUnits()
     for i,c in enumerate(cs):
         module = c["module"]
@@ -388,6 +421,8 @@ def run(args):
             values = {}
         elif module == "node_cap_leak":
             # Transient waveform is parsed from the PSFASCII tran dataset below.
+            continue
+        elif module in ("sample_hold", "phase_ctrl"):
             continue
         elif module == "crossbar_accumulator":
             expected, scale, units = ref_value(c, {})
@@ -423,8 +458,63 @@ def run(args):
         rows.append({"module": "node_cap_leak", "mode": "tran", "x0": c["x0"],
                      "samples": len(samples), "error_units": "x",
                      "abs_error_model_units": max_error, "rel_error": max_error / max(abs(c["x0"]), 1e-12)})
-    report = {"run_dir": str(run_dir), "measured_cases": len(rows), "uncharacterized": [
-        "sample_hold", "phase_ctrl"], "results": rows}
+    for i, c in enumerate(cs):
+        if c["module"] != "sample_hold":
+            continue
+        samples = traces[f"sh_out{i}"]
+        # Real StageBoundary capture provides deterministic injection/gain/droop.
+        import torch
+        from hw.timemux import StageBoundary, TimeMuxConfig
+        cfg = TimeMuxConfig(enable=True, inject_mv=c["params"]["inject_v"]*1e3,
+                            inject_gain_err=c["params"]["inject_gain_err"],
+                            droop_mv=c["params"]["droop_v"]*1e3, ktc=False)
+        boundary = StageBoundary(cfg, n_nodes=1, vu=VU, cu=50e-15, seed=1).eval()
+        x0 = torch.tensor([[c["x0"]]], dtype=torch.float64)
+        x_hold, x_transfer = boundary.capture(x0)
+        # The sample closes at 20 ns; assess after the 50 ns hold interval.
+        picked = min(samples, key=lambda row: abs(row[0]-70.1e-9))
+        measured_x = (picked[1]-VCM)/VU
+        expected_x = float(x_hold[0,0])
+        rows.append({"module":"sample_hold", "mode":"tran", "error_units":"x",
+                     "abs_error_model_units":abs(measured_x-expected_x),
+                     "rel_error":abs(measured_x-expected_x)/max(abs(expected_x),1e-12),
+                     "measured_model_units":measured_x,"reference_model_units":expected_x,
+                     "transfer_reference_x":float(x_transfer[0,0]), "ktc":"excluded"})
+    for i, c in enumerate(cs):
+        if c["module"] != "phase_ctrl":
+            continue
+        phase_trace, stage_trace = traces[f"pc_phase{i}"], traces[f"pc_stage{i}"]
+        params = c["params"]
+        # Pulse source crosses Vlogic halfway through its 10 ps rising edge.
+        boundaries = (5e-12, 30e-9+5e-12)
+        durations = [params[k] for k in ("t_hold","t_transfer","t_switch","t_evolve")]
+        horizon = boundaries[-1] + sum(durations) + 1e-9
+        observed = [(t,round(v)) for (t0,v0),(t,v) in zip(phase_trace,phase_trace[1:])
+                    if t <= horizon and round(v) != round(v0)]
+        expected = []
+        for start in boundaries:
+            cursor = start
+            for phase_no, duration in enumerate(durations, 1):
+                cursor += duration
+                expected.append((cursor, float(phase_no % 4)))
+        # Verify phase transition edges and stage-index increment at boundary end.
+        edge_errors = [abs(t-et) for (t,v),(et,ev) in zip(observed,expected) if v == ev]
+        stage_edges = [t1 for (t,v0),(t1,v1) in zip(stage_trace,stage_trace[1:])
+                       if t1 <= horizon and round(v1) != round(v0)]
+        expected_stage = [boundaries[j]+sum(durations) for j in range(2)]
+        edge_errors.extend(abs(a-b) for a,b in zip(stage_edges,expected_stage))
+        max_error = max(edge_errors) if edge_errors else float("inf")
+        rows.append({"module":"phase_ctrl", "mode":"tran", "error_units":"s",
+                     "abs_error_model_units":max_error,
+                     "rel_error":max_error/max(durations), "max_error_ns":max_error*1e9,
+                     "max_error_Tu":max_error/hw_units.tu, "phase_edges":len(observed),
+                     "stage_edges":len(stage_edges),
+                     "phase_edge_times_ns":[t*1e9 for t,v in observed],
+                     "phase_edge_codes":[v for t,v in observed],
+                     "expected_phase_edge_times_ns":[t*1e9 for t,v in expected],
+                     "stage_edge_times_ns":[t*1e9 for t in stage_edges],
+                     "expected_stage_edge_times_ns":[t*1e9 for t in expected_stage]})
+    report = {"run_dir": str(run_dir), "measured_cases": len(rows), "uncharacterized": [], "results": rows}
     out = run_dir / "characterization.json"
     out.write_text(json.dumps(report, indent=2) + "\n")
     for module in sorted({r["module"] for r in rows}):

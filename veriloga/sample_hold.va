@@ -4,16 +4,17 @@
 module sample_hold(in,out,clk);
   input in,clk; output out; electrical in,out,clk;
   parameter real C_hold=100e-15, R_on=1e3, R_off=1e12;
-  parameter real inject_v=0.0, droop_tau=1e99;
+  parameter real inject_v=0.0, inject_gain_err=0.0, droop_v=0.0, droop_time=50e-9, droop_tau=1e99;
   parameter real Vlogic=0.5;
-  integer sampled;
+  integer sampled, hold_started;
   real held;
   analog begin
-    @(initial_step) begin sampled=0; held=V(out); end
-    @(cross(V(clk)-Vlogic,+1)) sampled=1;
-    @(cross(V(clk)-Vlogic,-1)) begin sampled=0; held=V(out); end
+    @(initial_step) begin sampled=0; hold_started=0; held=V(out); end
+    @(cross(V(clk)-Vlogic,+1)) begin sampled=1; hold_started=0; end
+    @(cross(V(clk)-Vlogic,-1)) begin sampled=0; hold_started=1; held=V(out); end
     // Injection offset is present during acquisition and retained at switch-off.
-    I(out) <+ (sampled ? (V(out)-(V(in)+inject_v))/R_on : (V(out)-held)/R_off);
+    I(out) <+ (sampled ? (V(out)-(`HRK_VCM+(V(in)-`HRK_VCM+inject_v)*(1.0+inject_gain_err)))/R_on : (V(out)-held)/R_off);
+    I(out) <+ (hold_started && !sampled && droop_time>0.0 ? C_hold*droop_v/droop_time : 0.0);
     I(out) <+ C_hold*ddt(V(out));
     I(out) <+ C_hold*(V(out)-`HRK_VCM)/droop_tau;
   end

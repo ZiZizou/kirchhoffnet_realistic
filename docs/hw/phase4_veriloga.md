@@ -83,19 +83,19 @@ The baseline compile matrix needed no source changes; after the current-mode red
 | `rail_clip` DC (Torch `DifferentialStage.soft_clip`) | 11 | 1.39e-17 Iu | 2.78e-16 |
 | `boundary_sense_ota` boundary + sense (Torch `FreeTanhLibrary.forward_tanh`) | 16 | 7.84e-15 Iu | 3.24e-14 |
 | `crossbar_accumulator` (3 ideal W + hw offset-binary; Torch `xbar_map`/`acc_compliance`) | 18 outputs | 1.07e-6 Iu | 1.26e-6 |
-| `sample_hold` | — | not measured | not measured |
+| `sample_hold` deterministic capture | 1 transient | 1.81e-5 x | 1.33e-5; real `StageBoundary.capture` (kT/C excluded), injection/gain and 50 ns droop interval |
 | `interstage_transfer` HW clamp vs `StageTransfer` | 4 | 5.72e-9 x | 5.33e-10 |
 | `vca_bias` | 2 | 4.44e-16 gain | 4.18e-16 |
 | `gln_bias` tail trim | 2 | 0 trim | 0 |
-| `phase_ctrl` | — | not measured | not measured |
+| `phase_ctrl` | 2 boundaries (8 phase edges + 2 stage edges) | 2.78e-8 ns (3.70e-10 Tu) | 5.56e-9 versus longest configured phase duration |
 
 The characterization result JSON and all raw runs are under `.agent_scratch/taskD2/runs/characterize_<timestamp>/`; no Cadence-generated files belong in the worktree. The Spectre-backed test is slow-marked and explicitly run with `python -m pytest tests/test_veriloga_modules.py -q -m slow -k spectre`; it skips if `tcsh`, the kit setup, or Spectre is unavailable.
 
 ## Known gaps / release status
 
-- Characterization is partial: sample/hold capture and droop, and phase duration edges against `hw/timemux.py` remain to be simulated and compared. Crossbar DC mixing/compliance, node-cap RC transient, and rail clipping have characterized coverage, but this is not full module equivalence validation.
+- Characterization is partial: S&H deterministic capture/droop and two phase-controller boundaries are now measured; the phase output durations are set by the Verilog-A parameters because `hw/timemux.py` has no phase-duration API. Its `HWUnits.tu` supplies the normalized timing unit. Crossbar DC mixing/compliance, node-cap RC transient, and rail clipping have characterized coverage, but this is not full module equivalence validation.
 - Boundary/sense OTA uses the real `FreeTanhLibrary.forward_tanh` Torch path and matches 16 Spectre points to 7.84e-15 Iu maximum absolute and 3.24e-14 maximum relative error. Core OTA/shunt/GLN references are copied formulas rather than callable paths. Transfer uses the exact piecewise stage rewrite and matches callable `StageTransfer` to 5.72e-9 x maximum absolute error; cap-divider helper resolution remains unavailable.
 - The canonical A/B modes compile, but per-stage parameter arrays/indexing and complete timemux bank switching are still missing. The exporter and parameter table must drive actual instances consistently.
 - HW OTA compliance is a behavioral leg approximation and still needs comparison against `hw.constraints.leg_factors`/`compliance_legs` (including normalization and 85 °C thermal voltage). The specified Isat ceiling is not enforced inside this primitive.
-- S&H `kT/C` noise and exact acquisition/droop characterization are absent; deterministic injection/droop remain approximate circuit abstractions.
-- Transfer event timing and phase sequencing still require validation. Crossbar current polarity, offset-binary replica subtraction, and accumulator compliance match the selected Torch cases only; do not claim full model equivalence or use for tapeout.
+- S&H deterministic capture characterization is compared with `StageBoundary.capture` using kT/C disabled; stochastic kT/C remains out of scope. The Torch boundary has no C_int charge-sharing term (C_int only sets bias-settling tau), so no charge-sharing effect is claimed. Droop is the model's fixed-sign hold offset. The VA includes `inject_gain_err` and `droop_v` to represent that deterministic formula.
+- `phase_ctrl` was checked over two boundaries; `interstage_transfer` still models an algebraic rewrite, not physical event timing. Crossbar current polarity, offset-binary replica subtraction, and accumulator compliance match the selected Torch cases only; do not claim full model equivalence or use for tapeout.

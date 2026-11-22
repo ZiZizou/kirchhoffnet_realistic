@@ -14,7 +14,7 @@ MODULE_PARAMS = {
     "shunt": {"G", "z_gate", "vca", "vca_gate_shunt"},
     "node_cap_leak": {"c_eff", "c_phys", "g_leak"},
     "rail_clip": {"x_max", "sharp", "Iclip"},
-    "sample_hold": {"C_hold", "R_on", "R_off", "inject_v", "droop_tau"},
+    "sample_hold": {"C_hold", "R_on", "R_off", "inject_v", "inject_gain_err", "droop_v", "droop_time", "droop_tau"},
     "boundary_sense_ota": {"gm", "Isat", "A", "B", "theta", "s", "z_gate"},
     "crossbar_accumulator": {"W", "hw_mode", "hw_bits", "hw_bound", "acc_compliance_en", "Wmax", "lambda_v", "x_hard", "Vcm", "Vu", "Ut", "k_soft"},
     "interstage_transfer": {"w1", "w2", "w3", "vth", "x_hard"},
@@ -72,10 +72,11 @@ def test_spectre_ota_and_shunt_match_analytic_reference():
                             cwd=ROOT, text=True, capture_output=True, timeout=600, check=True)
     report_path = Path(result.stdout.strip().splitlines()[-1])
     report = json.loads(report_path.read_text())
-    assert report["measured_cases"] == 82
+    assert report["measured_cases"] == 84
     assert {r["module"] for r in report["results"]} == {
         "ota_edge", "shunt", "interstage_transfer", "vca_bias", "gln_bias",
         "node_cap_leak", "rail_clip", "boundary_sense_ota", "crossbar_accumulator",
+        "sample_hold", "phase_ctrl",
     }
     crossbar = [r for r in report["results"] if r["module"] == "crossbar_accumulator"]
     assert len(crossbar) == 18
@@ -101,8 +102,15 @@ def test_spectre_ota_and_shunt_match_analytic_reference():
         "vca_bias": 1e-5, "gln_bias": 1e-5,
         "node_cap_leak": 1e-5, "rail_clip": 1e-6,
         "boundary_sense_ota": 1e-5, "crossbar_accumulator": 1e-5,
+        "sample_hold": 5e-3, "phase_ctrl": 1e-10,
     }
     for module, tolerance in tolerances.items():
         rows = [r for r in report["results"] if r["module"] == module]
         assert rows, f"missing Spectre cases for {module}"
         assert max(r["abs_error_model_units"] for r in rows) <= tolerance
+    sample_hold = [r for r in report["results"] if r["module"] == "sample_hold"]
+    assert len(sample_hold) == 1 and sample_hold[0]["ktc"] == "excluded"
+    phase_ctrl = [r for r in report["results"] if r["module"] == "phase_ctrl"]
+    assert len(phase_ctrl) == 1
+    assert phase_ctrl[0]["phase_edges"] == 8
+    assert phase_ctrl[0]["stage_edges"] == 2

@@ -116,15 +116,21 @@ def test_interpreter_has_no_model_imports():
     assert not (forbidden & imported), f"forbidden model imports: {sorted(forbidden & imported)}"
 
 
-@pytest.mark.parametrize("preset", ["phase3a_core", "phase3a_core_diff"])
-def test_toy_net_hw_interpreter_roundtrip(tmp_path, preset):
+@pytest.mark.parametrize("preset,overrides", [
+    ("phase3a_core", {}),
+    ("phase3a_core_diff", {}),
+    ("phase3a_core", {"hw_vref_symmetric": True, "hw_vref_bits": 6}),
+])
+def test_toy_net_hw_interpreter_roundtrip(tmp_path, preset, overrides):
     """The resolved table must reproduce the actual constrained TOY_NET forward."""
     import copy
     import sys
     from hw import HWConfig, load_preset
     from tests.golden.make_golden import TOY_NET, make_model, CtleStudent, _build_net, seed_all
 
-    cfg = HWConfig.from_dict(load_preset(preset))
+    config = copy.deepcopy(load_preset(preset))
+    config["constraints"].update(overrides)
+    cfg = HWConfig.from_dict(config)
     spec = copy.deepcopy(TOY_NET)
     seed_all(20261122)
     net = _build_net(spec, hw=cfg).double()

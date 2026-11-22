@@ -63,9 +63,16 @@ def _core_edge_param_cost(stage) -> int:
 
 
 def _family_snapshot(core):
-    """Snapshot every specialised-family parameter of ``core`` by name."""
+    """Snapshot every specialised-family parameter of ``core`` by name.
+
+    The per-edge CORE VCA taps (``vca_v_core`` / ``vca_b_core``) are
+    excluded: they are re-indexed to the surviving core edges, so they are
+    checked separately (row-by-row against the surviving edges).
+    """
     out = {}
     for name, p in core.named_parameters():
+        if "vca_v_core" in name or "vca_b_core" in name:
+            continue
         if any(f in name for f in ("boundary", "output_ode", "vca", "readout_sense")):
             out[name] = p.detach().clone()
     return out
@@ -83,11 +90,6 @@ def _gate_edges_to_zero(core, removed):
 # ---------------------------------------------------------------------------
 # the reproduction
 # ---------------------------------------------------------------------------
-@pytest.mark.xfail(
-    strict=True,
-    reason="W8b: prune_stage drops the boundary/output-ODE families, the VCA "
-           "taps and the accumulator tail on a partial prune",
-)
 @pytest.mark.parametrize(
     "hw_name", [None, "phase3a_core"], ids=["no-hw", "phase3a-core"],
 )
@@ -147,6 +149,16 @@ def test_partial_prune_keeps_specialised_libs_params_and_forward(hw_name):
             new_s.vca_v_boundary, old_s.vca_v_boundary, rtol=0, atol=0)
         torch.testing.assert_close(
             new_s.vca_v_readout, old_s.vca_v_readout, rtol=0, atol=0)
+        # the per-edge core VCA taps are re-indexed to the surviving edges
+        kept = [
+            e for e in range(int(old_s.num_edges()))
+            if float(old_s.edge_gates().detach()[e]) > 0.01
+        ]
+        assert old_s.vca_v_core is not None
+        assert tuple(new_s.vca_v_core.shape) == (
+            len(kept), int(old_s.vca_v_core.shape[1]))
+        torch.testing.assert_close(
+            new_s.vca_v_core, old_s.vca_v_core[kept], rtol=0, atol=0)
         # the accumulator tail survives
         assert new_s.num_nodes == old_s.num_nodes
 

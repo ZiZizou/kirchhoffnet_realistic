@@ -8,9 +8,11 @@ under .agent_scratch/taskD2/runs, never in the source worktree.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -72,11 +74,21 @@ def main() -> int:
             f"cd {run_dir}; source {SETUP} >& /dev/null; "
             f"spectre -format psfascii {deck.name} +log {module}.log"
         )
-        result = subprocess.run(["tcsh", "-c", command], cwd=run_dir, text=True,
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        (run_dir / "spectre.log").write_text(result.stdout)
-        summary = re.search(r"spectre completes with (\d+) errors, (\d+) warnings", result.stdout)
-        ok = result.returncode == 0 and summary is not None and tuple(map(int, summary.groups())) == (0, 0)
+        launch = subprocess.run(
+            ["bash", "-c", f"nohup tcsh -c '{command}' > {run_dir}/run.out 2>&1 < /dev/null & echo $!"],
+            cwd=run_dir, text=True, stdout=subprocess.PIPE, check=True,
+        )
+        pid = int(launch.stdout.strip())
+        while True:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.5)
+        output = (run_dir / "run.out").read_text(errors="replace")
+        (run_dir / "spectre.log").write_text(output)
+        summary = re.search(r"spectre completes with (\d+) errors, (\d+) warnings", output)
+        ok = summary is not None and tuple(map(int, summary.groups())) == (0, 0)
         print(f"{'PASS' if ok else 'FAIL'} {module}: {run_dir / 'spectre.log'}")
         if not ok:
             failed.append(module)

@@ -46,3 +46,8 @@ tree_rematch/
 
 # ---- nested third-party repo (zhengqigao/kirchhoffnet), see README ----
 kirchhoffnet/
+# ---- small, intentionally committed model assets (override *.pt / *.npz / *.log above) ----
+!assets/**/*.pt
+!assets/**/*.npz
+!assets/**/*.log
+!assets/**/*.out

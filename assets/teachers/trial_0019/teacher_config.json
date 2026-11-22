@@ -1,0 +1,66 @@
+{
+  "schema_version": 2,
+  "trunk_width": 96,
+  "trunk_layers": 3,
+  "activation": "silu",
+  "use_layernorm": true,
+  "use_log_features": false,
+  "input_preprocessing": "knet",
+  "param_budget": null,
+  "plain_param_count": 20167,
+  "scaler": {
+    "scaler_p_scale": 0.7406217748160815,
+    "scaler_p_mean": -2.0538323823734324,
+    "eye_scale_j": 46.720001220703125,
+    "eye_scale_h": 47.099998474121094,
+    "eye_scale_w": 87.52999877929688
+  },
+  "input_log_min": [
+    -3.720545768737793,
+    -1.9411721229553223,
+    -2.7712390422821045,
+    -1.360185980796814
+  ],
+  "input_log_max": [
+    -0.517549455165863,
+    2.1875839233398438,
+    2.128568410873413,
+    2.1600089073181152
+  ],
+  "param_log_bounds": {
+    "fW": [
+      -6.0,
+      1.0
+    ],
+    "current": [
+      -3.3010299956639813,
+      0.3979400086720376
+    ],
+    "ind": [
+      -12.0,
+      0.47712125471966244
+    ],
+    "Rd": [
+      1.0,
+      3.1760912590556813
+    ],
+    "Cs": [
+      -15.0,
+      -9.0
+    ],
+    "Rs": [
+      1.0,
+      3.1760912590556813
+    ],
+    "VDD": [
+      -0.2218487496163564,
+      0.07918124604762482
+    ]
+  },
+  "checkpoint": "dagger_student_plain.pt",
+  "meta": {
+    "seed": 100,
+    "trained_at": "2026-09-02T19:34:12",
+    "git_commit": "4b24912"
+  }
+}

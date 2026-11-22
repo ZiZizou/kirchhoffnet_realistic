@@ -566,3 +566,25 @@ to (never inside) training tables.
 - Specs: `docs/specs/aux-core-probe.md` (aux contract),
   `docs/specs/twin-probe-spec.md`, `docs/specs/flow-sparse-gates.md`;
   verdicts/decisions: `docs/narma-progress-summary.md`.
+
+
+## Repository layout, branches and checkouts (Nov 2026 refactor)
+
+**Branches** (all share the `archive/full-snapshot-2026-11` history; `simplified` is the pre-snapshot GitHub branch):
+
+| Branch | Checkout on ssr0 | Purpose |
+|---|---|---|
+| `hw-refactor` | `~/Documents/kirchhoffnet_refactor` | Main work: simplification and the Verilog-A / Cadence refactor |
+| `narma-experiments` | `~/Documents/Narma_experiments` | All NARMA code, docs and batch scripts, `dynamic_leak` goes here |
+| `deq-experiments` | `~/Documents/DEQ_experiments` | DEQ solver (restored from `7b34b60^`), see `docs/DEQ_BRANCH_NOTES.md` |
+| `archive/full-snapshot-2026-11` | (none) | Snapshot of every script, doc and test that was previously git-ignored, plus the `ctle_kirchhoff_bo.py` adjoint/dopri5 variant (not the paper HR-KNet) |
+
+The two experiment checkouts are separate clones: their `origin` is GitHub (`https://github.com/ZiZizou/kirchhoffnet_realistic.git`) and the remote `local` points at `~/Documents/kirchhoffnet_refactor`. Nothing has been pushed to GitHub.
+
+**Nested repo:** `kirchhoffnet/` is a clone of <https://github.com/zhengqigao/kirchhoffnet.git> (HEAD `7024072aa115099c3ff781bc7292d33c9cfcf5f0`). It is git-ignored and not vendored; clone it again if needed.
+
+**Logs:** `*.out` and `*.log` are git-ignored. Key paper logs are kept in `docs/logs/` (paper run `run_train_knet_single_shot_distillation_2.sh-59014723.out`, its sibling run, and `trial_0019_log.txt`). Audit reports are in `docs/analysis/`.
+
+**Assets:** `assets/teachers/trial_0019/` is the PlainMLP teacher (W96, L3) used by the paper run. `assets/baselines/fixed_mlp_knet/` is the loadable `fixed_mlp_knet` CTLE checkpoint (golden baseline). Both are committed, via `!assets/**` exceptions in `.gitignore`. The CTLE dataset `augmented-cvae-ctle/` is an ignored on-disk asset.
+
+**Shell tip:** the ssr0 login shell is tcsh. `2>&1` and `2>/dev/null` fail there with "Ambiguous output redirect". Wrap commands in `bash -c '...'` or pipe an LF-only script to `bash -s`.

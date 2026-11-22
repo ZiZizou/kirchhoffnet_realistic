@@ -8,6 +8,6 @@ module rail_clip(node);
   real x;
   analog begin
     x=(V(node)-Vcm)/Vu;
-    I(node) <+ Iclip*(1.0/(1.0+limexp(-(x-x_max)/sharp))-1.0/(1.0+limexp(-(-x-x_max)/sharp)));
+    I(node) <+ Iclip*(1.0/(1.0+limexp(-(x-x_max)/sharp))-1.0/(1.0+limexp(-(-x-x_max)/sharp)))*`HRK_IU;
   end
 endmodule

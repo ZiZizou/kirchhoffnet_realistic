@@ -15,7 +15,7 @@ MODULE_PARAMS = {
     "interstage_transfer": {"w1", "w2", "w3", "vth", "x_hard"},
     "vca_bias": {"w0", "w1", "w2", "w3", "bias"},
     "gln_bias": {"w0", "w1", "w2", "w3", "bias", "delta_max"},
-    "phase_ctrl": {"stages", "t_hold", "t_transfer", "t_switch", "t_evolve"},
+    "phase_ctrl": {"stages", "t_hold", "t_transfer", "t_switch", "t_evolve", "Vlogic"},
 }
 
 

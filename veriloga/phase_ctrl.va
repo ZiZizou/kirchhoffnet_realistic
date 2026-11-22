@@ -4,13 +4,28 @@
 module phase_ctrl(clk,phase,stage);
   input clk; output phase,stage; electrical clk,phase,stage;
   parameter integer stages=7;
-  parameter real t_hold=1e-9,t_transfer=1e-9,t_switch=1e-9,t_evolve=50e-9;
-  integer p,s; real t0;
+  parameter real t_hold=1e-9,t_transfer=1e-9,t_switch=1e-9,t_evolve=50e-9,Vlogic=0.5;
+  integer p,s,armed; real next_time;
   analog begin
-    @(initial_step) begin p=0;s=0;t0=$abstime;end
-    @(timer(t0+t_hold+t_transfer+t_switch+t_evolve, t_hold+t_transfer+t_switch+t_evolve)) begin
-      p=(p+1)%4; if (p==0) s=(s+1)%stages;
+    @(initial_step) begin
+      p=0; s=0; armed=0; next_time=$abstime+1e20;
     end
-    V(phase) <+ p; V(stage) <+ s;
+    // Each rising clock edge starts one boundary sequence. phase: 0 hold,
+    // 1 transfer/write, 2 bank switch, 3 evolve.
+    @(cross(V(clk)-Vlogic,+1)) begin
+      if (armed==0) begin
+        p=0; armed=1; next_time=$abstime+t_hold;
+      end
+    end
+    @(timer(next_time)) begin
+      if (armed!=0) begin
+        if (p==0) begin p=1; next_time=$abstime+t_transfer; end
+        else if (p==1) begin p=2; next_time=$abstime+t_switch; end
+        else if (p==2) begin p=3; next_time=$abstime+t_evolve; end
+        else begin p=0; s=(s+1)%stages; armed=0; next_time=$abstime+1e20; end
+      end
+    end
+    V(phase) <+ p;
+    V(stage) <+ s;
   end
 endmodule

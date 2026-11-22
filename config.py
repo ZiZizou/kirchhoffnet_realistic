@@ -534,25 +534,6 @@ SOLVER = {
     "num_steps": 70,
 }
 
-# Deep Equilibrium (DEQ) stagewise fixed-point solver
-# (deq-core-prototype plan). Selected via --solver deq.
-# Defaults: Anderson forward + Anderson backward, with a small minimum-leak
-# floor so the fixed-point map Phi(x)=x+dt*rhs(x) is contractive (diagonal
-# damping dominates cross-coupling). The leak floor only takes effect under
-# DEQ; with --solver heun the stage uses leak_floor=0.0 and behaviour matches
-# the pre-DEQ path exactly.
-DEQ = {
-    "backend": "torchdeq",       # "torchdeq" | "fixed_point_iter"
-    "f_solver": "anderson",      # forward solver
-    "b_solver": "anderson",      # backward solver (implicit/IFT)
-    "f_max_iter": 30,
-    "f_tol": 1e-4,
-    "b_max_iter": 20,
-    "anderson_m": 5,
-    "deq_step": 0.1,             # damped-step size dt for Phi(x) = x + dt*rhs(x)
-    "leak_floor": 0.05,          # min effective leak per node under DEQ
-}
-
 # Degree budget / fraction competition (degree-budget-topk plan).
 # Each destination (or source) node keeps a fraction of its incoming
 # edges open via temperature-scaled softmax renormalization of z_logits
@@ -596,7 +577,7 @@ DEGREE_BUDGET = {
 #
 # Default rank=2 keeps the parameter cost small. Biases are opt-in via
 # ``--vca-bias`` (or ``VCA['bias'] = True``). Compatible with
-# --freeze-read because ``u`` is constant per sample across all Heun/DEQ
+# --freeze-read because ``u`` is constant per sample across all Heun
 # sub-iterations, so the VCA gate is computed once per sample at stage
 # entry and either folded into the frozen KCL contribution (freeze_read
 # ON) or passed as a kwarg to rhs (freeze_read OFF).

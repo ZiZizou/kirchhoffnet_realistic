@@ -351,7 +351,7 @@ def load_golden(model, golden_sd, ignored=()):
 
 # ---- the only places that touch model call signatures ---------------------
 def _net_forward(net, u):
-    out = net(u, store_trajectory=False, solver="heun")
+    out = net(u, store_trajectory=False)
     return out[0] if isinstance(out, tuple) else out
 
 

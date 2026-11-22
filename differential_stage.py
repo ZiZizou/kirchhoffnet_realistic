@@ -7,11 +7,6 @@ Edge currents are computed by a per-edge device library.
 Heun integration (predictor-corrector, 2nd order) is used for fixed-step
 BPTT. The stage returns both the final state and the full trajectory so
 that regularizers can be evaluated along the path.
-
-Deep Equilibrium (DEQ) forward path (deq-core-prototype plan): the stage
-exposes ``forward_equilibrium`` which solves ``rhs(x*)=0`` via the
-:mod:`deq_solver` adapter and returns implicit gradients. Selected by
-passing ``solver='deq'`` to ``forward``.
 """
 
 from __future__ import annotations
@@ -24,7 +19,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from config import (
-    DEQ,
     DRIVE,
     INIT,
     PHYS,
@@ -89,7 +83,7 @@ class DifferentialStage(nn.Module):
         freeze_read: When ``True``, edge currents (cell_lib output, edge gate,
             budget gate, and KCL scatter-add) are computed **once** at the
             start of the stage from the initial state ``x0`` and held constant
-            throughout all Heun / DEQ sub-iterations. Leak, clip, and drive
+            throughout all Heun sub-iterations. Leak, clip, and drive
             current still read the evolving ``x`` at each step. Default
             ``False`` (standard behavior: read and write at the same time).
             When ``core_refresh_interval > 0`` the core current is
@@ -100,7 +94,7 @@ class DifferentialStage(nn.Module):
         freeze_boundary: When ``True``, boundary fan-out edge currents (the
             tanh cell contribution with edge gate + VCA gate folded in) are
             computed **once** from ``(u, x0)`` and held constant across all
-            Heun / DEQ sub-iterations, while the family's resistive shunt
+            Heun sub-iterations, while the family's resistive shunt
             (when present) remains dynamic per-step. Mirrors the
             ``freeze_read`` semantics for the boundary edge family.
             Independent of ``freeze_read`` (can be combined). No-op when the
@@ -108,7 +102,7 @@ class DifferentialStage(nn.Module):
         freeze_temporal_read: When ``True``, temporal-readout edge currents
             (the tanh cell contribution with edge gate + VCA gate folded
             in) are computed once from ``x0`` and held constant across all
-            Heun / DEQ iterations. The family's resistive shunt (when
+            Heun iterations. The family's resistive shunt (when
             present) stays dynamic per-step, mirroring the
             ``freeze_read`` behavior for the core graph. Independent of
             ``freeze_read`` and ``freeze_boundary`` (can be combined). No-op
@@ -291,7 +285,7 @@ output_ode_src: list[int] | None = None,
         # ``u_proj`` is either ``sum(u)`` (default) or ``(W_u @ u)[0]``
         # (scalar projection when ``dynamic_leak_input_proj=True``). Off by
         # default; init a=0, b=0, c=raw_leak_init so the epoch-0 effective
-        # leak matches ``leak_floor + softplus(raw_leak)`` exactly.
+        # leak matches ``softplus(raw_leak)`` exactly.
         self.dynamic_leak_enabled = bool(dynamic_leak)
         self.dynamic_leak_input_proj = bool(dynamic_leak_input_proj)
         self.vca_enabled = bool(vca_enabled)
@@ -418,12 +412,6 @@ output_ode_src: list[int] | None = None,
             self.dyn_leak_b = None
             self.dyn_leak_c = None
             self.dyn_leak_W_u = None
-
-        # Minimum effective leak (deq-core-prototype plan). Defaults to 0.0 so
-        # the Heun path is byte-for-byte unchanged. Under DEQ this is set to a
-        # positive value (config DEQ['leak_floor']) via :meth:`set_leak_floor`
-        # to keep the fixed-point map contractive (diagonal damping).
-        self.leak_floor = 0.0
 
         # Gate parameters for complexity-regularized pruning (CP-1, CP-2).
         # z_e = sigmoid(z_logits) is the edge gate: multiplies the edge current.
@@ -832,15 +820,6 @@ output_ode_src: list[int] | None = None,
     def num_edges(self) -> int:
         return int(self.src.numel())
 
-    def set_leak_floor(self, leak_floor: float) -> None:
-        """Set the minimum effective leak per node.
-
-        Used by the DEQ solver path to enforce a positive diagonal damping so
-        the fixed-point map Phi(x)=x+dt*rhs(x) is contractive. Has no effect
-        on the Heun path beyond the explicit addend.
-        """
-        self.leak_floor = float(leak_floor)
-
     def set_budget_frac(self, frac: float, temperature: float) -> None:
         """Set the degree-budget fraction for this stage.
 
@@ -867,7 +846,7 @@ output_ode_src: list[int] | None = None,
         ``edge_gate = sigmoid(z_logits) * budget_gate``.
 
         Called once per epoch by the training loop. Captured by attribute
-        (not closure) so DEQ IFT re-evaluates with the same values.
+        (not closure).
         """
         self.budget_frac = float(frac)
         self.budget_temperature = float(temperature)
@@ -879,16 +858,15 @@ output_ode_src: list[int] | None = None,
             )
 
     def _effective_leak(self, num_nodes: int | None = None,
-                        leak_floor: float | None = None,
                         x: torch.Tensor | None = None,
                         u: torch.Tensor | None = None) -> torch.Tensor:
         """Return the per-node effective leak.
 
-        Programmable: ``leak_floor + softplus(raw_leak)`` (per-node).
-        Non-programmable: ``leak_floor + leak_constant`` (scalar, same for all nodes).
+        Programmable: ``softplus(raw_leak)`` (per-node).
+        Non-programmable: ``leak_constant`` (scalar, same for all nodes).
         Dynamic (knet-gated-memory): when ``dynamic_leak_enabled=True`` and a
         callable regime is requested, returns
-        ``leak_floor + softplus(a*x + b*u_proj + c)`` where ``a, b, c`` are
+        ``softplus(a*x + b*u_proj + c)`` where ``a, b, c`` are
         per-node parameters and ``u_proj`` is a scalar per call. ``x`` must
         be ``[N]`` (per-node) and ``u`` must be ``[in_dim]`` or ``[B, in_dim]``.
         Init is ``a=0, b=0, c=raw_leak_init`` so the dynamic path matches the
@@ -896,7 +874,6 @@ output_ode_src: list[int] | None = None,
         """
         if num_nodes is None:
             num_nodes = self.num_nodes
-        lf = self.leak_floor if leak_floor is None else float(leak_floor)
         if self.dynamic_leak_enabled and x is not None:
             x_n = x if x.dim() == 1 else x.reshape(-1)
             if x_n.shape[0] != num_nodes:
@@ -923,14 +900,11 @@ output_ode_src: list[int] | None = None,
             else:
                 u_term = torch.zeros((), dtype=x_n.dtype, device=x_n.device)
             logits = self.dyn_leak_a * x_n + u_term + self.dyn_leak_c
-            base = F.softplus(logits)
-            return base if lf == 0.0 else lf + base
+            return F.softplus(logits)
         if self.leak_mode == "programmable":
-            base = F.softplus(self.raw_leak)
-            return base if lf == 0.0 else lf + base
+            return F.softplus(self.raw_leak)
         else:
-            l = lf + self.leak_constant
-            return torch.full((num_nodes,), l, dtype=torch.float32)
+            return torch.full((num_nodes,), self.leak_constant, dtype=torch.float32)
 
     def _compute_budget_gate(self) -> torch.Tensor:
         """Compute the per-destination (or per-source) competitive budget gate.
@@ -945,7 +919,7 @@ output_ode_src: list[int] | None = None,
         clamped per-edge to [0, 1]. Groups with ``count <= k_eff`` incident
         edges receive an all-ones mask (no competition needed).
 
-        Fully differentiable (C-infinity) so it is compatible with DEQ
+        Fully differentiable (C-infinity) so it is compatible with autograd
         implicit differentiation. No STE, no hard threshold.
 
         Returns a tensor of shape ``[E]`` with values in ``[0, 1]``.
@@ -1388,7 +1362,6 @@ output_ode_src: list[int] | None = None,
     def rhs(self, x: torch.Tensor,
             u: torch.Tensor | None = None,
             x_drive: torch.Tensor | None = None, drive_scale: float = 0.0,
-            leak_floor: float | None = None,
             i_edge_const: torch.Tensor | None = None,
             i_boundary_const: torch.Tensor | None = None,
             i_readout_const: torch.Tensor | None = None,
@@ -1759,7 +1732,6 @@ output_ode_src: list[int] | None = None,
                 acc = acc_f32.to(dtype=x.dtype)
 
         leak = self._effective_leak(
-            leak_floor=leak_floor,
             x=(x[0] if x.dim() >= 2 else x) if self.dynamic_leak_enabled else None,
             u=u,
         ).unsqueeze(0).to(x.device)  # [1, N]
@@ -1795,51 +1767,23 @@ output_ode_src: list[int] | None = None,
         store_trajectory: bool = True,
         x_drive: torch.Tensor | None = None,
         drive_scale: float = 0.0,
-        solver: str = "heun",
-        deq_cfg: dict | None = None,
         u: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Integrate stage with fixed-step Heun or solve to fixed point.
-
-        Parameters
-        ----------
-        solver : str
-            ``"heun"`` (default) uses the 2nd-order Heun predictor-corrector
-            over ``num_steps``. ``"deq"`` solves ``rhs(x*) = 0`` via
-            :func:`deq_solver.solve_equilibrium` and returns implicit gradients.
-        deq_cfg : dict or None
-            Optional overrides for the DEQ solver. ``None`` uses defaults from
-            ``config.DEQ``. Recognized keys: ``backend``, ``f_solver``,
-            ``b_solver``, ``f_max_iter``, ``f_tol``, ``b_max_iter``,
-            ``anderson_m``, ``deq_step``, ``leak_floor``.
+        """Integrate the stage with fixed-step Heun (2nd-order predictor-corrector).
 
         Returns
         -------
         x_final : torch.Tensor
             Stage output state.
         traj : torch.Tensor or None
-            ``[batch, num_nodes, num_steps+1]`` for the Heun path; ``None`` for
-            the DEQ path (no trajectory at equilibrium).
+            ``[batch, num_nodes, num_steps+1]`` when ``store_trajectory``.
         """
-        if solver == "heun":
-            self.last_deq_info = None
-            return self._forward_heun(
-                x0=x0, t_span=t_span, num_steps=num_steps,
-                store_trajectory=store_trajectory,
-                x_drive=x_drive, drive_scale=drive_scale,
-                u=u,
-            )
-        if solver == "deq":
-            x_star, _info = self.forward_equilibrium(
-                x0=x0,
-                x_drive=x_drive, drive_scale=drive_scale,
-                deq_cfg=deq_cfg,
-                u=u,
-            )
-            self.last_deq_info = dict(_info)
-            traj = x_star.unsqueeze(-1) if store_trajectory else None
-            return x_star, traj
-        raise ValueError(f"DifferentialStage.forward: unknown solver={solver!r}")
+        return self._forward_heun(
+            x0=x0, t_span=t_span, num_steps=num_steps,
+            store_trajectory=store_trajectory,
+            x_drive=x_drive, drive_scale=drive_scale,
+            u=u,
+        )
 
     def _forward_heun(
         self,
@@ -2184,124 +2128,6 @@ output_ode_src: list[int] | None = None,
                 f"  [torch.compile] training will proceed without compilation."
             )
             self._heun_steps_compiled = False
-
-    def forward_equilibrium(
-        self,
-        x0: torch.Tensor,
-        x_drive: torch.Tensor | None = None,
-        drive_scale: float = 0.0,
-        deq_cfg: dict | None = None,
-        u: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, dict]:
-        """Solve ``rhs(x*) = 0`` starting from ``x0`` (Deep Equilibrium).
-
-        The damped fixed-point map is ``Phi(x) = x + dt * rhs(x)`` where
-        ``dt = deq_cfg['deq_step']`` (defaulting to ``config.DEQ['deq_step']``).
-        Returns ``(x_star, info)``. The DEQ path applies a positive
-        ``leak_floor`` so the fixed-point map has positive diagonal damping
-        (contractivity). The ``leak_floor`` value is captured by the ``phi``
-        closure so the backward pass (re-evaluated by torchdeq's IFT) uses
-        the same leak_floor as the forward solve. Solver runs in fp32;
-        autocast is disabled by the solver adapter.
-
-        Note: ``core_refresh_interval`` has no effect on the DEQ path (the
-        fixed-point iterations always read the evolving ``x``). A warning
-        is emitted if it is set so static-task users are not misled.
-        """
-        if int(self.core_refresh_interval) > 0:
-            warnings.warn(
-                "core_refresh_interval has no effect on the DEQ solver path "
-                "(fixed-point iterations always use evolving x); "
-                "the setting is ignored for this forward call.",
-                stacklevel=2,
-            )
-        from deq_solver import solve_equilibrium
-
-        cfg = dict(DEQ)
-        if deq_cfg:
-            cfg.update(deq_cfg)
-        lf = float(cfg.get("leak_floor", 0.0))
-        dt = float(cfg.get("deq_step", 0.1))
-
-        # Compute the core VCA gate cache once per forward (constant
-        # per sample). Hoisted out of the DEQ fixed-point iterations so
-        # the matmul is paid once, not per iteration.
-        gate_core_cached = None
-        if self._vca_core_enabled and u is not None and self.vca_v_core is not None:
-            gate_core_cached = self._compute_core_gate(u, x=x0 if self.vca_use_hidden else None)
-        self._gate_core_cached = gate_core_cached
-        # Phase-8 tied tap gate on the DEQ path: u is constant per solve,
-        # so compute once and hold across fixed-point iterations (mirrors
-        # the once-per-sample Heun convention). NARMA probes use Heun,
-        # but rhs(x*) = 0 must see the same gate for consistency.
-        tied_gate_cached = self.tap_rails(u) if self.tap_rails is not None and u is not None else None
-
-        # freeze_read: precompute edge currents (cell_lib + edge gate + budget
-        # gate + core VCA gate + KCL scatter-add) once from x0 and hold them
-        # constant across all fixed-point iterations.
-        i_edge_const = None
-        if self.freeze_read:
-            x_src0 = x0[:, self.src]
-            x_dst0 = x0[:, self.dst]
-            # Node activation: frozen DEQ precompute matches the rhs path.
-            if self.node_activation == "tanh":
-                _xb0 = self._node_broadcast(x0)
-                x_src0 = _xb0[:, self.src]
-                x_dst0 = _xb0[:, self.dst]
-            i_edge = self.cell_lib(x_src=x_src0, x_dst=x_dst0, x_max=self.x_max)
-            edge_mask = torch.sigmoid(self.z_logits)
-            if self.budget_enabled:
-                edge_mask = edge_mask * self._compute_budget_gate()
-            i_edge = i_edge * edge_mask.unsqueeze(0)
-            if gate_core_cached is not None:
-                i_edge = i_edge * gate_core_cached
-            i_edge_f32 = i_edge.float()
-            acc_const = torch.zeros_like(x0, dtype=torch.float32)
-            acc_const.index_add_(1, self.dst, i_edge_f32)
-            if not self.read_only_source:
-                acc_const.index_add_(1, self.src, -i_edge_f32)
-            i_edge_const = acc_const.to(dtype=x0.dtype)
-
-        # freeze_boundary / freeze_temporal_read: precompute once from (u, x0).
-        # No-op when the family is absent on this stage. Captured by the phi
-        # closure below so torchdeq's IFT re-evaluates with the same frozen
-        # values during the backward pass.
-        i_boundary_const = None
-        if self.freeze_boundary:
-            i_boundary_const = self._compute_frozen_boundary(u, x0)
-        i_readout_const = None
-        if self.freeze_temporal_read:
-            i_readout_const = self._compute_frozen_readout(u, x0)
-
-        self.set_leak_floor(lf)
-        try:
-            def phi(x):
-                return x + dt * self.rhs(x, u=u,
-                                        x_drive=x_drive, drive_scale=drive_scale,
-                                        leak_floor=lf,
-                                        i_edge_const=i_edge_const,
-                                        i_boundary_const=i_boundary_const,
-                                        i_readout_const=i_readout_const,
-                                        vca_gate_core=gate_core_cached,
-                                        tied_gate_multiplier=tied_gate_cached)
-
-            x_star, info = solve_equilibrium(phi, x0, cfg)
-            self.last_deq_info = {
-                "nstep": info.get("nstep"),
-                "rel_residual": info.get("rel_residual"),
-                "deq_step": dt,
-                "leak_floor": lf,
-            }
-            # Cast to the stage's parameter dtype so AMP/GradScaler and downstream
-            # regularizers behave like the Heun path.
-            param_dtype = next(self.parameters()).dtype
-            if x_star.dtype != param_dtype:
-                x_star = x_star.to(dtype=param_dtype)
-            return x_star, info
-        finally:
-            # Restore leak floor to 0.0 even if the solver fails so later
-            # Heun/validation calls do not inherit DEQ damping by accident.
-            self.set_leak_floor(0.0)
 
     def edge_gates(self) -> torch.Tensor:
         """Return edge gate values z_e = σ(z_logits), shape [E]."""

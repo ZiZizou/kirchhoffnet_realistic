@@ -1261,7 +1261,7 @@ def test_boundary_fan_out_zero_init():
     captured = {}
 
     def capture_x0(x0, t_span=None, num_steps=None, store_trajectory=True,
-                   x_drive=None, drive_scale=0.0, solver="heun", deq_cfg=None,
+                   x_drive=None, drive_scale=0.0,
                    u=None):
         captured["x0"] = x0.detach().clone()
         captured["u"] = u.detach().clone() if u is not None else None

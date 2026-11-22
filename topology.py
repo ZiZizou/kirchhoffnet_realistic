@@ -1407,7 +1407,7 @@ def topology_to_stage(
             match the network-wide ``in_dim``. Default 0 (unset).
             ``None`` uses ``config.INIT["leak_constant"]``.
         freeze_read: When ``True``, edge currents are computed once from the
-            initial state and held constant across all Heun / DEQ iterations
+            initial state and held constant across all Heun iterations
             inside the stage. Forwarded to ``DifferentialStage``.
         boundary_src: List of input-terminal indices for sparse OTA edges
             from fixed-voltage boundary terminals into the dynamic fabric.
@@ -1824,17 +1824,17 @@ def build_net_from_preset(
                     ResidualTanhEncoder tanh branch (default 64). Only
                     used when the corresponding type is "residual_tanh".
     * freeze_read: When ``True``, edge currents are computed once from the
-                    initial state and held constant across all Heun / DEQ
+                    initial state and held constant across all Heun
                     iterations inside every stage. Defaults to ``False``.
     * freeze_boundary: When ``True``, boundary fan-out tanh edge currents
                     are computed once from ``(u, x0)`` and held constant
-                    across all Heun / DEQ iterations. The family's resistive
+                    across all Heun iterations. The family's resistive
                     shunt (when present) stays dynamic. Independent of
                     ``freeze_read``. No-op when boundary fan-out is not
                     configured. Defaults to ``False``.
     * freeze_temporal_read: When ``True``, temporal-readout tanh edge
                     currents are computed once from ``x0`` and held
-                    constant across all Heun / DEQ iterations. The
+                    constant across all Heun iterations. The
                     family's resistive shunt (when present) stays
                     dynamic. Independent of ``freeze_read`` and
                     ``freeze_boundary``. No-op when temporal readout is

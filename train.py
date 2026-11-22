@@ -781,8 +781,6 @@ def compute_loss(
     amp: bool = False,
     amp_dtype: torch.dtype = torch.float16,
     reg_scale: float = 1.0,
-    solver: str = "heun",
-    deq_cfg: dict | None = None,
     teacher: KirchhoffNetWithIO | KirchhoffNet | None = None,
     kd_lambda: float = 0.0,
     device_l2_lambda: float = 0.0,
@@ -810,17 +808,15 @@ def compute_loss(
     )
     with autocast_ctx:
         if isinstance(net, KirchhoffNetWithIO):
-            out, trajs = net(x0, store_trajectory=True,
-                             solver=solver, deq_cfg=deq_cfg)
+            out, trajs = net(x0, store_trajectory=True)
         else:
-            out, trajs = net(x0, store_trajectory=True,
-                             solver=solver, deq_cfg=deq_cfg)
+            out, trajs = net(x0, store_trajectory=True)
 
         loss_task = task_fn(out, target)
 
         if teacher is not None:
             with torch.no_grad():
-                teacher_out, _ = teacher(x0, solver=solver, deq_cfg=deq_cfg)
+                teacher_out, _ = teacher(x0)
             loss_kd = kd_lambda * F.mse_loss(out, teacher_out.detach())
             loss_task = loss_task + loss_kd
 

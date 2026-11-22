@@ -131,8 +131,6 @@ class KirchhoffNet(nn.Module):
         store_trajectory: bool = False,
         drive_targets: list[torch.Tensor] | None = None,
         drive_scales: list[float] | None = None,
-        solver: str = "heun",
-        deq_cfg: dict | None = None,
         stage_noise_std: float = 0.0,
         stage_noise_generator: torch.Generator | None = None,
         u: torch.Tensor | None = None,
@@ -141,7 +139,6 @@ class KirchhoffNet(nn.Module):
         x = initial_state if initial_state is not None else x0
         all_trajs = []
         stage_outputs = []
-        stage_infos = []
         for i, stage in enumerate(self.stages):
             x_drive_i = None if drive_targets is None else drive_targets[i]
             drive_scale_i = 0.0 if drive_scales is None else drive_scales[i]
@@ -152,12 +149,9 @@ class KirchhoffNet(nn.Module):
                 store_trajectory=store_trajectory,
                 x_drive=x_drive_i,
                 drive_scale=drive_scale_i,
-                solver=solver,
-                deq_cfg=deq_cfg,
                 u=u,
             )
             stage_outputs.append(x.detach())
-            stage_infos.append(dict(getattr(stage, "last_deq_info", {}) or {}))
             if store_trajectory and traj is not None:
                 all_trajs.append(traj)
             # kirchhoff-noise: per-stage additive Gaussian noise on the state
@@ -173,10 +167,8 @@ class KirchhoffNet(nn.Module):
             if i < len(self.transfers):
                 x = self.transfers[i](x)
         self.last_stage_outputs = stage_outputs
-        self.last_stage_infos = stage_infos
         self.last_drive_targets = drive_targets
         self.last_drive_scales = list(drive_scales) if drive_scales is not None else None
-        self.last_solver = solver
         return x, all_trajs if store_trajectory else None
 
     def forward_sequence(
@@ -556,8 +548,6 @@ class KirchhoffNetWithIO(nn.Module):
         self,
         u: torch.Tensor,
         store_trajectory: bool = False,
-        solver: str = "heun",
-        deq_cfg: dict | None = None,
         stage_noise_std: float = 0.0,
         stage_noise_generator: torch.Generator | None = None,
         initial_state: torch.Tensor | None = None,
@@ -633,8 +623,6 @@ class KirchhoffNetWithIO(nn.Module):
                 x0_full, store_trajectory=store_trajectory and not return_final_state,
                 drive_targets=drive_targets,
                 drive_scales=self.drive_scales if (self.enable_drive and not self.enable_boundary) else None,
-                solver=solver,
-                deq_cfg=deq_cfg,
                 stage_noise_std=stage_noise_std,
                 stage_noise_generator=stage_noise_generator,
                 u=u if (

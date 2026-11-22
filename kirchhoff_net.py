@@ -22,7 +22,6 @@ import warnings
 import torch
 import torch.nn as nn
 
-from config import DRIVE
 from differential_stage import DifferentialStage
 from stage_transfer import StageTransfer
 
@@ -37,13 +36,11 @@ def format_parameter_breakdown(breakdown: dict) -> str:
 
         input_mapper:           20
         output_mapper:        1169
-        drive_mappers:           8
         stage_0:
           cell_lib:            320
           z_logits:             64
           u_logits:             16
           raw_leak:             16
-          raw_drive_g:           4
           ── stage total:      420
         ───────────────────────
         total:               1605
@@ -59,16 +56,15 @@ def format_parameter_breakdown(breakdown: dict) -> str:
     stage_label_w = max(stage_label_w, 8)
     width = max(label_w + 18, stage_label_w + 18, 30)
     lines: list[str] = []
-    for name in ("input_mapper", "output_mapper", "drive_mappers", "skip_linear", "gln_rails"):
-        if groups.get(name, 0) or name in ("input_mapper", "output_mapper", "drive_mappers"):
+    for name in ("input_mapper", "output_mapper", "skip_linear", "gln_rails"):
+        if groups.get(name, 0) or name in ("input_mapper", "output_mapper"):
             lines.append(f"  {name:<{label_w}}: {groups.get(name, 0):>{width - label_w - 4}}")
     for stage_key in sorted(per_stage.keys()):
         lines.append(f"  {stage_key}:")
         bucket = per_stage[stage_key]
         for sub_name in (
-            "cell_lib", "z_logits", "u_logits", "raw_leak", "raw_drive_g",
+            "cell_lib", "z_logits", "u_logits", "raw_leak",
             "boundary_cell_lib", "boundary_z_logits",
-            "raw_vref", "ref_z_logits", "ref_cell_lib",
             "output_ode_cell_lib", "output_ode_z_logits",
             "readout_sense_z_logits", "readout_sense_cell_lib",
             "readout_crossbar", "raw_vref_sense",
@@ -124,8 +120,6 @@ class KirchhoffNet(nn.Module):
         self,
         x0: torch.Tensor,
         store_trajectory: bool = False,
-        drive_targets: list[torch.Tensor] | None = None,
-        drive_scales: list[float] | None = None,
         u: torch.Tensor | None = None,
         initial_state: torch.Tensor | None = None,
     ):
@@ -133,15 +127,11 @@ class KirchhoffNet(nn.Module):
         all_trajs = []
         stage_outputs = []
         for i, stage in enumerate(self.stages):
-            x_drive_i = None if drive_targets is None else drive_targets[i]
-            drive_scale_i = 0.0 if drive_scales is None else drive_scales[i]
             x, traj = stage(
                 x0=x,
                 t_span=self.stage_times[i],
                 num_steps=self.stage_steps[i],
                 store_trajectory=store_trajectory,
-                x_drive=x_drive_i,
-                drive_scale=drive_scale_i,
                 u=u,
             )
             stage_outputs.append(x.detach())
@@ -150,8 +140,6 @@ class KirchhoffNet(nn.Module):
             if i < len(self.transfers):
                 x = self.transfers[i](x)
         self.last_stage_outputs = stage_outputs
-        self.last_drive_targets = drive_targets
-        self.last_drive_scales = list(drive_scales) if drive_scales is not None else None
         return x, all_trajs if store_trajectory else None
 
     def parameter_breakdown(self) -> dict:
@@ -215,9 +203,6 @@ class KirchhoffNetWithIO(nn.Module):
         final_proj_count: int | None = None,
         write_idx: list[int] | None = None,
         read_idx: list[int] | None = None,
-        enable_drive: bool = False,
-        drive_mappers: list | None = None,
-        drive_scales: list[float] | None = None,
         enable_skip_linear: bool = False,
         skip_linear_in_dim: int | None = None,
         skip_linear_out_dim: int | None = None,
@@ -247,33 +232,6 @@ class KirchhoffNetWithIO(nn.Module):
         self.final_proj_count = int(proj_count if final_proj_count is None else final_proj_count)
         self.write_idx = list(write_idx) if write_idx is not None else None
         self.read_idx = list(read_idx) if read_idx is not None else None
-        self.enable_drive = bool(enable_drive)
-        if self.enable_drive:
-            if drive_mappers is None:
-                raise ValueError("enable_drive=True requires drive_mappers list")
-            if len(drive_mappers) != len(core.stages):
-                raise ValueError(
-                    f"drive_mappers length {len(drive_mappers)} must equal "
-                    f"num_stages {len(core.stages)}"
-                )
-            self.drive_mappers = nn.ModuleList(drive_mappers)
-            # Validate all stages have the same width for drive target shape match.
-            stage_widths = [s.num_nodes for s in core.stages]
-            if len(set(stage_widths)) != 1:
-                raise ValueError(
-                    f"enable_drive=True requires all stages to have the same width, "
-                    f"got {stage_widths}"
-                )
-            self.drive_scales = [float(s) for s in (drive_scales or DRIVE["drive_scales"])]
-            if len(self.drive_scales) != len(core.stages):
-                self.drive_scales = self.drive_scales[:len(core.stages)]
-                if len(self.drive_scales) < len(core.stages):
-                    self.drive_scales = self.drive_scales + [0.0] * (
-                        len(core.stages) - len(self.drive_scales)
-                    )
-        else:
-            self.drive_mappers = None
-            self.drive_scales = []
         if self.write_idx is not None:
             if any(i < 0 or i >= self.hid_count for i in self.write_idx):
                 raise ValueError(
@@ -398,19 +356,6 @@ class KirchhoffNetWithIO(nn.Module):
             self.skip_linear_in_dim = None
             self.skip_linear_out_dim = None
 
-    def _make_full_drive(self, hidden_drive: torch.Tensor) -> torch.Tensor:
-        B = hidden_drive.shape[0]
-        parts = [hidden_drive]
-        if self.proj_count > 0:
-            proj_zeros = hidden_drive.new_zeros(B, self.proj_count)
-            parts.append(proj_zeros)
-        if self.output_ode_count > 0:
-            out_zeros = hidden_drive.new_zeros(B, self.output_ode_count)
-            parts.append(out_zeros)
-        if len(parts) == 1:
-            return hidden_drive
-        return torch.cat(parts, dim=1)
-
     def forward(
         self,
         u: torch.Tensor,
@@ -470,24 +415,11 @@ class KirchhoffNetWithIO(nn.Module):
             else:
                 x0_full = torch.cat(parts, dim=1)
 
-        # Build per-stage drive targets when persistent drive is enabled.
-        # Suppressed under boundary mode: drive targets would compete with
-        # the boundary-terminal OTA currents and add a second input path.
-        if self.enable_drive and not self.enable_boundary and self.drive_mappers is not None:
-            drive_targets = []
-            for dm in self.drive_mappers:
-                hidden_drive = dm(u)
-                drive_targets.append(self._make_full_drive(hidden_drive))
-        else:
-            drive_targets = None
-
         if all(t == 0.0 for t in self.core.stage_times):
             x_final, trajs = x0_full, None
         else:
             x_final, trajs = self.core(
                 x0_full, store_trajectory=store_trajectory and not return_final_state,
-                drive_targets=drive_targets,
-                drive_scales=self.drive_scales if (self.enable_drive and not self.enable_boundary) else None,
                 u=u if (
                     self.enable_boundary or self.enable_vca
                     or self.gln_rails is not None
@@ -524,12 +456,10 @@ class KirchhoffNetWithIO(nn.Module):
           - ``input_mapper.*``
           - ``output_mapper.*``
           - ``post_readout_transfer.*``  (post-OutputMapper residual-relu-tanh)
-          - ``drive_mappers.*``
           - ``skip_linear.*``  (skip connection, enabled via enable_skip_linear)
           - ``core.stages.N.z_logits``  (structural)
           - ``core.stages.N.u_logits``  (structural, deprecated)
           - ``core.stages.N.raw_leak``  (dynamical)
-          - ``core.stages.N.raw_drive_g``  (dynamical)
           - ``core.stages.N.cell_lib.*``  (per-edge device params)
 
         Returns a dict with per-group subtotals, per-stage ``stage_N``
@@ -540,7 +470,6 @@ class KirchhoffNetWithIO(nn.Module):
             "input_mapper": 0,
             "output_mapper": 0,
             "post_readout_transfer": 0,
-            "drive_mappers": 0,
             "skip_linear": 0,
             "gln_rails": 0,
         }
@@ -557,8 +486,6 @@ class KirchhoffNetWithIO(nn.Module):
                 groups["post_readout_transfer"] += n
             elif name.startswith("output_mapper"):
                 groups["output_mapper"] += n
-            elif name.startswith("drive_mappers"):
-                groups["drive_mappers"] += n
             elif name.startswith("skip_linear"):
                 groups["skip_linear"] += n
             elif name.startswith("gln_rails"):
@@ -575,12 +502,8 @@ class KirchhoffNetWithIO(nn.Module):
                     "z_logits": 0,
                     "u_logits": 0,
                     "raw_leak": 0,
-                    "raw_drive_g": 0,
                     "boundary_z_logits": 0,
                     "boundary_cell_lib": 0,
-                    "raw_vref": 0,
-                    "ref_z_logits": 0,
-                    "ref_cell_lib": 0,
                     "output_ode_z_logits": 0,
                     "output_ode_cell_lib": 0,
                     "readout_sense_z_logits": 0,
@@ -598,20 +521,12 @@ class KirchhoffNetWithIO(nn.Module):
                     stage_bucket["u_logits"] += n; matched = True
                 elif tail == "raw_leak":
                     stage_bucket["raw_leak"] += n; matched = True
-                elif tail == "raw_drive_g":
-                    stage_bucket["raw_drive_g"] += n; matched = True
                 elif tail == "boundary_z_logits":
                     stage_bucket["boundary_z_logits"] += n; matched = True
                 elif tail.startswith("boundary_cell_lib."):
                     stage_bucket["boundary_cell_lib"] += n; matched = True
                 elif tail.startswith("cell_lib."):
                     stage_bucket["cell_lib"] += n; matched = True
-                elif tail == "raw_vref":
-                    stage_bucket["raw_vref"] += n; matched = True
-                elif tail == "ref_z_logits":
-                    stage_bucket["ref_z_logits"] += n; matched = True
-                elif tail.startswith("ref_cell_lib."):
-                    stage_bucket["ref_cell_lib"] += n; matched = True
                 elif tail == "output_ode_z_logits":
                     stage_bucket["output_ode_z_logits"] += n; matched = True
                 elif tail.startswith("output_ode_cell_lib."):

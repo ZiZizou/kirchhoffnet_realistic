@@ -1022,8 +1022,7 @@ class LocalKirchhoffStudentWrapper(nn.Module):
         total = bd.get("total", 0)
         encoder = int(groups.get("input_mapper", 0))
         projector = int(groups.get("output_mapper", 0)) + int(groups.get("skip_linear", 0))
-        drive = int(groups.get("drive_mappers", 0))
-        circuit = int(total) - encoder - projector - drive
+        circuit = int(total) - encoder - projector
         return {
             "encoder": encoder,
             "circuit": circuit,
@@ -1423,7 +1422,7 @@ def _make_dagger_optimizer(student, lr, weight_decay):
             or _name.endswith(".vca_v_core")
         ):
             _struct.append(_p)
-        elif _name.endswith(".raw_leak") or _name.endswith(".raw_drive_g"):
+        elif _name.endswith(".raw_leak"):
             _dyn.append(_p)
         else:
             _other.append(_p)

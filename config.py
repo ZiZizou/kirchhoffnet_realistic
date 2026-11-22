@@ -53,10 +53,8 @@ PHYS = {
 BO_GM_MAX_RANGE = (1.0, 50.0)
 BO_ISAT_MAX_RANGE = (1.0, 50.0)
 
-# Reference-edge configuration (unary nonlinearities via OTA-to-Vref plan).
-# Each node gets one OTA edge to a global per-stage Vref voltage. Vref is a
-# learnable scalar parameter constrained to [0, x_max] via sigmoid. raw_vref=0
-# maps to Vref = x_max/2 (mid-rail init), giving neutral offsets at startup.
+# Shared-sense readout reference rail (``raw_vref_sense``): raw 0 maps to
+# Vref = x_max/2 (mid-rail init).
 REF = {
     "raw_vref_init": 0.0,
 }
@@ -313,14 +311,6 @@ VCA = {
 # accepted because the prior 88% open was effectively permanent — gates
 # never closed anyway. A 50% start that CAN close is more useful than
 # 88% that cannot.)
-# Drive current defaults for persistent bounded source (persistent-drive plan).
-# Units: drive_isat in μA, raw_drive_g in dimensionless log-space.
-DRIVE = {
-    "drive_isat": 0.5,
-    "raw_drive_g_init": -1.0,
-    "drive_scales": [1.0, 0.5, 0.25],
-}
-
 INIT = {
     "logits_z_bias": 0.0,
     "raw_mult_init": 0.0,

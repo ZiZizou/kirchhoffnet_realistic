@@ -38,8 +38,6 @@ def main():
     test_smooth2d_preset()
     test_smooth2d_grid_preset()
     test_housing_grid_preset()
-    test_persistent_drive_auto_fan_out()
-    test_persistent_drive_sparse_proj()
     test_amp_dtype_fix()
     test_fan_out_torus_bug_fix()
     test_write_fan_out_cli()
@@ -55,7 +53,6 @@ def main():
     test_boundary_fan_out_validation()
     test_boundary_fan_out_grad_flow()
     test_boundary_fan_out_with_no_edge_gates()
-    test_boundary_fan_out_incompatible_with_persistent_drive()
     test_boundary_fan_out_uses_null_input_mapper()
     test_temporal_readout_basic()
     test_temporal_readout_zero_init()
@@ -471,148 +468,6 @@ def test_housing_grid_preset():
     check("make_housing_grid_preset(4): write_mode still dense",
           cfg4["write_mode"] == "dense")
 
-def test_persistent_drive_auto_fan_out():
-    print("\nTest PD-1: --persistent-drive auto-injects write_fan_out for non-fan_out presets")
-    from train_script import _build_grid_write_fan_out
-    from config import make_housing_grid_preset, PRESETS
-    from topology import build_net_from_preset
-    from cell_library import make_cell_library
-
-    cfg = make_housing_grid_preset(grid_size=5)
-    check("housing_grid base preset has write_mode='dense' (no fan_out)",
-          cfg["write_mode"] == "dense")
-    check("housing_grid base preset has NO write_fan_out",
-          "write_fan_out" not in cfg or cfg.get("write_fan_out") is None)
-
-    num_inputs = int(cfg["stages"][0]["num_inputs"])
-    fan_out = _build_grid_write_fan_out(num_inputs=num_inputs, grid_size=5)
-    check("_build_grid_write_fan_out: one entry per input",
-          len(fan_out) == num_inputs)
-    all_targets = [t for tgts in fan_out.values() for t in tgts]
-    check("_build_grid_write_fan_out: all targets unique",
-          len(all_targets) == len(set(all_targets)))
-    check("_build_grid_write_fan_out: every input has >= 1 target",
-          all(len(v) >= 1 for v in fan_out.values()))
-
-    active = dict(PRESETS.get("housing_grid", {}))
-    if "write_fan_out" in active:
-        active.pop("write_fan_out", None)
-    active["write_fan_out"] = fan_out
-    active["write_mode"] = "fan_out"
-    PRESETS["housing_grid"] = active
-
-    try:
-        cell_lib = make_cell_library('tanh_free')
-        net = build_net_from_preset(
-            "housing_grid",
-            cell_lib=cell_lib,
-            write_mode="fan_out",
-            read_mode=None,
-            write_idx=None,
-            read_idx=None,
-            enable_drive=True,
-        )
-        from io_mapper import FanOutInputMapper
-        check("housing_grid + persistent-drive uses FanOutInputMapper",
-              isinstance(net.input_mapper, FanOutInputMapper))
-        check("housing_grid + persistent-drive has drive_mappers",
-              net.drive_mappers is not None and len(net.drive_mappers) == 3)
-        check("housing_grid + persistent-drive: forward output is finite",
-              torch.isfinite(net(torch.rand(4, 8))[0]).all().item())
-    finally:
-        PRESETS["housing_grid"] = make_housing_grid_preset(grid_size=5)
-
-
-def test_persistent_drive_sparse_proj():
-    print("\nTest PD-sparse_proj: persistent-drive with write_mode='sparse_proj'")
-    from config import PRESETS
-    from topology import build_net_from_preset
-    from cell_library import make_cell_library
-
-    cell_lib = make_cell_library('tanh_free')
-
-    # Use _make_dynamic_preset to build a proper torus preset
-    from train_script import _make_dynamic_preset
-    cfg = _make_dynamic_preset(
-        problem="smooth2d", hidden_family="torus", num_hidden=25,
-        num_stages=3, edge_repeats=1, grid_size=5, bidirectional=False,
-        write_mode_override="sparse_proj",
-    )
-    PRESETS["smooth2d_torus_persistent_test"] = cfg
-
-    # Test with drive_mode='fan_out' (default) - uses FanOutInputMapper with round-robin
-    net = build_net_from_preset(
-        "smooth2d_torus_persistent_test",
-        cell_lib=cell_lib,
-        write_mode="sparse_proj",
-        write_idx=[2, 7, 12, 17, 22],
-        read_idx=[0, 15, 4, 19],
-        enable_drive=True,
-        drive_mode="fan_out",
-    )
-    from io_mapper import FanOutInputMapper, ProjectedSparseInputMapper, SparseInputMapper
-    check("input_mapper is ProjectedSparseInputMapper",
-          isinstance(net.input_mapper, ProjectedSparseInputMapper))
-    check("drive_mappers exist (3 stages)",
-          net.drive_mappers is not None and len(net.drive_mappers) == 3)
-    check("drive_mappers are FanOutInputMapper (default mode)",
-          isinstance(net.drive_mappers[0], FanOutInputMapper))
-    check("drive fan_out_map covers all write_idx nodes",
-          len(set().union(*net.drive_mappers[0].fan_out_map.values())) == 5)
-    check("write_idx preserved",
-          list(net.write_idx) == [2, 7, 12, 17, 22])
-    y, _ = net(torch.rand(4, 2))
-    check("forward output is finite", torch.isfinite(y).all().item())
-
-    # Test with drive_mode='projection' - uses ProjectedSparseInputMapper
-    net = build_net_from_preset(
-        "smooth2d_torus_persistent_test",
-        cell_lib=cell_lib,
-        write_mode="sparse_proj",
-        write_idx=[2, 7, 12, 17, 22],
-        read_idx=[0, 15, 4, 19],
-        enable_drive=True,
-        drive_mode="projection",
-    )
-    check("drive_mappers are ProjectedSparseInputMapper (projection mode)",
-          isinstance(net.drive_mappers[0], ProjectedSparseInputMapper))
-    y, _ = net(torch.rand(4, 2))
-    check("forward output is finite (projection)", torch.isfinite(y).all().item())
-
-    # Test one_to_one with persistent drive (use write_idx far from read_idx to
-    # satisfy degree-of-separation validation on torus+kernel3 topology).
-    cfg2 = _make_dynamic_preset(
-        problem="smooth2d", hidden_family="torus", num_hidden=25,
-        num_stages=3, edge_repeats=1, grid_size=5, bidirectional=False,
-        write_mode_override="one_to_one",
-    )
-    cfg2["write_idx"] = [0, 5]
-    cfg2["read_idx"] = [12, 18]
-    PRESETS["smooth2d_one_to_one_persistent_test"] = cfg2
-
-    net = build_net_from_preset(
-        "smooth2d_one_to_one_persistent_test",
-        cell_lib=cell_lib,
-        write_mode="one_to_one",
-        write_idx=[0, 5],
-        read_idx=[12, 18],
-        enable_drive=True,
-        drive_mode="fan_out",
-    )
-    check("input_mapper is SparseInputMapper",
-          isinstance(net.input_mapper, SparseInputMapper))
-    check("drive_mappers are FanOutInputMapper (1-to-1)",
-          isinstance(net.drive_mappers[0], FanOutInputMapper))
-    check("drive fan_out_map has 1 target per input",
-          {i: [write_idx] for i, write_idx in zip(range(2), [0, 5])}
-          == net.drive_mappers[0].fan_out_map)
-    y, _ = net(torch.rand(4, 2))
-    check("forward output is finite (one_to_one)", torch.isfinite(y).all().item())
-
-    # Cleanup
-    PRESETS.pop("smooth2d_torus_persistent_test", None)
-    PRESETS.pop("smooth2d_one_to_one_persistent_test", None)
-
 
 def test_amp_dtype_fix():
     print("\nTest AMP-fix: index_copy_ dtype mismatch with half-precision input")
@@ -688,14 +543,10 @@ def test_fan_out_torus_bug_fix():
             cell_lib=cell_lib,
             write_mode="fan_out",
             read_idx=[12, 18],
-            enable_drive=True,  # also exercises the persistent-drive block
-            drive_mode="fan_out",
         )
         from io_mapper import FanOutInputMapper
-        check("builds successfully with fan_out + persistent-drive",
+        check("builds successfully with fan_out",
               isinstance(net.input_mapper, FanOutInputMapper))
-        check("drive_mappers created (3 stages)",
-              net.drive_mappers is not None and len(net.drive_mappers) == 3)
         y, _ = net(torch.rand(4, 2))
         check("forward output is finite",
               torch.isfinite(y).all().item())
@@ -744,16 +595,14 @@ def test_write_fan_out_cli():
             cell_lib=cell_lib,
             write_mode="fan_out",
             read_idx=[0, 15, 4, 19],
-            enable_drive=True,
-            drive_mode="fan_out",
         )
         from io_mapper import FanOutInputMapper
         check("input_mapper is FanOutInputMapper",
               isinstance(net.input_mapper, FanOutInputMapper))
         check("input_mapper uses the custom fan_out_map",
               net.input_mapper.fan_out_map == {0: [2, 12], 1: [7, 17]})
-        check("drive_mappers use the custom fan_out_map",
-              net.drive_mappers[0].fan_out_map == {0: [2, 12], 1: [7, 17]})
+        check("input mapper uses the custom fan_out_map",
+              net.input_mapper.fan_out_map == {0: [2, 12], 1: [7, 17]})
         check("write_idx derived from fan_out targets",
               set(net.write_idx) == {2, 7, 12, 17})
         y, _ = net(torch.rand(4, 2))
@@ -974,7 +823,7 @@ def test_parameter_breakdown_aggregates_components():
           f"breakdown={bd['total']} manual={manual_total}")
 
     # All three top-level groups exist, even if zero.
-    for k in ("input_mapper", "output_mapper", "drive_mappers"):
+    for k in ("input_mapper", "output_mapper"):
         check(f"PBD-1: groups[{k}] present and >= 0",
               k in bd["groups"] and bd["groups"][k] >= 0,
               f"got {bd['groups'].get(k)}")
@@ -987,7 +836,7 @@ def test_parameter_breakdown_aggregates_components():
     # Each stage bucket has all expected sub-keys.
     for sk, bucket in bd["per_stage"].items():
         for sub in ("cell_lib", "z_logits", "u_logits", "raw_leak",
-                    "raw_drive_g", "other"):
+                    "other"):
             check(f"PBD-1: {sk} has {sub} sub-key",
                   sub in bucket,
                   f"missing {sub} in {bucket}")
@@ -1113,13 +962,12 @@ def test_boundary_fan_out_zero_init():
     captured = {}
 
     def capture_x0(x0, t_span=None, num_steps=None, store_trajectory=True,
-                   x_drive=None, drive_scale=0.0,
-                   u=None):
+                                      u=None):
         captured["x0"] = x0.detach().clone()
         captured["u"] = u.detach().clone() if u is not None else None
         return stage._forward_heun(x0=x0, t_span=t_span, num_steps=num_steps,
                                     store_trajectory=store_trajectory,
-                                    x_drive=x_drive, drive_scale=drive_scale,
+                                    
                                     u=u)
 
     stage.forward = capture_x0
@@ -1252,25 +1100,6 @@ def test_boundary_fan_out_with_no_edge_gates():
           torch.isfinite(y).all().item())
 
 
-def test_boundary_fan_out_incompatible_with_persistent_drive():
-    print("\nTest BFO-6: --boundary-fan-out and --persistent-drive are mutually exclusive (CLI)")
-    # The mutual-exclusion check lives in train_script.py, where it parses
-    # both flags and raises ValueError. Re-implement the same check here
-    # so we don't have to spin up a subprocess.
-    import json
-    args_boundary_fan_out = '{"0": [2], "1": [7]}'
-    args_persistent_drive = True
-
-    raw = json.loads(args_boundary_fan_out)
-    boundary_fan_out_parsed = {int(k): [int(vv) for vv in v] for k, v in raw.items()}
-
-    # Mirror the train_script.py guard.
-    if args_persistent_drive and boundary_fan_out_parsed is not None:
-        check("boundary + persistent-drive combination rejected by CLI guard", True)
-    else:
-        check("boundary + persistent-drive combination rejected by CLI guard", False)
-
-
 def test_boundary_fan_out_uses_null_input_mapper():
     print("\nTest BFO-7: NullInputMapper returns zeros of correct shape")
     from io_mapper import NullInputMapper
@@ -1396,11 +1225,11 @@ def test_temporal_readout_zero_init():
     orig_forward = stage._forward_heun
 
     def capture_x0(x0, t_span=None, num_steps=None, store_trajectory=True,
-                   x_drive=None, drive_scale=0.0, u=None):
+                   u=None):
         captured["x0"] = x0.detach().clone()
         return orig_forward(x0=x0, t_span=t_span, num_steps=num_steps,
                             store_trajectory=store_trajectory,
-                            x_drive=x_drive, drive_scale=drive_scale, u=u)
+                             u=u)
 
     stage._forward_heun = capture_x0
     try:

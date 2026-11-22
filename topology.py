@@ -927,13 +927,6 @@ def prune_stage(
         )
     }
 
-    # Remap write_idx for persistent drive when the original stage had drive.
-    new_write_idx = None
-    if hasattr(stage, '_has_drive') and stage._has_drive:
-        drive_surviving = [int(idx) for idx in stage._drive_idx.tolist() if int(idx) in node_remap]
-        new_write_idx = [node_remap[int(idx)] for idx in stage._drive_idx.tolist()
-                         if int(idx) in node_remap] if drive_surviving else None
-
     is_free_tanh = isinstance(stage.cell_lib, FreeTanhLibrary)
     if is_free_tanh:
         old = stage.cell_lib
@@ -948,22 +941,6 @@ def prune_stage(
     else:
         new_lib = stage.cell_lib
 
-    has_ref = getattr(stage, '_has_ref', False)
-
-    # Ref cell library recreation (for ref edges per node)
-    if has_ref and stage.ref_cell_lib is not None:
-        old_ref = stage.ref_cell_lib
-        if isinstance(old_ref, FreeTanhLibrary):
-            new_ref_lib = FreeTanhLibrary(
-                num_edges=num_nodes_new, gm_min=old_ref.gm_min, gm_max=old_ref.gm_max,
-                isat_min=old_ref.isat_min, isat_max=old_ref.isat_max,
-                bias_enabled=old_ref._bias_enabled,
-            )
-        else:
-            new_ref_lib = old_ref
-    else:
-        new_ref_lib = None
-
     new_stage = DifferentialStage(
         num_nodes=num_nodes_new,
         src=new_src,
@@ -977,15 +954,12 @@ def prune_stage(
         clip_sharpness_init=getattr(stage, "clip_sharpness_init", None),
         clip_sharpness_min=getattr(stage, "clip_sharpness_min", None),
         clip_sharpness_max=getattr(stage, "clip_sharpness_max", None),
-        write_idx=new_write_idx,
         leak_mode=leak_mode,
         leak_constant=leak_constant,
         freeze_read=stage.freeze_read if freeze_read is None else freeze_read,
         freeze_boundary=stage.freeze_boundary if freeze_boundary is None else freeze_boundary,
         freeze_temporal_read=stage.freeze_temporal_read if freeze_temporal_read is None else freeze_temporal_read,
         boundary_cell_lib=stage.boundary_cell_lib,
-        enable_ref_edges=has_ref,
-        ref_cell_lib=new_ref_lib,
         vca_enabled=False,
         vca_rank=VCA["rank"],
         vca_in_dim=0,
@@ -1015,57 +989,6 @@ def prune_stage(
                 new_stage.clip_sharpness_raw.data.copy_(
                     stage.clip_sharpness_raw.data.cpu()
                 )
-        # Transfer raw_drive_g for surviving driven nodes.
-        if new_write_idx is not None and hasattr(stage, 'raw_drive_g'):
-            old_drive_idx_list = stage._drive_idx.tolist()
-            surv_mask = torch.tensor(
-                [int(idx) in node_remap for idx in old_drive_idx_list],
-                dtype=torch.bool,
-            )
-            with torch.no_grad():
-                new_stage.raw_drive_g.data.copy_(stage.raw_drive_g.data[surv_mask].cpu())
-
-        # Transfer reference-edge parameters (if stage had ref edges).
-        if has_ref and transfer_params:
-            with torch.no_grad():
-                if hasattr(new_stage, "raw_vref") and hasattr(stage, "raw_vref"):
-                    new_stage.raw_vref.data.copy_(stage.raw_vref.data.cpu())
-                if hasattr(new_stage, "ref_z_logits") and hasattr(stage, "ref_z_logits"):
-                    old_ref_z = stage.ref_z_logits.data[node_idx_old].cpu()
-                    new_stage.ref_z_logits.data.copy_(old_ref_z)
-                # Transfer per-node ref_cell_lib parameters (one ref edge per node).
-                if hasattr(new_stage, "ref_cell_lib") and new_stage.ref_cell_lib is not None \
-                   and hasattr(stage, "ref_cell_lib") and stage.ref_cell_lib is not None:
-                    rsrc = stage.ref_cell_lib
-                    rdst = new_stage.ref_cell_lib
-                    if hasattr(rdst, "param") and hasattr(rsrc, "param"):
-                        rdst.param.data.copy_(rsrc.param.data[:, node_idx_old].cpu())
-                    elif hasattr(rdst, "alpha_raw") and hasattr(rsrc, "alpha_raw"):
-                        rdst.alpha_raw.data.copy_(rsrc.alpha_raw.data[node_idx_old].cpu())
-                        if hasattr(rdst, "bias_raw") and hasattr(rsrc, "bias_raw"):
-                            rdst.bias_raw.data.copy_(rsrc.bias_raw.data[node_idx_old].cpu())
-                    elif hasattr(rdst, "kappa_raw") and hasattr(rsrc, "kappa_raw"):
-                        for name in ("kappa_raw", "gm_raw", "isat_raw"):
-                            getattr(rdst, name).data.copy_(
-                                getattr(rsrc, name).data[node_idx_old].cpu()
-                            )
-                        if hasattr(rdst, "theta_raw") and hasattr(rsrc, "theta_raw"):
-                            rdst.theta_raw.data.copy_(rsrc.theta_raw.data[node_idx_old].cpu())
-                    elif hasattr(rdst, "a_raw") and hasattr(rsrc, "a_raw"):
-                        for name in ("a_raw", "b_raw", "s_raw", "gm_raw", "isat_raw"):
-                            getattr(rdst, name).data.copy_(
-                                getattr(rsrc, name).data[node_idx_old].cpu()
-                            )
-                        if hasattr(rdst, "theta_raw") and hasattr(rsrc, "theta_raw"):
-                            rdst.theta_raw.data.copy_(rsrc.theta_raw.data[node_idx_old].cpu())
-                    elif hasattr(rdst, "alpha_raw") and hasattr(rsrc, "alpha_raw"):
-                        for name in ("alpha_raw", "gm_raw", "isat_raw"):
-                            getattr(rdst, name).data.copy_(
-                                getattr(rsrc, name).data[node_idx_old].cpu()
-                            )
-                        if hasattr(rdst, "bias_raw") and hasattr(rsrc, "bias_raw"):
-                            rdst.bias_raw.data.copy_(rsrc.bias_raw.data[node_idx_old].cpu())
-
     return new_stage, node_remap
 
 
@@ -1127,9 +1050,6 @@ def prune_network(
         else:
             wi, ri = None, None
             protected = set()
-        # Driven nodes must survive pruning in every stage (persistent drive).
-        if hasattr(s, '_has_drive') and s._has_drive:
-            protected.update(int(idx) for idx in s._drive_idx.tolist())
         protected = protected if protected else None
         new_s, remap = prune_stage(
             s,
@@ -1153,12 +1073,8 @@ def prune_network(
     for i in range(len(new_stages) - 1):
         activation = getattr(net.transfers[i], 'activation', 'none')
         residual_rank = getattr(net.transfers[i], 'residual_rank', -1)
-        drive_indices = None
-        if hasattr(new_stages[i], '_has_drive') and new_stages[i]._has_drive:
-            drive_indices = new_stages[i]._drive_idx.tolist()
         new_transfers.append(StageTransfer(new_widths[i], new_widths[i + 1],
                                            activation=activation,
-                                           drive_mask=drive_indices,
                                            residual_rank=residual_rank))
 
     return KirchhoffNet(
@@ -1227,7 +1143,6 @@ def topology_to_stage(
     clip_sharpness_min: float | None = None,
     clip_sharpness_max: float | None = None,
     gln_rails: "GLNRails | None" = None,
-    write_idx: list[int] | None = None,
     leak_mode: str = "programmable",
     leak_constant: float | None = None,
     read_only_source: bool = False,
@@ -1237,7 +1152,6 @@ def topology_to_stage(
     boundary_src: list[int] | None = None,
     boundary_dst: list[int] | None = None,
     boundary_cell_lib: FreeTanhLibrary | None = None,
-    enable_ref_edges: bool = False,
     output_ode_src: list[int] | None = None,
     output_ode_dst: list[int] | None = None,
     output_ode_cell_lib: FreeTanhLibrary | None = None,
@@ -1261,10 +1175,6 @@ def topology_to_stage(
     ODE branches). Hidden + projection nodes are remapped to compact 0..N-1.
 
     Args:
-        write_idx: Hidden-node indices (in user-facing 0..hid_count-1
-            coordinates) that should receive persistent drive current.
-            These indices map directly to the first hid_count positions
-            of the compact state vector.
         leak_mode: ``"programmable"`` (default) or ``"non-programmable"``.
             Controls whether the stage has a learnable per-node ``raw_leak``
             or a fixed constant.
@@ -1291,9 +1201,6 @@ def topology_to_stage(
         boundary_cell_lib: Cell library instance used to compute boundary
             edge currents; must match the cell type of ``cell_lib`` and be
             sized for ``len(boundary_src)`` edges.
-        enable_ref_edges: When ``True``, every node gets one OTA edge to a
-            global per-stage learnable reference voltage ``Vref``. Forwarded
-            to ``DifferentialStage``.
         output_ode_src: List of source node indices (compact coordinates) for
             temporal-readout OTA edges. The source is a hidden or projection
             node and is read-only (its voltage drives the OTA current, no
@@ -1354,23 +1261,6 @@ def topology_to_stage(
             bias_enabled=cell_lib._bias_enabled,
         )
 
-    # Reference-edge cell library: one OTA per node (num_nodes edges). Same
-    # cell type/config as the core lib so reference edges behave like normal
-    # OTA cells, just connected to a global per-stage learnable Vref instead
-    # of inter-node voltages.
-    ref_cell_lib = None
-    if enable_ref_edges:
-        n_ref = len(active_nodes) + int(output_ode_node_count)
-        if isinstance(cell_lib, FreeTanhLibrary):
-            ref_cell_lib = FreeTanhLibrary(
-                num_edges=n_ref,
-                gm_min=cell_lib.gm_min,
-                gm_max=cell_lib.gm_max,
-                isat_min=cell_lib.isat_min,
-                isat_max=cell_lib.isat_max,
-                bias_enabled=cell_lib._bias_enabled,
-            )
-
     # Shared-sense readout: clone the template sense cell library per stage
     # (mirrors the output_ode clone below) so each stage owns its own sense
     # OTA parameters. The sense src layout in ``build_net_from_config`` is
@@ -1405,7 +1295,7 @@ def topology_to_stage(
     # DifferentialStage and its parameters would appear N times in
     # named_parameters() (causing the optimizer to apply N gradient steps
     # per optimization pass). Same cloning pattern as the core cell_lib
-    # above and ref_cell_lib above.
+    # above.
     if output_ode_cell_lib is not None and len(output_ode_src or []) > 0:
         n_out_ode = len(output_ode_src)
         if isinstance(cell_lib, FreeTanhLibrary):
@@ -1432,7 +1322,6 @@ def topology_to_stage(
         clip_sharpness_min=clip_sharpness_min,
         clip_sharpness_max=clip_sharpness_max,
         gln_rails=gln_rails,
-        write_idx=write_idx,
         leak_mode=leak_mode,
         leak_constant=leak_constant,
         read_only_source=read_only_source,
@@ -1442,8 +1331,6 @@ def topology_to_stage(
         boundary_src=boundary_src,
         boundary_dst=boundary_dst,
         boundary_cell_lib=boundary_cell_lib,
-        enable_ref_edges=enable_ref_edges,
-        ref_cell_lib=ref_cell_lib,
         output_ode_src=output_ode_src,
         output_ode_dst=output_ode_dst,
         output_ode_cell_lib=output_ode_cell_lib,
@@ -1472,8 +1359,6 @@ def build_net_from_preset(
     read_mode: str | None = None,
     write_idx: list[int] | None = None,
     read_idx: list[int] | None = None,
-    enable_drive: bool = False,
-    drive_mode: str = "fan_out",
     leak_mode: str = "programmable",
     leak_constant: float | None = None,
     encoder_type: str | None = None,
@@ -1488,7 +1373,6 @@ def build_net_from_preset(
     freeze_temporal_read: bool = False,
     enable_skip_linear: bool = False,
     boundary_fan_out: dict[int, list[int]] | None = None,
-    enable_ref_edges: bool = False,
     enable_temporal_readout: bool = False,
     readout_mode: str = "ota_mesh",
     readout_senses_per_node: int = 1,
@@ -1531,14 +1415,6 @@ def build_net_from_preset(
     * read_mode:   "sparse" | "dense".  When ``None`` (default), use the
                    preset's ``read_mode`` if present, else ``"sparse"``.
     * write_idx / read_idx: explicit index lists override preset values.
-    * drive_mode:  "fan_out" | "projection". When ``enable_drive=True``,
-                   controls the per-stage drive mapper architecture.
-                   ``"fan_out"`` (default) uses FanOutInputMapper with
-                   per-input scalars (gain, bias) per driven node. With
-                   ``"projection"`` for write_mode='sparse_proj' or
-                   'one_to_one', uses ProjectedSparseInputMapper with a
-                   learned nn.Linear projection matching the input mapper.
-                   Only meaningful when enable_drive=True.
     * leak_mode / leak_constant: forwarded to :func:`topology_to_stage`.
     * encoder_type: "linear" | "residual_tanh". When "residual_tanh",
                     ``InputMapper`` is replaced by ``ResidualTanhInputMapper``
@@ -1574,14 +1450,6 @@ def build_net_from_preset(
                     is treated as fixed-voltage boundary terminals with
                     sparse OTA edges into the dynamic fabric. All dynamic
                     nodes start at zero (no initial-condition write).
-    * enable_ref_edges: When ``True``, every ODE node gets one OTA edge to
-                    a global per-stage learnable reference voltage ``Vref``
-                    (scalar, constrained to ``[0, x_max]``). Implements
-                    programmable unary nonlinearities (thresholding,
-                    saturation, soft activation, bias injection, etc.)
-                    without introducing a heterogeneous cell type. The
-                    reference edges use a separate cell library sized to
-                    ``num_nodes`` (one OTA per node). Default ``False``.
     * enable_temporal_readout: When ``True``, append ``out_dim`` extra
                     output ODE accumulator nodes to each stage's state
                     (after hidden+proj). All hidden nodes connect all-to-
@@ -1624,8 +1492,7 @@ def build_net_from_preset(
         if vca_rank is not None:
             cfg["vca_rank"] = int(vca_rank)
     return build_net_from_config(
-        cfg, cell_lib=cell_lib, enable_drive=enable_drive,
-        drive_mode=drive_mode,
+        cfg, cell_lib=cell_lib,
         leak_mode=leak_mode, leak_constant=leak_constant,
         read_only_source=read_only_source,
         interstage_activation=interstage_activation,
@@ -1635,7 +1502,6 @@ def build_net_from_preset(
         freeze_temporal_read=freeze_temporal_read,
         enable_skip_linear=enable_skip_linear,
         boundary_fan_out=boundary_fan_out,
-        enable_ref_edges=enable_ref_edges,
         enable_temporal_readout=enable_temporal_readout,
         readout_mode=readout_mode,
         readout_senses_per_node=readout_senses_per_node,
@@ -1662,8 +1528,6 @@ def build_net_from_preset(
 def build_net_from_config(
     cfg: dict,
     cell_lib: FreeTanhLibrary,
-    enable_drive: bool = False,
-    drive_mode: str = "fan_out",
     leak_mode: str | None = None,
     leak_constant: float | None = None,
     read_only_source: bool = False,
@@ -1674,7 +1538,6 @@ def build_net_from_config(
     freeze_temporal_read: bool = False,
     enable_skip_linear: bool = False,
     boundary_fan_out: dict[int, list[int]] | None = None,
-    enable_ref_edges: bool = False,
     enable_temporal_readout: bool = False,
     readout_mode: str = "ota_mesh",
     readout_senses_per_node: int = 1,
@@ -1721,10 +1584,6 @@ def build_net_from_config(
     via the ``cfg`` dict (``cfg['leak_mode']`` / ``cfg['leak_constant']``).
     Explicit kwargs take precedence.
 
-    ``drive_mode`` ("fan_out" | "projection") controls per-stage drive
-    mapper architecture when ``enable_drive=True``. See build_net_from_preset
-    for details.
-
     ``freeze_read`` can be specified either explicitly or via
     ``cfg['freeze_read']``. Explicit kwargs take precedence.
 
@@ -1753,10 +1612,6 @@ def build_net_from_config(
     ``decoder_hidden_dim`` control the hidden width of the residual
     tanh branch (default 64). Defaults are read from the ``cfg`` dict
     when not supplied via the API.
-
-    ``enable_ref_edges`` (``False`` default): every ODE node gets one
-    OTA edge to a global per-stage learnable ``Vref``. Forwarded to
-    :func:`topology_to_stage` for each stage.
 
     ``enable_temporal_readout`` (``False`` default): append ``out_dim``
     extra output ODE accumulator nodes to each stage. Hidden nodes
@@ -1790,11 +1645,6 @@ def build_net_from_config(
     gln_rank = int(cfg.get("gln_rank", gln_rank))
     gln_alpha_init = float(cfg.get("gln_alpha_init", gln_alpha_init))
     gln_families = cfg.get("gln_families", gln_families)
-    if drive_mode not in ("fan_out", "projection"):
-        raise ValueError(
-            f"drive_mode must be 'fan_out' or 'projection', got {drive_mode!r}"
-        )
-    # knet-gated-memory (plan): cfg dict > explicit kwarg.
     encoder_type = cfg.get("encoder_type", "linear")
     decoder_type = cfg.get("decoder_type", "linear")
     encoder_hidden_dim = int(cfg.get("encoder_hidden_dim", 64))
@@ -2108,12 +1958,6 @@ def build_net_from_config(
             input_mapper = MapperCls(in_dim=in_dim, out_dim=n_first_hid,
                                      x_max=x_max)
         write_idx_arg = None
-        if enable_drive:
-            raise ValueError(
-                "enable_drive=True requires write_mode='fan_out', "
-                "'sparse_proj', or 'one_to_one' "
-                f"(got write_mode={write_mode!r})"
-            )
 
     # GLN rails (F2): one shared module for the whole net. The rails read the
     # raw input ``u`` (boundary-terminal voltage vector, width ``in_dim``).
@@ -2168,7 +2012,7 @@ def build_net_from_config(
                 "readout", int(readout_senses_per_node) * n_first_hid,
             )
 
-    # Build stages with optional write_idx for persistent drive.
+    # Build stages.
     stage_modules = []
     transfers = []
     stage_times = []
@@ -2186,7 +2030,7 @@ def build_net_from_config(
         if boundary_first_stage_only and stage_idx > 0:
             _b_src, _b_dst, _b_lib = None, None, None
         stage, active_nodes, id_map = topology_to_stage(
-            topo, cell_lib=cell_lib, write_idx=write_idx_arg if enable_drive else None,
+            topo, cell_lib=cell_lib,
             leak_mode=leak_mode, leak_constant=leak_constant,
             read_only_source=read_only_source,
             freeze_read=freeze_read,
@@ -2195,7 +2039,6 @@ def build_net_from_config(
             boundary_src=_b_src,
             boundary_dst=_b_dst,
             boundary_cell_lib=_b_lib,
-            enable_ref_edges=enable_ref_edges,
             output_ode_src=output_ode_src,
             output_ode_dst=output_ode_dst,
             output_ode_cell_lib=output_ode_cell_lib,
@@ -2231,9 +2074,6 @@ def build_net_from_config(
             next_active = sorted(
                 set(next_topo.hidden_node_ids + next_topo.proj_node_ids)
             )
-            transfer_drive_mask = (
-                list(write_idx_arg) if (enable_drive and write_idx_arg is not None) else None
-            )
             # When temporal readout is active, each stage's state includes
             # output_ode_count extra output accumulator nodes appended after
             # the core nodes. StageTransfer must be sized for the full state
@@ -2246,7 +2086,6 @@ def build_net_from_config(
                 transfer_out_nodes += output_ode_count
             transfers.append(StageTransfer(transfer_in_nodes, transfer_out_nodes,
                                            activation=interstage_activation,
-                                           drive_mask=transfer_drive_mask,
                                            residual_rank=interstage_residual_rank))
 
     core = KirchhoffNet(
@@ -2255,81 +2094,6 @@ def build_net_from_config(
         stage_times=stage_times,
         stage_steps=stage_steps,
     )
-
-    # Build per-stage drive mappers when persistent drive is enabled.
-    drive_mappers_list = None
-    if enable_drive:
-        if fan_out_map is not None:
-            # write_mode == 'fan_out': use FanOutInputMapper directly.
-            drive_mappers_list = [
-                FanOutInputMapper(
-                    in_dim=in_dim,
-                    out_dim=len(first_hid),
-                    fan_out_map=fan_out_map,
-                    x_max=x_max,
-                )
-                for _ in range(len(stages_cfg))
-            ]
-        elif write_mode == "sparse_proj" and write_idx_arg is not None:
-            # write_mode == 'sparse_proj': drive targets come from write_idx.
-            # Default ('fan_out' drive_mode): round-robin assign write_idx
-            # entries to inputs to form a fan_out_map. 'projection' mode:
-            # use ProjectedSparseInputMapper with learned nn.Linear.
-            if drive_mode == "projection":
-                drive_mappers_list = [
-                    ProjectedSparseInputMapper(
-                        in_dim=in_dim,
-                        out_dim=len(first_hid),
-                        write_idx=list(write_idx_arg),
-                        x_max=x_max,
-                    )
-                    for _ in range(len(stages_cfg))
-                ]
-            else:
-                drive_fan_out = {
-                    i: list(write_idx_arg[i::in_dim])
-                    for i in range(in_dim)
-                }
-                drive_mappers_list = [
-                    FanOutInputMapper(
-                        in_dim=in_dim,
-                        out_dim=len(first_hid),
-                        fan_out_map=drive_fan_out,
-                        x_max=x_max,
-                    )
-                    for _ in range(len(stages_cfg))
-                ]
-        elif write_mode == "one_to_one" and write_idx_arg is not None:
-            # write_mode == 'one_to_one': drive targets come from write_idx.
-            # Both modes work here: 'projection' uses ProjectedSparseInputMapper
-            # (matches input mapper architecture), 'fan_out' uses 1-to-1
-            # FanOutInputMapper (one input per driven node).
-            if drive_mode == "projection":
-                drive_mappers_list = [
-                    ProjectedSparseInputMapper(
-                        in_dim=in_dim,
-                        out_dim=len(first_hid),
-                        write_idx=list(write_idx_arg),
-                        x_max=x_max,
-                    )
-                    for _ in range(len(stages_cfg))
-                ]
-            else:
-                # 1-to-1: input i -> [write_idx_arg[i]]
-                drive_fan_out = {i: [write_idx_arg[i]] for i in range(in_dim)}
-                drive_mappers_list = [
-                    FanOutInputMapper(
-                        in_dim=in_dim,
-                        out_dim=len(first_hid),
-                        fan_out_map=drive_fan_out,
-                        x_max=x_max,
-                    )
-                    for _ in range(len(stages_cfg))
-                ]
-        # else (write_mode == 'dense'): drive_mappers_list stays None.
-        # The dense-mode ValueError above already rejected this case, so
-        # reaching here means enable_drive=True without a write_idx — which
-        # only happens for dense mode. Leave drive disabled (no mappers).
 
     grouped_cfg = cfg.get("grouped_readout")
     if enable_temporal_readout_effective:
@@ -2418,8 +2182,6 @@ def build_net_from_config(
         final_proj_count=len(last_proj),
         write_idx=write_idx_arg,
         read_idx=read_idx_arg,
-        enable_drive=enable_drive,
-        drive_mappers=drive_mappers_list,
         enable_skip_linear=enable_skip_linear,
         skip_linear_in_dim=in_dim if enable_skip_linear else None,
         skip_linear_out_dim=out_dim if enable_skip_linear else None,

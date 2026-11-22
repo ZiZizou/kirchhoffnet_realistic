@@ -542,7 +542,7 @@ LR_DECAY_AFTER_ITER   = 3        # iteration index (0-based) after which LR *= 0
 LR_FLOOR             = 1e-4      # minimum LR during decay (was eta_min in scheduler)
 MAPPER_LR_SCALE       = 1.0      # I/O mapper + OutputAffine readout (base * 1.0)
 STRUCT_LR_SCALE       = 4.0      # structural core params: name.endswith('.z_logits')
-DYN_LR_SCALE          = 1.0      # sensitive dynamical params: raw_leak, raw_drive_g
+DYN_LR_SCALE          = 1.0      # sensitive dynamical params: raw_leak
 FAILURE_CAP_RATIO     = 0.40     # max new failures / existing dataset size per iter
 CONVERGENCE_THRESHOLD = 0.02     # early-stop if failure_rate < 2%
 # Best-model selection (plan dagger_knet_best_model_selection_improvement):
@@ -2000,8 +2000,7 @@ class LocalKirchhoffStudentWrapper(nn.Module):
         per_stage = bd.get("per_stage", {})
         encoder = int(groups.get("input_mapper", 0))
         projector = int(groups.get("output_mapper", 0)) + int(groups.get("skip_linear", 0))
-        drive = int(groups.get("drive_mappers", 0))
-        circuit = int(total) - encoder - projector - drive
+        circuit = int(total) - encoder - projector
         return {
             "encoder": encoder,
             "circuit": circuit,
@@ -3175,7 +3174,7 @@ if getattr(_bo_args, 'count_params_only', False):
 #   - struct: name.endswith('.z_logits') (per-stage edge-gate logits)
 #             + .vca_W / .vca_W_core / .vca_v_{boundary,readout,core}
 #             (VCA routing-structure params, train.py:1102-1108)
-#   - dyn:    name.endswith('.raw_leak') or '.raw_drive_g'
+#   - dyn:    name.endswith('.raw_leak')
 #             + '.clip_sharpness_raw' (F1) + 'gln_rails.*' (F2)
 #   - other:  everything else (stages/transfers/vref/etc.)
 # The 'lr_scale' key is stored in each group dict so the per-iteration LR
@@ -3202,7 +3201,7 @@ def _make_dagger_optimizer(student, lr, weight_decay):
             # routed to the structural LR group (4x base by convention)
             # so the gate signal learns alongside z_logits.
             _struct.append(_p)
-        elif (_name.endswith(".raw_leak") or _name.endswith(".raw_drive_g")
+        elif (_name.endswith(".raw_leak")
               or _name.endswith(".clip_sharpness_raw")
               or _name.startswith("gln_rails.")):
             # F1/F2 params ride the dynamic LR group (same convention as

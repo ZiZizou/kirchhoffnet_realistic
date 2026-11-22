@@ -7,8 +7,7 @@ applied after the width adjustment:
 * ``activation="none"`` (default): pure identity / truncate / pad.
 * ``activation="relu"``: ``F.relu`` on the state vector.
 * ``activation="residual"``: per-node learnable residual
-  ``W1 * x + W2 * tanh(x)`` on non-driven nodes. Driven nodes (those
-  receiving persistent drive current) pass through as identity. W1
+  ``W1 * x + W2 * tanh(x)``. W1
   is initialized to 1 and W2 to 0, so the network starts as identity.
 * ``activation="residual_mixing"``: like ``"residual"`` plus an additive
   zero-initialized mixing term that can mix signals across nodes.
@@ -42,19 +41,12 @@ class StageTransfer(nn.Module):
             ``"none"`` (default): identity / truncate / pad.
             ``"relu"``: ``F.relu`` on the state vector.
             ``"residual"``: per-node learnable
-            ``residual_w1 * x + residual_w2 * tanh(x)`` on non-driven
-            nodes; driven nodes pass through as identity. Adds
+            ``residual_w1 * x + residual_w2 * tanh(x)``. Adds
             ``out_nodes`` learnable parameters per side (W1 init=1, W2
             init=0).
             ``"residual_mixing"``: same as ``"residual"`` plus an
             additive zero-initialized mixing term (full matrix or
             low-rank depending on ``residual_rank``).
-        drive_mask: Optional list of node indices that should pass
-            through unchanged (identity) when ``activation`` is
-            ``"residual"`` or ``"residual_mixing"``. For other
-            activations the mask is ignored. ``None`` (default) means
-            no nodes are treated as driven, so the transform is
-            applied to all nodes.
         residual_rank: Rank of the additive mixing term when
             ``activation="residual_mixing"``. ``-1`` (default) or any
             value ``>= out_nodes``: full N×N matrix. ``0``: pure
@@ -69,7 +61,6 @@ class StageTransfer(nn.Module):
         in_nodes: int,
         out_nodes: int,
         activation: str = "none",
-        drive_mask: list[int] | None = None,
         residual_rank: int = -1,
     ) -> None:
         super().__init__()
@@ -80,11 +71,6 @@ class StageTransfer(nn.Module):
                 f"activation must be one of {STAGE_TRANSFER_VALID_ACTIVATIONS}, "
                 f"got {activation!r}"
             )
-        if drive_mask is not None:
-            if any(i < 0 or i >= out_nodes for i in drive_mask):
-                raise ValueError(
-                    f"drive_mask entries must be in [0, {out_nodes}), got {drive_mask}"
-                )
         self.in_nodes = int(in_nodes)
         self.out_nodes = int(out_nodes)
         self.activation = activation
@@ -136,13 +122,6 @@ class StageTransfer(nn.Module):
                 self.mix_u2 = nn.Parameter(torch.zeros(self.out_nodes, r))
                 self.mix_v2 = nn.Parameter(torch.zeros(r, self.out_nodes))
 
-        if drive_mask is not None:
-            self.register_buffer(
-                "_drive_mask", torch.tensor(list(drive_mask), dtype=torch.long)
-            )
-        else:
-            self.register_buffer("_drive_mask", torch.empty(0, dtype=torch.long))
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() != 2 or x.size(1) != self.in_nodes:
             raise ValueError(
@@ -164,8 +143,6 @@ class StageTransfer(nn.Module):
                 + self.residual_w2 * torch.tanh(out)
                 + self.residual_w3 * F.relu(out - self.residual_vth)
             )
-            if self._drive_mask.numel() > 0:
-                transformed[:, self._drive_mask] = out[:, self._drive_mask]
             out = transformed
         elif self.activation in ("residual", "residual_mixing"):
             transformed = self.residual_w1 * out + self.residual_w2 * torch.tanh(out)
@@ -186,8 +163,6 @@ class StageTransfer(nn.Module):
                     )
                 # r == 0: pure diagonal, no mixing term to add.
 
-            if self._drive_mask.numel() > 0:
-                transformed[:, self._drive_mask] = out[:, self._drive_mask]
             out = transformed
         return out
 
@@ -199,6 +174,4 @@ class StageTransfer(nn.Module):
         ]
         if self.activation == "residual_mixing":
             parts.append(f"residual_rank={self.residual_rank}")
-        if self._drive_mask.numel() > 0:
-            parts.append(f"drive_nodes={self._drive_mask.numel()}")
         return ", ".join(parts)

@@ -3377,7 +3377,7 @@ def _build_phase_a_optimizer(student, *, lr, weight_decay,
     Single-group when all scales are 1.0 (safe for MLP / Plain students).
     Group naming follows the same conventions used by the Friedman KNet
     harness (input_mapper / output_mapper / post_readout_transfer /
-    z_logits / u_logits / raw_leak / raw_drive_g / cell_lib.* / vca_*).
+    z_logits / u_logits / raw_leak / cell_lib.* / vca_*).
     """
     mapper_params, struct_params, dyn_params = [], [], []
     for name, p in student.named_parameters():
@@ -3388,7 +3388,7 @@ def _build_phase_a_optimizer(student, *, lr, weight_decay,
                                     "post_readout_transfer.")):
             mapper_params.append(p)
         elif any(tag in n for tag in ("z_logits", "u_logits", "raw_leak",
-                                      "raw_drive_g", "vca_")):
+                                      "vca_")):
             struct_params.append(p)
         else:
             dyn_params.append(p)

@@ -373,7 +373,7 @@ def _build_grid_write_fan_out(num_inputs: int, grid_size: int | None) -> dict:
     (those adjacent to center) and finally the center column itself
     are used as fallbacks when the end columns are exhausted, in which
     case the topology may not satisfy ``>1 hop`` and the caller is
-    expected to either drop ``--persistent-drive`` or supply an
+    expected to supply an
     explicit ``--read-idx`` matching the allowed topology.
     """
     if grid_size is None or grid_size < 2:
@@ -658,8 +658,6 @@ def _save_config_snapshot(out_dir: Path, problem: str, args, lambdas: dict,
             if effective_write == "fan_out":
                 f.write(f"  fan_out_map: {net.input_mapper.fan_out_map}\n")
             f.write(f"  write_idx: {list(net.write_idx) if net.write_idx is not None else None}\n")
-            f.write(f"  persistent_drive: {args.persistent_drive}\n")
-            f.write(f"  drive_mode: {args.drive_mode}\n")
             f.write(f"  output_mapper: {type(net.output_mapper).__name__}\n")
             f.write(f"  read_idx: {list(net.read_idx) if net.read_idx is not None else None}\n")
             f.write(f"  hid_count: {net.hid_count}\n")
@@ -1245,7 +1243,7 @@ def collect_gradient_norms(raw_net):
             if any(
                 name.endswith("." + lib_prefix + "." + s)
                 for lib_prefix in ("cell_lib", "boundary_cell_lib",
-                                   "output_ode_cell_lib", "ref_cell_lib",
+                                   "output_ode_cell_lib",
                                    "readout_sense_cell_lib")
                 for s in device_param_suffixes
             ):
@@ -1269,7 +1267,7 @@ def collect_gradient_norms(raw_net):
             if any(
                 name.endswith("." + lib_prefix + "." + s)
                 for lib_prefix in ("cell_lib", "boundary_cell_lib",
-                                   "output_ode_cell_lib", "ref_cell_lib",
+                                   "output_ode_cell_lib",
                                    "readout_sense_cell_lib")
                 for s in device_param_suffixes
             ):
@@ -1328,7 +1326,7 @@ def compute_update_norms(
             or name.endswith(".vca_v_core")
         ):
             g = "struct"
-        elif (name.endswith(".raw_leak") or name.endswith(".raw_drive_g")
+        elif (name.endswith(".raw_leak")
               or name.endswith(".clip_sharpness_raw")
               or name.startswith("gln_rails.")):
             g = "dyn"
@@ -1729,7 +1727,7 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--dyn-lr-scale", type=float, default=1.0,
         help="LR multiplier for sensitive dynamical params (raw_leak, "
-             "raw_drive_g). Default 1.0 (base LR). These affect the Jacobian "
+             "...). Default 1.0 (base LR). These affect the Jacobian "
              "and fixed-point conditioning, so boosting aggressively can "
              "destabilize the dynamics. When != 1.0, uses flat global groups "
              "and ignores --stage-lr-scale.")
@@ -1953,24 +1951,6 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "meaningful with --schedule three_phase / four_phase).")
 
     parser.add_argument(
-        "--persistent-drive", action="store_true", default=False,
-        dest="persistent_drive",
-        help="Enable persistent drive current in all stages. The drive "
-             "current I_drive = I_sat * tanh(g * (x_drive - x) / I_sat) "
-             "adds an input-dependent forcing term to every stage. "
-             "Compatible with write_mode='fan_out', 'sparse_proj', and "
-             "'one_to_one' (the driven nodes are the write_idx entries). "
-             "")
-    parser.add_argument(
-        "--drive-mode", choices=["fan_out", "projection"], default="fan_out",
-        dest="drive_mode",
-        help="Drive mapper type when --persistent-drive is active. "
-             "'fan_out': per-input scalar (gain,bias) pairs drive each "
-             "node independently (no input mixing). 'projection': learned "
-             "nn.Linear(in_dim, len(write_idx)) with tanh, mixing all "
-             "inputs into every driven node (matches ProjectedSparseInputMapper). "
-             "Default: 'fan_out'.")
-    parser.add_argument(
         "--write-fan-out", type=str, default=None, dest="write_fan_out",
         help="JSON dict for --write-mode fan_out specifying the input->target "
              "mapping, e.g. '{\"0\": [2, 12], \"1\": [7, 17]}' means input 0 "
@@ -1989,19 +1969,6 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "input terminal itself never drained (unlike core OTA edges). "
              "Each boundary edge carries its own OTA cell parameters and "
              "edge gate (compatible with --no-edge-gates).")
-    parser.add_argument(
-        "--enable-ref-edges", action="store_true", default=False,
-        dest="enable_ref_edges",
-        help="Enable reference edges (unary nonlinearities via OTA-to-Vref): "
-             "every ODE node gets one OTA edge to a global per-stage learnable "
-             "reference voltage Vref (scalar, constrained to [0, x_max]). The "
-             "reference edge injects I_OTA(Vref, x_j) into node j only (no "
-             "source drain — Vref is an ideal voltage source). Implements "
-             "programmable thresholding, saturation, soft activation, bias "
-             "injection, and nonlinear leak without introducing a heterogeneous "
-             "cell type. Each reference edge uses the same OTA cell family as "
-             "the core edges and carries its own edge gate (compatible with "
-             "--no-edge-gates). Default: disabled.")
     parser.add_argument(
         "--temporal-readout", action="store_true", default=False,
         dest="enable_temporal_readout",
@@ -2673,7 +2640,6 @@ def main():
             f"write_mode={new_preset['write_mode']} read_mode={new_preset['read_mode']}"
         )
     # Resolve write_fan_out: explicit CLI override > auto-generate (any family).
-    # Done before persistent-drive so it's independent of that flag.
     active_preset = PRESETS.get(args.problem)
     if active_preset is None:
         raise ValueError(f"Unknown problem: {args.problem!r}")
@@ -2744,10 +2710,7 @@ def main():
 
     # Resolve boundary_fan_out: explicit JSON from --boundary-fan-out.
     # Boundary mode replaces the initial-condition write with continuous
-    # OTA edge injection from fixed-voltage input terminals. Mutually
-    # exclusive with persistent drive (boundary terminals already inject
-    # the signal continuously; adding drive targets on top would be
-    # redundant and is rejected).
+    # OTA edge injection from fixed-voltage input terminals.
     boundary_fan_out_parsed = None
     if args.boundary_fan_out is not None:
         try:
@@ -2774,24 +2737,6 @@ def main():
                 )
         except json.JSONDecodeError as e:
             raise ValueError(f"Invalid --boundary-fan-out JSON: {e}")
-        if args.persistent_drive:
-            raise ValueError(
-                "--boundary-fan-out is incompatible with --persistent-drive: "
-                "boundary terminals already inject the input signal "
-                "continuously; persistent drive would double-inject."
-            )
-
-    # Persistent drive: supports fan_out, sparse_proj, and one_to_one modes.
-    # write_fan_out is already resolved above; for sparse_proj/one_to_one the
-    # driven nodes come from --write-idx (handled by build_net_from_config).
-    if args.persistent_drive:
-        if args.write_mode is not None and args.write_mode not in (
-                "fan_out", "sparse_proj", "one_to_one"):
-            raise ValueError(
-                "--persistent-drive requires write_mode='fan_out', "
-                "'sparse_proj', or 'one_to_one' "
-                f"(got --write-mode {args.write_mode!r})"
-            )
 
     # VCA (input-driven attention gating): requires at least one gated
     # edge family (boundary, temporal-readout, or core). With --vca-core
@@ -2839,8 +2784,6 @@ def main():
         read_mode=args.read_mode,
         write_idx=write_idx_arg,
         read_idx=read_idx_arg,
-        enable_drive=args.persistent_drive,
-        drive_mode=args.drive_mode,
         leak_mode=args.leak,
         leak_constant=args.leak_constant,
         encoder_type=args.encoder_type,
@@ -2855,7 +2798,6 @@ def main():
         interstage_residual_rank=args.interstage_residual_rank,
         enable_skip_linear=args.skip_linear,
         boundary_fan_out=boundary_fan_out_parsed,
-        enable_ref_edges=args.enable_ref_edges,
         enable_temporal_readout=enable_temporal_readout,
         readout_mode=readout_mode,
         readout_senses_per_node=readout_senses,
@@ -2886,16 +2828,13 @@ def main():
             if hasattr(stage, 'boundary_z_logits') and stage.boundary_z_logits is not None:
                 stage.boundary_z_logits.data.fill_(10.0)
                 stage.boundary_z_logits.requires_grad_(False)
-            if hasattr(stage, 'ref_z_logits') and stage.ref_z_logits is not None:
-                stage.ref_z_logits.data.fill_(10.0)
-                stage.ref_z_logits.requires_grad_(False)
             if hasattr(stage, 'output_ode_z_logits') and stage.output_ode_z_logits is not None:
                 stage.output_ode_z_logits.data.fill_(10.0)
                 stage.output_ode_z_logits.requires_grad_(False)
             if hasattr(stage, 'readout_sense_z_logits') and stage.readout_sense_z_logits is not None:
                 stage.readout_sense_z_logits.data.fill_(10.0)
                 stage.readout_sense_z_logits.requires_grad_(False)
-        print("[train] --no-edge-gates: z_logits (core + boundary + ref + temporal-readout + shared-sense) frozen to +10 (all edges permanently on)")
+        print("[train] --no-edge-gates: z_logits (core + boundary + temporal-readout + shared-sense) frozen to +10 (all edges permanently on)")
 
     # --no-resistive-shunt: bypass the parallel resistive shunt across all
     # stages (no-resistive-shunt). Sets _has_resistive=False so rhs() skips

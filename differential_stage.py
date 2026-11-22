@@ -19,7 +19,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from config import (
-    DRIVE,
     INIT,
     PHYS,
     REF,
@@ -61,12 +60,6 @@ class DifferentialStage(nn.Module):
             (default from config ``PHYS['clip_sharpness_min']``).
         clip_sharpness_max: Upper bound of the mapped learnable sharpness
             (default from config ``PHYS['clip_sharpness_max']``).
-        write_idx: Indices of hidden nodes that receive persistent bounded
-            drive current. When provided, a drive source is created with
-            learnable per-node conductance ``raw_drive_g``. ``None`` disables
-            drive for this stage.
-        drive_isat: Saturation current for the bounded drive source. When
-            ``None``, uses ``config.DRIVE["drive_isat"]``.
         leak_mode: ``"programmable"`` (default) creates a learnable per-node
             ``raw_leak`` parameter. ``"non-programmable"`` uses a fixed scalar
             ``leak_constant`` (see ``leak_constant``) for all nodes, saving
@@ -114,19 +107,6 @@ class DifferentialStage(nn.Module):
             edge currents ``I_OTA(u_i, x_j)``. Must match the cell type
             of the core ``cell_lib`` and be sized for ``len(boundary_src)``
             edges. Must be provided when boundary edges are configured.
-        enable_ref_edges: When ``True``, every node gets one OTA edge to a
-            global per-stage learnable reference voltage ``Vref`` (scalar,
-            constrained to ``[0, x_max]`` via ``sigmoid(raw_vref) * x_max``).
-            Vref is held constant during the ODE integration of a single
-            stage (no current sourced/sinked into Vref; it's an ideal voltage
-            source). The reference edge injects ``I_OTA(Vref, x_j)`` into
-            node ``j`` only. Implemented via a separate cell library
-            (``ref_cell_lib``) sized to ``num_nodes`` so each node has its
-            own programmable OTA parameters. Default ``False``.
-        ref_cell_lib: Cell library instance used to compute reference edge
-            currents ``I_OTA(Vref, x_j)``. Must match the cell type of
-            the core ``cell_lib`` and be sized for ``num_nodes`` edges. Required
-            when ``enable_ref_edges=True``.
         output_ode_src: List of source node indices (compact 0..num_nodes-1
             coordinate space) for the temporal-readout OTA edges. These edges
             inject current from a hidden (or projection) node into an output
@@ -188,8 +168,6 @@ class DifferentialStage(nn.Module):
         clip_sharpness_min: float | None = None,
         clip_sharpness_max: float | None = None,
         gln_rails: "GLNRails | None" = None,
-        write_idx: list[int] | None = None,
-        drive_isat: float | None = None,
         leak_mode: str = "programmable",
         leak_constant: float | None = None,
         read_only_source: bool = False,
@@ -199,8 +177,6 @@ class DifferentialStage(nn.Module):
         boundary_src: list[int] | None = None,
         boundary_dst: list[int] | None = None,
         boundary_cell_lib: FreeTanhLibrary | None = None,
-        enable_ref_edges: bool = False,
-        ref_cell_lib: FreeTanhLibrary | None = None,
 output_ode_src: list[int] | None = None,
         output_ode_dst: list[int] | None = None,
         output_ode_cell_lib: FreeTanhLibrary | None = None,
@@ -295,23 +271,6 @@ output_ode_src: list[int] | None = None,
         self.register_buffer("src", torch.tensor(src, dtype=torch.long))
         self.register_buffer("dst", torch.tensor(dst, dtype=torch.long))
 
-        # Persistent drive: optional bounded input-current source.
-        if write_idx is not None:
-            if any(i < 0 or i >= self.num_nodes for i in write_idx):
-                raise ValueError(f"write_idx entries must be in [0, {self.num_nodes}), got {write_idx}")
-            if len(set(write_idx)) != len(write_idx):
-                raise ValueError(f"write_idx entries must be unique, got {write_idx}")
-            self.register_buffer("_drive_idx", torch.tensor(write_idx, dtype=torch.long))
-            self.raw_drive_g = nn.Parameter(
-                torch.full((len(write_idx),), float(DRIVE["raw_drive_g_init"]))
-            )
-            self.drive_isat = float(drive_isat if drive_isat is not None else DRIVE["drive_isat"])
-            self._has_drive = True
-        else:
-            self.register_buffer("_drive_idx", torch.empty(0, dtype=torch.long))
-            self._has_drive = False
-            self.drive_isat = 0.0
-
         if self.leak_mode == "programmable":
             self.raw_leak = nn.Parameter(torch.full((num_nodes,), float(INIT["raw_leak_init"])))
         else:
@@ -392,39 +351,6 @@ output_ode_src: list[int] | None = None,
             self.boundary_cell_lib = None
             self.boundary_z_logits = None
             self._has_boundary = False
-
-        # Reference edges (unary nonlinearities via OTA-to-Vref plan).
-        # Every node gets one OTA edge to a global per-stage learnable Vref
-        # voltage constrained to [0, x_max]. Vref is held constant during a
-        # single stage's ODE integration (ideal voltage source: no current
-        # drawn from the Vref rail). Each reference edge has its own OTA
-        # cell in ``ref_cell_lib`` (sized to num_nodes) with independent
-        # per-node gm/Isat/theta/etc., and its own gate ``ref_z_logits``.
-        if enable_ref_edges:
-            if ref_cell_lib is None:
-                raise ValueError(
-                    "DifferentialStage: ref_cell_lib is required when "
-                    "enable_ref_edges=True"
-                )
-            self.ref_cell_lib = ref_cell_lib
-            self.raw_vref = nn.Parameter(
-                torch.tensor([float(REF["raw_vref_init"])], dtype=torch.float32)
-            )
-            self.ref_z_logits = nn.Parameter(
-                torch.full((num_nodes,), z_init),
-            )
-            self.register_buffer(
-                "ref_dst", torch.arange(num_nodes, dtype=torch.long),
-            )
-            self._has_ref = True
-        else:
-            self.register_buffer(
-                "ref_dst", torch.empty(0, dtype=torch.long),
-            )
-            self.ref_cell_lib = None
-            self.raw_vref = None
-            self.ref_z_logits = None
-            self._has_ref = False
 
         # Temporal-readout OTA edges (temporal-readout plan).
         # Sparse programmable edges from hidden/projection nodes (read-only
@@ -703,19 +629,6 @@ output_ode_src: list[int] | None = None,
             return F.softplus(self.raw_leak)
         return torch.full((num_nodes,), self.leak_constant, dtype=torch.float32)
 
-    def drive_current(
-        self, x: torch.Tensor, x_drive: torch.Tensor | None, drive_scale: float
-    ) -> torch.Tensor:
-        if x_drive is None or not self._has_drive or drive_scale == 0.0:
-            return torch.zeros_like(x)
-        g_in = F.softplus(self.raw_drive_g).unsqueeze(0)
-        err = x_drive[:, self._drive_idx] - x[:, self._drive_idx]
-        i = self.drive_isat * torch.tanh(g_in * err / self.drive_isat)
-        i = float(drive_scale) * i
-        out = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
-        out[:, self._drive_idx] = i
-        return out.to(dtype=x.dtype)
-
     def _compute_vca_gate(
         self,
         u: torch.Tensor,
@@ -984,7 +897,6 @@ output_ode_src: list[int] | None = None,
 
     def rhs(self, x: torch.Tensor,
             u: torch.Tensor | None = None,
-            x_drive: torch.Tensor | None = None, drive_scale: float = 0.0,
             i_edge_const: torch.Tensor | None = None,
             i_boundary_const: torch.Tensor | None = None,
             i_readout_const: torch.Tensor | None = None,
@@ -1013,14 +925,6 @@ output_ode_src: list[int] | None = None,
           + edge gate + VCA gate are precomputed once from ``(u, x0)``
           and the per-step block only recomputes the family's resistive
           shunt (when present).
-
-        Reference edges (unary nonlinearities via OTA-to-Vref plan):
-        - When ``self._has_ref``, every node gets one OTA edge to a
-          global per-stage learnable ``Vref = sigmoid(raw_vref) * x_max``.
-          The reference current ``I_OTA(Vref, x_j)`` is injected into
-          node ``j`` only (no source drain — Vref is an ideal voltage
-          source). Like boundary edges, reference currents are NOT frozen
-          by ``freeze_read`` (the destination voltage ``x_j`` evolves).
 
         Temporal-readout OTA edges (temporal-readout plan):
         - When ``self._has_output_ode``, ``I_OTA(x[output_ode_src[e]],
@@ -1183,27 +1087,6 @@ output_ode_src: list[int] | None = None,
                     # NOTE: no source drain — boundary terminals are fixed.
                     acc = (acc.float() + acc_b_res).to(dtype=x.dtype)
 
-        # Reference edges (unary nonlinearities via OTA-to-Vref plan).
-        # For each node j: I_ref = I_OTA(Vref, x_j), injected into dst only.
-        # Vref = sigmoid(raw_vref) * x_max is a per-stage learnable scalar
-        # held constant during the ODE integration (no current sourced
-        # from or sinked into the Vref rail — it's an ideal voltage source).
-        if self._has_ref:
-            vref = torch.sigmoid(self.raw_vref) * self.x_max  # [1], in [0, x_max]
-            vref_expanded = vref.view(1, 1).expand(x.size(0), self.num_nodes)  # [B, N]
-            i_ref = self.ref_cell_lib(
-                x_src=vref_expanded, x_dst=x, x_max=self.x_max,
-            )  # [B, N]
-            ref_mask = torch.sigmoid(self.ref_z_logits)  # [N]
-            i_ref = i_ref * ref_mask.unsqueeze(0)  # [B, N]
-            i_ref_f32 = i_ref.float()
-            if i_edge_const is not None:
-                acc = acc.clone()
-            acc_ref = torch.zeros_like(x, dtype=torch.float32)
-            acc_ref.index_add_(1, self.ref_dst, i_ref_f32)
-            # NOTE: no source drain — Vref is an ideal voltage source.
-            acc = (acc.float() + acc_ref).to(dtype=x.dtype)
-
         # Temporal-readout OTA edges (temporal-readout plan).
         # For each edge e: I_out = I_OTA(x[output_ode_src[e]], x[output_ode_dst[e]]).
         # Current is injected into the destination (output ODE accumulator)
@@ -1330,8 +1213,7 @@ output_ode_src: list[int] | None = None,
 
         clip_term = self.soft_clip(x)
 
-        i_drive = self.drive_current(x, x_drive, drive_scale)
-        return (acc + i_drive - leak_term - clip_term) / self.c_eff
+        return (acc - leak_term - clip_term) / self.c_eff
 
     def compile_rhs(self, backend: str = "inductor"):
         """Compile `rhs` with `torch.compile` for kernel fusion.
@@ -1348,8 +1230,6 @@ output_ode_src: list[int] | None = None,
         t_span: float | None = None,
         num_steps: int | None = None,
         store_trajectory: bool = True,
-        x_drive: torch.Tensor | None = None,
-        drive_scale: float = 0.0,
         u: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Integrate the stage with fixed-step Heun (2nd-order predictor-corrector).
@@ -1364,7 +1244,6 @@ output_ode_src: list[int] | None = None,
         return self._forward_heun(
             x0=x0, t_span=t_span, num_steps=num_steps,
             store_trajectory=store_trajectory,
-            x_drive=x_drive, drive_scale=drive_scale,
             u=u,
         )
 
@@ -1374,8 +1253,6 @@ output_ode_src: list[int] | None = None,
         t_span: float | None,
         num_steps: int | None,
         store_trajectory: bool,
-        x_drive: torch.Tensor | None,
-        drive_scale: float,
         u: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         t_span = float(t_span if t_span is not None else SOLVER["t_span"])
@@ -1423,13 +1300,13 @@ output_ode_src: list[int] | None = None,
         traj_chunks = [x] if store_trajectory else None
 
         for step in range(num_steps):
-            k1 = self.rhs(x, u=u, x_drive=x_drive, drive_scale=drive_scale,
+            k1 = self.rhs(x, u=u,
                           i_edge_const=i_edge_const,
                           i_boundary_const=i_boundary_const,
                           i_readout_const=i_readout_const,
                           vca_gate_core=gate_core_cached)
             x_pred = x + dt * k1
-            k2 = self.rhs(x_pred, u=u, x_drive=x_drive, drive_scale=drive_scale,
+            k2 = self.rhs(x_pred, u=u,
                           i_edge_const=i_edge_const,
                           i_boundary_const=i_boundary_const,
                           i_readout_const=i_readout_const,
@@ -1518,38 +1395,6 @@ output_ode_src: list[int] | None = None,
                 )
                 if hasattr(self.boundary_cell_lib, "theta_raw"):
                     bdev += int(self.boundary_cell_lib.theta_raw.numel())
-        # Reference (unary nonlinearity) stats
-        ref_n = 0
-        ref_device_n = 0
-        if self._has_ref:
-            if hasattr(self, "raw_vref"):
-                ref_n += int(self.raw_vref.numel())
-            if hasattr(self, "ref_z_logits"):
-                ref_n += int(self.ref_z_logits.numel())
-            # Device param: count all parameters in ref_cell_lib
-            if self.ref_cell_lib is not None:
-                if hasattr(self.ref_cell_lib, "param"):
-                    ref_device_n += int(self.ref_cell_lib.param.numel())
-                elif hasattr(self.ref_cell_lib, "alpha_raw"):
-                    r = self.ref_cell_lib.alpha_raw.numel()
-                    ref_device_n += r
-                    if hasattr(self.ref_cell_lib, "bias_raw"):
-                        ref_device_n += int(self.ref_cell_lib.bias_raw.numel())
-                elif hasattr(self.ref_cell_lib, "gm_raw"):
-                    r = int(self.ref_cell_lib.gm_raw.numel())
-                    ref_device_n += r
-                    if hasattr(self.ref_cell_lib, "isat_raw"):
-                        ref_device_n += int(self.ref_cell_lib.isat_raw.numel())
-                    if hasattr(self.ref_cell_lib, "a_raw"):
-                        ref_device_n += int(self.ref_cell_lib.a_raw.numel())
-                    if hasattr(self.ref_cell_lib, "b_raw"):
-                        ref_device_n += int(self.ref_cell_lib.b_raw.numel())
-                    if hasattr(self.ref_cell_lib, "s_raw"):
-                        ref_device_n += int(self.ref_cell_lib.s_raw.numel())
-                    if hasattr(self.ref_cell_lib, "theta_raw"):
-                        ref_device_n += int(self.ref_cell_lib.theta_raw.numel())
-                    if hasattr(self.ref_cell_lib, "kappa_raw"):
-                        ref_device_n += int(self.ref_cell_lib.kappa_raw.numel())
         # Temporal-readout OTA edge stats
         out_z = int(self.output_ode_z_logits.numel()) if self.output_ode_z_logits is not None else 0
         out_dev = 0
@@ -1643,9 +1488,6 @@ output_ode_src: list[int] | None = None,
             "device_param": device_n,
             "boundary_z_logits": bz,
             "boundary_device_param": bdev,
-            "raw_vref": ref_n,
-            "ref_z_logits": ref_n,
-            "ref_device_param": ref_device_n,
             "output_ode_z_logits": out_z,
             "output_ode_device_param": out_dev,
             "readout_sense_z_logits": sense_z,
@@ -1662,8 +1504,6 @@ output_ode_src: list[int] | None = None,
                 + device_n
                 + bz
                 + bdev
-                + ref_n
-                + ref_device_n
                 + out_z
                 + out_dev
                 + sense_z

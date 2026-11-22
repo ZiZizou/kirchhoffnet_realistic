@@ -33,7 +33,17 @@ import make_golden as mg  # noqa: E402
 # state_dict key patterns that are allowed to exist ONLY in the golden file
 # (removed parameters/buffers).  Example after removing node gates:
 #   IGNORED_KEYS = ["core.stages.*.u_logits"]
-IGNORED_KEYS: list[str] = []
+IGNORED_KEYS: list[str] = [
+    # surgery B3: persistent drive removed (empty int buffers, never populated by any golden model)
+    "*.core.stages.*._drive_idx",
+    "core.stages.*._drive_idx",
+    "*._drive_mask",
+    "*core.transfers.*._drive_mask",
+    "post_readout_transfer._drive_mask",
+    "net.post_readout_transfer._drive_mask",
+    # surgery B3: reference edges removed (empty int buffer, never populated)
+    "*core.stages.*.ref_dst",
+]
 # Per-case build-kwarg overrides, e.g. {"paper": {"build": {"core_refresh_interval": 0}}}
 SPEC_OVERRIDES: dict[str, dict] = {}
 

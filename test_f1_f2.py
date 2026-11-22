@@ -280,8 +280,10 @@ def test_gln_prune_fails_loud():
     """Pruning a GLN net raises (no-prune v1), never silently drops GLN."""
     from topology import prune_network
     net = _build_small_net(gln_rails=True)
+    # A keep-all request is now an exact identity copy even for GLN nets;
+    # use a threshold above the initial gate to exercise unsupported pruning.
     with pytest.raises(ValueError):
-        prune_network(net.core, edge_threshold=0.0)
+        prune_network(net.core, edge_threshold=0.999)
 
 
 def test_count_params_agreement_phase0_arch():

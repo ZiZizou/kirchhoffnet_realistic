@@ -1363,6 +1363,13 @@ output_ode_src: list[int] | None = None,
                     if _g is not None:
                         i_res_b = i_res_b * _g
                     i_boundary_f32 = i_boundary_f32 + i_res_b.float()
+                # W5 fix: inject the boundary current into its destination
+                # nodes (this scatter was missing, so under hw_compliance the
+                # boundary family -- i.e. the network input -- was
+                # disconnected).  Not in place: ``acc`` may alias i_edge_const.
+                acc_b = torch.zeros_like(x, dtype=torch.float32)
+                acc_b.index_add_(1, self.boundary_dst, i_boundary_f32)
+                acc = (acc.float() + acc_b).to(dtype=x.dtype)
             elif i_boundary_const is None:
                 # Dynamic path: full cell forward (tanh + resistive shunt).
                 # GLN (F2): modulate the family's gm with the shared rails
@@ -1457,6 +1464,12 @@ output_ode_src: list[int] | None = None,
                     if _g is not None:
                         i_res_o = i_res_o * _g
                     i_out_f32 = i_out_f32 + i_res_o.float()
+                # W5 fix: inject into the accumulator nodes (missing scatter:
+                # the temporal-mesh readout was disconnected under
+                # hw_compliance).  Not in place: ``acc`` may alias i_edge_const.
+                acc_out = torch.zeros_like(x, dtype=torch.float32)
+                acc_out.index_add_(1, self.output_ode_dst, i_out_f32)
+                acc = (acc.float() + acc_out).to(dtype=x.dtype)
             elif i_readout_const is None:
                 # Dynamic path: full cell forward (tanh + resistive shunt).
                 i_out = self.output_ode_cell_lib(

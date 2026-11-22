@@ -231,6 +231,15 @@ def rail_stats(model, recs, finals, units: HWUnits) -> List[dict]:
     return out
 
 
+def _rows(v, n_rows: int, batch: int):
+    """The first ``n_rows`` batch rows of an rhs kwarg (tensor or 3.4 ``FrozenLegs``)."""
+    if isinstance(v, torch.Tensor):
+        return v[:n_rows] if v.dim() > 0 and v.shape[0] == batch else v
+    if hasattr(v, "i_pos") and hasattr(v, "i_neg"):          # differential_stage.FrozenLegs
+        return type(v)(_rows(v.i_pos, n_rows, batch), _rows(v.i_neg, n_rows, batch))
+    return v
+
+
 def stiffness_stats(model, recs, n_rows: int = 64) -> List[dict]:
     """``max(dt * rho(J))`` per stage with the exact Jacobian of the stage ``rhs``."""
     core = model.net.core
@@ -241,8 +250,7 @@ def stiffness_stats(model, recs, n_rows: int = 64) -> List[dict]:
         for (x, u, kw) in recs[i]:
             xb = x[:n_rows].clone().requires_grad_(True)
             ub = None if u is None else u[:n_rows]
-            kwb = {k: (v[:n_rows] if isinstance(v, torch.Tensor) and v.dim() > 0
-                       and v.shape[0] == x.shape[0] else v) for k, v in kw.items()}
+            kwb = {k: _rows(v, n_rows, x.shape[0]) for k, v in kw.items()}
             with torch.enable_grad():
                 f = type(st).rhs(st, xb, u=ub, **kwb)
                 N = f.shape[1]

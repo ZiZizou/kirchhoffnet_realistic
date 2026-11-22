@@ -282,7 +282,7 @@ Common rules:
   A = 2r/(1+r),   B = 2/(1+r)            →  A + B = 2,  A/B = r,  A,B ∈ [0.4, 1.6]
   ```
   `r_raw` initialises at 0 (A = B = 1). The old init (0.693) is not reproduced; it is a different model, so this flag is a retrain flag, not an epoch-0 identity.
-- **Mapping:** A and B are the input attenuations of the two pair inputs. A passive capacitor divider cannot exceed 1. Realised as `Â = A/max(A,B)`, `B̂ = B/max(A,B)` (so max = 1), with the common gain folded into the overall slope factor of §3.2: `u = s_max·g·(sgn·(Â·x_s − B̂·x_d) + θ)`. Â, B̂ are set by a 3-4-bit capacitor-ratio bank per input, or by a W-ratio / degeneration ratio. In Verilog-A: `V(pin_p) = Vcm + Â·(V(s)−Vcm)`; `V(pin_n) = Vcm + B̂·(V(d)−Vcm)`.
+- **Mapping:** A and B are input attenuations of the two pair inputs. In this historical ratio mode, realised as `Â = A/max(A,B)`, `B̂ = B/max(A,B)` (max = 1), with the common gain folded into the slope factor of §3.2. For a physically realistic unequal pair-input gain use the passive switched-cap divider in the A/B modes subsection below; do not emulate it with asymmetric W/L, which creates offset rather than gain.
 - **Effect:** removes the unbounded slope `gm·A`. A ≠ B gives a common-mode term `(A−B)·x_cm` that a real pair does not have; the ratio form bounds A−B = 2(r−1)/(r+1) to ±1.2 rather than unbounded. Trained readout edges with r outside [1/4, 4] (e.g. A = 2.65 against B = 0.43 is r ≈ 6) are clipped to the bound. Expect a small accuracy cost; measure it before enabling other flags.
 - Flag: `hw_ratio_ab`. Code site: `_tanh_core` (`cell_library.py:344-345`).
 

@@ -1,16 +1,20 @@
 `include "constants.vams"
 `include "disciplines.vams"
+`include "hrknet_constants.vams"
 module sample_hold(in,out,clk);
   input in,clk; output out; electrical in,out,clk;
   parameter real C_hold=100e-15, R_on=1e3, R_off=1e12;
   parameter real inject_v=0.0, droop_tau=1e99;
   parameter real Vlogic=0.5;
   integer sampled;
+  real held;
   analog begin
+    @(initial_step) begin sampled=0; held=V(out); end
     @(cross(V(clk)-Vlogic,+1)) sampled=1;
-    @(cross(V(clk)-Vlogic,-1)) sampled=0;
-    I(out) <+ (sampled ? (V(out)-V(in))/R_on : (V(out)-V(in))/R_off);
+    @(cross(V(clk)-Vlogic,-1)) begin sampled=0; held=V(out); end
+    // Injection offset is present during acquisition and retained at switch-off.
+    I(out) <+ (sampled ? (V(out)-(V(in)+inject_v))/R_on : (V(out)-held)/R_off);
     I(out) <+ C_hold*ddt(V(out));
-    I(out) <+ C_hold*V(out)/droop_tau;
+    I(out) <+ C_hold*(V(out)-`HRK_VCM)/droop_tau;
   end
 endmodule

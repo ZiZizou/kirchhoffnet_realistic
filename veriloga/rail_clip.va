@@ -1,5 +1,6 @@
 `include "constants.vams"
 `include "disciplines.vams"
+`include "hrknet_constants.vams"
 module rail_clip(node);
   inout node; electrical node;
   parameter real x_max=4.0, sharp=0.02, Iclip=0.05;

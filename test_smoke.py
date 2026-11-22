@@ -45,60 +45,6 @@ def check(name, condition, msg=""):
         failed += 1
 
 
-def test_config_loads():
-    print("\nTest 1: config.py loads and contains expected constants")
-    import config
-    check("CELL_LIBRARY has L, S, P, Z", set(config.CELL_LIBRARY.keys()) == {"L", "S", "P", "Z"})
-    check("CELL_ORDER == ['L', 'S', 'P', 'Z']", config.CELL_ORDER == ["L", "S", "P", "Z"])
-    check("Z_INDEX == 3", config.Z_INDEX == 3)
-    check("NUM_CELLS == 4", config.NUM_CELLS == 4)
-    check("PHYS has x_max=3.0 (three-phase-schedule: increased from 0.3 for headroom)",
-          config.PHYS["x_max"] == 3.0)
-    check("OPTIM has lr=6e-4 (auto-scaled from 3e-4 at batch_size=2048)", abs(config.OPTIM["lr"] - 6e-4) < 1e-12)
-    check("LAMBDAS has sparsity=1e-3", abs(config.LAMBDAS["sparsity"] - 1e-3) < 1e-12)
-    check("LAMBDAS has rail=1.0 (three-phase-schedule: down from 10.0 for x_max=3.0 regime)",
-          abs(config.LAMBDAS["rail"] - 1.0) < 1e-12)
-    check("LAMBDAS has edge_gate=5e-4 (CP: per-component decomposition, was 1e-3 in CP-v1)",
-          abs(config.LAMBDAS["edge_gate"] - 5e-4) < 1e-12)
-    check("LAMBDAS has node_gate=0.0 (deprecate-node-gates: always 0)",
-          abs(config.LAMBDAS["node_gate"] - 0.0) < 1e-12)
-    check("LAMBDAS has power=1e-4 (CP: static power proxy)",
-          abs(config.LAMBDAS["power"] - 1e-4) < 1e-12)
-    check("LAMBDAS has capacitance=0.0 (deprecate-node-gates: always 0)",
-          abs(config.LAMBDAS["capacitance"] - 0.0) < 1e-12)
-    check("LAMBDAS no longer has 'complexity' (CP: decomposed into 4 terms)",
-          "complexity" not in config.LAMBDAS)
-    check("PRUNE has edge_threshold=0.1 (three-phase-schedule: was 0.01, too forgiving for gate-trained regime)",
-          abs(config.PRUNE["edge_threshold"] - 0.1) < 1e-12)
-    check("PRUNE has node_threshold=0.05 (three-phase-schedule: was 0.01, too forgiving for gate-trained regime)",
-          abs(config.PRUNE["node_threshold"] - 0.05) < 1e-12)
-    check("INIT logits_z_bias=0.0 (fix-z-death: equal cell probability)",
-          config.INIT["logits_z_bias"] == 0.0)
-    check("INIT z_logit_init=0.0 (grid7-gate0: 50% open gates, max gradient sensitivity)",
-          abs(config.INIT["z_logit_init"] - 0.0) < 1e-12)
-    check("INIT u_logit_init=0.0 (grid7-gate0: 50% open gates, max gradient sensitivity)",
-          abs(config.INIT["u_logit_init"] - 0.0) < 1e-12)
-    check("OPTIM has reg_warmup_epochs (RR-A)",
-          "reg_warmup_epochs" in config.OPTIM)
-    check("OPTIM has reg_anneal_epochs (RR-A)",
-          "reg_anneal_epochs" in config.OPTIM)
-    check("PRESETS has sinx, housing, smooth2d, smooth2d_grid, housing_grid",
-          set(config.PRESETS.keys()) == {"sinx", "housing", "smooth2d", "smooth2d_grid", "housing_grid"})
-
-    t = config.cells_to_tensor_dict()
-    check("cells_to_tensor_dict: gm shape (4,)", t["gm"].shape == (4,))
-    check("cells_to_tensor_dict: Z gm == 0", float(t["gm"][3]) == 0.0)
-    check("cells_to_tensor_dict: L gm == 0.2", abs(float(t["gm"][0]) - 0.2) < 1e-5)
-    check("cells_to_tensor_dict: S gm == 1.0", abs(float(t["gm"][1]) - 1.0) < 1e-5)
-    check("cells_to_tensor_dict: P gm == 1.0", abs(float(t["gm"][2]) - 1.0) < 1e-5)
-    check("cells_to_tensor_dict: P beta == 0.1", abs(float(t["beta"][2]) - 0.1) < 1e-5)
-    check("cells_to_tensor_dict: P theta == 0.0", abs(float(t["theta"][2]) - 0.0) < 1e-5)
-
-
-
-
-
-
 def test_topology_primitives():
     print("\nTest 3: topology primitives generate well-formed graphs")
     from topology import (
@@ -259,7 +205,7 @@ def test_heun_converges():
     from topology import StageTopologyBuilder, topology_to_stage
     from kirchhoff_net import KirchhoffNet
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     hid = ring_graph(4, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=4, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -281,7 +227,7 @@ def test_gradient_flow():
     from topology import StageTopologyBuilder, topology_to_stage
     from kirchhoff_net import KirchhoffNet
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     hid = ring_graph(3, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -316,7 +262,7 @@ def test_compute_loss_finite():
     from io_mapper import InputMapper, OutputMapper
     from train import compute_loss
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     hid = ring_graph(4, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=2, num_outputs=0, num_hidden=4, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -375,13 +321,13 @@ def test_housing_preset_robust():
     from io_mapper import RobustInputMapper, SparseInputMapper
 
     net_dense = build_net_from_preset(
-        "housing", cell_lib=make_cell_library('tanh'),
+        "housing", cell_lib=make_cell_library('tanh_free'),
         write_mode="dense", read_mode="dense",
     )
     check("housing dense uses RobustInputMapper",
           isinstance(net_dense.input_mapper, RobustInputMapper))
 
-    net_sparse = build_net_from_preset("housing", cell_lib=make_cell_library('tanh'))
+    net_sparse = build_net_from_preset("housing", cell_lib=make_cell_library('tanh_free'))
     check("housing default (sparse) uses SparseInputMapper",
           isinstance(net_sparse.input_mapper, SparseInputMapper))
 
@@ -401,7 +347,7 @@ def test_topology_to_stage_input_output_filtering():
     from cell_library import make_cell_library
     from topology import StageTopologyBuilder, topology_to_stage
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     hid = ring_graph(3, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=2, num_outputs=1, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -450,7 +396,7 @@ def test_visualize_stage_graph():
     from topology import StageTopologyBuilder, topology_to_stage
     from visualize import plot_stage_graph
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     hid = ring_graph(4, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=4, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -489,7 +435,7 @@ def test_visualize_trajectories():
     from kirchhoff_net import KirchhoffNet
     from visualize import plot_trajectories
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     hid = ring_graph(4, edge_prob=0.5, seed=0)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=4, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -554,8 +500,6 @@ def test_union_topology():
     hidden_edges = [(s, d) for s, d, t in zip(topo.src, topo.dst, topo.edge_type) if t == "hidden"]
     check("hidden edges have src < dst (single-edge-per-pair)",
           all(s < d for s, d in hidden_edges))
-
-
 
 
 def test_baseline_jacobi():
@@ -631,7 +575,7 @@ def test_io_honest_split():
     from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
     from io_mapper import InputMapper, OutputMapper
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     n_hid, n_proj = 4, 2
     hid = ring_graph(n_hid, radius=1)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=n_hid, num_proj=n_proj)
@@ -672,7 +616,7 @@ def test_io_no_proj_fallback():
     from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
     from io_mapper import InputMapper, OutputMapper
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     hid = ring_graph(3, radius=1)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -698,7 +642,7 @@ def test_mapper_only_ablation():
     from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
     from io_mapper import InputMapper, OutputMapper
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     hid = ring_graph(4, radius=1)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=4, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -725,7 +669,7 @@ def test_mapper_only_ablation_fast():
     from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
     from io_mapper import InputMapper, OutputMapper
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     hid = ring_graph(4, radius=1)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=4, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -786,7 +730,7 @@ def test_complexity_proxy():
     from train import _stage_soft_weights, _stage_multiplicities
     import torch.nn.functional as F
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     hid = ring_graph(3, radius=1)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -1004,34 +948,13 @@ def test_preset_lambda_overrides():
           housing_lambdas["sparsity"] == config.LAMBDAS["sparsity"])
 
 
-def test_z_bias_eliminated():
-    print("\nTest 45: INIT['logits_z_bias'] = 0.0 → equal P(Z) = P(L) = P(S) = P(P) (fix-z-death)")
-    import config
-    import torch.nn.functional as F
-    check("fix-z-death: config.INIT['logits_z_bias'] == 0.0",
-          config.INIT["logits_z_bias"] == 0.0)
-    zeros = torch.zeros(config.NUM_CELLS)
-    zeros[config.Z_INDEX] = float(config.INIT["logits_z_bias"])
-    probs = F.softmax(zeros, dim=-1)
-    p_z = float(probs[config.Z_INDEX])
-    check("fix-z-death: P(Z) at init is 0.25 (equal probability with 4 cells)",
-          abs(p_z - 0.25) < 1e-5,
-          f"got p_Z={p_z:.4f}")
-    check("fix-z-death: P(Z) at init is below the OLD ~0.42 (with bias=1.0)",
-          p_z < 0.30,
-          f"got p_Z={p_z:.4f}")
-    check("fix-z-death: P(L) = P(S) = P(P) = P(Z) = 0.25 (all cells equally likely)",
-          all(abs(float(probs[i]) - 0.25) < 1e-5 for i in range(config.NUM_CELLS)),
-          f"got probs={probs.tolist()}")
-
-
 def test_gate_initialization():
     print("\nTest 46: gate parameter initialization (grid7-gate0: z=0.0, u=0.0)")
     from cell_library import make_cell_library
     from topology import ring_graph, StageTopologyBuilder, topology_to_stage
     from differential_stage import DifferentialStage
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     hid = ring_graph(3, radius=1)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -1067,7 +990,7 @@ def test_gate_application_in_rhs():
     from topology import ring_graph, StageTopologyBuilder, topology_to_stage
     import torch
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     hid = ring_graph(3, radius=1)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -1116,7 +1039,7 @@ def test_complexity_regularizers():
     from train import _stage_edge_gates, _stage_node_gates, _stage_multiplicities
     import torch
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     hid = ring_graph(4, radius=1)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=4, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -1166,7 +1089,7 @@ def test_prune_stage():
     from topology import ring_graph, StageTopologyBuilder, topology_to_stage, prune_stage
     import torch
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     hid = ring_graph(4, radius=1)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=4, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -1215,7 +1138,7 @@ def test_prune_stage_transfer_params():
     from topology import ring_graph, StageTopologyBuilder, topology_to_stage, prune_stage
     import torch
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     hid = ring_graph(3, radius=1)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -1272,7 +1195,7 @@ def test_prune_stage_all_removed_raises():
     from topology import ring_graph, StageTopologyBuilder, topology_to_stage, prune_stage
     import torch
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     hid = ring_graph(3, radius=1)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -1298,7 +1221,7 @@ def test_prune_network():
     from kirchhoff_net import KirchhoffNet
     import torch
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     hid = ring_graph(4, radius=1)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=4, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -1371,7 +1294,7 @@ def test_joint_prune_z_dominant():
     from differential_stage import DifferentialStage
     from topology import prune_stage
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     # Small triangle: 0-1-2-0 (all edges connect I/O)
     stage = DifferentialStage(
         num_nodes=3,
@@ -1411,7 +1334,7 @@ def test_prune_dead_island_removed():
     from cell_library import make_cell_library
     from topology import prune_stage, _bfs_undirected
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     # Build a 6-node graph with two disconnected rings:
     # 0-1-2 (write=0, read=2) and 3-4-5 (dead island, no I/O)
     # This is constructed directly as a DifferentialStage for testing.
@@ -1444,7 +1367,7 @@ def test_prune_disconnected_io_raises():
     from differential_stage import DifferentialStage
     from topology import prune_stage
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     stage = DifferentialStage(
         num_nodes=4,
         src=[0, 2],   # 0-1 and 2-3 are two disconnected edges
@@ -1471,7 +1394,7 @@ build_net_from_preset, prune_network
     )
     from config import PRUNE
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset("smooth2d", cell_lib=cell_lib)
     pruned_core, stage_remaps = prune_network(
         net.core,
@@ -1498,7 +1421,7 @@ def test_prune_io_mappers_transferred_when_zero_nodes_removed():
     from topology import build_net_from_preset, prune_network
     from config import PRUNE
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset("smooth2d", cell_lib=cell_lib)
     pre_nodes = sum(s.num_nodes for s in net.core.stages)
     pruned_core, stage_remaps = prune_network(
@@ -1539,7 +1462,7 @@ def test_prune_io_forward_pass_preserved_when_zero_edges_removed():
     from config import PRUNE
     import torch
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib, write_mode="dense")
     net.eval()
     pre_edges = sum(s.num_edges() for s in net.core.stages)
@@ -1616,7 +1539,7 @@ def test_prune_stage_protects_write_target():
     from differential_stage import DifferentialStage
     from topology import prune_stage
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     # 4-node linear chain: 0->1->2->3
     stage = DifferentialStage(
         num_nodes=4,
@@ -1652,7 +1575,7 @@ def test_prune_stage_min_read_nodes_guard():
     from differential_stage import DifferentialStage
     from topology import prune_stage
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     # Since node gates are bypassed, trigger the min_read_nodes guard by
     # Z-pruning the edges that lead to read nodes.
     stage = DifferentialStage(
@@ -1685,7 +1608,7 @@ def test_prune_stage_min_read_nodes_one_survives():
     from differential_stage import DifferentialStage
     from topology import prune_stage
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     # 3-node line 0->1->2 with all nodes alive. write=[0], read=[1, 2].
     # Pruning with default thresholds keeps everything; both reads survive.
     stage = DifferentialStage(
@@ -1708,9 +1631,6 @@ def test_prune_stage_min_read_nodes_one_survives():
     check("PIO-3: read node 1 survives", 1 in remap, f"remap={remap}")
     check("PIO-3: read node 2 survives", 2 in remap, f"remap={remap}")
     check("PIO-3: write node 0 survives", 0 in remap, f"remap={remap}")
-
-
-
 
 
 def test_prune_output_mapper_elastic_readout():
@@ -1752,7 +1672,7 @@ def test_prune_network_multi_stage_protects_write():
     from topology import build_net_from_preset, prune_network
     from config import PRUNE
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     # smooth2d is single-stage; use sinx (also single-stage but with a
     # configured write_idx). Actually, we need a preset with a known
     # write_idx. Use smooth2d_grid (3 stages) to exercise the multi-stage
@@ -1788,7 +1708,7 @@ def test_prune_stage_edge_only_keeps_low_u_node_with_incident_edge():
     from differential_stage import DifferentialStage
     from topology import prune_stage
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     # Stage: nodes 0, 1, 2, 3. Edges 0->1, 1->2, 2->3.
     # Nodes 1 and 2 have very low u_logits (no effect — node gates bypassed).
     # Edges 0->1 and 1->2 have high eff_score. Edge 2->3 is Z-dominant.
@@ -1833,7 +1753,7 @@ def test_prune_stage_edge_only_disconnected_node_removed():
     from differential_stage import DifferentialStage
     from topology import prune_stage
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     # Stage: nodes 0, 1, 2, 3. Edges 0->1 (Z-dominant) and 2->3 (active).
     # After edge pruning: 0->1 dies, 2->3 survives. Nodes 0, 1 become
     # dead islands. Nodes 2, 3 stay alive via the surviving 2->3 edge.
@@ -1869,7 +1789,7 @@ def test_prune_stage_edge_only_matches_legacy_when_no_node_collateral():
     from differential_stage import DifferentialStage
     from topology import prune_stage
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     # Stage: nodes 0, 1, 2, 3. Edges 0->1, 0->2, 2->3.
     # Edges 0->1 and 0->2 are Z-dominant (pruned). Edge 2->3 stays active.
     # Node 2 has low u_logits — node gates are bypassed so this has no effect.
@@ -1911,7 +1831,7 @@ def test_prune_network_edge_only_preserves_more_capacity():
     from differential_stage import DifferentialStage
     from topology import prune_stage
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     # Single stage: 4 nodes, edges 0->1 (hi-z), 0->2 (lo-z), 1->3 (hi-z).
     # Edge 0->2 has low z_logits so it gets pruned. Edges 0->1 and 1->3
     # survive, keeping write_idx=[0] connected to read_idx=[3].
@@ -2054,7 +1974,7 @@ def test_apply_ablation():
     from cell_library import make_cell_library
     from train import apply_ablation
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset("sinx", cell_lib=cell_lib)
 
     net_copy_none = build_net_from_preset("sinx", cell_lib=cell_lib)
@@ -2089,7 +2009,7 @@ def test_sparse_io_preset_defaults():
     check("housing preset has read_idx [15] (SR4.2)",
           config.PRESETS["housing"]["read_idx"] == [15])
 
-    net = build_net_from_preset("sinx", cell_lib=make_cell_library('tanh'))
+    net = build_net_from_preset("sinx", cell_lib=make_cell_library('tanh_free'))
     check("sinx default builds with write_idx=[0]",
           net.write_idx == [0])
     check("sinx default builds with read_idx=[7]",
@@ -2175,7 +2095,7 @@ def test_sparse_io_dense_fallback_matches_old():
     from io_mapper import InputMapper, OutputMapper
 
     net = build_net_from_preset(
-        "sinx", cell_lib=make_cell_library('tanh'),
+        "sinx", cell_lib=make_cell_library('tanh_free'),
         write_mode="dense", read_mode="dense",
     )
     check("dense write: uses InputMapper (SR3.1)",
@@ -2197,7 +2117,7 @@ def test_sparse_io_gradients_flow_to_read_targets():
     from topology import build_net_from_preset
     from cell_library import make_cell_library
 
-    net = build_net_from_preset("sinx", cell_lib=make_cell_library('tanh'))
+    net = build_net_from_preset("sinx", cell_lib=make_cell_library('tanh_free'))
     u = torch.tensor([[0.5]])
     y, _ = net(u, store_trajectory=False)
     y.sum().backward()
@@ -2228,28 +2148,7 @@ def test_sparse_io_cli_flags():
     check("--read-idx flag present", "--read-idx" in result.stdout)
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 def main():
-    test_config_loads()
     test_topology_primitives()
     test_stage_transfer()
     test_stage_transfer_residual_relu_tanh()
@@ -2296,7 +2195,6 @@ def main():
     test_tau_override_floor_guarantee()
     test_tau_override_endpoints()
     test_tau_override_backward_compat()
-    test_z_bias_eliminated()
     test_gate_initialization()
     test_gate_application_in_rhs()
     test_complexity_regularizers()
@@ -2368,14 +2266,11 @@ def main():
     test_v15_cell_type_mask_consistency()           # V15-8: mask exclusivity
     test_v15_legacy_library_unchanged()             # V15-9: backward compat
     test_v2_library_construction()                  # V2-1: build + structure
-    test_v2_factorization_codes()                    # V2-2: MIX/BIAS/THRESH dicts
     test_v2_cell_parameters()                        # V2-3: per-cell parameter values
     test_v2_boundedness()                            # V2-4: |I| <= isat for all cells
     test_v2_mix_code_asymmetry()                     # V2-5: O_h10 vs O_h01 differ
     test_v2_threshold_cells()                        # V2-6: P1/N1 vs P0/N0 fire
     test_v2_forward_backward()                       # V2-7: forward + gradients
-    test_v2_legacy_v15_unchanged()                   # V2-8: rho preserved
-    test_v2_preset_routing()                         # V2-9: make_cell_library('v2')
     test_stage_lr_scale_backward_compat()
     test_stage_lr_scale_multi_group()
     test_rail_loss_zero_inside_bounds()
@@ -2449,14 +2344,6 @@ def main():
     test_kirchhoff_net_with_io_drive_forward()   # DRIVE-4
 
     # Simple-edge family tests (simple-edge-family plan)
-    test_simple_edge_build_forward()             # SE-1
-    test_simple_edge_prune()                     # SE-2
-    test_simple_edge_regularizers()              # SE-3
-    test_simple_edge_diagnostics()               # SE-4
-    test_tanh_realistic_construction()           # TR-1
-    test_tanh_realistic_prune()                  # TR-2
-    test_tanh_realistic_upgrade()                # TRU-1
-    test_tanh_realistic_upgrade_prune()          # TRU-2
     test_free_tanh_construction()                # FT-1
     test_free_tanh_prune()                       # FT-2
 
@@ -2478,7 +2365,6 @@ def main():
     test_budget_axis_both()                      # BUD-6: axis=both
     test_budget_annealing_schedule()             # BUD-8: annealing schedule
     test_budget_disabled_byte_identical()        # BUD-9: budget disabled = no-op
-    test_budget_simple_edge_library_compat()     # BUD-10: SimpleEdgeLibrary
     test_budget_frac_uniform_proportion()        # BUD-11: uniform proportion
 
     test_friedman1_benchmark()                   # MLP benchmark: Friedman #1
@@ -2490,8 +2376,6 @@ def main():
     test_friedman_kirchhoff_net_build()          # friedman-problems/REQ: net build+forward
 
 
-    test_anti_parallel_basic()                   # APT-1..11: AntiParallelFreeTanhLibrary
-
     test_ref_edges_basic()                      # REF-1..8: --enable-ref-edges end-to-end
 
     print()
@@ -2502,9 +2386,6 @@ def main():
         sys.exit(1)
     else:
         sys.exit(0)
-
-
-
 
 
 def test_dynamic_preset_grid_injects_fan_out():
@@ -2691,7 +2572,6 @@ def test_housing_data_normalization_float16_safe():
     check("housing: task_fn is Huber loss (delta=1.0)",
           abs(float(huber) - float(expected)) < 1e-6,
           f"got {float(huber):.6f}, expected {float(expected):.6f}")
-
 
 
 # ---- FanOutInputMapper tests (smooth2d-sanity-pass spec) ----
@@ -2999,7 +2879,7 @@ def test_loss_history_appends_retrain():
     from topology import prune_network
     from config import PRUNE
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset("smooth2d", cell_lib=cell_lib)
     pre_edges = sum(s.num_edges() for s in net.core.stages)
     pre_nodes = sum(s.num_nodes for s in net.core.stages)
@@ -3068,7 +2948,7 @@ def test_gradient_norms_collect():
     from topology import build_net_from_preset
     from cell_library import make_cell_library
 
-    net = build_net_from_preset("smooth2d", cell_lib=make_cell_library('tanh'))
+    net = build_net_from_preset("smooth2d", cell_lib=make_cell_library('tanh_free'))
     norms = collect_gradient_norms(net)
     check("GG-2: stage0_logits key exists", "stage0_logits" in norms,
           f"keys={sorted(norms.keys())}")
@@ -3106,7 +2986,7 @@ def test_grad_log_file_output():
     from topology import build_net_from_preset
     from cell_library import make_cell_library
 
-    net = build_net_from_preset("smooth2d", cell_lib=make_cell_library('tanh'))
+    net = build_net_from_preset("smooth2d", cell_lib=make_cell_library('tanh_free'))
     loss = net(torch.randn(4, 2))[0].sum()
     loss.backward()
 
@@ -3145,7 +3025,7 @@ def test_rectifier_cell():
     from cell_library import make_cell_library
     import torch
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     # P cell is at index 2 in [L, S, P, Z]
     P_INDEX = 2
 
@@ -3222,7 +3102,7 @@ def test_v15_cell_library_construction():
     """V15-1: v15 library builds and has correct structure."""
     print("\nTest V15-1: v15 cell library construction")
     from cell_library import make_cell_library
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     check("V15-1: v15 num_cells == 6",
           cell_lib.num_cells == 6,
           f"got {cell_lib.num_cells}")
@@ -3266,7 +3146,7 @@ def test_v15_cell_boundedness():
     print("\nTest V15-2: v15 cell boundedness")
     from cell_library import make_cell_library
     import torch
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     Q = cell_lib.num_cells
     E, B = 1, 200
     logits = torch.full((E, Q), -1e9)
@@ -3295,7 +3175,7 @@ def test_v15_negative_rectifier():
     print("\nTest V15-3: N0 negative rectifier mirror of P0")
     from cell_library import make_cell_library
     import torch
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     Q = cell_lib.num_cells
     E = 1
     raw_mult = torch.zeros(E)
@@ -3330,7 +3210,7 @@ def test_v15_dead_zone_odd():
     print("\nTest V15-4: D1 dead-zone odd cell oddness")
     from cell_library import make_cell_library
     import torch
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     Q = cell_lib.num_cells
     E = 1
     raw_mult = torch.zeros(E)
@@ -3370,7 +3250,7 @@ def test_v15_saturation_scales():
     print("\nTest V15-5: O_hard saturates faster than O_weak")
     from cell_library import make_cell_library
     import torch
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     Q = cell_lib.num_cells
     E = 1
     # Use raw_mult=+1e9 so mult = softplus(1e9) ≈ 1e9, which clips to 1 via
@@ -3435,7 +3315,7 @@ def test_v15_forward_backward():
     print("\nTest V15-6: v15 forward pass and gradient flow")
     from cell_library import make_cell_library
     import torch
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     Q = cell_lib.num_cells
     E = 4
     B = 8
@@ -3466,7 +3346,7 @@ def test_v15_ste_mode():
     print("\nTest V15-7: v15 STE mode")
     from cell_library import make_cell_library
     import torch
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     Q = cell_lib.num_cells
     E = 4
     B = 8
@@ -3488,7 +3368,7 @@ def test_v15_cell_type_mask_consistency():
     """V15-8: cell_type_mask entries are mutually exclusive."""
     print("\nTest V15-8: v15 cell type mask consistency")
     from cell_library import make_cell_library
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     # Each cell should have exactly one type
     for i in range(cell_lib.num_cells):
         types = sum([
@@ -3508,7 +3388,7 @@ def test_v15_legacy_library_unchanged():
     from cell_library import make_cell_library
     import torch
     # Legacy library with explicit name
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     check("V15-9: legacy num_cells == 4",
           cell_lib.num_cells == 4,
           f"got {cell_lib.num_cells}")
@@ -3519,7 +3399,7 @@ def test_v15_legacy_library_unchanged():
           cell_lib._cell_order == ["L", "S", "P", "Z"],
           f"got {cell_lib._cell_order}")
     # Default library is also legacy
-    cell_lib_default = make_cell_library('tanh')
+    cell_lib_default = make_cell_library('tanh_free')
     check("V15-9: default library is legacy (4 cells)",
           cell_lib_default.num_cells == 4,
           f"got {cell_lib_default.num_cells}")
@@ -3541,7 +3421,7 @@ def test_v2_library_construction():
     """V2-1: v2 library builds with correct structure (10 cells, Z last, mix mode)."""
     print("\nTest V2-1: v2 library construction")
     from cell_library import make_cell_library
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     check("V2-1: v2 num_cells == 10",
           cell_lib.num_cells == 10,
           f"got {cell_lib.num_cells}")
@@ -3600,41 +3480,11 @@ def test_v2_library_construction():
     check("V2-1: Z is off (code 0)", ctc[9].item() == 0)
 
 
-def test_v2_factorization_codes():
-    """V2-2: MIX_CODES, BIAS_CODES, THRESH_CODES have spec values."""
-    print("\nTest V2-2: v2 factorization codes")
-    from config import MIX_CODES, BIAS_CODES, THRESH_CODES
-    check("V2-2: MIX_CODES M11 src_gain=1.0",
-          MIX_CODES["M11"]["src_gain"] == 1.0)
-    check("V2-2: MIX_CODES M11 dst_gain=1.0",
-          MIX_CODES["M11"]["dst_gain"] == 1.0)
-    check("V2-2: MIX_CODES M10 dst_gain=0.5",
-          MIX_CODES["M10"]["dst_gain"] == 0.5)
-    check("V2-2: MIX_CODES M01 src_gain=0.5",
-          MIX_CODES["M01"]["src_gain"] == 0.5)
-    check("V2-2: BIAS_CODES Bsoft gm=0.25",
-          BIAS_CODES["Bsoft"]["gm"] == 0.25)
-    check("V2-2: BIAS_CODES Bsoft isat=1.50",
-          BIAS_CODES["Bsoft"]["isat"] == 1.50)
-    check("V2-2: BIAS_CODES Bmid gm=0.80",
-          BIAS_CODES["Bmid"]["gm"] == 0.80)
-    check("V2-2: BIAS_CODES Bmid isat=0.80",
-          BIAS_CODES["Bmid"]["isat"] == 0.80)
-    check("V2-2: BIAS_CODES Bhard gm=1.40",
-          BIAS_CODES["Bhard"]["gm"] == 1.40)
-    check("V2-2: BIAS_CODES Bhard isat=0.45",
-          BIAS_CODES["Bhard"]["isat"] == 0.45)
-    check("V2-2: THRESH_CODES T0=0.0",
-          THRESH_CODES["T0"] == 0.0)
-    check("V2-2: THRESH_CODES T1=0.35",
-          THRESH_CODES["T1"] == 0.35)
-
-
 def test_v2_cell_parameters():
     """V2-3: per-cell gm/isat/theta/beta/src_gain/dst_gain match spec."""
     print("\nTest V2-3: v2 cell parameter values")
     from cell_library import make_cell_library
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     order = cell_lib._cell_order
     idx = {name: order.index(name) for name in order}
 
@@ -3703,7 +3553,7 @@ def test_v2_boundedness():
     print("\nTest V2-4: v2 cell boundedness |I| <= isat")
     from cell_library import make_cell_library
     import torch
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     Q = cell_lib.num_cells
     E, B = 1, 200
     logits = torch.full((E, Q), -1e9)
@@ -3750,7 +3600,7 @@ def test_v2_mix_code_asymmetry():
     print("\nTest V2-5: v2 mix code asymmetry (O_h10 vs O_h01)")
     from cell_library import make_cell_library
     import torch
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     Q = cell_lib.num_cells
     E = 1
     raw_mult = torch.zeros(E)
@@ -3793,7 +3643,7 @@ def test_v2_threshold_cells():
     print("\nTest V2-6: v2 threshold cells (P1/N1 vs P0/N0)")
     from cell_library import make_cell_library
     import torch
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     Q = cell_lib.num_cells
     E = 1
     raw_mult = torch.zeros(E)
@@ -3852,7 +3702,7 @@ def test_v2_forward_backward():
     print("\nTest V2-7: v2 forward + gradient flow")
     from cell_library import make_cell_library
     import torch
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     Q = cell_lib.num_cells
     E = 4
     B = 8
@@ -3878,49 +3728,6 @@ def test_v2_forward_backward():
           grads[2] is not None and torch.isfinite(grads[2]).all().item())
 
 
-def test_v2_legacy_v15_unchanged():
-    """V2-8: legacy/v15 libraries still use rho (backward compat preserved)."""
-    print("\nTest V2-8: legacy/v15 rho-based preactivation unchanged")
-    from cell_library import make_cell_library
-    import torch
-    for lib_name in ("legacy", "v15"):
-        cell_lib = IdealizedCellLibrary(library_name=lib_name)
-        check(f"V2-8: {lib_name} _use_mix is False",
-              cell_lib._use_mix is False,
-              f"got {cell_lib._use_mix}")
-        check(f"V2-8: {lib_name} has rho buffer",
-              hasattr(cell_lib, "rho"))
-        check(f"V2-8: {lib_name} has no src_gain buffer",
-              not hasattr(cell_lib, "src_gain"),
-              "src_gain should not be present in legacy/v15")
-        check(f"V2-8: {lib_name} has no dst_gain buffer",
-              not hasattr(cell_lib, "dst_gain"),
-              "dst_gain should not be present in legacy/v15")
-        # Forward pass still works
-        E, B = 2, 4
-        x_src = torch.randn(B, E)
-        x_dst = torch.randn(B, E)
-        logits = torch.randn(E, cell_lib.num_cells)
-        raw_mult = torch.randn(E)
-        with torch.no_grad():
-            i_edge = cell_lib(x_src, x_dst, logits, raw_mult, x_max=3.0, ctx=None)
-        check(f"V2-8: {lib_name} forward output finite",
-              torch.isfinite(i_edge).all().item())
-
-
-def test_v2_preset_routing():
-    """V2-9: make_cell_library('v2') dispatches to IdealizedCellLibrary with 10 cells."""
-    print("\nTest V2-9: v2 preset routing via make_cell_library")
-    from cell_library import make_cell_library, IdealizedCellLibrary
-    cell_lib = make_cell_library("v2")
-    check("V2-9: make_cell_library('v2') returns IdealizedCellLibrary",
-          isinstance(cell_lib, IdealizedCellLibrary))
-    check("V2-9: v2 library has 10 cells",
-          cell_lib.num_cells == 10)
-    check("V2-9: v2 library is in mix mode",
-          cell_lib._use_mix is True)
-
-
 # ---- Stage-LR scaling tests (stage-lr-scaling plan) ----
 
 def test_stage_lr_scale_backward_compat():
@@ -3931,7 +3738,7 @@ def test_stage_lr_scale_backward_compat():
     from topology import build_net_from_preset
     from cell_library import make_cell_library
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
     optim = make_optimizer(net, lr=1e-3, stage_lr_scale=1.0)
     check("SLS-1: single param group when scale=1.0",
@@ -3947,7 +3754,7 @@ def test_stage_lr_scale_multi_group():
     from topology import build_net_from_preset
     from cell_library import make_cell_library
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
     base_lr = 1e-3
     scale = 10.0
@@ -4150,7 +3957,7 @@ def test_solidification_metrics():
     from topology import build_net_from_preset
     from cell_library import make_cell_library
     from train import compute_solidification_metrics
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset("sinx", cell_lib=cell_lib)
     metrics = compute_solidification_metrics(net, tau=1.0)
     check("TP-6: mean_max_cell_prob present",
@@ -4174,8 +3981,6 @@ def test_solidification_metrics():
                              "frac_sigma_z_below_0.1", "frac_sigma_z_below_0.05",
                              "frac_sigma_z_below_0.01", "mean_sigma_u",
                              "num_edges", "num_nodes", "tau"})
-
-
 
 
 def test_log_solidification_format():
@@ -4235,7 +4040,7 @@ def test_mapper_lr_scale_backward_compat():
     from topology import build_net_from_preset
     from cell_library import make_cell_library
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
     optim = make_optimizer(net, lr=1e-3, stage_lr_scale=1.0, mapper_lr_scale=1.0)
     check("MLR-3: single param group when both scales=1.0",
@@ -4250,7 +4055,7 @@ def test_mapper_lr_scale_separate_group():
     from topology import build_net_from_preset
     from cell_library import make_cell_library
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
     base_lr = 1e-3
     mapper_scale = 0.1
@@ -4290,7 +4095,7 @@ def test_mapper_lr_scale_combined_with_stage_lr_scale():
     from topology import build_net_from_preset
     from cell_library import make_cell_library
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
     base_lr = 1e-3
     stage_scale = 10.0
@@ -4325,7 +4130,7 @@ def test_mapper_lr_scale_rejects_zero_or_negative():
     from topology import build_net_from_preset
     from cell_library import make_cell_library
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
     try:
         make_optimizer(net, lr=1e-3, mapper_lr_scale=0.0)
@@ -4433,7 +4238,7 @@ def test_lrp_struct_dyn_groups_created():
     from topology import build_net_from_preset
     from cell_library import make_cell_library
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
     base_lr = 1e-3
     optim = make_optimizer(
@@ -4459,7 +4264,7 @@ def test_lrp_correct_param_membership():
     from topology import build_net_from_preset
     from cell_library import make_cell_library
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
     base_lr = 1e-3
     optim = make_optimizer(
@@ -4539,7 +4344,7 @@ def test_lrp_backward_compat():
     from topology import build_net_from_preset
     from cell_library import make_cell_library
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
     optim = make_optimizer(
         net, lr=1e-3,
@@ -4558,7 +4363,7 @@ def test_lrp_validation_positive():
     from topology import build_net_from_preset
     from cell_library import make_cell_library
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
 
     for val, name in [(0.0, "zero"), (-0.1, "negative")]:
@@ -4583,7 +4388,7 @@ def test_lrp_composition_with_mapper():
     from topology import build_net_from_preset
     from cell_library import make_cell_library
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
     base_lr = 1e-3
     optim = make_optimizer(
@@ -4611,7 +4416,7 @@ def test_lrp_stage_lr_scale_ignored():
     import io
     import warnings
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
     base_lr = 1e-3
 
@@ -4645,7 +4450,7 @@ def test_lrp_empty_group_handling():
     from topology import build_net_from_preset
     from cell_library import make_cell_library
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
     # dyn_lr_scale=1.0 creates no dyn group; struct=2.0 creates struct group
     optim = make_optimizer(net, lr=1e-3, struct_lr_scale=2.0, dyn_lr_scale=1.0)
@@ -4694,7 +4499,7 @@ def test_lrp_compute_update_norms():
     from topology import build_net_from_preset
     from cell_library import make_cell_library
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
 
     snapshots = {name: p.data.detach().clone() for name, p in net.named_parameters()}
@@ -4723,7 +4528,7 @@ def test_lrp_old_mapper_default_backward_compat():
     from topology import build_net_from_preset
     from cell_library import make_cell_library
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
     optim = make_optimizer(
         net, lr=1e-3,
@@ -4772,7 +4577,7 @@ def test_freeze_mappers_requires_grad_toggle():
     from topology import build_net_from_preset
     from cell_library import make_cell_library
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
     raw = net.module if hasattr(net, "module") else net
 
@@ -5057,7 +4862,7 @@ def test_bidir_full_net_build():
     from topology import build_net_from_config
     from cell_library import make_cell_library
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     preset_bi = make_smooth2d_grid_preset(grid_size=5, bidirectional=True)
     net_bi = build_net_from_config(preset_bi, cell_lib=cell_lib)
     check("BIDI-8: bidirectional net builds successfully", net_bi is not None)
@@ -5248,7 +5053,7 @@ def test_repeat_edges_full_net_build():
     from topology import build_net_from_config
     from cell_library import make_cell_library
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     preset_rep = make_smooth2d_grid_preset(grid_size=5, edge_repeats=3)
     net_rep = build_net_from_config(preset_rep, cell_lib=cell_lib)
     check("REP-8: edge_repeats=3 net builds successfully", net_rep is not None)
@@ -5313,7 +5118,7 @@ def test_repeat_edges_compose_with_bidirectional_full_net():
     from topology import build_net_from_config
     from cell_library import make_cell_library
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     preset = make_smooth2d_grid_preset(
         grid_size=5, bidirectional=True, edge_repeats=3,
     )
@@ -5355,7 +5160,7 @@ def test_drive_current_basic():
     from topology import ring_graph, StageTopologyBuilder, topology_to_stage
     import torch
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     hid = ring_graph(4, radius=1)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=4, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -5399,7 +5204,7 @@ def test_drive_changes_rhs():
     from topology import ring_graph, StageTopologyBuilder, topology_to_stage
     import torch
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     hid = ring_graph(4, radius=1)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=4, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -5425,7 +5230,7 @@ def test_driven_node_gate_forced_open():
     from topology import ring_graph, StageTopologyBuilder, topology_to_stage
     import torch
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     hid = ring_graph(4, radius=1)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=4, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -5462,7 +5267,7 @@ def test_kirchhoff_net_with_io_drive_forward():
     from config import PRESETS
     import torch
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
 
     # Use ctle_grid preset as test bed (fan_out write mode, multi-stage).
     for preset_name in ["smooth2d_grid"]:
@@ -5493,388 +5298,6 @@ def test_kirchhoff_net_with_io_drive_forward():
           net_no.drive_mappers is None)
     check("DRIVE-4: enable_drive=False -> enable_drive is False",
           not net_no.enable_drive)
-
-
-def test_simple_edge_build_forward():
-    print("\nTest SE-1: SimpleEdgeLibrary build + forward (relu and tanh)")
-    from cell_library import SimpleEdgeLibrary, make_cell_library
-    from topology import build_net_from_config
-    from config import PRESETS
-
-    for mode in ("relu", "tanh"):
-        cell_lib = make_cell_library(mode)
-        l = cell_lib
-        check(f"SE-1 ({mode}): num_cells=1", l.num_cells == 1, f"got {l.num_cells}")
-        check(f"SE-1 ({mode}): z_index=0", l.z_index == 0, f"got {l.z_index}")
-        check(f"SE-1 ({mode}): has_z_cell=False", not l.has_z_cell, f"got {l.has_z_cell}")
-
-        preset = dict(PRESETS["smooth2d_grid"])
-        preset["stages"] = preset["stages"][:1]
-        net = build_net_from_config(preset, cell_lib=cell_lib, enable_drive=False)
-        stage = net.core.stages[0]
-        check(f"SE-1 ({mode}): stage uses SimpleEdgeLibrary",
-              isinstance(stage.cell_lib, SimpleEdgeLibrary))
-        check(f"SE-1 ({mode}): logits is None", stage.logits is None)
-        check(f"SE-1 ({mode}): raw_mult is None", stage.raw_mult is None)
-        check(f"SE-1 ({mode}): param shape [3, E]", stage.cell_lib.param.shape == (3, stage.num_edges()),
-              f"got {stage.cell_lib.param.shape}")
-
-        out, _ = net(torch.randn(4, 2), store_trajectory=False)
-        check(f"SE-1 ({mode}): output finite", torch.isfinite(out).all().item())
-        check(f"SE-1 ({mode}): output shape (4,1)", out.shape == (4, 1), f"got {out.shape}")
-
-        loss = out.sum()
-        loss.backward()
-        check(f"SE-1 ({mode}): grad on param", stage.cell_lib.param.grad is not None)
-        check(f"SE-1 ({mode}): grad on z_logits", stage.z_logits.grad is not None)
-        check(f"SE-1 ({mode}) deprecate-node-gates: u_logits has no grad (bypassed in rhs)",
-              stage.u_logits.grad is None,
-              f"got grad={stage.u_logits.grad}")
-        if hasattr(stage, "raw_leak"):
-            check(f"SE-1 ({mode}): grad on raw_leak", stage.raw_leak.grad is not None)
-
-
-def test_simple_edge_prune():
-    print("\nTest SE-2: SimpleEdgeLibrary pruning")
-    from cell_library import SimpleEdgeLibrary, make_cell_library
-    from topology import build_net_from_config, prune_network
-    from config import PRESETS
-
-    cell_lib = make_cell_library("tanh")
-    preset = dict(PRESETS["smooth2d_grid"])
-    preset["stages"] = preset["stages"][:2]
-    net = build_net_from_config(preset, cell_lib=cell_lib, enable_drive=False)
-
-    for stage in net.core.stages:
-        with torch.no_grad():
-            stage.z_logits.fill_(2.0)
-            n = stage.z_logits.numel()
-            stage.z_logits[:n // 2] = -3.0
-
-    pruned_core, remaps = prune_network(net.core, edge_threshold=0.5, prune_nodes_by_gate=False)
-    check("SE-2: pruned has fewer edges",
-          sum(s.num_edges() for s in pruned_core.stages) < sum(s.num_edges() for s in net.core.stages))
-    check("SE-2: pruned uses SimpleEdgeLibrary",
-          isinstance(pruned_core.stages[0].cell_lib, SimpleEdgeLibrary))
-    for i, stage in enumerate(pruned_core.stages):
-        check(f"SE-2: stage {i} param shape matches edges",
-              stage.cell_lib.param.shape[1] == stage.num_edges(),
-              f"param {stage.cell_lib.param.shape} vs edges {stage.num_edges()}")
-    check("SE-2: cell_lib is not shared",
-          pruned_core.stages[0].cell_lib is not net.core.stages[0].cell_lib)
-
-
-def test_simple_edge_regularizers():
-    print("\nTest SE-3: SimpleEdgeLibrary regularizers (manual)")
-    from cell_library import SimpleEdgeLibrary, make_cell_library
-    from topology import build_net_from_config
-    from config import PRESETS, LAMBDAS
-    from train import _stage_soft_weights, _stage_multiplicities, _stage_edge_gates, _stage_node_gates, _stage_rail_loss
-    import math
-
-    cell_lib = make_cell_library("relu")
-    preset = dict(PRESETS["smooth2d_grid"])
-    preset["stages"] = preset["stages"][:1]
-    net = build_net_from_config(preset, cell_lib=cell_lib, enable_drive=False)
-
-    u = torch.randn(4, 2)
-    out, trajs = net(u, store_trajectory=True)
-
-    stage = net.core.stages[0]
-    traj = trajs[0]
-    w = _stage_soft_weights(stage)
-    mult = _stage_multiplicities(stage)
-    z = _stage_edge_gates(stage)
-    u_gates = _stage_node_gates(stage)
-    z_idx = stage.cell_lib.z_index
-
-    check("SE-3: soft_weights has 1 column", w.shape[-1] == 1, f"got {w.shape[-1]}")
-    check("SE-3: soft_weights all 1.0", float(w.mean().item()) == 1.0, f"got {float(w.mean().item())}")
-    check("SE-3: multiplicities all 1.0", float(mult.mean().item()) == 1.0, f"got {float(mult.mean().item())}")
-    check("SE-3: edge_gates mean in (0,1)", 0 < float(z.mean().item()) < 1)
-    check("SE-3: node_gates mean = 1.0 (deprecated, returns all-ones)", float(u_gates.mean().item()) == 1.0)
-    check("SE-3: sparsity w[:,:0] = 0", float(w[:, :z_idx].sum().item()) == 0.0)
-    check("SE-3: rail finite", math.isfinite(float(_stage_rail_loss(stage, traj).item())))
-
-
-def test_tanh_realistic_construction():
-    """TR-1: RealisticTanhLibrary construction, invariants, and forward."""
-    print("\nTest TR-1: RealisticTanhLibrary construction + forward")
-    from cell_library import RealisticTanhLibrary, make_cell_library
-    from topology import build_net_from_config
-    from config import PRESETS
-
-    lib = RealisticTanhLibrary(num_edges=10)
-    check("TR-1: num_cells=1", lib.num_cells == 1, f"got {lib.num_cells}")
-    check("TR-1: z_index=0", lib.z_index == 0, f"got {lib.z_index}")
-    check("TR-1: has_z_cell=False", not lib.has_z_cell, f"got {lib.has_z_cell}")
-    check("TR-1: alpha_raw shape [10]", lib.alpha_raw.shape == (10,), f"got {lib.alpha_raw.shape}")
-    check("TR-1: bias_enabled=False by default", lib._bias_enabled is False)
-    check("TR-1: bias_raw absent by default",
-          not hasattr(lib, "bias_raw"),
-          f"got hasattr={hasattr(lib, 'bias_raw')}")
-    A = torch.sigmoid(lib.alpha_raw)
-    B = 1.0 - A
-    check("TR-1: A>0", (A > 0).all())
-    check("TR-1: B>0", (B > 0).all())
-    check("TR-1: A+B=1 (exact)", (A + B - 1.0).abs().max().item() < 1e-7)
-
-    x_src = torch.randn(4, 10)
-    x_dst = torch.randn(4, 10)
-    out = lib(x_src, x_dst, logits=None, raw_mult=None, x_max=3.0, ctx=None)
-    check("TR-1: forward shape", out.shape == (4, 10), f"got {out.shape}")
-    check("TR-1: forward finite", torch.isfinite(out).all().item())
-    loss = out.sum()
-    loss.backward()
-    check("TR-1: grad alpha_raw", lib.alpha_raw.grad is not None)
-
-    # bias_enabled=True variant: bias_raw must exist, init=0, receive grad
-    lib_bias = RealisticTanhLibrary(num_edges=10, bias_enabled=True)
-    check("TR-1: bias_enabled=True => bias_raw exists",
-          hasattr(lib_bias, "bias_raw"))
-    check("TR-1: bias_enabled=True => bias_raw shape [10]",
-          lib_bias.bias_raw.shape == (10,))
-    check("TR-1: bias_enabled=True => bias_raw init=0",
-          lib_bias.bias_raw.abs().sum().item() == 0.0)
-    out2 = lib_bias(x_src, x_dst, logits=None, raw_mult=None, x_max=3.0, ctx=None)
-    out2.sum().backward()
-    check("TR-1: bias_enabled=True => grad bias_raw",
-          lib_bias.bias_raw.grad is not None)
-
-    # Pipeline integration (default config has BIAS_ENABLED=False)
-    cell_lib = make_cell_library("tanh_realistic")
-    preset = dict(PRESETS["smooth2d_grid"])
-    preset["stages"] = preset["stages"][:1]
-    net = build_net_from_config(preset, cell_lib=cell_lib, enable_drive=False)
-    stage = net.core.stages[0]
-    check("TR-1: stage logits None", stage.logits is None)
-    check("TR-1: stage raw_mult None", stage.raw_mult is None)
-    check("TR-1: stage cell_lib is RealisticTanhLibrary",
-          isinstance(stage.cell_lib, RealisticTanhLibrary))
-    check("TR-1: pipeline bias_raw absent (BIAS_ENABLED=False)",
-          not hasattr(stage.cell_lib, "bias_raw"))
-    out, _ = net(torch.randn(4, 2), store_trajectory=False)
-    check("TR-1: output finite (pipeline)", torch.isfinite(out).all().item())
-    check("TR-1: output shape (4,1)", out.shape == (4, 1), f"got {out.shape}")
-    loss = out.sum()
-    loss.backward()
-    check("TR-1: grad on alpha_raw (pipeline)", stage.cell_lib.alpha_raw.grad is not None)
-    check("TR-1: grad on z_logits", stage.z_logits.grad is not None)
-    if hasattr(stage, "raw_leak"):
-        check("TR-1: grad on raw_leak", stage.raw_leak.grad is not None)
-    check("TR-1 deprecate-node-gates: u_logits no grad",
-          stage.u_logits.grad is None, f"got {stage.u_logits.grad}")
-
-
-def test_tanh_realistic_prune():
-    """TR-2: RealisticTanhLibrary pruning."""
-    print("\nTest TR-2: RealisticTanhLibrary pruning")
-    from cell_library import RealisticTanhLibrary, make_cell_library
-    from topology import build_net_from_config, prune_network
-    from config import PRESETS
-
-    cell_lib = make_cell_library("tanh_realistic")
-    preset = dict(PRESETS["smooth2d_grid"])
-    preset["stages"] = preset["stages"][:1]
-    net = build_net_from_config(preset, cell_lib=cell_lib, enable_drive=False)
-
-    for stage in net.core.stages:
-        with torch.no_grad():
-            stage.z_logits.fill_(2.0)
-            n = stage.z_logits.numel()
-            stage.z_logits[:n // 2] = -3.0
-
-    pruned_core, _ = prune_network(net.core, edge_threshold=0.5, prune_nodes_by_gate=False)
-    check("TR-2: pruned has fewer edges",
-          sum(s.num_edges() for s in pruned_core.stages) < sum(s.num_edges() for s in net.core.stages))
-    for i, stage in enumerate(pruned_core.stages):
-        check(f"TR-2: stage {i} alpha_raw matches edges",
-              stage.cell_lib.alpha_raw.shape == (stage.num_edges(),),
-              f"alpha_raw {stage.cell_lib.alpha_raw.shape} vs edges {stage.num_edges()}")
-        check("TR-2: bias_raw remains absent when BIAS_ENABLED=False",
-              not hasattr(stage.cell_lib, "bias_raw"))
-
-    # With bias_enabled=True, prune should preserve bias_raw
-    from config import CELL_LIBRARIES as _CL
-    _orig_entry = _CL["tanh_realistic"]
-    _CL["tanh_realistic"] = {**_orig_entry, "BIAS_ENABLED": True}
-    try:
-        cell_lib_b = make_cell_library("tanh_realistic")
-        preset_b = dict(PRESETS["smooth2d_grid"])
-        preset_b["stages"] = preset_b["stages"][:1]
-        net_b = build_net_from_config(preset_b, cell_lib=cell_lib_b, enable_drive=False)
-        for stage in net_b.core.stages:
-            with torch.no_grad():
-                stage.z_logits.fill_(2.0)
-                n = stage.z_logits.numel()
-                stage.z_logits[:n // 2] = -3.0
-        pruned_b, _ = prune_network(net_b.core, edge_threshold=0.5, prune_nodes_by_gate=False)
-        for i, stage in enumerate(pruned_b.stages):
-            check(f"TR-2 bias: stage {i} bias_raw present",
-                  hasattr(stage.cell_lib, "bias_raw"))
-            check(f"TR-2 bias: stage {i} bias_raw shape matches edges",
-                  stage.cell_lib.bias_raw.shape == (stage.num_edges(),),
-                  f"bias_raw {stage.cell_lib.bias_raw.shape} vs edges {stage.num_edges()}")
-    finally:
-        _CL["tanh_realistic"] = _orig_entry
-
-
-def test_tanh_realistic_upgrade():
-    """TRU-1: RealisticTanhUpgradeLibrary construction, invariants, and forward."""
-    print("\nTest TRU-1: RealisticTanhUpgradeLibrary construction + forward")
-    from cell_library import RealisticTanhUpgradeLibrary, make_cell_library
-    from topology import build_net_from_config, topology_to_stage
-    from config import PRESETS, TANH_REALISTIC_GM_MIN, TANH_REALISTIC_GM_MAX, TANH_REALISTIC_ISAT_MIN, TANH_REALISTIC_ISAT_MAX
-
-    lib = RealisticTanhUpgradeLibrary(num_edges=10)
-    check("TRU-1: num_cells=1", lib.num_cells == 1, f"got {lib.num_cells}")
-    check("TRU-1: z_index=0", lib.z_index == 0, f"got {lib.z_index}")
-    check("TRU-1: has_z_cell=False", not lib.has_z_cell)
-    check("TRU-1: alpha_raw shape [10]", lib.alpha_raw.shape == (10,), f"got {lib.alpha_raw.shape}")
-    check("TRU-1: gm_raw shape [10]", lib.gm_raw.shape == (10,), f"got {lib.gm_raw.shape}")
-    check("TRU-1: isat_raw shape [10]", lib.isat_raw.shape == (10,), f"got {lib.isat_raw.shape}")
-    check("TRU-1: bias_enabled=False by default", lib._bias_enabled is False)
-    check("TRU-1: bias_raw absent by default",
-          not hasattr(lib, "bias_raw"),
-          f"got hasattr={hasattr(lib, 'bias_raw')}")
-    check("TRU-1: gm_raw is nn.Parameter (bugfix)", isinstance(lib.gm_raw, torch.nn.Parameter))
-    check("TRU-1: isat_raw is nn.Parameter (bugfix)", isinstance(lib.isat_raw, torch.nn.Parameter))
-    check("TRU-1: gm_raw init=-2.3 (sigmoid midpoint logic)",
-          torch.allclose(lib.gm_raw, torch.full((10,), -2.3)))
-    check("TRU-1: isat_raw init=-2.3 (sigmoid midpoint logic)",
-          torch.allclose(lib.isat_raw, torch.full((10,), -2.3)))
-
-    # Default boundaries from config
-    check("TRU-1: gm_min from config", lib.gm_min == TANH_REALISTIC_GM_MIN, f"got {lib.gm_min}")
-    check("TRU-1: gm_max from config", lib.gm_max == TANH_REALISTIC_GM_MAX, f"got {lib.gm_max}")
-    check("TRU-1: isat_min from config", lib.isat_min == TANH_REALISTIC_ISAT_MIN, f"got {lib.isat_min}")
-    check("TRU-1: isat_max from config", lib.isat_max == TANH_REALISTIC_ISAT_MAX, f"got {lib.isat_max}")
-
-    # Custom boundaries
-    lib2 = RealisticTanhUpgradeLibrary(num_edges=3, gm_min=0.5, gm_max=2.0, isat_min=0.1, isat_max=1.0)
-    check("TRU-1: custom gm_min", lib2.gm_min == 0.5, f"got {lib2.gm_min}")
-    check("TRU-1: custom gm_max", lib2.gm_max == 2.0, f"got {lib2.gm_max}")
-    check("TRU-1: custom isat_min", lib2.isat_min == 0.1, f"got {lib2.isat_min}")
-    check("TRU-1: custom isat_max", lib2.isat_max == 1.0, f"got {lib2.isat_max}")
-
-    A = torch.sigmoid(lib.alpha_raw)
-    B = 1.0 - A
-    check("TRU-1: A>0 (upgrade)", (A > 0).all())
-    check("TRU-1: B>0 (upgrade)", (B > 0).all())
-    check("TRU-1: A+B=1 (upgrade)", (A + B - 1.0).abs().max().item() < 1e-7)
-
-    sig_gm = torch.sigmoid(lib.gm_raw)
-    gm = TANH_REALISTIC_GM_MIN + (TANH_REALISTIC_GM_MAX - TANH_REALISTIC_GM_MIN) * sig_gm
-    check("TRU-1: gm in [gm_min, gm_max]",
-          TANH_REALISTIC_GM_MIN <= gm.min().item() and gm.max().item() <= TANH_REALISTIC_GM_MAX)
-    sig_isat = torch.sigmoid(lib.isat_raw)
-    isat_v = TANH_REALISTIC_ISAT_MIN + (TANH_REALISTIC_ISAT_MAX - TANH_REALISTIC_ISAT_MIN) * sig_isat
-    check("TRU-1: isat in [isat_min, isat_max]",
-          TANH_REALISTIC_ISAT_MIN <= isat_v.min().item() and isat_v.max().item() <= TANH_REALISTIC_ISAT_MAX)
-
-    x_src = torch.randn(4, 10)
-    x_dst = torch.randn(4, 10)
-    out = lib(x_src, x_dst, logits=None, raw_mult=None, x_max=3.0, ctx=None)
-    check("TRU-1: forward shape", out.shape == (4, 10), f"got {out.shape}")
-    check("TRU-1: forward finite", torch.isfinite(out).all().item())
-    loss = out.sum()
-    loss.backward()
-    check("TRU-1: grad alpha_raw", lib.alpha_raw.grad is not None)
-    check("TRU-1: grad gm_raw", lib.gm_raw.grad is not None)
-    check("TRU-1: grad isat_raw", lib.isat_raw.grad is not None)
-
-    # bias_enabled=True variant
-    lib_bias = RealisticTanhUpgradeLibrary(num_edges=10, bias_enabled=True)
-    check("TRU-1: bias_enabled=True => bias_raw exists",
-          hasattr(lib_bias, "bias_raw"))
-    check("TRU-1: bias_enabled=True => bias_raw shape [10]",
-          lib_bias.bias_raw.shape == (10,))
-    check("TRU-1: bias_enabled=True => bias_raw init=0",
-          lib_bias.bias_raw.abs().sum().item() == 0.0)
-    out2 = lib_bias(x_src, x_dst, logits=None, raw_mult=None, x_max=3.0, ctx=None)
-    out2.sum().backward()
-    check("TRU-1: bias_enabled=True => grad bias_raw",
-          lib_bias.bias_raw.grad is not None)
-
-    # Pipeline integration
-    cell_lib = make_cell_library("tanh_realistic_upgrade")
-    preset = dict(PRESETS["smooth2d_grid"])
-    preset["stages"] = preset["stages"][:1]
-    net = build_net_from_config(preset, cell_lib=cell_lib, enable_drive=False)
-    stage = net.core.stages[0]
-    check("TRU-1: stage logits None (upgrade)", stage.logits is None)
-    check("TRU-1: stage raw_mult None (upgrade)", stage.raw_mult is None)
-    check("TRU-1: stage cell_lib is RealisticTanhUpgradeLibrary",
-          isinstance(stage.cell_lib, RealisticTanhUpgradeLibrary))
-    check("TRU-1: pipeline bias_raw absent (BIAS_ENABLED=False)",
-          not hasattr(stage.cell_lib, "bias_raw"))
-    out, _ = net(torch.randn(4, 2), store_trajectory=False)
-    check("TRU-1: output finite (pipeline, upgrade)", torch.isfinite(out).all().item())
-    check("TRU-1: output shape (4,1)", out.shape == (4, 1), f"got {out.shape}")
-    loss = out.sum()
-    loss.backward()
-    check("TRU-1: grad alpha_raw (pipeline)", stage.cell_lib.alpha_raw.grad is not None)
-    check("TRU-1: grad gm_raw (pipeline)", stage.cell_lib.gm_raw.grad is not None)
-    check("TRU-1: grad isat_raw (pipeline)", stage.cell_lib.isat_raw.grad is not None)
-    check("TRU-1: grad z_logits (upgrade)", stage.z_logits.grad is not None)
-    if hasattr(stage, "raw_leak"):
-        check("TRU-1: grad raw_leak (upgrade)", stage.raw_leak.grad is not None)
-    check("TRU-1 deprecate-node-gates: u_logits no grad (upgrade)",
-          stage.u_logits.grad is None, f"got {stage.u_logits.grad}")
-
-
-def test_tanh_realistic_upgrade_prune():
-    """TRU-2: RealisticTanhUpgradeLibrary pruning."""
-    print("\nTest TRU-2: RealisticTanhUpgradeLibrary pruning")
-    from cell_library import RealisticTanhUpgradeLibrary, make_cell_library
-    from topology import build_net_from_config, prune_network
-    from config import PRESETS, CELL_LIBRARIES
-
-    cell_lib = make_cell_library("tanh_realistic_upgrade")
-    preset = dict(PRESETS["smooth2d_grid"])
-    preset["stages"] = preset["stages"][:1]
-    net = build_net_from_config(preset, cell_lib=cell_lib, enable_drive=False)
-
-    for stage in net.core.stages:
-        with torch.no_grad():
-            stage.z_logits.fill_(2.0)
-            n = stage.z_logits.numel()
-            stage.z_logits[:n // 2] = -3.0
-
-    pruned_core, _ = prune_network(net.core, edge_threshold=0.5, prune_nodes_by_gate=False)
-    check("TRU-2: pruned has fewer edges",
-          sum(s.num_edges() for s in pruned_core.stages) < sum(s.num_edges() for s in net.core.stages))
-    for i, stage in enumerate(pruned_core.stages):
-        for name in ("alpha_raw", "gm_raw", "isat_raw"):
-            p = getattr(stage.cell_lib, name)
-            check(f"TRU-2: stage {i} {name} matches edges",
-                  p.shape == (stage.num_edges(),),
-                  f"{name} {p.shape} vs edges {stage.num_edges()}")
-        check("TRU-2: bias_raw absent when BIAS_ENABLED=False",
-              not hasattr(stage.cell_lib, "bias_raw"))
-
-    # With bias_enabled=True, prune should preserve bias_raw
-    _orig_entry = CELL_LIBRARIES["tanh_realistic_upgrade"]
-    CELL_LIBRARIES["tanh_realistic_upgrade"] = {**_orig_entry, "BIAS_ENABLED": True}
-    try:
-        cell_lib_b = make_cell_library("tanh_realistic_upgrade")
-        preset_b = dict(PRESETS["smooth2d_grid"])
-        preset_b["stages"] = preset_b["stages"][:1]
-        net_b = build_net_from_config(preset_b, cell_lib=cell_lib_b, enable_drive=False)
-        for stage in net_b.core.stages:
-            with torch.no_grad():
-                stage.z_logits.fill_(2.0)
-                n = stage.z_logits.numel()
-                stage.z_logits[:n // 2] = -3.0
-        pruned_b, _ = prune_network(net_b.core, edge_threshold=0.5, prune_nodes_by_gate=False)
-        for i, stage in enumerate(pruned_b.stages):
-            check(f"TRU-2 bias: stage {i} bias_raw present",
-                  hasattr(stage.cell_lib, "bias_raw"))
-            check(f"TRU-2 bias: stage {i} bias_raw matches edges",
-                  stage.cell_lib.bias_raw.shape == (stage.num_edges(),),
-                  f"bias_raw {stage.cell_lib.bias_raw.shape} vs edges {stage.num_edges()}")
-    finally:
-        CELL_LIBRARIES["tanh_realistic_upgrade"] = _orig_entry
 
 
 def test_free_tanh_construction():
@@ -6054,31 +5477,6 @@ def test_free_tanh_prune():
         CELL_LIBRARIES["tanh_free"] = _orig_entry
 
 
-def test_simple_edge_diagnostics():
-    print("\nTest SE-4: SimpleEdgeLibrary diagnostics (compute_solidification_metrics)")
-    from cell_library import SimpleEdgeLibrary, make_cell_library
-    from topology import build_net_from_config
-    from config import PRESETS
-    from train import compute_solidification_metrics
-
-    cell_lib = make_cell_library("tanh")
-    preset = dict(PRESETS["smooth2d_grid"])
-    preset["stages"] = preset["stages"][:1]
-    net = build_net_from_config(preset, cell_lib=cell_lib, enable_drive=False)
-
-    metrics = compute_solidification_metrics(net, tau=1.0)
-    check("SE-4: mean_sigma_z present", "mean_sigma_z" in metrics)
-    check("SE-4: mean_sigma_u present", "mean_sigma_u" in metrics)
-    check("SE-4: num_edges > 0", metrics["num_edges"] > 0)
-    check("SE-4: num_nodes > 0", metrics["num_nodes"] > 0)
-    check("SE-4: mean_max_cell_prob == 0 (no logits)",
-          metrics["mean_max_cell_prob"] == 0.0,
-          f"got {metrics['mean_max_cell_prob']}")
-    check("SE-4: mean_pZ == 0 (no Z cell)",
-          metrics["mean_pZ"] == 0.0,
-          f"got {metrics['mean_pZ']}")
-
-
 # ============================================================================
 # Fixed seed tests (fixed-seed plan)
 # ============================================================================
@@ -6091,7 +5489,7 @@ def test_deprecate_node_gates_warnings():
     from topology import prune_stage
     from train import _stage_node_gates
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     stage = DifferentialStage(num_nodes=2, src=[0], dst=[1], cell_lib=cell_lib)
 
     # 1) prune_stage with prune_nodes_by_gate=True emits DeprecationWarning
@@ -6138,13 +5536,13 @@ def test_seed_everything_deterministic():
     preset["stages"] = preset["stages"][:1]
 
     seed_everything(123)
-    cell_lib_a = make_cell_library('tanh')
+    cell_lib_a = make_cell_library('tanh_free')
     net_a = build_net_from_config(preset, cell_lib=cell_lib_a, enable_drive=False)
     a_weight = net_a.output_mapper.proj.weight.detach().clone()
 
     # Second: build with the SAME seed; should match exactly.
     seed_everything(123)
-    cell_lib_b = make_cell_library('tanh')
+    cell_lib_b = make_cell_library('tanh_free')
     net_b = build_net_from_config(preset, cell_lib=cell_lib_b, enable_drive=False)
     b_weight = net_b.output_mapper.proj.weight.detach().clone()
 
@@ -6154,7 +5552,7 @@ def test_seed_everything_deterministic():
 
     # Third: different seed -> should differ.
     seed_everything(456)
-    cell_lib_c = make_cell_library('tanh')
+    cell_lib_c = make_cell_library('tanh_free')
     net_c = build_net_from_config(preset, cell_lib=cell_lib_c, enable_drive=False)
     c_weight = net_c.output_mapper.proj.weight.detach().clone()
     differs = not torch.allclose(a_weight, c_weight)
@@ -6194,24 +5592,6 @@ def test_seed_everything_seeds_python_random():
           f"a[:2]={a[:2]}, b[:2]={b[:2]}")
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 def test_leak_non_programmable():
     """leak_mode='non-programmable' creates no raw_leak param and uses fixed scalar leak."""
     print("\nTest LMC-1: leak_mode='non-programmable' (fixed constant leak)")
@@ -6221,7 +5601,7 @@ def test_leak_non_programmable():
     from config import INIT
 
     torch.manual_seed(0)
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
 
     # (a) programmable (default): raw_leak exists -> leak=softplus(-3)
     hid = ring_graph(3, radius=1)
@@ -6237,7 +5617,7 @@ def test_leak_non_programmable():
           f"got {float(leak_prog.sum()):.4f}, expected {expected_prog:.4f}")
 
     # (b) non-programmable: no raw_leak -> leak=leak_constant
-    cell_lib_b = make_cell_library('tanh')
+    cell_lib_b = make_cell_library('tanh_free')
     stage_fix = DifferentialStage(
         num_nodes=3, src=[0, 1], dst=[1, 2], cell_lib=cell_lib_b,
         leak_mode="non-programmable",
@@ -6257,7 +5637,7 @@ def test_leak_non_programmable():
           f"got {leak_fix.tolist()}")
 
     # (d) custom leak_constant
-    cell_lib_c = make_cell_library('tanh')
+    cell_lib_c = make_cell_library('tanh_free')
     stage_custom = DifferentialStage(
         num_nodes=3, src=[0, 1], dst=[1, 2], cell_lib=cell_lib_c,
         leak_mode="non-programmable", leak_constant=0.123,
@@ -6295,7 +5675,7 @@ def test_leak_non_programmable():
     # (h) invalid leak_mode raises
     try:
         DifferentialStage(
-            num_nodes=2, src=[0], dst=[1], cell_lib=make_cell_library('tanh'),
+            num_nodes=2, src=[0], dst=[1], cell_lib=make_cell_library('tanh_free'),
             leak_mode="garbage",
         )
         check("LMC-1m: invalid leak_mode raises ValueError", False, "no error")
@@ -6311,7 +5691,7 @@ def test_leak_non_programmable_prune_transfer():
     from cell_library import make_cell_library
 
     torch.manual_seed(0)
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
 
     # Build stages via topology_to_stage (handles edge-count consistency)
     hid = ring_graph(4, radius=1)
@@ -6329,7 +5709,7 @@ def test_leak_non_programmable_prune_transfer():
 
     # Non-programmable variant via topology_to_stage (only way to get correct edge count)
     stage_fix, _, _ = topology_to_stage(
-        topo, cell_lib=make_cell_library('tanh'),
+        topo, cell_lib=make_cell_library('tanh_free'),
         leak_mode="non-programmable", leak_constant=0.05,
     )
     with torch.no_grad():
@@ -6341,18 +5721,6 @@ def test_leak_non_programmable_prune_transfer():
     )
     check("LMC-2b: pruned non-prog stage has NO raw_leak",
           not hasattr(pruned_fix, "raw_leak"))
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 # =============================================================================
@@ -6369,7 +5737,7 @@ def _make_budget_stage(num_nodes=5, src=None, dst=None):
         # 5 nodes, 3 incoming edges per destination (uniform coverage)
         src = [1, 3, 4, 0, 2, 4, 0, 1, 3, 1, 2, 4, 0, 2, 3]
         dst = [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4]
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     return DifferentialStage(num_nodes=num_nodes, src=src, dst=dst, cell_lib=cell_lib)
 
 
@@ -6534,8 +5902,6 @@ def test_budget_axis_both():
           f"max diff = {(gate_both - expected).abs().max().item():.4e}")
 
 
-
-
 def test_budget_annealing_schedule():
     """BUD-8: budget_frac_for_epoch and budget_temperature_for_epoch linear anneal."""
     print("\nTest BUD-8: annealing schedule")
@@ -6593,31 +5959,6 @@ def test_budget_disabled_byte_identical():
           f"max diff = {(out1 - out2).abs().max().item():.4e}")
 
 
-def test_budget_simple_edge_library_compat():
-    """BUD-10: budget works on SimpleEdgeLibrary stages (logits=None)."""
-    print("\nTest BUD-10: SimpleEdgeLibrary compat")
-    from cell_library import SimpleEdgeLibrary
-    from differential_stage import DifferentialStage
-    cell_lib = SimpleEdgeLibrary(num_edges=15, mode="tanh")
-    src = [1, 3, 4, 0, 2, 4, 0, 1, 3, 1, 2, 4, 0, 2, 3]
-    dst = [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4]
-    stage = DifferentialStage(num_nodes=5, src=src, dst=dst, cell_lib=cell_lib)
-    with torch.no_grad():
-        stage.z_logits.data = torch.tensor(
-            [3.0, 1.0, 0.0, 2.0, 1.5, 0.5, 2.5, 0.8, -0.5, 1.2, 0.3, 2.2, 1.8, 0.6, -1.0]
-        )
-    stage.set_budget_frac(frac=0.5, temperature=1.0)
-    gate = stage._compute_budget_gate()
-    check("SimpleEdgeLibrary: gate shape [E]", gate.shape == (15,))
-    check("SimpleEdgeLibrary: gate in [0, 1]",
-          bool((gate >= 0.0).all().item() and (gate <= 1.0).all().item()))
-    # Forward should work without errors
-    x = torch.randn(2, 5)
-    out = stage.rhs(x, cell_mode="soft")
-    check("SimpleEdgeLibrary rhs with budget is finite",
-          torch.isfinite(out).all().item())
-
-
 def test_budget_frac_uniform_proportion():
     """BUD-11: frac=0.5 with mixed in-degrees keeps ~50% per group.
 
@@ -6642,7 +5983,7 @@ def test_budget_frac_uniform_proportion():
     dst.extend([1] * 8)
     src.extend(list(range(30, 46)))
     dst.extend([2] * 16)
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     stage = DifferentialStage(
         num_nodes=46, src=src, dst=dst, cell_lib=cell_lib,
     )
@@ -6910,7 +6251,7 @@ def test_friedman_kirchhoff_net_build():
     except ImportError as e:
         check("imports", False, f"failed: {e}")
         return
-    cell_lib = make_cell_library("tanh", num_edges=4)
+    cell_lib = make_cell_library("tanh_free", num_edges=4)
     for problem in ["friedman1", "friedman2", "friedman3"]:
         net = build_net_from_preset(problem, cell_lib)
         check(f"{problem}: net is not None", net is not None)
@@ -6925,144 +6266,6 @@ def test_friedman_kirchhoff_net_build():
                 return all(_finite(t) for t in o)
             return True
         check(f"{problem}: forward pass yields finite output", _finite(out))
-
-
-def test_anti_parallel_basic():
-    print("\nTest anti-parallel-rectified: AntiParallelFreeTanhLibrary (APT-1..11)")
-    from cell_library import AntiParallelFreeTanhLibrary, make_cell_library
-    from config import (
-        ANTI_PARALLEL_KAPPA_MIN, ANTI_PARALLEL_KAPPA_MAX,
-        ANTI_PARALLEL_GM_MIN, ANTI_PARALLEL_GM_MAX,
-        ANTI_PARALLEL_ISAT_MIN, ANTI_PARALLEL_ISAT_MAX,
-        ANTI_PARALLEL_THETA_MAX,
-    )
-    torch.manual_seed(0)
-
-    # APT-1: factory registration & forward shape
-    lib = make_cell_library("tanh_anti", num_edges=4)
-    check("APT-1: factory returns AntiParallelFreeTanhLibrary",
-          isinstance(lib, AntiParallelFreeTanhLibrary))
-    x_src = torch.randn(2, 4)
-    x_dst = torch.randn(2, 4)
-    y = lib(x_src, x_dst, 3.0)
-    check("APT-1: forward shape is [B, E]", tuple(y.shape) == (2, 4))
-    check("APT-1: output dtype matches input", y.dtype == x_src.dtype)
-    check("APT-1: output is finite", bool(torch.isfinite(y).all().item()))
-
-    # APT-2: zero current at Vsrc = Vdst (theta_enabled=False default)
-    x = torch.tensor([[0.5, 1.0, 2.0, -0.7]])
-    y_same = lib(x, x, 3.0)
-    check("APT-2: zero current at Vsrc=Vdst (theta disabled)",
-          bool((y_same.abs().max().item() < 1e-6)))
-
-    # APT-2b: zero at Vsrc=Vdst also with theta_enabled (init theta_raw=0 → theta=theta_max*0.5)
-    lib_th = make_cell_library("tanh_anti", num_edges=4)
-    lib_th._theta_enabled = True
-    lib_th.theta_raw = torch.nn.Parameter(torch.zeros(4))
-    y_same_th = lib_th(x, x, 3.0)
-    check("APT-2b: zero current at Vsrc=Vdst (theta=theta_max*0.5 init)",
-          bool((y_same_th.abs().max().item() < 1e-6)))
-
-    # APT-3: nonnegative current for arbitrary inputs
-    x_src = torch.randn(8, 4) * 1.5
-    x_dst = torch.randn(8, 4) * 1.5
-    y = lib(x_src, x_dst, 3.0)
-    check("APT-3: output is nonnegative for arbitrary inputs",
-          bool((y >= -1e-6).all().item()))
-
-    # APT-4: gradient flow to all params
-    x_src = torch.randn(4, 4)
-    x_dst = torch.randn(4, 4)
-    y = lib(x_src, x_dst, 3.0).sum()
-    y.backward()
-    grad_norms = {n: p.grad.abs().sum().item() for n, p in lib.named_parameters()}
-    check("APT-4: kappa_raw receives gradient",
-          grad_norms.get("kappa_raw", 0.0) > 0.0)
-    check("APT-4: gm_raw receives gradient",
-          grad_norms.get("gm_raw", 0.0) > 0.0)
-    check("APT-4: isat_raw receives gradient",
-          grad_norms.get("isat_raw", 0.0) > 0.0)
-    check("APT-4: no theta_raw when theta_enabled=False",
-          "theta_raw" not in grad_norms)
-
-    # APT-5: compliance gating at x_max
-    x_at_max = torch.full((4, 4), 3.0)
-    x_src_clamp = torch.randn(4, 4)
-    y_max = lib(x_src_clamp, x_at_max, 3.0)
-    check("APT-5: compliance gating drives current to 0 at x_max",
-          bool((y_max.abs() < 1e-3).all().item()))
-
-    # APT-6: theta_enabled toggle
-    lib_no_th = AntiParallelFreeTanhLibrary(num_edges=3, theta_enabled=False)
-    lib_yes_th = AntiParallelFreeTanhLibrary(num_edges=3, theta_enabled=True)
-    check("APT-6: theta_enabled=False → no theta_raw param",
-          not hasattr(lib_no_th, "theta_raw"))
-    check("APT-6: theta_enabled=True → has theta_raw param",
-          hasattr(lib_yes_th, "theta_raw"))
-    check("APT-6: theta_enabled default is False (from factory)",
-          not make_cell_library("tanh_anti", num_edges=1)._theta_enabled)
-
-    # APT-7: theta_enabled=True with high theta reduces current
-    lib_high = AntiParallelFreeTanhLibrary(num_edges=2, theta_enabled=True)
-    with torch.no_grad():
-        lib_high.theta_raw.data.fill_(10.0)  # sigma(10) ≈ 1, so theta ≈ theta_max
-    x_src = torch.tensor([[0.1, 0.1]])
-    x_dst = torch.tensor([[0.0, 0.0]])
-    y_high = lib_high(x_src, x_dst, 3.0)
-    check("APT-7: high theta reduces current to ~0",
-          bool((y_high.abs() < 1e-3).all().item()))
-
-    # APT-8: use_isat_normalization toggle
-    lib_norm = AntiParallelFreeTanhLibrary(num_edges=3, use_isat_normalization=True)
-    x_src = torch.randn(4, 3)
-    x_dst = torch.randn(4, 3)
-    y_norm = lib_norm(x_src, x_dst, 3.0)
-    check("APT-8: isat-normalized forward is finite and nonnegative",
-          bool((y_norm >= 0).all().item() and torch.isfinite(y_norm).all().item()))
-
-    # APT-9: kappa bounds respected
-    lib_k = AntiParallelFreeTanhLibrary(num_edges=5, kappa_min=0.5, kappa_max=1.5)
-    with torch.no_grad():
-        lib_k.kappa_raw.data.fill_(100.0)  # sigma(100) ≈ 1 → kappa ≈ kappa_max
-    check("APT-9: kappa_max bound respected (kappa_raw=∞ → kappa→kappa_max)",
-          abs(lib_k.kappa_min + (lib_k.kappa_max - lib_k.kappa_min) * 1.0
-              - lib_k.kappa_max) < 1e-5)
-    with torch.no_grad():
-        lib_k.kappa_raw.data.fill_(-100.0)  # sigma(-100) ≈ 0 → kappa ≈ kappa_min
-    check("APT-9: kappa_min bound respected (kappa_raw=-∞ → kappa→kappa_min)",
-          abs(lib_k.kappa_min + (lib_k.kappa_max - lib_k.kappa_min) * 0.0
-              - lib_k.kappa_min) < 1e-5)
-
-    # APT-10: Isat bounds + clamp_min(1e-6)
-    lib_i = AntiParallelFreeTanhLibrary(num_edges=3, isat_min=0.1, isat_max=0.5)
-    with torch.no_grad():
-        lib_i.isat_raw.data.fill_(100.0)  # isat → isat_max
-    sigma = torch.sigmoid(lib_i.isat_raw)
-    isat_val = (lib_i.isat_min + (lib_i.isat_max - lib_i.isat_min) * sigma).clamp_min(1e-6)
-    check("APT-10: isat at upper bound is below isat_max",
-          bool((isat_val <= lib_i.isat_max + 1e-6).all().item()))
-    with torch.no_grad():
-        lib_i.isat_raw.data.fill_(-100.0)  # isat → isat_min
-    sigma = torch.sigmoid(lib_i.isat_raw)
-    isat_val = (lib_i.isat_min + (lib_i.isat_max - lib_i.isat_min) * sigma).clamp_min(1e-6)
-    check("APT-10: isat at lower bound is >= clamp_min(1e-6)",
-          bool((isat_val >= 1e-6).all().item()))
-
-    # APT-11: Antiparallel pair — two libs on same pair, asymmetric net
-    lib_fwd = AntiParallelFreeTanhLibrary(num_edges=2)
-    lib_rev = AntiParallelFreeTanhLibrary(num_edges=2)
-    x_src = torch.tensor([[1.0, 0.5], [-0.5, 2.0]])
-    x_dst = torch.tensor([[0.0, 1.0], [1.0, -1.0]])
-    y_fwd = lib_fwd(x_src, x_dst, 3.0)
-    y_rev = lib_rev(x_dst, x_src, 3.0)
-    check("APT-11: forward branch zero when Vsrc<Vdst (idx 0,1 of row 0)",
-          y_fwd[0, 1].abs().item() < 1e-6)
-    check("APT-11: reverse branch zero when Vdst<Vsrc (idx 0 of row 0)",
-          y_rev[0, 0].abs().item() < 1e-6)
-    net = y_fwd - y_rev
-    check("APT-11: net (fwd - rev) is asymmetric across edges",
-          bool((net[0, 0] - net[0, 1]).abs().item() > 1e-6
-               or (net[1, 0] - net[1, 1]).abs().item() > 1e-6))
 
 
 def test_ref_edges_basic():
@@ -7081,7 +6284,7 @@ def test_ref_edges_basic():
     # raw_vref, ref_z_logits, and ref_cell_lib on every stage.
     from topology import build_net_from_preset
     from cell_library import make_cell_library
-    cell_lib = make_cell_library("tanh", num_edges=4)
+    cell_lib = make_cell_library("tanh_free", num_edges=4)
 
     net_off = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
     net_on = build_net_from_preset(

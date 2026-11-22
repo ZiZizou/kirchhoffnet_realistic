@@ -143,7 +143,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--kn-small-world-p", type=float, default=0.2)
     p.add_argument("--kn-small-world-seed", type=int, default=1)
     p.add_argument("--kn-edge-repeats", type=int, default=2)
-    p.add_argument("--kn-cell-library", default="tanh_free")
+    p.add_argument("--kn-cell-library", default="tanh_free", choices=["tanh_free"])
     p.add_argument("--kn-leak-mode", default="non-programmable")
     p.add_argument("--kn-interstage-activation", default="residual-relu-tanh")
     p.add_argument("--kn-freeze-read", dest="kn_freeze_read",

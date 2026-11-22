@@ -85,7 +85,7 @@ from config import (
     VCA,
     make_smooth2d_grid_preset,
     make_housing_grid_preset)
-from cell_library import make_cell_library, SimpleEdgeLibrary
+from cell_library import make_cell_library
 from topology import build_net_from_preset
 from kirchhoff_net import format_parameter_breakdown
 from train import (
@@ -1221,16 +1221,11 @@ def collect_gradient_norms(raw_net):
     """
     stage_sq = {}
     stage_components = ("raw_leak", "z_logits", "u_logits")
-    # Per-edge device parameter suffixes: covers SimpleEdgeLibrary.param
-    # (I=ReLU/tanh(p0*Vsrc+p1*Vdest+p2)), RealisticTanhLibrary
-    # (alpha_raw, bias_raw), RealisticTanhUpgradeLibrary (alpha_raw,
-    # gm_raw, isat_raw, bias_raw), FreeTanhLibrary (a_raw, b_raw, s_raw,
-    # gm_raw, isat_raw, theta_raw), and AntiParallelFreeTanhLibrary
-    # (kappa_raw, gm_raw, isat_raw, theta_raw). All contribute to the same
+    # Per-edge device parameter suffixes of FreeTanhLibrary (a_raw, b_raw,
+    # s_raw, gm_raw, isat_raw, theta_raw); all contribute to the same
     # `device_param` gradient-norm metric per stage.
     device_param_suffixes = (
-        "param", "alpha_raw", "bias_raw", "gm_raw", "isat_raw",
-        "a_raw", "b_raw", "s_raw", "theta_raw", "kappa_raw")
+        "gm_raw", "isat_raw", "a_raw", "b_raw", "s_raw", "theta_raw")
     transfer_sq = 0.0
     transfer_found = False
     in_sq = 0.0
@@ -1504,23 +1499,15 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "Only applies when --problem smooth2d_grid or --problem housing_grid.")
     parser.add_argument(
         "--cell-library", type=str, default=None, dest="cell_library",
-        choices=["legacy", "v15", "v2", "relu", "tanh", "tanh_realistic", "tanh_realistic_upgrade", "tanh_free", "tanh_anti"],
-        help="Cell library: 'legacy' (L,S,P,Z, default), 'v15' (O_weak,O_hard,P0,N0,D1,Z), "
-             "'v2' (mix-code/bias-code bounded library), "
-             "'relu' (I=ReLU(p0*Vsrc+p1*Vdest+p2)), 'tanh' (I=tanh(p0*Vsrc+p1*Vdest+p2)), "
-             "'tanh_realistic' (I=tanh(A*Vsrc - B*Vdest + C), A,B>0, A+B=1), "
-             "'tanh_realistic_upgrade' (I=Isat*tanh(gm*(A*Vsrc - B*Vdest) + C), "
-             "bounded gm/Isat per-edge), "
-             "'tanh_free' (I=Isat*tanh(gm*(s*(A*Vsrc - B*Vdest) + theta)), "
-             "A,B>=0 independent (no A+B=1), s=+/-1 via STE, bounded gm/Isat per-edge), "
-             "'tanh_anti' (I=Isat*tanh(gm*relu(kappa*(Vsrc-Vdst)-theta)), "
-             "rectified differential OTA slice for antiparallel edge fabrics, "
-             "i>=0 and exactly zero at Vsrc=Vdst). "
-             "Overrides the preset's cell_library key if present.")
+        choices=["tanh_free"],
+        help="Cell library. Only 'tanh_free' "
+             "(I=Isat*tanh(gm*(s*(A*Vsrc - B*Vdest) + theta)), A,B>=0 "
+             "independent, s=+/-1 via STE, bounded gm/Isat per-edge, plus a "
+             "resistive shunt) is supported (default).")
     parser.add_argument(
         "--gm-min", type=float, default=None, dest="gm_min",
         help="Lower rail of the bounded sigmoid gm parameterization for "
-             "tanh_realistic_upgrade / tanh_free / tanh_anti cell libraries "
+             "tanh_free cell library "
              "(default: config TANH_REALISTIC_GM_MIN=0.01). "
              "kn-bayes-opt uses this as an optimization dimension.")
     parser.add_argument(
@@ -2710,9 +2697,9 @@ def main():
     read_idx_arg = _parse_int_list(args.read_idx)
 
     # Resolve cell library: CLI overrides preset, preset overrides default.
-    lib_name = "legacy"
+    lib_name = "tanh_free"
     if args.problem in PRESETS:
-        lib_name = PRESETS[args.problem].get("cell_library", "legacy")
+        lib_name = PRESETS[args.problem].get("cell_library", "tanh_free")
     if args.cell_library is not None:
         lib_name = args.cell_library
     cell_lib = make_cell_library(
@@ -3912,9 +3899,7 @@ def main():
         if compile_enabled and isinstance(device, str) and device.startswith("cuda"):
             try:
                 for stage in pruned_net.core.stages:
-                    if hasattr(stage, "cell_lib") and not isinstance(
-                        stage.cell_lib, SimpleEdgeLibrary
-                    ):
+                    if hasattr(stage, "cell_lib"):
                         lib = stage.cell_lib
                         if hasattr(lib.forward, "__wrapped__"):
                             lib.forward = lib.forward.__wrapped__

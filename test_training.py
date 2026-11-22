@@ -87,7 +87,7 @@ def test_sparsity_push():
     from io_mapper import InputMapper, OutputMapper
     from train import compute_loss, make_optimizer, LAMBDAS
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     hid = ring_graph(3)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
@@ -127,7 +127,7 @@ def test_round_trip_preset():
     from cell_library import make_cell_library
     from train import compute_loss, make_optimizer, LAMBDAS
 
-    net = build_net_from_preset("sinx", cell_lib=make_cell_library('tanh'))
+    net = build_net_from_preset("sinx", cell_lib=make_cell_library('tanh_free'))
 
     u = torch.linspace(-math.pi, math.pi, 32).unsqueeze(1)
     target = torch.sin(u)
@@ -183,7 +183,7 @@ def test_smooth2d_preset():
           f"got {s['num_steps']}")
     check("smooth2d: no lambdas override", "lambdas" not in cfg)
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset("smooth2d", cell_lib=cell_lib)
     check("smooth2d: builds successfully", net is not None)
     check("smooth2d: write_idx=[0,1]", net.write_idx == [0, 1])
@@ -272,7 +272,7 @@ def test_smooth2d_grid_preset():
     check("smooth2d_grid: legacy preset lambdas capacitance=0.0 (deprecate-node-gates)",
           cfg.get("lambdas", {}).get("capacitance") == 0.0)
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
     check("smooth2d_grid: builds successfully (center column reads >= 3 hops from writes)",
           net is not None)
@@ -340,14 +340,14 @@ def test_smooth2d_grid_preset():
 
     from io_mapper import InputMapper, FanOutInputMapper
     net_dense = build_net_from_preset(
-        "smooth2d_grid", cell_lib=make_cell_library('tanh'), write_mode="dense",
+        "smooth2d_grid", cell_lib=make_cell_library('tanh_free'), write_mode="dense",
     )
     check("smooth2d_grid: write_mode='dense' override produces InputMapper",
           isinstance(net_dense.input_mapper, InputMapper)
           and type(net_dense.input_mapper) is InputMapper,
           f"got {type(net_dense.input_mapper).__name__}")
     net_fanout = build_net_from_preset(
-        "smooth2d_grid", cell_lib=make_cell_library('tanh'),
+        "smooth2d_grid", cell_lib=make_cell_library('tanh_free'),
     )
     check("smooth2d_grid: default (no write_mode) produces FanOutInputMapper",
           isinstance(net_fanout.input_mapper, FanOutInputMapper),
@@ -408,7 +408,7 @@ def test_housing_grid_preset():
     check("housing_grid: preset lambdas rail=0.1",
           cfg.get("lambdas", {}).get("rail") == 0.1)
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset("housing_grid", cell_lib=cell_lib)
     check("housing_grid: builds successfully", net is not None)
     check("housing_grid: core has 3 stages", len(net.core.stages) == 3)
@@ -502,7 +502,7 @@ def test_persistent_drive_auto_fan_out():
     PRESETS["housing_grid"] = active
 
     try:
-        cell_lib = make_cell_library('tanh')
+        cell_lib = make_cell_library('tanh_free')
         net = build_net_from_preset(
             "housing_grid",
             cell_lib=cell_lib,
@@ -529,7 +529,7 @@ def test_persistent_drive_sparse_proj():
     from topology import build_net_from_preset
     from cell_library import make_cell_library
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
 
     # Use _make_dynamic_preset to build a proper torus preset
     from train_script import _make_dynamic_preset
@@ -665,7 +665,7 @@ def test_fan_out_torus_bug_fix():
     from cell_library import make_cell_library
     from train_script import _make_dynamic_preset
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
 
     # Build a torus preset with fan_out mode — the bug was that
     # _make_dynamic_preset only generated write_fan_out for 'grid' family,
@@ -711,7 +711,7 @@ def test_write_fan_out_cli():
     from cell_library import make_cell_library
     from train_script import _make_dynamic_preset
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
 
     # Simulate the CLI flow: user passes --write-fan-out JSON, which is parsed
     # and injected into the active preset dict before build_net_from_preset.
@@ -917,7 +917,7 @@ def test_v15_cell_parameters_preset_smooth2d_grid():
     print("\nTest V15-10: v15 library with smooth2d_grid build")
     from cell_library import make_cell_library
     from topology import build_net_from_preset
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
     import torch
     x = torch.randn(4, 2)
@@ -938,7 +938,7 @@ def test_stage_lr_scale_scheduler_compat():
     from cell_library import make_cell_library
     from torch.optim.lr_scheduler import CosineAnnealingLR
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
     optim = make_optimizer(net, lr=1e-3, stage_lr_scale=10.0)
     scheduler = CosineAnnealingLR(optim, T_max=100, eta_min=OPTIM["scheduler_eta_min"])
@@ -964,7 +964,7 @@ def test_parameter_breakdown_aggregates_components():
     from topology import build_net_from_preset
     from kirchhoff_net import format_parameter_breakdown
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
     bd = net.parameter_breakdown()
 
@@ -1025,7 +1025,7 @@ def test_edge_repeats_propagation_to_preset():
     cfg["stages"][0]["edge_repeats"] = 3
     PRESETS["__test_friedman2_x3"] = cfg
     try:
-        cell_lib = make_cell_library('tanh')
+        cell_lib = make_cell_library('tanh_free')
         net = build_net_from_preset("__test_friedman2_x3", cell_lib=cell_lib)
         # num_edges should be 3 * 64 (single torus edge count) = 192
         edges = net.core.stages[0].num_edges()
@@ -1048,7 +1048,7 @@ def test_boundary_fan_out_basic():
     from cell_library import make_cell_library
     from io_mapper import NullInputMapper
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     boundary_fan_out = {0: [2, 5], 1: [7, 9]}
 
     net = build_net_from_preset(
@@ -1090,7 +1090,7 @@ def test_boundary_fan_out_zero_init():
     from topology import build_net_from_preset
     from cell_library import make_cell_library
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     boundary_fan_out = {0: [3], 1: [8]}
 
     net = build_net_from_preset(
@@ -1139,7 +1139,7 @@ def test_boundary_fan_out_validation():
     from cell_library import make_cell_library
     from config import PRESETS
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
 
     # 1. Duplicate targets across inputs.
     try:
@@ -1195,7 +1195,7 @@ def test_boundary_fan_out_grad_flow():
     from cell_library import make_cell_library
     import torch.nn.functional as F
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset(
         "smooth2d",
         cell_lib=cell_lib,
@@ -1213,8 +1213,8 @@ def test_boundary_fan_out_grad_flow():
           stage.boundary_z_logits.grad is not None
           and stage.boundary_z_logits.grad.abs().sum().item() > 0)
     check("boundary_cell_lib parameter receives gradient",
-          stage.boundary_cell_lib.param.grad is not None
-          and stage.boundary_cell_lib.param.grad.abs().sum().item() > 0)
+          any(q.grad is not None and q.grad.abs().sum().item() > 0
+              for q in stage.boundary_cell_lib.parameters()))
 
 
 def test_boundary_fan_out_with_no_edge_gates():
@@ -1223,7 +1223,7 @@ def test_boundary_fan_out_with_no_edge_gates():
     from cell_library import make_cell_library
     import torch
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset(
         "smooth2d",
         cell_lib=cell_lib,
@@ -1297,7 +1297,7 @@ def test_temporal_readout_basic():
     from cell_library import make_cell_library
     from io_mapper import OutputAffine
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     # Use sinx (out_dim=1) for a deterministic test.
     net = build_net_from_preset(
         "sinx",
@@ -1369,7 +1369,7 @@ def test_temporal_readout_zero_init():
     from topology import build_net_from_preset
     from cell_library import make_cell_library
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset(
         "sinx",
         cell_lib=cell_lib,
@@ -1420,7 +1420,7 @@ def test_temporal_readout_grad_flow():
     from topology import build_net_from_preset
     from cell_library import make_cell_library
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset(
         "sinx",
         cell_lib=cell_lib,
@@ -1459,7 +1459,7 @@ def test_temporal_readout_hidden_grid_untouched():
     from cell_library import make_cell_library
     from differential_stage import DifferentialStage
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset(
         "sinx",
         cell_lib=cell_lib,
@@ -1494,7 +1494,7 @@ def test_temporal_readout_validation():
     from cell_library import make_cell_library
     from config import PRESETS
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
 
     # residual_tanh decoder must be rejected
     cfg = dict(PRESETS["sinx"])
@@ -1525,7 +1525,7 @@ def test_temporal_readout_with_boundary_mode():
     from cell_library import make_cell_library
     from io_mapper import NullInputMapper
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset(
         "smooth2d",
         cell_lib=cell_lib,
@@ -1586,7 +1586,7 @@ def test_temporal_readout_with_no_edge_gates():
     from topology import build_net_from_preset
     from cell_library import make_cell_library
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset(
         "sinx",
         cell_lib=cell_lib,
@@ -1616,7 +1616,7 @@ def test_state_carryover_basic():
     from topology import build_net_from_preset
     from cell_library import make_cell_library
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset(
         "sinx",
         cell_lib=cell_lib,
@@ -1648,7 +1648,7 @@ def test_state_carryover_with_narma_preset():
     from topology import build_net_from_preset
     from cell_library import make_cell_library
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset(
         "narma10", cell_lib=cell_lib, enable_temporal_readout=True,
     )
@@ -1671,7 +1671,7 @@ def test_state_carryover_grad_flow():
     from topology import build_net_from_preset
     from cell_library import make_cell_library
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset(
         "narma10", cell_lib=cell_lib, enable_temporal_readout=True,
     )
@@ -1707,7 +1707,7 @@ def test_state_carryover_validation():
     from topology import build_net_from_preset
     from cell_library import make_cell_library
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset(
         "sinx",
         cell_lib=cell_lib,
@@ -1730,7 +1730,7 @@ def test_state_carryover_trajectory_off():
     from topology import build_net_from_preset
     from cell_library import make_cell_library
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset(
         "sinx",
         cell_lib=cell_lib,
@@ -1780,7 +1780,7 @@ def test_narma_preset_forward():
     from cell_library import make_cell_library
     from config import PRESET_NARMA10
 
-    cell_lib = make_cell_library('tanh')
+    cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset(
         "narma10", cell_lib=cell_lib, enable_temporal_readout=True,
         boundary_fan_out=PRESET_NARMA10["boundary_fan_out"],

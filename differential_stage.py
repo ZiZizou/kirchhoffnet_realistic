@@ -27,12 +27,7 @@ from config import (
     VCA,
 )
 from cell_library import (
-    AntiParallelFreeTanhLibrary,
     FreeTanhLibrary,
-    LinearOTALibrary,
-    RealisticTanhLibrary,
-    RealisticTanhUpgradeLibrary,
-    SimpleEdgeLibrary,
 )
 
 
@@ -188,7 +183,7 @@ class DifferentialStage(nn.Module):
         num_nodes: int,
         src: list[int],
         dst: list[int],
-        cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | LinearOTALibrary | AntiParallelFreeTanhLibrary,
+        cell_lib: FreeTanhLibrary,
         c_eff: float | None = None,
         x_max: float | None = None,
         clip_current: float | None = None,
@@ -210,16 +205,16 @@ class DifferentialStage(nn.Module):
         freeze_temporal_read: bool = False,
         boundary_src: list[int] | None = None,
         boundary_dst: list[int] | None = None,
-        boundary_cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | LinearOTALibrary | AntiParallelFreeTanhLibrary | None = None,
+        boundary_cell_lib: FreeTanhLibrary | None = None,
         enable_ref_edges: bool = False,
-        ref_cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | LinearOTALibrary | AntiParallelFreeTanhLibrary | None = None,
+        ref_cell_lib: FreeTanhLibrary | None = None,
 output_ode_src: list[int] | None = None,
         output_ode_dst: list[int] | None = None,
-        output_ode_cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | LinearOTALibrary | AntiParallelFreeTanhLibrary | None = None,
+        output_ode_cell_lib: FreeTanhLibrary | None = None,
         readout_mode: str = "ota_mesh",
         readout_senses_per_node: int = 1,
         readout_sense_src: list[int] | None = None,
-        readout_sense_cell_lib: SimpleEdgeLibrary | RealisticTanhLibrary | RealisticTanhUpgradeLibrary | FreeTanhLibrary | LinearOTALibrary | AntiParallelFreeTanhLibrary | None = None,
+        readout_sense_cell_lib: FreeTanhLibrary | None = None,
         readout_crossbar_shape: tuple[int, int] | None = None,
         vca_enabled: bool = False,
         vca_rank: int = 2,
@@ -2164,39 +2159,11 @@ output_ode_src: list[int] | None = None,
 
     def parameter_breakdown(self) -> dict:
         """Return parameter counts including gate parameters (for diagnostics)."""
-        if isinstance(self.cell_lib, SimpleEdgeLibrary):
-            device_n = int(self.cell_lib.param.numel())
-        elif isinstance(self.cell_lib, RealisticTanhLibrary):
-            device_n = int(self.cell_lib.alpha_raw.numel())
-            if hasattr(self.cell_lib, "bias_raw"):
-                device_n += int(self.cell_lib.bias_raw.numel())
-        elif isinstance(self.cell_lib, RealisticTanhUpgradeLibrary):
-            device_n = (
-                int(self.cell_lib.alpha_raw.numel())
-                + int(self.cell_lib.gm_raw.numel())
-                + int(self.cell_lib.isat_raw.numel())
-            )
-            if hasattr(self.cell_lib, "bias_raw"):
-                device_n += int(self.cell_lib.bias_raw.numel())
-        elif isinstance(self.cell_lib, (FreeTanhLibrary, LinearOTALibrary)):
+        if isinstance(self.cell_lib, FreeTanhLibrary):
             device_n = (
                 int(self.cell_lib.a_raw.numel())
                 + int(self.cell_lib.b_raw.numel())
                 + int(self.cell_lib.s_raw.numel())
-                + int(self.cell_lib.gm_raw.numel())
-                + int(self.cell_lib.isat_raw.numel())
-            )
-            if hasattr(self.cell_lib, "theta_raw"):
-                device_n += int(self.cell_lib.theta_raw.numel())
-            if getattr(self.cell_lib, "_parallel_tanh_mult_enabled", False):
-                device_n += (
-                    int(self.cell_lib.gm_x_raw.numel())
-                    + int(self.cell_lib.gm_y_raw.numel())
-                    + int(self.cell_lib.isat_parallel_raw.numel())
-                )
-        elif isinstance(self.cell_lib, AntiParallelFreeTanhLibrary):
-            device_n = (
-                int(self.cell_lib.kappa_raw.numel())
                 + int(self.cell_lib.gm_raw.numel())
                 + int(self.cell_lib.isat_raw.numel())
             )
@@ -2215,39 +2182,11 @@ output_ode_src: list[int] | None = None,
         bz = int(self.boundary_z_logits.numel()) if self.boundary_z_logits is not None else 0
         bdev = 0
         if self.boundary_cell_lib is not None:
-            if isinstance(self.boundary_cell_lib, SimpleEdgeLibrary):
-                bdev = int(self.boundary_cell_lib.param.numel())
-            elif isinstance(self.boundary_cell_lib, RealisticTanhLibrary):
-                bdev = int(self.boundary_cell_lib.alpha_raw.numel())
-                if hasattr(self.boundary_cell_lib, "bias_raw"):
-                    bdev += int(self.boundary_cell_lib.bias_raw.numel())
-            elif isinstance(self.boundary_cell_lib, RealisticTanhUpgradeLibrary):
-                bdev = (
-                    int(self.boundary_cell_lib.alpha_raw.numel())
-                    + int(self.boundary_cell_lib.gm_raw.numel())
-                    + int(self.boundary_cell_lib.isat_raw.numel())
-                )
-                if hasattr(self.boundary_cell_lib, "bias_raw"):
-                    bdev += int(self.boundary_cell_lib.bias_raw.numel())
-            elif isinstance(self.boundary_cell_lib, (FreeTanhLibrary, LinearOTALibrary)):
+            if isinstance(self.boundary_cell_lib, FreeTanhLibrary):
                 bdev = (
                     int(self.boundary_cell_lib.a_raw.numel())
                     + int(self.boundary_cell_lib.b_raw.numel())
                     + int(self.boundary_cell_lib.s_raw.numel())
-                    + int(self.boundary_cell_lib.gm_raw.numel())
-                    + int(self.boundary_cell_lib.isat_raw.numel())
-                )
-                if hasattr(self.boundary_cell_lib, "theta_raw"):
-                    bdev += int(self.boundary_cell_lib.theta_raw.numel())
-                if getattr(self.boundary_cell_lib, "_parallel_tanh_mult_enabled", False):
-                    bdev += (
-                        int(self.boundary_cell_lib.gm_x_raw.numel())
-                        + int(self.boundary_cell_lib.gm_y_raw.numel())
-                        + int(self.boundary_cell_lib.isat_parallel_raw.numel())
-                    )
-            elif isinstance(self.boundary_cell_lib, AntiParallelFreeTanhLibrary):
-                bdev = (
-                    int(self.boundary_cell_lib.kappa_raw.numel())
                     + int(self.boundary_cell_lib.gm_raw.numel())
                     + int(self.boundary_cell_lib.isat_raw.numel())
                 )
@@ -2344,12 +2283,6 @@ output_ode_src: list[int] | None = None,
                     sense_dev += int(self.readout_sense_cell_lib.kappa_raw.numel())
                 if hasattr(self.readout_sense_cell_lib, "g_resistive_raw"):
                     sense_dev += int(self.readout_sense_cell_lib.g_resistive_raw.numel())
-                if getattr(self.readout_sense_cell_lib, "_parallel_tanh_mult_enabled", False):
-                    sense_dev += (
-                        int(self.readout_sense_cell_lib.gm_x_raw.numel())
-                        + int(self.readout_sense_cell_lib.gm_y_raw.numel())
-                        + int(self.readout_sense_cell_lib.isat_parallel_raw.numel())
-                    )
         sense_crossbar = (
             int(self.readout_crossbar_W.numel())
             if getattr(self, "readout_crossbar_W", None) is not None else 0

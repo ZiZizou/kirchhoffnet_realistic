@@ -2,11 +2,9 @@
 
 Every other module imports from this file. To tune the system, edit this file.
 
-Cell library ordering: L (weak linear), S (saturating tanh), P (smooth bounded
-rectifier), Z (disabled). Z is at index 3 so that logits[:, 3] = +1.0 yields
-softmax ≈ [0.155, 0.155, 0.155, 0.421] — about 58% active cells at init.
-(RR-A: lowered from +2.0 to start with more active edges so the network can
-learn freely before staged regularizers are annealed in).
+Only the ``tanh_free`` cell library (``cell_library.FreeTanhLibrary``) is
+supported; the legacy L/S/P/Z, v1.5 and v2 cell tables were removed in
+surgery 5/6 (see the ``pre-surgery`` tag).
 
 Units (R7): All conductance, current, and capacitance values are NORMALIZED
 to lie in physically plausible ranges. They are NOT calibrated to a
@@ -15,289 +13,19 @@ integration window, and ``C_eff`` is a pure scaling. No pretence is made
 that the resulting ω = g/C is a real analog time constant.
 """
 
-# Cell type identifiers for formula dispatch.
-CELL_TYPE_STANDARD = "standard"
-CELL_TYPE_POS_RECT = "pos_rect"
-CELL_TYPE_NEG_RECT = "neg_rect"
-CELL_TYPE_DEAD_ZONE = "dead_zone"
-CELL_TYPE_OFF = "off"
-
-# Cell library: gm (normalized transconductance, μS-scale), isat (sat current,
-# μA-scale), rho (destination feedback coefficient, dimensionless), gleak
-# (residual linear leakage, μS-scale), bias (per-family fixed offset, μA-scale).
-# cell_type: selects the I(u) formula in cell_library.py.
-CELL_L = {
-    "cell_type": CELL_TYPE_STANDARD,
-    "gm": 0.2,
-    "isat": 10.0,
-    "rho": 1.0,
-    "gleak": 0.01,
-    "bias": 0.0,
-    "theta": 0.0,
-    "beta": 1.0,
-}
-
-CELL_S = {
-    "cell_type": CELL_TYPE_STANDARD,
-    "gm": 1.0,
-    "isat": 0.5,
-    "rho": 1.0,
-    "gleak": 0.01,
-    "bias": 0.0,
-    "theta": 0.0,
-    "beta": 1.0,
-}
-
-CELL_P = {
-    "cell_type": CELL_TYPE_POS_RECT,
-    "gm": 1.0,
-    "isat": 1.0,
-    "rho": 1.0,
-    "gleak": 0.0,
-    "bias": 0.0,
-    "theta": 0.0,
-    "beta": 0.1,
-}
-
-CELL_Z = {
-    "cell_type": CELL_TYPE_OFF,
-    "gm": 0.0,
-    "isat": 0.0,
-    "rho": 0.0,
-    "gleak": 0.0,
-    "bias": 0.0,
-    "theta": 0.0,
-    "beta": 1.0,
-}
-
-# ---- v1.5 expanded library cells ----
-
-CELL_O_WEAK = {
-    "cell_type": CELL_TYPE_STANDARD,
-    "gm": 0.3,
-    "isat": 5.0,
-    "rho": 1.0,
-    "gleak": 0.0,
-    "bias": 0.0,
-    "theta": 0.0,
-    "beta": 1.0,
-}
-
-CELL_O_HARD = {
-    "cell_type": CELL_TYPE_STANDARD,
-    "gm": 3.0,
-    "isat": 0.3,
-    "rho": 1.0,
-    "gleak": 0.0,
-    "bias": 0.0,
-    "theta": 0.0,
-    "beta": 1.0,
-}
-
-CELL_P0 = {
-    "cell_type": CELL_TYPE_POS_RECT,
-    "gm": 1.0,
-    "isat": 1.0,
-    "rho": 1.0,
-    "gleak": 0.0,
-    "bias": 0.0,
-    "theta": 0.0,
-    "beta": 0.1,
-}
-
-CELL_N0 = {
-    "cell_type": CELL_TYPE_NEG_RECT,
-    "gm": 1.0,
-    "isat": 1.0,
-    "rho": 1.0,
-    "gleak": 0.0,
-    "bias": 0.0,
-    "theta": 0.0,
-    "beta": 0.1,
-}
-
-CELL_D1 = {
-    "cell_type": CELL_TYPE_DEAD_ZONE,
-    "gm": 1.0,
-    "isat": 1.0,
-    "rho": 1.0,
-    "gleak": 0.0,
-    "bias": 0.0,
-    "theta": 0.5,
-    "beta": 0.1,
-}
-
-# ---- v2 library: standardized "OTA slice" basis with mix / bias / threshold codes ----
-# (cell-library-v2 spec, see library_improvements.md). Each v2 cell carries
-# per-cell src_gain/dst_gain mix coefficients (replacing rho) and has
-# gleak=0 (strict mathematical boundedness). Bias codes are normalized
-# (gm/Id-style) pairs of (gm, isat).
-
-# Mix codes: preactivation u = src_gain * x_src - dst_gain * x_dst.
-MIX_CODES = {
-    "M11": {"src_gain": 1.0, "dst_gain": 1.0},
-    "M10": {"src_gain": 1.0, "dst_gain": 0.5},
-    "M01": {"src_gain": 0.5, "dst_gain": 1.0},
-}
-
-# Bias codes: discrete (gm, isat) pairs standing in for gm/Id inversion levels.
-BIAS_CODES = {
-    "Bsoft": {"gm": 0.25, "isat": 1.50},
-    "Bmid":  {"gm": 0.80, "isat": 0.80},
-    "Bhard": {"gm": 1.40, "isat": 0.45},
-}
-
-# Threshold codes: discrete preactivation offsets for rectifying cells.
-THRESH_CODES = {
-    "T0": 0.00,
-    "T1": 0.35,
-}
-
-
-def _v2_cell(
-    family: str,
-    mix: str,
-    bias: str,
-    thresh: str,
-    beta: float,
-    cell_type: str | None = None,
-) -> dict:
-    """Build a v2 cell dict from (family, mix, bias, threshold) code refs.
-
-    Resolves the MIX/BIAS/THRESH codes into explicit numeric values and
-    uses the supplied ``beta`` (family-specific softness for rectifier/dead-zone
-    cells; 1.0 for standard). ``cell_type`` defaults to ``family``.
-    """
-    m = MIX_CODES[mix]
-    b = BIAS_CODES[bias]
-    t = THRESH_CODES[thresh]
-    if cell_type is None:
-        cell_type = family
-    return {
-        "cell_type": cell_type,
-        "gm": b["gm"],
-        "isat": b["isat"],
-        "src_gain": m["src_gain"],
-        "dst_gain": m["dst_gain"],
-        "gleak": 0.0,
-        "bias": 0.0,
-        "theta": t,
-        "beta": beta,
-    }
-
-
-# v2 cell definitions (factorized from codes). beta differs by family:
-# P/N use 0.08, D uses 0.10, O and Z use 1.0 (unused for non-rectifier cells).
-CELL_V2_Z    = {
-    "cell_type": CELL_TYPE_OFF,
-    "gm": 0.0,
-    "isat": 0.0,
-    "src_gain": 0.0,
-    "dst_gain": 0.0,
-    "gleak": 0.0,
-    "bias": 0.0,
-    "theta": 0.0,
-    "beta": 1.0,
-}
-CELL_V2_O_W11 = _v2_cell("standard", "M11", "Bsoft", "T0", beta=1.0)
-CELL_V2_O_H11 = _v2_cell("standard", "M11", "Bhard", "T0", beta=1.0)
-CELL_V2_O_H10 = _v2_cell("standard", "M10", "Bhard", "T0", beta=1.0)
-CELL_V2_O_H01 = _v2_cell("standard", "M01", "Bhard", "T0", beta=1.0)
-CELL_V2_P0   = _v2_cell(CELL_TYPE_POS_RECT,  "M11", "Bmid", "T0", beta=0.08)
-CELL_V2_P1   = _v2_cell(CELL_TYPE_POS_RECT,  "M11", "Bmid", "T1", beta=0.08)
-CELL_V2_N0   = _v2_cell(CELL_TYPE_NEG_RECT,  "M11", "Bmid", "T0", beta=0.08)
-CELL_V2_N1   = _v2_cell(CELL_TYPE_NEG_RECT,  "M11", "Bmid", "T1", beta=0.08)
-CELL_V2_D1   = _v2_cell(CELL_TYPE_DEAD_ZONE, "M11", "Bmid", "T1", beta=0.10)
-
-# Named library configs. Each entry has "cells" (ordered dict), "cell_order"
-# (list), and "z_index" (int). Z is always the LAST cell in every library.
-# Legacy globals (CELL_LIBRARY, CELL_ORDER, NUM_CELLS, Z_INDEX) reflect the
-# "legacy" library for backward compatibility.
-_CELL_LIBRARY_LEGACY = {
-    "cells": {"L": CELL_L, "S": CELL_S, "P": CELL_P, "Z": CELL_Z},
-    "cell_order": ["L", "S", "P", "Z"],
-}
-
-_CELL_LIBRARY_V15 = {
-    "cells": {
-        "O_weak": CELL_O_WEAK,
-        "O_hard": CELL_O_HARD,
-        "P0": CELL_P0,
-        "N0": CELL_N0,
-        "D1": CELL_D1,
-        "Z": CELL_Z,
-    },
-    "cell_order": ["O_weak", "O_hard", "P0", "N0", "D1", "Z"],
-}
-
-# v2 library: 10-cell bounded OTA slice basis with per-cell src_gain/dst_gain
-# mix coefficients (MIX_CODES), standardized bias codes (BIAS_CODES), and
-# discrete thresholds (THRESH_CODES). Adds 4 cells vs v1.5: P1, N1, O_h10,
-# O_h01. Z is always last.
-_CELL_LIBRARY_V2 = {
-    "cells": {
-        "O_w11": CELL_V2_O_W11,
-        "O_h11": CELL_V2_O_H11,
-        "O_h10": CELL_V2_O_H10,
-        "O_h01": CELL_V2_O_H01,
-        "P0": CELL_V2_P0,
-        "P1": CELL_V2_P1,
-        "N0": CELL_V2_N0,
-        "N1": CELL_V2_N1,
-        "D1": CELL_V2_D1,
-        "Z": CELL_V2_Z,
-    },
-    "cell_order": ["O_w11", "O_h11", "O_h10", "O_h01", "P0", "P1", "N0", "N1", "D1", "Z"],
-}
-
+# Named cell-library configs (only ``tanh_free`` is supported).
 CELL_LIBRARIES = {
-    "legacy": _CELL_LIBRARY_LEGACY,
-    "v15": _CELL_LIBRARY_V15,
-    "v2": _CELL_LIBRARY_V2,
-    "relu": {"cells": {}, "cell_order": ["S"], "device": "relu"},
-    "tanh": {"cells": {}, "cell_order": ["S"], "device": "tanh"},
-    "tanh_realistic": {"cells": {}, "cell_order": ["S"], "device": "tanh_realistic", "BIAS_ENABLED": False},
-    "tanh_realistic_upgrade": {"cells": {}, "cell_order": ["S"], "device": "tanh_realistic_upgrade", "BIAS_ENABLED": False},
-    "tanh_free": {"cells": {}, "cell_order": ["S"], "device": "tanh_free", "BIAS_ENABLED": True, "PARALLEL_TANH_MULT_ENABLED": False},
-    "linear_ota": {"cells": {}, "cell_order": ["S"], "device": "linear_ota"},
-    "tanh_anti": {"cells": {}, "cell_order": ["S"], "device": "tanh_anti", "THETA_ENABLED": False},
+    "tanh_free": {"device": "tanh_free", "BIAS_ENABLED": True},
 }
 
-# tanh_realistic_upgrade defaults: per-edge gm and Isat use bounded
-# sigmoid parameterization gm = gm_min + (gm_max - gm_min) * sigmoid(gm_raw),
+# tanh_free defaults: per-edge gm and Isat use bounded sigmoid
+# parameterization gm = gm_min + (gm_max - gm_min) * sigmoid(gm_raw),
 # isat = isat_min + (isat_max - isat_min) * sigmoid(isat_raw). Overridable
-# via the RealisticTanhUpgradeLibrary constructor.
+# via the FreeTanhLibrary constructor.
 TANH_REALISTIC_GM_MIN = 0.01
 TANH_REALISTIC_GM_MAX = 10.0
 TANH_REALISTIC_ISAT_MIN = 0.01
 TANH_REALISTIC_ISAT_MAX = 10.0
-
-# tanh_anti defaults: per-edge differential gain kappa, transconductance gm,
-# saturation current Isat, and optional turn-on threshold theta use bounded
-# sigmoid parameterizations. Used by AntiParallelFreeTanhLibrary (rectified
-# OTA slice: i = Isat * tanh(gm * relu(kappa * (Vsrc - Vdst) - theta))).
-ANTI_PARALLEL_KAPPA_MIN = 0.25
-ANTI_PARALLEL_KAPPA_MAX = 2.0
-ANTI_PARALLEL_GM_MIN = 0.25
-ANTI_PARALLEL_GM_MAX = 4.0
-ANTI_PARALLEL_ISAT_MIN = 1e-3
-ANTI_PARALLEL_ISAT_MAX = 1.0
-ANTI_PARALLEL_THETA_MAX = 1.0
-
-# Legacy globals for backward compatibility.
-CELL_LIBRARY = _CELL_LIBRARY_LEGACY["cells"]
-CELL_ORDER = _CELL_LIBRARY_LEGACY["cell_order"]
-NUM_CELLS = len(CELL_ORDER)
-Z_INDEX = NUM_CELLS - 1
-
-# Type code mapping for serialization into buffers.
-_CELL_TYPE_CODE = {
-    CELL_TYPE_STANDARD: 0,
-    CELL_TYPE_POS_RECT: 1,
-    CELL_TYPE_NEG_RECT: 2,
-    CELL_TYPE_DEAD_ZONE: 3,
-    CELL_TYPE_OFF: 0,  # Off cells use the standard formula (all zeros).
-}
 
 # Normalized physical limits (R7: not calibrated to real SI units).
 PHYS = {
@@ -624,48 +352,6 @@ INIT = {
     "z_logit_init": 0.0,
     "u_logit_init": 0.0,
 }
-
-def cells_to_tensor_dict(library_name: str = "legacy"):
-    """Stack a named library into a dict of 1-D tensors ordered by cell_order.
-
-    Args:
-        library_name: Which library to load (``"legacy"``, ``"v15"``, or ``"v2"``).
-
-    Returns dict of tensors with shape [Q] for: gm, isat, gleak, bias, theta,
-    beta. Also includes ``cell_type_code`` (int codes 0-3) for formula
-    dispatch. theta/beta are only used by rectifier cells; other cells carry
-    neutral dummy values.
-
-    Preactivation coefficients:
-      - ``legacy``/``v15`` libraries: emits ``rho`` (single destination gain;
-        preactivation u = x_src - rho * x_dst).
-      - ``v2`` library: emits ``src_gain`` and ``dst_gain`` (per-cell mix
-        coefficients; preactivation u = src_gain * x_src - dst_gain * x_dst).
-
-    The library auto-detects which set is present via buffer introspection.
-    """
-    import torch
-    lib = CELL_LIBRARIES[library_name]
-    cell_order = lib["cell_order"]
-    cells = lib["cells"]
-    keys = ["gm", "isat", "gleak", "bias", "theta", "beta"]
-    result = {k: torch.tensor([cells[c][k] for c in cell_order], dtype=torch.float32) for k in keys}
-    if all("src_gain" in cells[c] for c in cell_order):
-        result["src_gain"] = torch.tensor(
-            [cells[c]["src_gain"] for c in cell_order], dtype=torch.float32,
-        )
-        result["dst_gain"] = torch.tensor(
-            [cells[c]["dst_gain"] for c in cell_order], dtype=torch.float32,
-        )
-    else:
-        result["rho"] = torch.tensor(
-            [cells[c]["rho"] for c in cell_order], dtype=torch.float32,
-        )
-    result["cell_type_code"] = torch.tensor(
-        [_CELL_TYPE_CODE[cells[c].get("cell_type", CELL_TYPE_STANDARD)] for c in cell_order],
-        dtype=torch.long,
-    )
-    return result
 
 
 # =============================================================================

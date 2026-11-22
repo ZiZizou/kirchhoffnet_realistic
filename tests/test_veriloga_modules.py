@@ -1,6 +1,11 @@
 """Fast structural checks for the Verilog-A primitive library."""
 from pathlib import Path
 import re
+import json
+import shutil
+import subprocess
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 VA = ROOT / "veriloga"
@@ -47,3 +52,26 @@ def test_shared_unit_constants_match_hw_units_contract():
     for macro in ("HRK_VDD", "HRK_VCM", "HRK_VU", "HRK_CU", "HRK_TU", "HRK_IU", "HRK_GU"):
         assert f"`define {macro} " in text
     assert "350e-9/4.660583" in text
+
+
+@pytest.mark.slow
+@pytest.mark.spectre
+def test_spectre_ota_and_shunt_match_analytic_reference():
+    tcsh = shutil.which("tcsh")
+    setup = Path.home() / "workarea_GF22_FDX_EXT" / "kit.gf22fdx_ext.v1.0_4.1_stack19_oa.csh"
+    if tcsh is None or not setup.is_file():
+        pytest.skip("Cadence setup/tcsh is unavailable")
+    probe = subprocess.run([tcsh, "-c", f"source {setup} >& /dev/null; which spectre"],
+                           text=True, capture_output=True, timeout=30)
+    if probe.returncode or "spectre" not in probe.stdout.lower():
+        pytest.skip("Spectre is unavailable")
+    script = ROOT / "scripts" / "spectre" / "characterize.py"
+    result = subprocess.run(["/home/annaik/Documents/kirchhoffnet_refactor/venv/bin/python", str(script)],
+                            cwd=ROOT, text=True, capture_output=True, timeout=600, check=True)
+    report_path = Path(result.stdout.strip().splitlines()[-1])
+    report = json.loads(report_path.read_text())
+    assert report["measured_cases"] == 25
+    legacy = [r for r in report["results"] if r["module"] == "ota_edge" and r["mode"] == "legacy"]
+    assert len(legacy) == 16
+    assert max(r["rel_error"] for r in legacy) <= 1e-6
+    assert max(r["abs_error_model_units"] for r in report["results"]) < 1e-5

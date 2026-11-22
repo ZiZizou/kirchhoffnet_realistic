@@ -78,6 +78,24 @@ def test_standalone_interp_matches_paper_forward():
     assert state_err <= 1e-6, f"per-stage final-state max absolute error {state_err:.3g}"
 
 
+def test_hw_physical_view_round_trips_to_dimensionless_values():
+    from hw.units import HWUnits
+    model=load_paper_checkpoint(CKPT,dtype=torch.float64)
+    table=spectre_export.build_param_table(model,mode="hw")
+    units=HWUnits()
+    for stage in table["stages"]:
+        dim=stage["cells"]["core"]
+        phys=stage["physical"]["cells"]["core"]
+        assert torch.allclose(torch.tensor(phys["Isat_eff_A"],dtype=torch.float64)/units.iu,
+                              torch.tensor(dim["isat"],dtype=torch.float64),atol=1e-12,rtol=1e-12)
+        assert torch.allclose(torch.tensor(phys["G_eff_S"],dtype=torch.float64)/units.gu,
+                              torch.tensor(dim["conductance"],dtype=torch.float64),atol=1e-12,rtol=1e-12)
+        assert torch.allclose(torch.tensor(phys["gm_eff_S"],dtype=torch.float64)/units.gu,
+                              torch.tensor(dim["gm"],dtype=torch.float64),atol=1e-12,rtol=1e-12)
+        assert torch.allclose(torch.tensor(stage["physical"]["C_node_F"])/units.cu,
+                              torch.full((stage["num_nodes"],),float(model.net.core.stages[stage["index"]].c_eff)),
+                              atol=1e-12,rtol=1e-12)
+
 def test_interpreter_has_no_model_imports():
     source=(ROOT/"export/netlist_interp.py").read_text()
     tree=ast.parse(source)

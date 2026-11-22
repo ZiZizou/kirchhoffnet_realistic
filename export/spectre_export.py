@@ -50,9 +50,9 @@ def _cell_table(lib):
 def _physical_cell(cell, units):
     """Physical-unit companion; normalized cell values remain interpreter inputs."""
     return {"A_hat": cell["A"], "B_hat": cell["B"],
-            "Isat_eff_A": (torch.as_tensor(cell["isat"]) * units.iu).tolist(),
-            "G_eff_S": (torch.as_tensor(cell["conductance"]) * units.gu).tolist(),
-            "gm_eff_S": (torch.as_tensor(cell["gm"]) * units.gu).tolist(),
+            "Isat_eff_A": (torch.as_tensor(cell["isat"], dtype=torch.float64) * units.iu).tolist(),
+            "G_eff_S": (torch.as_tensor(cell["conductance"], dtype=torch.float64) * units.gu).tolist(),
+            "gm_eff_S": (torch.as_tensor(cell["gm"], dtype=torch.float64) * units.gu).tolist(),
             "theta_V": (torch.as_tensor(cell["theta"]) * units.vu).tolist()}
 
 def build_param_table(model, mode="legacy", hw=None) -> dict:
@@ -141,10 +141,14 @@ def build_param_table(model, mode="legacy", hw=None) -> dict:
             "readout":{"crossbar_W":_tensor(s.crossbar_weights()), "vref":_tensor(s.sense_vref())},
             "vca":vca, "gln":gln_table}
         if mode == "hw":
+            node_cap = s.node_capacitance(torch.zeros((1,n), dtype=s.z_logits.dtype, device=s.z_logits.device))
+            node_cap = torch.as_tensor(_tensor(node_cap)).reshape(-1)
+            if node_cap.numel() == 1:
+                node_cap = node_cap.expand(n)
             stage_table["physical"] = {
                 "cells": {name: (_physical_cell(cell, units) if cell is not None else None)
                           for name, cell in stage_table["cells"].items()},
-                "C_node_F": (torch.as_tensor(_tensor(s.node_capacitance(torch.zeros((1,n), dtype=s.z_logits.dtype, device=s.z_logits.device))).reshape(-1)) * units.cu).tolist(),
+                "C_node_F": (node_cap * units.cu).tolist(),
                 "leak_S": (torch.as_tensor(_tensor(s._effective_leak())).reshape(-1) * units.gu).tolist(),
                 "Vref_V": (units.vcm + torch.as_tensor(stage_table["readout"]["vref"]) * units.vu).tolist(),
                 "clip_current_A": float(s.clip_current) * units.iu,

@@ -30,6 +30,7 @@ from config import (
 from hw.constraints import (
     G_MIN,
     THETA_MAX,
+    IsatScale,
     attenuation,
     ic_factor,
     ratio_ab,
@@ -297,6 +298,12 @@ class FreeTanhLibrary(nn.Module):
         so the forward stays bit-identical to the pre-constraint model.
         """
         c = self.hw_constraints
+        # 3.10 GLN "tail" mode: the GLN multiplies Isat (a tail-current DAC) instead of
+        # the tanh slope; the slope then stays at the cell's static (hardware) value.
+        isat_scale = None
+        if isinstance(gm_override, IsatScale):
+            isat_scale = gm_override.m
+            gm_override = None
         if c is not None and c.hw_ratio_ab:                          # 3.1
             A, B = self.ab_values()                                 # [E]
             A = A.unsqueeze(0)                                      # [1, E]
@@ -341,7 +348,10 @@ class FreeTanhLibrary(nn.Module):
             t = tanh_ste(u, c.hw_alpha_bwd)                              # forward: tanh(u)
         else:
             t = torch.tanh(u) + self.ALPHA * u
-        return isat.unsqueeze(0) * t
+        isat_f = isat.unsqueeze(0)                                       # [1, E]
+        if isat_scale is not None:
+            isat_f = isat_f * isat_scale                                 # [B, E] / [1, E]
+        return isat_f * t
 
     def forward_tanh(
         self,

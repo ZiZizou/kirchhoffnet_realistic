@@ -30,7 +30,7 @@ from cell_library import (
     FreeTanhLibrary,
 )
 from gating.gln import gln_gm_override
-from gating.vca import vca_edge_gain
+from gating.vca import isat_eff_scale, vca_edge_gain
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle
     from hw import HWConfig
@@ -630,6 +630,31 @@ output_ode_src: list[int] | None = None,
             return F.softplus(self.raw_leak)
         return torch.full((num_nodes,), self.leak_constant, dtype=torch.float32)
 
+    # ------------------------------------------------------------------
+    # hardware helpers (Phase 3a 3.10)
+    # ------------------------------------------------------------------
+    @property
+    def hw_constraints(self):
+        """The ``HWConstraints`` of ``self.hw`` or ``None`` when the hardware layer is off."""
+        hw = getattr(self, "hw", None)
+        return None if hw is None else hw.constraints
+
+    def _hw_vca_bits(self) -> int | None:
+        """3.10: the width of the VCA logit DAC (``None`` = no quantisation)."""
+        c = self.hw_constraints
+        return None if c is None else c.hw_vca_bits
+
+    def _clamp_isat_eff(self, i_edge: torch.Tensor, cell_lib, mask: torch.Tensor,
+                        gain: torch.Tensor | None) -> torch.Tensor:
+        """3.10: keep ``Isat_eff = Isat * sigma(z) * g_vca`` under the hardware ceiling.
+
+        No-op when ``hw_isat_eff_clamp`` is off.
+        """
+        c = self.hw_constraints
+        if c is None or not c.hw_isat_eff_clamp:
+            return i_edge
+        return i_edge * isat_eff_scale(cell_lib.isat_values(), mask, gain)
+
     def edge_gain(self, family: str, u: torch.Tensor | None) -> torch.Tensor | None:
         """VCA interface: per-edge gain ``2*sigmoid((u @ W) @ v_e.T [+ b])`` ``[B, E]``.
 
@@ -645,7 +670,8 @@ output_ode_src: list[int] | None = None,
             if not self._vca_core_enabled or self.vca_v_core is None:
                 return None
             W = self.vca_W_core if self.vca_separate_core_bus else self.vca_W
-            return vca_edge_gain(u, W, self.vca_v_core, self.vca_b_core)
+            return vca_edge_gain(u, W, self.vca_v_core, self.vca_b_core,
+                                  bits=self._hw_vca_bits())
         if family == "boundary":
             v_e, bias = self.vca_v_boundary, self.vca_b_boundary
         elif family == "readout":
@@ -654,7 +680,7 @@ output_ode_src: list[int] | None = None,
             raise ValueError(f"edge_gain: unknown family {family!r}")
         if v_e is None:
             return None
-        return vca_edge_gain(u, self.vca_W, v_e, bias)
+        return vca_edge_gain(u, self.vca_W, v_e, bias, bits=self._hw_vca_bits())
 
     def _gln_rails_z(self, u: torch.Tensor | None) -> torch.Tensor | None:
         """GLN rail activations ``[B, n_rails]`` for input ``u`` (``None`` when GLN is off)."""
@@ -665,8 +691,16 @@ output_ode_src: list[int] | None = None,
 
     def edge_gm_scale(self, family: str, cell_lib, gln_z: torch.Tensor | None) -> torch.Tensor | None:
         """GLN interface: input-conditioned gm ``[B, E]`` for ``family`` (``"boundary"`` or
-        ``"readout"``), or ``None`` when GLN does not gate it (use the cell's static gm)."""
-        return gln_gm_override(getattr(self, "gln_rails", None), family, cell_lib, gln_z)
+        ``"readout"``), or ``None`` when GLN does not gate it (use the cell's static gm).
+
+        With ``hw_gln_mode == "tail"`` (3.10) the override is an
+        ``hw.constraints.IsatScale`` marker: a multiplier on Isat instead of on the slope.
+        """
+        c = self.hw_constraints
+        mode = None if c is None else c.hw_gln_mode
+        delta_max = None if c is None else c.hw_gln_delta_max
+        return gln_gm_override(getattr(self, "gln_rails", None), family, cell_lib, gln_z,
+                               mode=mode, delta_max=delta_max)
 
     def _ota_current(self, cell_lib, x_src, x_dst, gm) -> torch.Tensor:
         """Full OTA current (tanh + resistive shunt); GLN gm enters inside the tanh only."""
@@ -720,6 +754,7 @@ output_ode_src: list[int] | None = None,
         _g = self.edge_gain("boundary", u)
         if _g is not None:
             i_edge = i_edge * _g
+        i_edge = self._clamp_isat_eff(i_edge, cell_lib, b_mask, _g)
         acc_b = torch.zeros_like(x0, dtype=torch.float32)
         acc_b.index_add_(1, self.boundary_dst, i_edge.float())
         return acc_b.to(dtype=x0.dtype)
@@ -767,6 +802,7 @@ output_ode_src: list[int] | None = None,
         _g = self.edge_gain("readout", u)
         if _g is not None:
             i_edge = i_edge * _g
+        i_edge = self._clamp_isat_eff(i_edge, cell_lib, o_mask, _g)
         acc_o = torch.zeros_like(x0, dtype=torch.float32)
         acc_o.index_add_(1, self.output_ode_dst, i_edge.float())
         return acc_o.to(dtype=x0.dtype)
@@ -820,6 +856,7 @@ output_ode_src: list[int] | None = None,
         _g = self.edge_gain("readout", u)
         if _g is not None:
             i_edge = i_edge * _g
+        i_edge = self._clamp_isat_eff(i_edge, cell_lib, sense_mask, _g)
         return i_edge.to(dtype=x0.dtype)  # [B, n_sense]
 
     def _compute_i_edge_const(
@@ -857,6 +894,7 @@ output_ode_src: list[int] | None = None,
         i_edge = i_edge * edge_mask.unsqueeze(0)
         if gate_core_cached is not None:
             i_edge = i_edge * gate_core_cached
+        i_edge = self._clamp_isat_eff(i_edge, self.cell_lib, edge_mask, gate_core_cached)
         i_edge_f32 = i_edge.float()
         acc_const = torch.zeros_like(x_src_state, dtype=torch.float32)
         acc_const.index_add_(1, self.dst, i_edge_f32)
@@ -974,6 +1012,7 @@ output_ode_src: list[int] | None = None,
             # real VCA. No-op when vca_gate_core is None.
             if vca_gate_core is not None:
                 i_edge = i_edge * vca_gate_core                # [B, E]
+            i_edge = self._clamp_isat_eff(i_edge, self.cell_lib, edge_mask, vca_gate_core)
 
             # KCL scatter-add: accumulate in float32 for AMP robustness.
             # Under torch.autocast the node/edge gate multiplications promote
@@ -1036,6 +1075,8 @@ output_ode_src: list[int] | None = None,
                 _g = self.edge_gain("boundary", u)
                 if _g is not None:
                     i_boundary = i_boundary * _g
+                i_boundary = self._clamp_isat_eff(
+                    i_boundary, self.boundary_cell_lib, boundary_mask, _g)
                 i_boundary_f32 = i_boundary.float()
                 # Clone when freeze_read is active so we don't mutate the shared
                 # ``acc`` (= i_edge_const) tensor.
@@ -1086,6 +1127,8 @@ output_ode_src: list[int] | None = None,
                 _g = self.edge_gain("readout", u)
                 if _g is not None:
                     i_out = i_out * _g
+                i_out = self._clamp_isat_eff(
+                    i_out, self.output_ode_cell_lib, out_mask, _g)
                 i_out_f32 = i_out.float()
                 if i_edge_const is not None:
                     acc = acc.clone()
@@ -1142,6 +1185,8 @@ output_ode_src: list[int] | None = None,
                 _g = self.edge_gain("readout", u)
                 if _g is not None:
                     i_s = i_s * _g
+                i_s = self._clamp_isat_eff(
+                    i_s, self.readout_sense_cell_lib, sense_mask, _g)
             else:
                 # Frozen-tanh path (freeze_temporal_read=True): the tanh cell
                 # contribution (sense gate + VCA gate already folded in at

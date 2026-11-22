@@ -41,6 +41,7 @@ MISMATCH_KEYS = tuple(MISMATCH_DEFAULT)
 MISMATCH_SEED = 0            # default seed of the per-slot mismatch draws (reproducible)
 
 XBAR_MODES = ("signed", "offset_binary", "differential")
+GLN_DELTA_MAX_DEFAULT = math.log(4.0)   # 3.10: +-47 mV at the tail gate (16:1 range)
 C_NODE_MODES = (None, "uniform", "physical")
 GLN_MODES = (None, "tail", "slope")
 

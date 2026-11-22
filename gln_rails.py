@@ -174,6 +174,29 @@ class GLNRails(nn.Module):
         do not precompute ``z``)."""
         return self.modulate_gm_z(gm0, self.rails(u), family)
 
+    def modulate_delta_z(self, z: torch.Tensor, family: str) -> torch.Tensor:
+        """The raw log-modulation ``delta = z @ W.T`` of a family, ``[Bch, E]``.
+
+        This is the quantity the "tail" mode of Phase 3a 3.10 clamps and turns into an
+        Isat multiplier (a tail-current DAC modulates Isat, not the tanh slope).
+        """
+        if family not in self.families:
+            raise ValueError(
+                f"GLNRails has no family {family!r}; registered: "
+                f"{sorted(self.families)}"
+            )
+        W = self.families[family].weight()                 # [E, B]
+        return z @ W.T                                    # [Bch, E]
+
+    def modulate_isat_z(self, z: torch.Tensor, family: str, delta_max: float) -> torch.Tensor:
+        """3.10 "tail" mode: the Isat multiplier ``exp(clamp(delta, -delta_max, delta_max))``.
+
+        Returns ``[Bch, E]``.  With ``W = 0`` (the identity init) the result is exactly 1, so the
+        epoch-0 forward is unchanged.
+        """
+        from hw.constraints import gln_tail
+        return gln_tail(self.modulate_delta_z(z, family), float(delta_max))
+
 
 def gln_param_count(
     *,

@@ -21,11 +21,14 @@ from cell_library import FreeTanhLibrary, make_cell_library  # noqa: E402
 from hw import HWConfig  # noqa: E402
 from hw.constraints import (  # noqa: E402
     HWConstraints,
+    ISAT_HW_MAX,
+    IsatScale,
     MISMATCH_DEFAULT,
     MismatchState,
     THETA_MAX,
     mismatch_draw,
 )
+from gating.vca import isat_eff_scale, vca_edge_gain  # noqa: E402
 from topology import build_net_from_config  # noqa: E402
 
 D = torch.float64
@@ -279,5 +282,92 @@ def test_theta_bound_limits_the_offset():
 
 def test_theta_bound_forward_backward_is_finite():
     y, grads, _ = toy_forward_backward(hw_of(hw_theta_bound=True))
+    assert torch.isfinite(y).all()
+    assert all(torch.isfinite(g).all() for g in grads.values() if g is not None)
+
+
+# ---------------------------------------------------------------------------
+# 3.10 GLN tail mode, VCA bits, Isat_eff ceiling
+# ---------------------------------------------------------------------------
+def test_gln_tail_mode_multiplies_isat_and_leaves_the_slope_static():
+    lib = cell(hw_of(hw_gln_mode="tail"))
+    x_src = torch.tensor([[0.5, -0.2, 1.0, 0.0]], dtype=D)
+    x_dst = torch.tensor([[0.1, 0.3, -0.4, 0.2]], dtype=D)
+    scale = IsatScale(torch.full((1, 4), 2.0, dtype=D))
+    got = lib._tanh_core(x_src, x_dst, gm_override=scale)
+    # reference: the static gm, Isat multiplied by the GLN tail factor
+    A = torch.nn.functional.softplus(lib.a_raw).unsqueeze(0)
+    B = torch.nn.functional.softplus(lib.b_raw).unsqueeze(0)
+    s = torch.sign(lib.s_raw)
+    s_ste = s + lib.s_raw - lib.s_raw.detach()
+    gm = lib.current_gm().unsqueeze(0)
+    theta = lib.theta_raw.unsqueeze(0)
+    u = (s_ste.unsqueeze(0) * (A * x_src - B * x_dst) + theta) * gm
+    expect = (2.0 * lib.isat_values().unsqueeze(0)) * (torch.tanh(u) + lib.ALPHA * u)
+    torch.testing.assert_close(got, expect, rtol=1e-12, atol=1e-12)
+
+
+def test_gln_tail_multiplier_is_one_at_init_and_bounded_by_delta_max():
+    net = build_toy(hw_of(hw_gln_mode="tail"))
+    st = net.core.stages[0]
+    u = torch.rand(4, 4, generator=torch.Generator().manual_seed(5), dtype=D)
+    ov = st.edge_gm_scale("boundary", st.boundary_cell_lib, st._gln_rails_z(u))
+    assert isinstance(ov, IsatScale)
+    # the GLN mix is zero at init -> the tail multiplier is exactly 1
+    torch.testing.assert_close(ov.m, torch.ones_like(ov.m), rtol=0, atol=0)
+    # after a perturbation it stays inside exp(+-delta_max)
+    with torch.no_grad():
+        for mix in st.gln_rails.families.values():
+            mix.Q.normal_(0.0, 0.5)
+    ov = st.edge_gm_scale("boundary", st.boundary_cell_lib, st._gln_rails_z(u))
+    dmax = math.exp(st.hw_constraints.hw_gln_delta_max)
+    assert float(ov.m.min()) >= 1.0 / dmax - 1e-9
+    assert float(ov.m.max()) <= dmax + 1e-9
+
+
+def test_gln_tail_mode_forward_backward_is_finite():
+    y, grads, _ = toy_forward_backward(hw_of(hw_gln_mode="tail"))
+    assert torch.isfinite(y).all()
+    assert all(torch.isfinite(g).all() for g in grads.values() if g is not None)
+
+
+def test_vca_bits_quantise_the_logit_with_a_straight_through_gradient():
+    g = torch.Generator().manual_seed(1)
+    u = torch.randn(8, 4, generator=g, dtype=D)
+    W = torch.randn(4, 3, generator=g, dtype=D)
+    v_e = torch.randn(6, 3, generator=g, dtype=D)
+    plain = vca_edge_gain(u, W, v_e)
+    assert len(torch.unique(plain)) > 2
+    for bits in (4, 6):
+        q = vca_edge_gain(u, W, v_e, None, bits=bits)
+        # at most 2**bits distinct gains (the zeta grid)
+        assert len(torch.unique(q)) <= 2 ** bits
+        assert len(torch.unique(q)) < len(torch.unique(plain))
+    # STE: the gradient of the quantised logit is 1
+    from hw.constraints import vca_quantize
+    z = torch.tensor([0.3], dtype=D, requires_grad=True)
+    vca_quantize(z, 4).sum().backward()
+    assert float(z.grad) == pytest.approx(1.0, rel=1e-9)
+
+
+def test_vca_bits_forward_backward_is_finite():
+    y, grads, _ = toy_forward_backward(hw_of(hw_vca_bits=4))
+    assert torch.isfinite(y).all()
+    assert all(torch.isfinite(g).all() for g in grads.values() if g is not None)
+
+
+def test_isat_eff_clamp_keeps_the_effective_current_under_the_ceiling():
+    isat = torch.tensor([100.0, 1.0], dtype=D)
+    sigma_z = torch.tensor([1.0, 1.0], dtype=D)
+    scale = isat_eff_scale(isat, sigma_z)
+    eff = isat * scale
+    assert float(eff.max()) <= ISAT_HW_MAX + 1e-9
+    # nothing to clip -> the scale is 1
+    torch.testing.assert_close(isat_eff_scale(torch.tensor([1.0]), sigma_z[:1]),
+                               torch.ones(1, dtype=D), rtol=0, atol=0)
+
+
+def test_isat_eff_clamp_forward_backward_is_finite():
+    y, grads, _ = toy_forward_backward(hw_of(hw_isat_eff_clamp=True))
     assert torch.isfinite(y).all()
     assert all(torch.isfinite(g).all() for g in grads.values() if g is not None)

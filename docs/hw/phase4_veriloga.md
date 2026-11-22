@@ -32,10 +32,26 @@ Single-ended core supply is 0.8 V, Vcm=0.4 V, Vu=0.07 V/unit, C_u=50 fF, T_u=75.
 
 The Python behavioral exporter is available as `python -m export.spectre_export --checkpoint ... [--hw-config ... | --hw-preset NAME] --mode legacy|hw --fabric timemux|copies --specs N --out DIR`; library callers can use `export_model(model, ...)` for an already-built KirchhoffNetWithIO. `params.json` contains `resolved` (schema `kirchhoffnet-resolved-params-v1`) with input scaling, topology, stage settings/cells/gates/readout/VCA/GLN, transfers and output mapping. Dimensionless values are the interpreter's source of truth. In hw mode each stage additionally has a `physical` view (V, A, S, F, s) and cap-divider integer codes. `HWUnits` provides the conversions: x→V uses Vcm+Vu*x, currents use Iu, conductances use Gu, capacitances use Cu, and time uses Tu.
 
-The state-dict map is deliberately strict: each serialized key must be classified as a topology entry, a mapped behavioral parameter, or an explicit digital/off-chip key (`DIGITAL_OFFCHIP_KEYS`; input log scaling and output affine/post-transfer are off-chip). Unknown keys fail export. The exporter uses an explicit owner/module-and-leaf whitelist (not leaf names alone); an unconsumed `z_logits` under an unrecognized owner fails.
+The state-dict map classifies serialized keys as topology, mapped parameter, or explicit digital/off-chip (`DIGITAL_OFFCHIP_KEYS`; input log scaling and output affine/post-transfer are off-chip). Unknown or unrecognized-owner keys fail export. The mapper uses owner/module-and-leaf restrictions; the known-name regression case `net.core.stages.0.unused.z_logits` fails rather than being accepted merely because its leaf is familiar. On the paper checkpoint the current export accounts for 317 keys: 255 behavioral parameter keys, 49 topology keys, and 13 digital/off-chip keys. This remains whitelist-based rather than instrumentation of each table-builder tensor read, so extending the builder requires maintaining the owner/leaf map.
 
-Hw export resolves A/B modes (including cap-divider codes), slope/IC coupling, no-alpha, theta bound, Vref and crossbar transforms from the model's resolved module methods. It refuses stochastic mismatch, training-only power, VCA-logit quantization, output compliance, hard transfer clamp, node-capacitance modes, GLN tail mode, Isat-eff ceiling, and active timemux/S&H; these paths are not yet represented by the standalone interpreter and are rejected rather than silently approximated. Validate flags using `HWConfig` before export. `phase3a_core_diff` and cap-divider core presets are candidate supported configurations; `phase3a_full` and `phase3b_tm` currently include refused dynamics.
+### Python interpreter support matrix
+
+The standalone interpreter resolves and reproduces the table for the following forward-affecting hardware groups: symmetric/6-bit Vref; bounded/5-bit signed crossbar; transfer rail clamp; physical node capacitance; and GLN tail modulation (including `delta_max`). They are applied in the same transfer/RHS location as the model and are tested independently on perturbed `TOY_NET` parameters. The existing core and core-differential toy preset round trips also remain exact.
+
+| Configuration | Result on toy round-trip | Notes |
+|---|---:|---|
+| `phase3a_core` | 0 output / 0 state | exact |
+| `phase3a_core_diff` | 0 output / 0 state | exact |
+| core + symmetric 6-bit Vref | 0 / 0 | exact |
+| core + bounded 5-bit signed crossbar | 0 / 0 | exact |
+| core + transfer clamp | 0 / 0 | exact |
+| core + physical node capacitance | 0 / 0 | exact |
+| core + GLN tail, `delta_max=ln(4)` | 0 / 0 | exact for current TOY_NET GLN configuration |
+| `phase3a_full` | rejected | `hw_compliance` remains unsupported (see below) |
+| `phase3b_tm` | rejected | compliance plus active S&H/timemux dynamics remain unsupported |
+
+Remaining refused flags: `hw_compliance` requires all of the model's leg-wise current locations (core, boundary terminals, shared-sense, crossbar accumulator and temporal output mesh), replacing the input soft gate and soft clip while preserving the distinction between live node voltages and frozen leg currents; a single signed edge current plus global soft clip cannot represent these equations. `hw_isat_eff_clamp` needs per-family post-gate/VCA Isat clamping. `hw_vca_bits` needs quantized VCA logits. Stochastic mismatch needs the model's shared per-slot draws. `hw_power_lambda` is a training objective, not an inference behavior. Active timemux requires sample/hold injection, hold-only droop, optional kT/C draws, internal-capacitance settling, and transfer-mode handling; it remains rejected, including `phase3b_tm`. The current interpreter does not accept a `noise=` draw interface, so kT/C is not being approximated as deterministic. Validate flags using `HWConfig` before export.
 
 ## Validation
 
-The interpreter has no model imports and the legacy paper-checkpoint path is tested against forward/logits and per-stage dynamics. The unit-view round-trip test checks Isat, gm, G and C conversions. Spectre/ahdlcmi availability and Verilog-A simulation are environment dependent; these Python tests do not establish analog signoff or CTLE closure. Full hardware-preset toy round trips, consumption-based mapping coverage, and measured per-preset error bounds remain outstanding.
+The interpreter has no model imports. The paper-checkpoint legacy path and per-stage dynamics, unit conversions, and hardware toy round trips are tested. The listed supported single groups each have an individual round-trip case with maximum output and final-state error 0. The full suite is not an analog signoff: Spectre/ahdlcmi availability and Verilog-A simulation are environment dependent. `phase3a_full` and `phase3b_tm` are intentionally not reported as supported until their remaining dynamics are represented.

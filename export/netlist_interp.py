@@ -43,6 +43,8 @@ def _gln_gm(table, family, cell, u):
     if table.get("gln") is None or u is None or family not in table["gln"]["families"]:
         return _t(cell["gm"], u) if u is not None else None
     gln = table["gln"]
+    if gln.get("mode") == "tail":
+        return _t(cell["gm"],u)
     a, c, alpha = _t(gln["a"],u), _t(gln["c"],u), _t(gln["alpha"],u)
     z = torch.tanh(alpha * (u @ a.T + c))
     W = _t(gln["families"][family]["W"],u)
@@ -56,8 +58,18 @@ def _cell(cell, src, dst, u, family, stage):
     theta = _t(cell["theta"],ref)
     gm = _gln_gm(stage, family, cell, u) if family in ("boundary","readout") else _t(cell["gm"],ref)
     if gm is None: gm = _t(cell["gm"],ref)
+    isat = _t(cell["isat"],ref)
+    gln = stage.get("gln")
+    if (gln is not None and gln.get("mode") == "tail" and u is not None
+            and family in gln.get("families", {})):
+        a, c, alpha = _t(gln["a"],u), _t(gln["c"],u), _t(gln["alpha"],u)
+        rails = torch.tanh(alpha * (u @ a.T + c))
+        W = _t(gln["families"][family]["W"],u)
+        delta = rails @ W.T
+        scale = torch.exp(torch.clamp(delta, -float(gln["delta_max"]), float(gln["delta_max"])))
+        isat = isat.unsqueeze(0) * scale
     z = (sign * (A * src - B * dst) + theta) * gm
-    cur = _t(cell["isat"],ref) * (torch.tanh(z) + float(cell["alpha"]) * z)
+    cur = isat * (torch.tanh(z) + float(cell["alpha"]) * z)
     gate_src = torch.sigmoid((float(stage["settings"]["x_max"]) - src.abs()) / float(cell["beta_softness"]))
     gate_dst = torch.sigmoid((float(stage["settings"]["x_max"]) - dst.abs()) / float(cell["beta_softness"]))
     cur = cur * gate_src * gate_dst
@@ -133,7 +145,8 @@ def stage_rhs(table, stage_idx, x_live, x_held, u_inputs):
     x_max=float(settings["x_max"])
     sharp=float(settings["clip_sharpness"])
     clip=float(settings["clip_current"])*(torch.sigmoid((x-x_max)/sharp)-torch.sigmoid((-x-x_max)/sharp))
-    return (acc.to(dtype=x.dtype)-leak.unsqueeze(0)*x-clip)/float(settings["c_eff"])
+    divisor = _t(settings["c_node"],x) if settings.get("c_node") is not None else float(settings["c_eff"])
+    return (acc.to(dtype=x.dtype)-leak.unsqueeze(0)*x-clip)/divisor
 
 def _transfer(x, t, clamp_x_hard=None):
     n=int(t["in_nodes"])

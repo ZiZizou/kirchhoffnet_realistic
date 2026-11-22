@@ -90,8 +90,6 @@ def build_param_table(model, mode="legacy", hw=None) -> dict:
             raise ValueError("export does not support hw_vca_bits: quantized VCA logits are not resolved")
         refused = {
             "hw_compliance": constraints.hw_compliance,
-            "hw_c_node": constraints.hw_c_node is not None,
-            "hw_gln_mode": constraints.hw_gln_mode is not None,
             "hw_isat_eff_clamp": constraints.hw_isat_eff_clamp,
         }
         active = [name for name, enabled in refused.items() if enabled]
@@ -109,6 +107,8 @@ def build_param_table(model, mode="legacy", hw=None) -> dict:
         if gln is not None:
             gln_table = {"a": _tensor(gln.a), "c": _tensor(gln.c),
                          "alpha": _tensor(torch.nn.functional.softplus(gln.alpha_raw) + 1e-6),
+                         "mode": None if constraints is None else constraints.hw_gln_mode,
+                         "delta_max": None if constraints is None else float(constraints.hw_gln_delta_max),
                          "gm_min": gln.gm_min, "gm_max": gln.gm_max,
                          "families": {name: {"W": _tensor(m.weight())} for name,m in gln.families.items()}}
         vca = {"enabled": bool(s.vca_enabled), "core_enabled": bool(s._vca_core_enabled),
@@ -133,7 +133,7 @@ def build_param_table(model, mode="legacy", hw=None) -> dict:
                 "readout_sense_src": _tensor(s.readout_sense_src),
                 "readout_dst_start": int(s._readout_dst_start)},
             "solver": {"method":"heun", "t_span": float(net.core.stage_times[i]), "num_steps":int(net.core.stage_steps[i])},
-            "settings": {"c_eff":float(s.c_eff), "x_max":float(s.x_max), "clip_current":float(s.clip_current),
+            "settings": {"c_eff":float(s.c_eff), "c_node":_tensor(s.node_capacitance(torch.zeros((1,n), dtype=s.z_logits.dtype, device=s.z_logits.device))) if constraints is not None and constraints.hw_c_node is not None else None, "x_max":float(s.x_max), "clip_current":float(s.clip_current),
                 "clip_sharpness":sharp, "leak":_tensor(s._effective_leak()),
                 "freeze_read":bool(s.freeze_read), "freeze_boundary":bool(s.freeze_boundary),
                 "freeze_temporal_read":bool(s.freeze_temporal_read), "read_only_source":bool(s.read_only_source),

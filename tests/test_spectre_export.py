@@ -122,6 +122,8 @@ def test_interpreter_has_no_model_imports():
     ("phase3a_core", {"hw_vref_symmetric": True, "hw_vref_bits": 6}),
     ("phase3a_core", {"hw_xbar_bound": True, "hw_xbar_bits": 5, "hw_xbar_mode": "signed"}),
     ("phase3a_core", {"hw_clamp_transfer": True}),
+    ("phase3a_core", {"hw_c_node": "physical"}),
+    ("phase3a_core", {"hw_gln_mode": "tail", "hw_gln_delta_max": 1.3862943611198906}),
 ])
 def test_toy_net_hw_interpreter_roundtrip(tmp_path, preset, overrides):
     """The resolved table must reproduce the actual constrained TOY_NET forward."""

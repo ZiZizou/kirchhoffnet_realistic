@@ -47,6 +47,7 @@ The standalone interpreter resolves and reproduces the table for the following f
 | core + transfer clamp | 0 / 0 | exact |
 | core + physical node capacitance | 0 / 0 | exact |
 | core + GLN tail, `delta_max=ln(4)` | 0 / 0 | exact for current TOY_NET GLN configuration |
+| `phase3a_full` with `hw_compliance=false` | 0 output / 0 state | combined non-compliance flags compose exactly |
 | `phase3a_full` | rejected | `hw_compliance` remains unsupported (see below) |
 | `phase3b_tm` | rejected | compliance plus active S&H/timemux dynamics remain unsupported |
 

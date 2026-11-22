@@ -60,6 +60,7 @@ Notes that matter for hardware:
 - The 0.01·u term is a linear function of the OTA input (`cell_library.py:358`). It has no hardware meaning (`feature_surgery_audit.md:210`).
 - With `freeze_read=True` (paper config) the whole tanh branch is evaluated once at stage entry and held for the 10 Heun steps. Only shunt, leak, clip, boundary and sense currents see the evolving state (`differential_stage.py:1880-1886`, `circuit_model_report.md:105`).
 - σ(z_e) multiplies both the tanh and the shunt (`differential_stage.py:1527-1545`), so it can be folded into Isat and G at export. It is fractional (0.39-0.83) in the trained model (`trained_ctle_audit.md:35`, `:255`).
+- The parallel resistive shunt of the core family is counted **exactly once** in every path: the frozen path (`freeze_read=True`), the dynamic path (`freeze_read=False`), the 3.4 compliance path and the boundary / sense / mesh families. The dynamic path used to add it twice (once inside the cell forward `i_tanh + i_res` and once in the `_has_resistive` block of `rhs`); that was a bug and was fixed in commit `7cda290` (the core cell current there is now the tanh-only `forward_tanh`). The core VCA gate therefore scales the tanh part only -- the shunt is scaled by `g_vca` only with `--vca-gate-shunt`.
 
 Initial values (`cell_library.py:290-313`): `a_raw = b_raw = 0` (A = B = 0.693), `gm_raw = isat_raw = −5` (σ = 0.0067; gm and Isat ≈ 0.077 for ceiling 10, ≈ 0.04 and 0.20 for the paper ceilings 4.24 and 28.7), `g_res_raw = −5` (G = 0.0067), `z = 0` (σ = 0.5).
 

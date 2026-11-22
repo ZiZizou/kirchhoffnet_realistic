@@ -39,7 +39,7 @@ Code behaviour:
 
 - At stage entry `_compute_i_edge_const(x0)` evaluates the core tanh branch once from the stage-entry state and holds it for all 10 Heun steps (`differential_stage.py:1885-1886`, body `:1296-1346`). It reads **both** edge terminals, `x[src]` and `x[dst]`, which are hidden nodes only (`src` max index 8, `dst` max index 10 in the checkpoint). Accumulators are never core-OTA inputs.
 - The paper run sets `freeze_read=True` (`dagger-nuance-distillation-kirchhoffnet.py:622`, passed at `:1889`).
-- What stays **live** (reads the evolving node): the shunt `G·(Vs − Vd)` (`differential_stage.py:1486-1492`, `cell_library.py:402-414`), leak and soft clip (`:1761-1768`), the 8 boundary OTAs (`freeze_boundary=False`, `:100-107`, `circuit_model_report.md:146`) and the 22 sense OTAs (`freeze_temporal_read=False`, `circuit_model_report.md:162`).
+- What stays **live** (reads the evolving node): the shunt `G·(Vs − Vd)` (`differential_stage.py:1486-1492`, `cell_library.py:402-414`), leak and soft clip (`:1761-1768`), the 8 boundary OTAs (`freeze_boundary=False`, `:100-107`, `circuit_model_report.md:146`) and the 22 sense OTAs (`freeze_temporal_read=False`, `circuit_model_report.md:162`). The shunt is counted exactly once in every path (fixed in commit `7cda290`: the dynamic `freeze_read=False` path used to count it twice).
 
 Hardware mapping:
 

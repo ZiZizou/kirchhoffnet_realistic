@@ -29,12 +29,14 @@ The OTA input offset (``theta_raw``) is set to a non-zero value in the test:
 with the init value 0 every tanh current is exactly 0 at ``x = 0`` and the
 comparison would be vacuous.
 
-Known pre-existing inconsistency (NOT touched here: it is baked into the
-golden data): with ``freeze_read=False`` the *plain* path counts the parallel
-resistive shunt of the core family TWICE (``cell_lib(...)`` already contains
-it and the ``_has_resistive`` block of ``rhs`` adds it again), while the
-frozen path and the compliance path count it once.  The resistive-shunt test
-therefore checks the compliance path against the analytic shunt current.
+Shunt accounting (fixed in commit 7cda290): the parallel resistive shunt of the
+core family is counted EXACTLY ONCE in every path.  The dynamic
+(``freeze_read=False``) *plain* path used to count it TWICE (``cell_lib(...)``
+already contains the shunt and the ``_has_resistive`` block of ``rhs`` added it
+again); the core cell current there is now the tanh-only ``forward_tanh``,
+exactly like in the frozen path.  The resistive-shunt test below therefore
+checks BOTH the plain and the compliance path against the analytic shunt
+current.
 """
 
 from __future__ import annotations
@@ -247,30 +249,34 @@ def test_resistive_shunt_enters_the_rhs_once_and_is_not_rolled_off(spec_name, fr
     analytic ``G * (x_src - x_dst)`` scatter (no roll-off factor).
     """
     spec = getattr(mg, spec_name)
+    plain = _build(spec, BASE)
     comp = _build(spec, dict(BASE, hw_compliance=True))
+    comp.load_state_dict(plain.state_dict())
+    _set_theta(plain)
     _set_theta(comp)
     u = _inputs()
-    for st in comp.core.stages:
-        g_raw = getattr(st.cell_lib, "g_resistive_raw", None)
-        if not isinstance(g_raw, torch.Tensor):
-            continue
-        # a state with a voltage difference across the core edges
-        x = torch.zeros(B, st.num_nodes, dtype=D)
-        x[:, :] = torch.linspace(0.0, 0.6, st.num_nodes, dtype=D)
-        with torch.no_grad():
-            g_raw.fill_(-30.0)                     # G = softplus(-30) ~ 0
-            off = _rhs(st, u, x, freeze_read, False, False)
-            g_raw.fill_(0.5)                       # G = softplus(0.5) = 1.07
-            on = _rhs(st, u, x, freeze_read, False, False)
-        xs, xd = x[:, st.src], x[:, st.dst]
-        mask = torch.sigmoid(st.z_logits).unsqueeze(0)
-        i_res = st.cell_lib.resistive_current(xs, xd) * mask
-        expect = torch.zeros_like(x)
-        expect.index_add_(1, st.dst, i_res.float().double())
-        expect.index_add_(1, st.src, -i_res.float().double())
-        expect = expect / st.c_eff
-        got = (on - off)
-        torch.testing.assert_close(got, expect, rtol=1e-6, atol=1e-12)
+    for st, st_c in zip(plain.core.stages, comp.core.stages):
+        for stage in (st, st_c):
+            g_raw = getattr(stage.cell_lib, "g_resistive_raw", None)
+            if not isinstance(g_raw, torch.Tensor):
+                continue
+            # a state with a voltage difference across the core edges
+            x = torch.zeros(B, stage.num_nodes, dtype=D)
+            x[:, :] = torch.linspace(0.0, 0.6, stage.num_nodes, dtype=D)
+            with torch.no_grad():
+                g_raw.fill_(-30.0)                     # G = softplus(-30) ~ 0
+                off = _rhs(stage, u, x, freeze_read, False, False)
+                g_raw.fill_(0.5)                       # G = softplus(0.5) = 1.07
+                on = _rhs(stage, u, x, freeze_read, False, False)
+            xs, xd = x[:, stage.src], x[:, stage.dst]
+            mask = torch.sigmoid(stage.z_logits).unsqueeze(0)
+            i_res = stage.cell_lib.resistive_current(xs, xd) * mask
+            expect = torch.zeros_like(x)
+            expect.index_add_(1, stage.dst, i_res.float().double())
+            expect.index_add_(1, stage.src, -i_res.float().double())
+            expect = expect / stage.c_eff
+            got = (on - off)
+            torch.testing.assert_close(got, expect, rtol=1e-6, atol=1e-12)
 
 
 @pytest.mark.parametrize("spec_name", sorted(FAMILIES))

@@ -1,0 +1,1471 @@
+$ /home/annaik/Documents/kirchhoffnet_realistic/ENV/bin/python /home/annaik/Documents/kirchhoffnet_realistic/generative-distillation-plain-mlp.py --dagger-iterations 8 --epochs-per-iter 100 --common-eval-size 1000 --earlystop-eval-every 5 --lr 0.00071001533 --weight-decay 2.3035148e-06 --batch-size 256 --plain-trunk-width 96 --plain-trunk-layers 3 --plain-activation silu --input-preprocessing knet --seed 100 --device cuda --output /home/annaik/Documents/kirchhoffnet_realistic/outputs/generative_plain_bayes_opt/plain_knet_budget25000_fproxy/trial_0019 --plain-use-layernorm --teacher-dir /home/annaik/Documents/improved-zig-nf-spline-pytorch-default-v2/ --data-dir /home/annaik/Documents/augmented-cvae-ctle/
+19:10:19 [INFO] Student model: 20,359 trainable / 20,373 total params  (plain W=96 L=3 act=silu LN=True log_features=False)
+19:10:19 [INFO] Using device: cuda
+19:10:19 [INFO]   TEACHER_DIR=/home/annaik/Documents/improved-zig-nf-spline-pytorch-default-v2/
+19:10:19 [INFO]   DATA_DIR=/home/annaik/Documents/augmented-cvae-ctle/
+19:10:19 [INFO]   OUTPUT_DIR=/home/annaik/Documents/kirchhoffnet_realistic/outputs/generative_plain_bayes_opt/plain_knet_budget25000_fproxy/trial_0019
+19:10:19 [INFO] Teacher artifacts loaded
+19:10:19 [INFO]   flow scaler_X mean: [-5.22107447 -2.65785535 -8.41856601]...
+19:10:19 [INFO]   zig scaler_X mean: [-5.22107447 -2.65785535 -8.41856601]...
+19:10:19 [INFO]   flow scaler_y_p: mean=-2.0538, scale=0.7406
+19:10:19 [INFO]   zig scaler_y_p:  mean=-2.0538, scale=0.7406
+19:10:19 [INFO]   eye_scale_h (Q75 scale): 47.099998
+19:10:19 [INFO]   eye_scale_w (Q75 scale): 87.529999
+19:10:19 [INFO]   eye_scale_j (Q75 scale): 46.720001
+19:10:19 [INFO]   per_target_hurdle: False
+19:10:19 [INFO] HybridHurdleModel (ZIG) loaded from checkpoint
+19:10:19 [INFO] [TIMER] load historical dataset started
+19:10:19 [INFO] [TIMER] load historical dataset done (0.2s)
+19:10:19 [INFO] Filtered rows: 11161
+19:10:19 [INFO] Input preprocessing: knet (4 features, min-max, clip [-4,4])
+19:10:19 [INFO] power: n=11161, min=0.0003, max=0.2172, median=0.0057
+19:10:19 [INFO] stage_2_eye_max_height: n=11161, min=0.0028, max=80.5100, median=31.9100
+19:10:19 [INFO] stage_2_eye_max_width: n=11161, min=0.0631, max=100.0000, median=77.4100
+19:10:19 [INFO] stage_2_jitter: n=11161, min=0.0176, max=99.9800, median=23.5700
+19:10:19 [INFO] [TIMER] plain-mlp DAgger training started
+19:10:19 [INFO] [TIMER] RUNNING DIAGNOSTICS started
+19:10:19 [INFO] ============================================================
+19:10:19 [INFO]   RUNNING DIAGNOSTICS
+19:10:19 [INFO] ============================================================
+19:10:19 [INFO] 1. Teacher flow validity yield on 200 boundary specs (n_candidates=10000, valid=0.5):
+19:10:27 [INFO]   filter_by_zig_validity: 199/200 passed (threshold=0.5)
+19:10:27 [INFO]   label_batch: 199/200 passed validity gate (threshold=0.5)
+19:10:27 [INFO]   filter_by_zig_validity: 199/200 passed (threshold=0.5)
+19:10:27 [INFO]    Flow teacher yield: 199/200 (99.5%)
+19:10:27 [INFO] 2. Empirical k-NN validity yield on 200 boundary specs (k=3):
+19:10:27 [INFO]   filter_by_zig_validity: 126/200 passed (threshold=0.5)
+19:10:27 [INFO]    k-NN empirical yield: 126/200 (63.0%)
+19:10:27 [INFO] 3. ZIG validity on 1000 real empirical rows:
+19:10:27 [INFO]   filter_by_zig_validity: 812/1000 passed (threshold=0.5)
+19:10:27 [INFO]    ZIG validity on real data: 812/1000 (81.2%)
+19:10:27 [INFO] ============================================================
+19:10:27 [INFO]   DIAGNOSTICS COMPLETE
+19:10:27 [INFO] ============================================================
+19:10:27 [INFO] Interpretation:
+19:10:27 [INFO]   If (1) >50%:  teacher is fine -> focus on loss/replay
+19:10:27 [INFO]   If (1) <50%:  flow teacher is weak -> increase candidate budget
+19:10:27 [INFO]   If (2) <50%:  empirical data is weak -> need better training set
+19:10:27 [INFO]   If (3) <50%:  ZIG p_valid threshold may be too high (lower to 0.3)
+19:10:27 [INFO] [TIMER] RUNNING DIAGNOSTICS done (7.5s)
+19:10:27 [INFO] [TIMER] build COMMON_EVAL_SPECS shared eval set started
+19:10:27 [INFO] [TIMER] build COMMON_EVAL_SPECS shared eval set done (0.0s)
+19:10:27 [INFO]   COMMON_EVAL_SPECS: shape=(1000, 4), seed=24681012
+19:10:29 [INFO] [TIMER] build initial flow distillation dataset started
+19:10:50 [INFO]   Labeled 500/20000...
+19:11:09 [INFO]   Labeled 1000/20000...
+19:11:27 [INFO]   Labeled 1500/20000...
+19:11:46 [INFO]   Labeled 2000/20000...
+19:12:04 [INFO]   Labeled 2500/20000...
+19:12:23 [INFO]   Labeled 3000/20000...
+19:12:41 [INFO]   Labeled 3500/20000...
+19:13:00 [INFO]   Labeled 4000/20000...
+19:13:18 [INFO]   Labeled 4500/20000...
+19:13:36 [INFO]   Labeled 5000/20000...
+19:13:55 [INFO]   Labeled 5500/20000...
+19:14:13 [INFO]   Labeled 6000/20000...
+19:14:32 [INFO]   Labeled 6500/20000...
+19:14:50 [INFO]   Labeled 7000/20000...
+19:15:09 [INFO]   Labeled 7500/20000...
+19:15:27 [INFO]   Labeled 8000/20000...
+19:15:46 [INFO]   Labeled 8500/20000...
+19:16:04 [INFO]   Labeled 9000/20000...
+19:16:22 [INFO]   Labeled 9500/20000...
+19:16:41 [INFO]   Labeled 10000/20000...
+19:16:59 [INFO]   Labeled 10500/20000...
+19:17:18 [INFO]   Labeled 11000/20000...
+19:17:36 [INFO]   Labeled 11500/20000...
+19:17:55 [INFO]   Labeled 12000/20000...
+19:18:13 [INFO]   Labeled 12500/20000...
+19:18:33 [INFO]   Labeled 13000/20000...
+19:18:51 [INFO]   Labeled 13500/20000...
+19:19:10 [INFO]   Labeled 14000/20000...
+19:19:29 [INFO]   Labeled 14500/20000...
+19:19:47 [INFO]   Labeled 15000/20000...
+19:20:06 [INFO]   Labeled 15500/20000...
+19:20:33 [INFO]   Labeled 16000/20000...
+19:20:51 [INFO]   Labeled 16500/20000...
+19:21:09 [INFO]   Labeled 17000/20000...
+19:21:28 [INFO]   Labeled 17500/20000...
+19:21:46 [INFO]   Labeled 18000/20000...
+19:22:05 [INFO]   Labeled 18500/20000...
+19:22:23 [INFO]   Labeled 19000/20000...
+19:22:42 [INFO]   Labeled 19500/20000...
+19:22:52 [INFO]   Labeled 20000/20000...
+19:22:52 [INFO]   filter_by_zig_validity: 19846/20000 passed (threshold=0.5)
+19:22:52 [INFO]   label_batch: 19846/20000 passed validity gate (threshold=0.5)
+19:22:52 [INFO]   filter_by_zig_validity: 19846/20000 passed (threshold=0.5)
+19:22:52 [INFO] Flow teacher produced 154/20000 low-validity initial labels; replacing with empirical k-NN fallback
+19:22:52 [INFO] Flow distillation dataset: 20000 samples ready (noisy inputs -> teacher labels for those inputs)
+19:22:52 [INFO] [TIMER] build initial flow distillation dataset done (742.6s)
+19:22:52 [INFO] Initial dataset (flow teacher labels): 20000 samples
+19:22:52 [INFO] Train: 18000, Val: 2000
+19:22:52 [INFO] ============================================================
+19:22:52 [INFO]   DAgger Iteration 1/8
+19:22:52 [INFO] ============================================================
+19:22:52 [INFO] Dataset size: 20000
+19:22:52 [INFO]   Prev-iter baseline: no prior model (iteration 1) -> prev_failure_rate=100.0%
+19:22:52 [INFO]   Shared eval set (COMMON_EVAL_SPECS): n=1000 specs (seed=24681012, every=5ep, log_every=10ep, skip_first=5ep)
+19:22:54 [INFO]   Epoch   1/100  train=0.0553(imit=0.055,spec=0.000,phys=0.000,invalid=0.000,manifold=0.422)  val=0.0000(imit=0.027,spec=0.000,phys=0.000,invalid=0.000,manifold=0.352)  lr=1.00e-03
+19:22:59 [INFO]     earlystop@  5: failure_rate=28.60% (skipped, epoch 5 <= EARLYSTOP_SKIP_EPOCHS=5)
+19:23:03 [INFO]   Epoch  10/100  train=5.4793(imit=0.067,spec=3.179,phys=0.041,invalid=0.147,manifold=0.381)  val=0.0000(imit=0.076,spec=3.948,phys=0.043,invalid=0.210,manifold=0.413)  lr=9.78e-04
+19:23:03 [INFO]     earlystop@ 10: failure_rate=65.40% (new best, prev=100.00%, delta=+34.60pts)
+19:23:03 [INFO]     earlystop/power: mean=0.1283 median=0.0343 p90=0.2952 degrade_rate=19.8%
+19:23:03 [INFO]     earlystop/jitter: mean=0.2404 median=0.0000 p90=0.8013 degrade_rate=33.3%
+19:23:03 [INFO]     earlystop/height: mean=0.4425 median=0.4010 p90=0.9136 degrade_rate=82.3%
+19:23:03 [INFO]     earlystop/width: mean=0.2898 median=0.0834 p90=0.8815 degrade_rate=39.4%
+19:23:03 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=1.75 failure_rate=65.4%
+19:23:03 [INFO]     earlystop/validity: invalid_rate=19.8%
+19:23:03 [INFO]     earlystop/power raw: pred_mean=0.0043 target_mean=0.0078 pred_med=0.0038 target_med=0.0045
+19:23:03 [INFO]     earlystop/jitter raw: pred_mean=28.1827 target_mean=35.4828 pred_med=21.2070 target_med=24.8750
+19:23:03 [INFO]     earlystop/height raw: pred_mean=15.2915 target_mean=30.4517 pred_med=15.2808 target_med=30.7000
+19:23:03 [INFO]     earlystop/width raw: pred_mean=48.1303 target_mean=66.6874 pred_med=60.3917 target_med=76.2600
+19:23:07 [INFO]     earlystop@ 15: failure_rate=20.90% (new best, prev=100.00%, delta=+79.10pts)
+19:23:11 [INFO]   Epoch  20/100  train=5.1922(imit=0.066,spec=3.008,phys=0.039,invalid=0.138,manifold=0.369)  val=0.0000(imit=0.066,spec=3.190,phys=0.038,invalid=0.138,manifold=0.386)  lr=9.14e-04
+19:23:11 [INFO]     earlystop@ 20: failure_rate=17.20% (new best, prev=100.00%, delta=+82.80pts)
+19:23:11 [INFO]     earlystop/power: mean=0.0798 median=0.0000 p90=0.1571 degrade_rate=7.6%
+19:23:11 [INFO]     earlystop/jitter: mean=0.0840 median=0.0000 p90=0.1860 degrade_rate=9.6%
+19:23:11 [INFO]     earlystop/height: mean=0.1640 median=0.0316 p90=0.6024 degrade_rate=28.4%
+19:23:11 [INFO]     earlystop/width: mean=0.1201 median=0.0000 p90=0.5813 degrade_rate=19.0%
+19:23:11 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.65 failure_rate=17.2%
+19:23:11 [INFO]     earlystop/validity: invalid_rate=8.4%
+19:23:11 [INFO]     earlystop/power raw: pred_mean=0.0046 target_mean=0.0078 pred_med=0.0038 target_med=0.0045
+19:23:11 [INFO]     earlystop/jitter raw: pred_mean=24.6642 target_mean=35.4828 pred_med=17.9957 target_med=24.8750
+19:23:11 [INFO]     earlystop/height raw: pred_mean=25.7816 target_mean=30.4517 pred_med=27.8759 target_med=30.7000
+19:23:11 [INFO]     earlystop/width raw: pred_mean=62.8363 target_mean=66.6874 pred_med=77.2375 target_med=76.2600
+19:23:15 [INFO]     earlystop@ 25: failure_rate=19.00% (no accept; best=17.20%, min_delta=1.0%)
+19:23:20 [INFO]   Epoch  30/100  train=4.7435(imit=0.068,spec=2.734,phys=0.038,invalid=0.124,manifold=0.351)  val=0.0000(imit=0.067,spec=2.896,phys=0.037,invalid=0.124,manifold=0.366)  lr=8.15e-04
+19:23:20 [INFO]     earlystop@ 30: failure_rate=9.90% (new best, prev=100.00%, delta=+90.10pts)
+19:23:20 [INFO]     earlystop/power: mean=0.0553 median=0.0000 p90=0.1069 degrade_rate=5.2%
+19:23:20 [INFO]     earlystop/jitter: mean=0.0955 median=0.0000 p90=0.2452 degrade_rate=11.8%
+19:23:20 [INFO]     earlystop/height: mean=0.0941 median=0.0303 p90=0.2712 degrade_rate=19.8%
+19:23:20 [INFO]     earlystop/width: mean=0.0633 median=0.0071 p90=0.1718 degrade_rate=9.0%
+19:23:20 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.46 failure_rate=9.9%
+19:23:20 [INFO]     earlystop/validity: invalid_rate=2.3%
+19:23:20 [INFO]     earlystop/power raw: pred_mean=0.0051 target_mean=0.0078 pred_med=0.0038 target_med=0.0045
+19:23:20 [INFO]     earlystop/jitter raw: pred_mean=27.2071 target_mean=35.4828 pred_med=22.0267 target_med=24.8750
+19:23:20 [INFO]     earlystop/height raw: pred_mean=27.4571 target_mean=30.4517 pred_med=29.2480 target_med=30.7000
+19:23:20 [INFO]     earlystop/width raw: pred_mean=65.8536 target_mean=66.6874 pred_med=76.4967 target_med=76.2600
+19:23:24 [INFO]     earlystop@ 35: failure_rate=9.40% (no accept; best=9.90%, min_delta=1.0%)
+19:23:28 [INFO]   Epoch  40/100  train=4.6034(imit=0.068,spec=2.644,phys=0.038,invalid=0.120,manifold=0.353)  val=0.0000(imit=0.069,spec=2.843,phys=0.038,invalid=0.130,manifold=0.364)  lr=6.89e-04
+19:23:28 [INFO]     earlystop@ 40: failure_rate=8.60% (new best, prev=100.00%, delta=+91.40pts)
+19:23:28 [INFO]     earlystop/power: mean=0.0519 median=0.0000 p90=0.0892 degrade_rate=4.9%
+19:23:28 [INFO]     earlystop/jitter: mean=0.0804 median=0.0000 p90=0.2136 degrade_rate=10.4%
+19:23:28 [INFO]     earlystop/height: mean=0.1365 median=0.1087 p90=0.2910 degrade_rate=24.6%
+19:23:28 [INFO]     earlystop/width: mean=0.0763 median=0.0143 p90=0.2098 degrade_rate=10.7%
+19:23:28 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.51 failure_rate=8.6%
+19:23:28 [INFO]     earlystop/validity: invalid_rate=2.7%
+19:23:28 [INFO]     earlystop/power raw: pred_mean=0.0054 target_mean=0.0078 pred_med=0.0038 target_med=0.0045
+19:23:28 [INFO]     earlystop/jitter raw: pred_mean=28.1530 target_mean=35.4828 pred_med=22.3281 target_med=24.8750
+19:23:28 [INFO]     earlystop/height raw: pred_mean=26.1205 target_mean=30.4517 pred_med=27.0300 target_med=30.7000
+19:23:28 [INFO]     earlystop/width raw: pred_mean=63.5357 target_mean=66.6874 pred_med=73.4046 target_med=76.2600
+19:23:32 [INFO]     earlystop@ 45: failure_rate=9.50% (no accept; best=8.60%, min_delta=1.0%)
+19:23:36 [INFO]   Epoch  50/100  train=4.5550(imit=0.069,spec=2.612,phys=0.037,invalid=0.122,manifold=0.348)  val=0.0000(imit=0.068,spec=2.689,phys=0.037,invalid=0.119,manifold=0.365)  lr=5.50e-04
+19:23:36 [INFO]     earlystop@ 50: failure_rate=6.80% (new best, prev=100.00%, delta=+93.20pts)
+19:23:36 [INFO]     earlystop/power: mean=0.0424 median=0.0000 p90=0.0691 degrade_rate=4.1%
+19:23:36 [INFO]     earlystop/jitter: mean=0.0636 median=0.0000 p90=0.1744 degrade_rate=8.8%
+19:23:36 [INFO]     earlystop/height: mean=0.0885 median=0.0287 p90=0.2397 degrade_rate=13.9%
+19:23:36 [INFO]     earlystop/width: mean=0.0612 median=0.0073 p90=0.1367 degrade_rate=7.9%
+19:23:36 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.35 failure_rate=6.8%
+19:23:36 [INFO]     earlystop/validity: invalid_rate=2.7%
+19:23:36 [INFO]     earlystop/power raw: pred_mean=0.0053 target_mean=0.0078 pred_med=0.0037 target_med=0.0045
+19:23:36 [INFO]     earlystop/jitter raw: pred_mean=27.8425 target_mean=35.4828 pred_med=22.1403 target_med=24.8750
+19:23:36 [INFO]     earlystop/height raw: pred_mean=27.8270 target_mean=30.4517 pred_med=28.9625 target_med=30.7000
+19:23:36 [INFO]     earlystop/width raw: pred_mean=64.9794 target_mean=66.6874 pred_med=75.1364 target_med=76.2600
+19:23:41 [INFO]     earlystop@ 55: failure_rate=7.10% (no accept; best=6.80%, min_delta=1.0%)
+19:23:45 [INFO]   Epoch  60/100  train=4.5056(imit=0.068,spec=2.584,phys=0.035,invalid=0.119,manifold=0.348)  val=0.0000(imit=0.068,spec=2.749,phys=0.036,invalid=0.118,manifold=0.363)  lr=4.11e-04
+19:23:45 [INFO]     earlystop@ 60: failure_rate=6.20% (no accept; best=6.80%, min_delta=1.0%)
+19:23:45 [INFO]     earlystop/power: mean=0.0470 median=0.0000 p90=0.0823 degrade_rate=4.1%
+19:23:45 [INFO]     earlystop/jitter: mean=0.0548 median=0.0000 p90=0.1605 degrade_rate=8.2%
+19:23:45 [INFO]     earlystop/height: mean=0.0824 median=0.0151 p90=0.2309 degrade_rate=14.2%
+19:23:45 [INFO]     earlystop/width: mean=0.0520 median=0.0023 p90=0.0779 degrade_rate=7.1%
+19:23:45 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.34 failure_rate=6.2%
+19:23:45 [INFO]     earlystop/validity: invalid_rate=2.3%
+19:23:45 [INFO]     earlystop/power raw: pred_mean=0.0055 target_mean=0.0078 pred_med=0.0038 target_med=0.0045
+19:23:45 [INFO]     earlystop/jitter raw: pred_mean=27.8626 target_mean=35.4828 pred_med=21.8189 target_med=24.8750
+19:23:45 [INFO]     earlystop/height raw: pred_mean=28.3100 target_mean=30.4517 pred_med=29.5488 target_med=30.7000
+19:23:45 [INFO]     earlystop/width raw: pred_mean=65.5446 target_mean=66.6874 pred_med=76.3316 target_med=76.2600
+19:23:49 [INFO]     earlystop@ 65: failure_rate=5.80% (no accept; best=6.80%, min_delta=1.0%)
+19:23:53 [INFO]   Epoch  70/100  train=4.3938(imit=0.068,spec=2.513,phys=0.035,invalid=0.119,manifold=0.344)  val=0.0000(imit=0.068,spec=2.652,phys=0.035,invalid=0.121,manifold=0.365)  lr=2.85e-04
+19:23:53 [INFO]     earlystop@ 70: failure_rate=6.70% (no accept; best=6.80%, min_delta=1.0%)
+19:23:53 [INFO]     earlystop/power: mean=0.0462 median=0.0000 p90=0.0836 degrade_rate=4.1%
+19:23:53 [INFO]     earlystop/jitter: mean=0.0514 median=0.0000 p90=0.1321 degrade_rate=7.8%
+19:23:53 [INFO]     earlystop/height: mean=0.1096 median=0.0603 p90=0.2636 degrade_rate=18.9%
+19:23:53 [INFO]     earlystop/width: mean=0.0588 median=0.0061 p90=0.1438 degrade_rate=8.2%
+19:23:53 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.39 failure_rate=6.7%
+19:23:53 [INFO]     earlystop/validity: invalid_rate=2.0%
+19:23:53 [INFO]     earlystop/power raw: pred_mean=0.0055 target_mean=0.0078 pred_med=0.0038 target_med=0.0045
+19:23:53 [INFO]     earlystop/jitter raw: pred_mean=28.3966 target_mean=35.4828 pred_med=22.3918 target_med=24.8750
+19:23:53 [INFO]     earlystop/height raw: pred_mean=27.3431 target_mean=30.4517 pred_med=27.9659 target_med=30.7000
+19:23:53 [INFO]     earlystop/width raw: pred_mean=64.5056 target_mean=66.6874 pred_med=75.0013 target_med=76.2600
+19:23:57 [INFO]     earlystop@ 75: failure_rate=8.60% (no accept; best=6.80%, min_delta=1.0%)
+19:24:02 [INFO]   Epoch  80/100  train=4.3483(imit=0.068,spec=2.484,phys=0.035,invalid=0.117,manifold=0.344)  val=0.0000(imit=0.068,spec=2.658,phys=0.035,invalid=0.124,manifold=0.359)  lr=1.86e-04
+19:24:02 [INFO]     earlystop@ 80: failure_rate=8.50% (no accept; best=6.80%, min_delta=1.0%)
+19:24:02 [INFO]     earlystop/power: mean=0.0544 median=0.0078 p90=0.1047 degrade_rate=4.3%
+19:24:02 [INFO]     earlystop/jitter: mean=0.0753 median=0.0000 p90=0.1727 degrade_rate=8.7%
+19:24:02 [INFO]     earlystop/height: mean=0.1032 median=0.0559 p90=0.2563 degrade_rate=17.6%
+19:24:02 [INFO]     earlystop/width: mean=0.0661 median=0.0126 p90=0.1490 degrade_rate=8.5%
+19:24:02 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.39 failure_rate=8.5%
+19:24:02 [INFO]     earlystop/validity: invalid_rate=1.9%
+19:24:02 [INFO]     earlystop/power raw: pred_mean=0.0056 target_mean=0.0078 pred_med=0.0039 target_med=0.0045
+19:24:02 [INFO]     earlystop/jitter raw: pred_mean=28.9899 target_mean=35.4828 pred_med=23.3378 target_med=24.8750
+19:24:02 [INFO]     earlystop/height raw: pred_mean=27.3504 target_mean=30.4517 pred_med=27.5128 target_med=30.7000
+19:24:02 [INFO]     earlystop/width raw: pred_mean=63.8464 target_mean=66.6874 pred_med=72.9371 target_med=76.2600
+19:24:06 [INFO]     earlystop@ 85: failure_rate=6.70% (no accept; best=6.80%, min_delta=1.0%)
+19:24:10 [INFO]   Epoch  90/100  train=4.3173(imit=0.068,spec=2.464,phys=0.035,invalid=0.117,manifold=0.344)  val=0.0000(imit=0.068,spec=2.631,phys=0.035,invalid=0.117,manifold=0.359)  lr=1.22e-04
+19:24:10 [INFO]     earlystop@ 90: failure_rate=6.90% (no accept; best=6.80%, min_delta=1.0%)
+19:24:10 [INFO]     earlystop/power: mean=0.0499 median=0.0058 p90=0.0918 degrade_rate=4.2%
+19:24:10 [INFO]     earlystop/jitter: mean=0.0541 median=0.0000 p90=0.1354 degrade_rate=7.3%
+19:24:10 [INFO]     earlystop/height: mean=0.0939 median=0.0431 p90=0.2400 degrade_rate=15.4%
+19:24:10 [INFO]     earlystop/width: mean=0.0512 median=0.0037 p90=0.0962 degrade_rate=7.5%
+19:24:10 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.34 failure_rate=6.9%
+19:24:10 [INFO]     earlystop/validity: invalid_rate=1.9%
+19:24:10 [INFO]     earlystop/power raw: pred_mean=0.0055 target_mean=0.0078 pred_med=0.0039 target_med=0.0045
+19:24:10 [INFO]     earlystop/jitter raw: pred_mean=28.5385 target_mean=35.4828 pred_med=22.5337 target_med=24.8750
+19:24:10 [INFO]     earlystop/height raw: pred_mean=27.8226 target_mean=30.4517 pred_med=28.8156 target_med=30.7000
+19:24:10 [INFO]     earlystop/width raw: pred_mean=65.1841 target_mean=66.6874 pred_med=75.2118 target_med=76.2600
+19:24:14 [INFO]     earlystop@ 95: failure_rate=6.30% (no accept; best=6.80%, min_delta=1.0%)
+19:24:18 [INFO]   Epoch 100/100  train=4.3122(imit=0.068,spec=2.461,phys=0.035,invalid=0.116,manifold=0.343)  val=0.0000(imit=0.068,spec=2.612,phys=0.035,invalid=0.118,manifold=0.358)  lr=1.00e-04
+19:24:18 [INFO]     earlystop@100: failure_rate=6.00% (no accept; best=6.80%, min_delta=1.0%)
+19:24:18 [INFO]     earlystop/power: mean=0.0447 median=0.0000 p90=0.0797 degrade_rate=4.0%
+19:24:18 [INFO]     earlystop/jitter: mean=0.0500 median=0.0000 p90=0.1250 degrade_rate=7.2%
+19:24:18 [INFO]     earlystop/height: mean=0.0850 median=0.0309 p90=0.2181 degrade_rate=12.5%
+19:24:18 [INFO]     earlystop/width: mean=0.0486 median=0.0000 p90=0.0868 degrade_rate=6.8%
+19:24:18 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.30 failure_rate=6.0%
+19:24:18 [INFO]     earlystop/validity: invalid_rate=1.3%
+19:24:18 [INFO]     earlystop/power raw: pred_mean=0.0054 target_mean=0.0078 pred_med=0.0038 target_med=0.0045
+19:24:18 [INFO]     earlystop/jitter raw: pred_mean=28.3826 target_mean=35.4828 pred_med=22.2934 target_med=24.8750
+19:24:18 [INFO]     earlystop/height raw: pred_mean=28.1393 target_mean=30.4517 pred_med=28.2757 target_med=30.7000
+19:24:18 [INFO]     earlystop/width raw: pred_mean=65.6660 target_mean=66.6874 pred_med=75.4533 target_med=76.2600
+19:24:19 [INFO]   Carry-forward: restored best-failure-rate model (6.80% on COMMON_EVAL_SPECS, prev=100.00%, delta=+93.20pts)
+19:24:19 [INFO] Validation failure rate: 6.8%  (68/1000 specs)
+19:24:19 [INFO]   boundary: 10.8%  interior: 2.8%
+19:24:19 [INFO]   val/power: mean=0.0424 median=0.0000 p90=0.0691 degrade_rate=4.1%
+19:24:19 [INFO]   val/jitter: mean=0.0636 median=0.0000 p90=0.1744 degrade_rate=8.8%
+19:24:19 [INFO]   val/height: mean=0.0885 median=0.0287 p90=0.2397 degrade_rate=13.9%
+19:24:19 [INFO]   val/width: mean=0.0612 median=0.0073 p90=0.1367 degrade_rate=7.9%
+19:24:19 [INFO]   val/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.35 failure_rate=6.8%
+19:24:19 [INFO]   val/validity: invalid_rate=2.7%
+19:24:19 [INFO]   val/power raw: pred_mean=0.0053 target_mean=0.0078 pred_med=0.0037 target_med=0.0045
+19:24:19 [INFO]   val/jitter raw: pred_mean=27.8425 target_mean=35.4828 pred_med=22.1403 target_med=24.8750
+19:24:19 [INFO]   val/height raw: pred_mean=27.8270 target_mean=30.4517 pred_med=28.9625 target_med=30.7000
+19:24:19 [INFO]   val/width raw: pred_mean=64.9794 target_mean=66.6874 pred_med=75.1364 target_med=76.2600
+19:24:19 [INFO]   Iter 1 final=6.80% vs prev=100.00% (delta +93.20 pts) -> keep_new
+19:24:19 [INFO]   Iter 1 loss summary: train_total=4.892(imit=0.068,spec=2.841,phys=0.036,invalid=0.123,manifold=0.355)  val_total=0.000(imit=0.068,spec=2.612,phys=0.035,invalid=0.118,manifold=0.358)
+19:24:19 [INFO]   LR reset to 1.00e-03; cosine scheduler restarted for next iteration
+19:24:19 [INFO]   Querying teacher for 68 failed specs ...
+19:24:19 [INFO]   Interior specs (14): using flow teacher
+19:24:19 [INFO]   filter_by_zig_validity: 14/14 passed (threshold=0.5)
+19:24:19 [INFO]   label_batch: 14/14 passed validity gate (threshold=0.5)
+19:24:19 [INFO]   filter_by_zig_validity: 14/14 passed (threshold=0.5)
+19:24:19 [INFO]   Boundary specs (54): high-budget flow + k-NN fallback
+19:24:22 [INFO]   filter_by_zig_validity: 54/54 passed (threshold=0.5)
+19:24:22 [INFO]   label_batch: 54/54 passed validity gate (threshold=0.5)
+19:24:22 [INFO]   filter_by_zig_validity: 54/54 passed (threshold=0.5)
+19:24:22 [INFO]   Teacher labels: flow=68, k-NN=0, total=68/68
+19:24:22 [INFO]   filter_by_zig_validity: 68/68 passed (threshold=0.5)
+19:24:22 [INFO]   filter_by_zig_consistency: 39/68 passed  (boundary=54, interior=14)
+19:24:22 [INFO]   filter_by_zig_consistency_relaxed: 39/68 passed  (boundary=54, interior=14)
+19:24:22 [INFO]   DAgger labels: validity@0.5=100.0%  strict_consistency=57.4%  relaxed_consistency=57.4%
+19:24:22 [INFO]   Added 68 labeled failures.  Dataset now: 20068
+19:24:22 [INFO] ============================================================
+19:24:22 [INFO]   DAgger Iteration 2/8
+19:24:22 [INFO] ============================================================
+19:24:22 [INFO] Dataset size: 20068
+19:24:22 [INFO]   Prev-iter baseline: prev_failure_rate=6.80% on COMMON_EVAL_SPECS (n=1000)
+19:24:22 [INFO]   Shared eval set (COMMON_EVAL_SPECS): n=1000 specs (seed=24681012, every=5ep, log_every=10ep, skip_first=5ep)
+19:24:23 [INFO]   Epoch   1/100  train=0.0369(imit=0.037,spec=0.000,phys=0.000,invalid=0.000,manifold=0.334)  val=0.0000(imit=0.028,spec=0.000,phys=0.000,invalid=0.000,manifold=0.358)  lr=1.00e-03
+19:24:27 [INFO]     earlystop@  5: failure_rate=9.20% (skipped, epoch 5 <= EARLYSTOP_SKIP_EPOCHS=5)
+19:24:31 [INFO]   Epoch  10/100  train=4.5782(imit=0.068,spec=2.630,phys=0.037,invalid=0.122,manifold=0.346)  val=0.0000(imit=0.069,spec=2.824,phys=0.036,invalid=0.133,manifold=0.356)  lr=9.78e-04
+19:24:31 [INFO]     earlystop@ 10: failure_rate=10.20% (no accept; best=6.80%, min_delta=1.0%)
+19:24:31 [INFO]     earlystop/power: mean=0.0771 median=0.0383 p90=0.1561 degrade_rate=5.8%
+19:24:31 [INFO]     earlystop/jitter: mean=0.0492 median=0.0000 p90=0.0990 degrade_rate=6.8%
+19:24:31 [INFO]     earlystop/height: mean=0.1579 median=0.1277 p90=0.3284 degrade_rate=31.5%
+19:24:31 [INFO]     earlystop/width: mean=0.0797 median=0.0032 p90=0.2359 degrade_rate=10.7%
+19:24:31 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.55 failure_rate=10.2%
+19:24:31 [INFO]     earlystop/validity: invalid_rate=4.3%
+19:24:31 [INFO]     earlystop/power raw: pred_mean=0.0057 target_mean=0.0078 pred_med=0.0041 target_med=0.0045
+19:24:31 [INFO]     earlystop/jitter raw: pred_mean=27.6104 target_mean=35.4828 pred_med=22.1245 target_med=24.8750
+19:24:31 [INFO]     earlystop/height raw: pred_mean=25.0173 target_mean=30.4517 pred_med=26.0762 target_med=30.7000
+19:24:31 [INFO]     earlystop/width raw: pred_mean=62.8596 target_mean=66.6874 pred_med=72.4969 target_med=76.2600
+19:24:35 [INFO]     earlystop@ 15: failure_rate=8.80% (no accept; best=6.80%, min_delta=1.0%)
+19:24:39 [INFO]   Epoch  20/100  train=4.4729(imit=0.070,spec=2.557,phys=0.038,invalid=0.124,manifold=0.344)  val=0.0000(imit=0.068,spec=2.754,phys=0.036,invalid=0.122,manifold=0.361)  lr=9.14e-04
+19:24:39 [INFO]     earlystop@ 20: failure_rate=7.30% (no accept; best=6.80%, min_delta=1.0%)
+19:24:39 [INFO]     earlystop/power: mean=0.0442 median=0.0000 p90=0.0753 degrade_rate=3.6%
+19:24:39 [INFO]     earlystop/jitter: mean=0.0575 median=0.0000 p90=0.1296 degrade_rate=7.9%
+19:24:39 [INFO]     earlystop/height: mean=0.0966 median=0.0388 p90=0.2520 degrade_rate=15.6%
+19:24:39 [INFO]     earlystop/width: mean=0.0600 median=0.0000 p90=0.1704 degrade_rate=8.9%
+19:24:39 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.36 failure_rate=7.3%
+19:24:39 [INFO]     earlystop/validity: invalid_rate=2.8%
+19:24:39 [INFO]     earlystop/power raw: pred_mean=0.0055 target_mean=0.0078 pred_med=0.0038 target_med=0.0045
+19:24:39 [INFO]     earlystop/jitter raw: pred_mean=27.4767 target_mean=35.4828 pred_med=21.2351 target_med=24.8750
+19:24:39 [INFO]     earlystop/height raw: pred_mean=27.4957 target_mean=30.4517 pred_med=28.5106 target_med=30.7000
+19:24:39 [INFO]     earlystop/width raw: pred_mean=65.2183 target_mean=66.6874 pred_med=76.1846 target_med=76.2600
+19:24:43 [INFO]     earlystop@ 25: failure_rate=10.40% (no accept; best=6.80%, min_delta=1.0%)
+19:24:48 [INFO]   Epoch  30/100  train=4.4033(imit=0.070,spec=2.527,phys=0.036,invalid=0.120,manifold=0.328)  val=0.0000(imit=0.070,spec=2.717,phys=0.036,invalid=0.130,manifold=0.349)  lr=8.15e-04
+19:24:48 [INFO]     earlystop@ 30: failure_rate=8.70% (no accept; best=6.80%, min_delta=1.0%)
+19:24:48 [INFO]     earlystop/power: mean=0.0362 median=0.0000 p90=0.0471 degrade_rate=3.5%
+19:24:48 [INFO]     earlystop/jitter: mean=0.0688 median=0.0000 p90=0.1701 degrade_rate=8.8%
+19:24:48 [INFO]     earlystop/height: mean=0.1400 median=0.1019 p90=0.3120 degrade_rate=26.6%
+19:24:48 [INFO]     earlystop/width: mean=0.0745 median=0.0109 p90=0.1958 degrade_rate=9.9%
+19:24:48 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.49 failure_rate=8.7%
+19:24:48 [INFO]     earlystop/validity: invalid_rate=2.7%
+19:24:48 [INFO]     earlystop/power raw: pred_mean=0.0052 target_mean=0.0078 pred_med=0.0036 target_med=0.0045
+19:24:48 [INFO]     earlystop/jitter raw: pred_mean=29.0744 target_mean=35.4828 pred_med=23.2682 target_med=24.8750
+19:24:48 [INFO]     earlystop/height raw: pred_mean=26.0262 target_mean=30.4517 pred_med=26.5040 target_med=30.7000
+19:24:48 [INFO]     earlystop/width raw: pred_mean=62.9339 target_mean=66.6874 pred_med=72.3364 target_med=76.2600
+19:24:53 [INFO]     earlystop@ 35: failure_rate=5.70% (new best, prev=6.80%, delta=+1.10pts)
+19:24:57 [INFO]   Epoch  40/100  train=4.3584(imit=0.070,spec=2.498,phys=0.033,invalid=0.123,manifold=0.324)  val=0.0000(imit=0.070,spec=2.682,phys=0.034,invalid=0.127,manifold=0.340)  lr=6.89e-04
+19:24:57 [INFO]     earlystop@ 40: failure_rate=6.40% (no accept; best=5.70%, min_delta=1.0%)
+19:24:57 [INFO]     earlystop/power: mean=0.0508 median=0.0003 p90=0.0854 degrade_rate=4.2%
+19:24:57 [INFO]     earlystop/jitter: mean=0.0516 median=0.0000 p90=0.1506 degrade_rate=8.4%
+19:24:57 [INFO]     earlystop/height: mean=0.0899 median=0.0325 p90=0.2354 degrade_rate=13.8%
+19:24:57 [INFO]     earlystop/width: mean=0.0548 median=0.0017 p90=0.1214 degrade_rate=7.7%
+19:24:57 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.34 failure_rate=6.4%
+19:24:57 [INFO]     earlystop/validity: invalid_rate=2.2%
+19:24:57 [INFO]     earlystop/power raw: pred_mean=0.0056 target_mean=0.0078 pred_med=0.0038 target_med=0.0045
+19:24:57 [INFO]     earlystop/jitter raw: pred_mean=28.3022 target_mean=35.4828 pred_med=22.3030 target_med=24.8750
+19:24:57 [INFO]     earlystop/height raw: pred_mean=27.9898 target_mean=30.4517 pred_med=28.4767 target_med=30.7000
+19:24:57 [INFO]     earlystop/width raw: pred_mean=65.0106 target_mean=66.6874 pred_med=75.3054 target_med=76.2600
+19:25:02 [INFO]     earlystop@ 45: failure_rate=7.90% (no accept; best=5.70%, min_delta=1.0%)
+19:25:06 [INFO]   Epoch  50/100  train=4.3534(imit=0.072,spec=2.497,phys=0.032,invalid=0.126,manifold=0.316)  val=0.0000(imit=0.072,spec=2.686,phys=0.031,invalid=0.132,manifold=0.336)  lr=5.50e-04
+19:25:06 [INFO]     earlystop@ 50: failure_rate=8.10% (no accept; best=5.70%, min_delta=1.0%)
+19:25:06 [INFO]     earlystop/power: mean=0.0386 median=0.0000 p90=0.0621 degrade_rate=3.6%
+19:25:06 [INFO]     earlystop/jitter: mean=0.0558 median=0.0000 p90=0.1480 degrade_rate=8.1%
+19:25:06 [INFO]     earlystop/height: mean=0.1239 median=0.0868 p90=0.2808 degrade_rate=22.3%
+19:25:06 [INFO]     earlystop/width: mean=0.0647 median=0.0075 p90=0.1648 degrade_rate=8.5%
+19:25:06 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.42 failure_rate=8.1%
+19:25:06 [INFO]     earlystop/validity: invalid_rate=2.8%
+19:25:06 [INFO]     earlystop/power raw: pred_mean=0.0055 target_mean=0.0078 pred_med=0.0037 target_med=0.0045
+19:25:06 [INFO]     earlystop/jitter raw: pred_mean=28.8154 target_mean=35.4828 pred_med=22.6217 target_med=24.8750
+19:25:06 [INFO]     earlystop/height raw: pred_mean=26.1946 target_mean=30.4517 pred_med=26.2678 target_med=30.7000
+19:25:06 [INFO]     earlystop/width raw: pred_mean=64.0529 target_mean=66.6874 pred_med=73.6616 target_med=76.2600
+19:25:10 [INFO]     earlystop@ 55: failure_rate=6.00% (no accept; best=5.70%, min_delta=1.0%)
+19:25:14 [INFO]   Epoch  60/100  train=4.2645(imit=0.073,spec=2.443,phys=0.030,invalid=0.127,manifold=0.307)  val=0.0000(imit=0.071,spec=2.631,phys=0.031,invalid=0.123,manifold=0.330)  lr=4.11e-04
+19:25:14 [INFO]     earlystop@ 60: failure_rate=6.80% (no accept; best=5.70%, min_delta=1.0%)
+19:25:14 [INFO]     earlystop/power: mean=0.0536 median=0.0153 p90=0.0930 degrade_rate=4.0%
+19:25:14 [INFO]     earlystop/jitter: mean=0.0483 median=0.0000 p90=0.1262 degrade_rate=7.7%
+19:25:14 [INFO]     earlystop/height: mean=0.0876 median=0.0320 p90=0.2326 degrade_rate=14.6%
+19:25:14 [INFO]     earlystop/width: mean=0.0549 median=0.0034 p90=0.1122 degrade_rate=7.3%
+19:25:14 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.34 failure_rate=6.8%
+19:25:14 [INFO]     earlystop/validity: invalid_rate=1.8%
+19:25:14 [INFO]     earlystop/power raw: pred_mean=0.0057 target_mean=0.0078 pred_med=0.0039 target_med=0.0045
+19:25:14 [INFO]     earlystop/jitter raw: pred_mean=28.4420 target_mean=35.4828 pred_med=22.4595 target_med=24.8750
+19:25:14 [INFO]     earlystop/height raw: pred_mean=27.8196 target_mean=30.4517 pred_med=27.3444 target_med=30.7000
+19:25:14 [INFO]     earlystop/width raw: pred_mean=65.2146 target_mean=66.6874 pred_med=74.5715 target_med=76.2600
+19:25:19 [INFO]     earlystop@ 65: failure_rate=6.40% (no accept; best=5.70%, min_delta=1.0%)
+19:25:24 [INFO]   Epoch  70/100  train=4.2610(imit=0.073,spec=2.438,phys=0.031,invalid=0.125,manifold=0.311)  val=0.0000(imit=0.073,spec=2.595,phys=0.032,invalid=0.134,manifold=0.328)  lr=2.85e-04
+19:25:24 [INFO]     earlystop@ 70: failure_rate=8.30% (no accept; best=5.70%, min_delta=1.0%)
+19:25:24 [INFO]     earlystop/power: mean=0.0488 median=0.0014 p90=0.1015 degrade_rate=3.6%
+19:25:24 [INFO]     earlystop/jitter: mean=0.0493 median=0.0000 p90=0.1417 degrade_rate=7.2%
+19:25:24 [INFO]     earlystop/height: mean=0.1269 median=0.0904 p90=0.2927 degrade_rate=22.6%
+19:25:24 [INFO]     earlystop/width: mean=0.0674 median=0.0078 p90=0.1744 degrade_rate=9.3%
+19:25:24 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.43 failure_rate=8.3%
+19:25:24 [INFO]     earlystop/validity: invalid_rate=2.8%
+19:25:24 [INFO]     earlystop/power raw: pred_mean=0.0058 target_mean=0.0078 pred_med=0.0038 target_med=0.0045
+19:25:24 [INFO]     earlystop/jitter raw: pred_mean=28.9567 target_mean=35.4828 pred_med=22.8828 target_med=24.8750
+19:25:24 [INFO]     earlystop/height raw: pred_mean=26.4116 target_mean=30.4517 pred_med=25.8060 target_med=30.7000
+19:25:24 [INFO]     earlystop/width raw: pred_mean=63.3832 target_mean=66.6874 pred_med=72.4750 target_med=76.2600
+19:25:28 [INFO]     earlystop@ 75: failure_rate=6.10% (no accept; best=5.70%, min_delta=1.0%)
+19:25:32 [INFO]   Epoch  80/100  train=4.2743(imit=0.071,spec=2.451,phys=0.031,invalid=0.125,manifold=0.309)  val=0.0000(imit=0.072,spec=2.587,phys=0.032,invalid=0.127,manifold=0.328)  lr=1.86e-04
+19:25:32 [INFO]     earlystop@ 80: failure_rate=6.50% (no accept; best=5.70%, min_delta=1.0%)
+19:25:32 [INFO]     earlystop/power: mean=0.0428 median=0.0000 p90=0.0787 degrade_rate=3.4%
+19:25:32 [INFO]     earlystop/jitter: mean=0.0492 median=0.0000 p90=0.1352 degrade_rate=7.1%
+19:25:32 [INFO]     earlystop/height: mean=0.0878 median=0.0262 p90=0.2301 degrade_rate=15.8%
+19:25:32 [INFO]     earlystop/width: mean=0.0569 median=0.0045 p90=0.1312 degrade_rate=8.0%
+19:25:32 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.34 failure_rate=6.5%
+19:25:32 [INFO]     earlystop/validity: invalid_rate=2.3%
+19:25:32 [INFO]     earlystop/power raw: pred_mean=0.0058 target_mean=0.0078 pred_med=0.0038 target_med=0.0045
+19:25:32 [INFO]     earlystop/jitter raw: pred_mean=28.7748 target_mean=35.4828 pred_med=22.7810 target_med=24.8750
+19:25:32 [INFO]     earlystop/height raw: pred_mean=28.2132 target_mean=30.4517 pred_med=27.7268 target_med=30.7000
+19:25:32 [INFO]     earlystop/width raw: pred_mean=64.6224 target_mean=66.6874 pred_med=74.5479 target_med=76.2600
+19:25:37 [INFO]     earlystop@ 85: failure_rate=5.00% (no accept; best=5.70%, min_delta=1.0%)
+19:25:41 [INFO]   Epoch  90/100  train=4.2514(imit=0.073,spec=2.439,phys=0.029,invalid=0.125,manifold=0.304)  val=0.0000(imit=0.072,spec=2.855,phys=0.031,invalid=0.125,manifold=0.328)  lr=1.22e-04
+19:25:41 [INFO]     earlystop@ 90: failure_rate=5.80% (no accept; best=5.70%, min_delta=1.0%)
+19:25:41 [INFO]     earlystop/power: mean=0.0430 median=0.0000 p90=0.0833 degrade_rate=3.5%
+19:25:41 [INFO]     earlystop/jitter: mean=0.0457 median=0.0000 p90=0.1191 degrade_rate=6.6%
+19:25:41 [INFO]     earlystop/height: mean=0.0832 median=0.0269 p90=0.2150 degrade_rate=12.8%
+19:25:41 [INFO]     earlystop/width: mean=0.0513 median=0.0013 p90=0.1179 degrade_rate=7.4%
+19:25:41 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.30 failure_rate=5.8%
+19:25:41 [INFO]     earlystop/validity: invalid_rate=2.1%
+19:25:41 [INFO]     earlystop/power raw: pred_mean=0.0057 target_mean=0.0078 pred_med=0.0038 target_med=0.0045
+19:25:41 [INFO]     earlystop/jitter raw: pred_mean=28.4593 target_mean=35.4828 pred_med=22.4454 target_med=24.8750
+19:25:41 [INFO]     earlystop/height raw: pred_mean=28.1718 target_mean=30.4517 pred_med=28.3696 target_med=30.7000
+19:25:41 [INFO]     earlystop/width raw: pred_mean=65.2758 target_mean=66.6874 pred_med=74.9758 target_med=76.2600
+19:25:45 [INFO]     earlystop@ 95: failure_rate=6.00% (no accept; best=5.70%, min_delta=1.0%)
+19:25:49 [INFO]   Epoch 100/100  train=4.2646(imit=0.073,spec=2.443,phys=0.030,invalid=0.125,manifold=0.310)  val=0.0000(imit=0.072,spec=2.875,phys=0.031,invalid=0.123,manifold=0.329)  lr=1.00e-04
+19:25:49 [INFO]     earlystop@100: failure_rate=5.00% (no accept; best=5.70%, min_delta=1.0%)
+19:25:49 [INFO]     earlystop/power: mean=0.0411 median=0.0000 p90=0.0716 degrade_rate=3.3%
+19:25:49 [INFO]     earlystop/jitter: mean=0.0426 median=0.0000 p90=0.1105 degrade_rate=6.7%
+19:25:49 [INFO]     earlystop/height: mean=0.0742 median=0.0077 p90=0.2029 degrade_rate=10.3%
+19:25:49 [INFO]     earlystop/width: mean=0.0462 median=0.0000 p90=0.1085 degrade_rate=7.1%
+19:25:49 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.27 failure_rate=5.0%
+19:25:49 [INFO]     earlystop/validity: invalid_rate=1.7%
+19:25:49 [INFO]     earlystop/power raw: pred_mean=0.0056 target_mean=0.0078 pred_med=0.0037 target_med=0.0045
+19:25:49 [INFO]     earlystop/jitter raw: pred_mean=28.1759 target_mean=35.4828 pred_med=21.8758 target_med=24.8750
+19:25:49 [INFO]     earlystop/height raw: pred_mean=28.7332 target_mean=30.4517 pred_med=29.1842 target_med=30.7000
+19:25:49 [INFO]     earlystop/width raw: pred_mean=66.0182 target_mean=66.6874 pred_med=76.0121 target_med=76.2600
+19:25:49 [INFO]   Carry-forward: restored best-failure-rate model (5.70% on COMMON_EVAL_SPECS, prev=6.80%, delta=+1.10pts)
+19:25:49 [INFO] Validation failure rate: 5.7%  (57/1000 specs)
+19:25:49 [INFO]   boundary: 9.0%  interior: 2.4%
+19:25:49 [INFO]   val/power: mean=0.0554 median=0.0118 p90=0.0917 degrade_rate=4.1%
+19:25:49 [INFO]   val/jitter: mean=0.0519 median=0.0000 p90=0.1411 degrade_rate=7.4%
+19:25:49 [INFO]   val/height: mean=0.0744 median=0.0009 p90=0.2079 degrade_rate=10.7%
+19:25:49 [INFO]   val/width: mean=0.0491 median=0.0000 p90=0.1223 degrade_rate=7.3%
+19:25:49 [INFO]   val/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.29 failure_rate=5.7%
+19:25:49 [INFO]   val/validity: invalid_rate=1.7%
+19:25:49 [INFO]   val/power raw: pred_mean=0.0056 target_mean=0.0078 pred_med=0.0039 target_med=0.0045
+19:25:49 [INFO]   val/jitter raw: pred_mean=27.6317 target_mean=35.4828 pred_med=21.2528 target_med=24.8750
+19:25:49 [INFO]   val/height raw: pred_mean=28.8270 target_mean=30.4517 pred_med=29.5678 target_med=30.7000
+19:25:49 [INFO]   val/width raw: pred_mean=66.0844 target_mean=66.6874 pred_med=76.6239 target_med=76.2600
+19:25:49 [INFO]   Iter 2 final=5.70% vs prev=6.80% (delta +1.10 pts) -> keep_new
+19:25:49 [INFO]   Iter 2 loss summary: train_total=4.773(imit=0.070,spec=2.785,phys=0.031,invalid=0.121,manifold=0.323)  val_total=0.000(imit=0.072,spec=2.875,phys=0.031,invalid=0.123,manifold=0.329)
+19:25:49 [INFO]   LR reset to 1.00e-03; cosine scheduler restarted for next iteration
+19:25:49 [INFO]   Querying teacher for 57 failed specs ...
+19:25:49 [INFO]   Interior specs (12): using flow teacher
+19:25:49 [INFO]   filter_by_zig_validity: 12/12 passed (threshold=0.5)
+19:25:49 [INFO]   label_batch: 12/12 passed validity gate (threshold=0.5)
+19:25:49 [INFO]   filter_by_zig_validity: 12/12 passed (threshold=0.5)
+19:25:49 [INFO]   Boundary specs (45): high-budget flow + k-NN fallback
+19:25:51 [INFO]   filter_by_zig_validity: 45/45 passed (threshold=0.5)
+19:25:51 [INFO]   label_batch: 45/45 passed validity gate (threshold=0.5)
+19:25:51 [INFO]   filter_by_zig_validity: 45/45 passed (threshold=0.5)
+19:25:51 [INFO]   Teacher labels: flow=57, k-NN=0, total=57/57
+19:25:51 [INFO]   filter_by_zig_validity: 57/57 passed (threshold=0.5)
+19:25:51 [INFO]   filter_by_zig_consistency: 36/57 passed  (boundary=45, interior=12)
+19:25:51 [INFO]   filter_by_zig_consistency_relaxed: 36/57 passed  (boundary=45, interior=12)
+19:25:51 [INFO]   DAgger labels: validity@0.5=100.0%  strict_consistency=63.2%  relaxed_consistency=63.2%
+19:25:51 [INFO]   Added 57 labeled failures.  Dataset now: 20125
+19:25:51 [INFO] ============================================================
+19:25:51 [INFO]   DAgger Iteration 3/8
+19:25:51 [INFO] ============================================================
+19:25:51 [INFO] Dataset size: 20125
+19:25:51 [INFO]   Prev-iter baseline: prev_failure_rate=5.70% on COMMON_EVAL_SPECS (n=1000)
+19:25:51 [INFO]   Shared eval set (COMMON_EVAL_SPECS): n=1000 specs (seed=24681012, every=5ep, log_every=10ep, skip_first=5ep)
+19:25:52 [INFO]   Epoch   1/100  train=0.0381(imit=0.038,spec=0.000,phys=0.000,invalid=0.000,manifold=0.348)  val=0.0000(imit=0.028,spec=0.000,phys=0.000,invalid=0.000,manifold=0.360)  lr=1.00e-03
+19:25:55 [INFO]     earlystop@  5: failure_rate=19.10% (skipped, epoch 5 <= EARLYSTOP_SKIP_EPOCHS=5)
+19:25:59 [INFO]   Epoch  10/100  train=4.8059(imit=0.064,spec=2.747,phys=0.034,invalid=0.134,manifold=0.387)  val=0.0000(imit=0.064,spec=2.929,phys=0.035,invalid=0.143,manifold=0.398)  lr=9.78e-04
+19:25:59 [INFO]     earlystop@ 10: failure_rate=15.60% (no accept; best=5.70%, min_delta=1.0%)
+19:25:59 [INFO]     earlystop/power: mean=0.0529 median=0.0000 p90=0.1192 degrade_rate=3.9%
+19:25:59 [INFO]     earlystop/jitter: mean=0.0533 median=0.0000 p90=0.1474 degrade_rate=6.6%
+19:25:59 [INFO]     earlystop/height: mean=0.1451 median=0.0600 p90=0.3997 degrade_rate=26.3%
+19:25:59 [INFO]     earlystop/width: mean=0.1207 median=0.0119 p90=0.5138 degrade_rate=17.7%
+19:25:59 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.55 failure_rate=15.6%
+19:25:59 [INFO]     earlystop/validity: invalid_rate=7.0%
+19:25:59 [INFO]     earlystop/power raw: pred_mean=0.0053 target_mean=0.0078 pred_med=0.0036 target_med=0.0045
+19:25:59 [INFO]     earlystop/jitter raw: pred_mean=26.7231 target_mean=35.4828 pred_med=21.3697 target_med=24.8750
+19:25:59 [INFO]     earlystop/height raw: pred_mean=27.2930 target_mean=30.4517 pred_med=30.9887 target_med=30.7000
+19:25:59 [INFO]     earlystop/width raw: pred_mean=60.5377 target_mean=66.6874 pred_med=72.7493 target_med=76.2600
+19:26:04 [INFO]     earlystop@ 15: failure_rate=15.00% (no accept; best=5.70%, min_delta=1.0%)
+19:26:08 [INFO]   Epoch  20/100  train=4.4860(imit=0.065,spec=2.550,phys=0.034,invalid=0.129,manifold=0.368)  val=0.0000(imit=0.065,spec=2.757,phys=0.035,invalid=0.140,manifold=0.386)  lr=9.14e-04
+19:26:08 [INFO]     earlystop@ 20: failure_rate=19.50% (no accept; best=5.70%, min_delta=1.0%)
+19:26:08 [INFO]     earlystop/power: mean=0.0401 median=0.0000 p90=0.0722 degrade_rate=3.5%
+19:26:08 [INFO]     earlystop/jitter: mean=0.0708 median=0.0000 p90=0.2033 degrade_rate=10.4%
+19:26:08 [INFO]     earlystop/height: mean=0.1810 median=0.1134 p90=0.5132 degrade_rate=32.8%
+19:26:08 [INFO]     earlystop/width: mean=0.1478 median=0.0357 p90=0.5688 degrade_rate=21.3%
+19:26:08 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.68 failure_rate=19.5%
+19:26:08 [INFO]     earlystop/validity: invalid_rate=8.0%
+19:26:08 [INFO]     earlystop/power raw: pred_mean=0.0052 target_mean=0.0078 pred_med=0.0037 target_med=0.0045
+19:26:08 [INFO]     earlystop/jitter raw: pred_mean=28.7334 target_mean=35.4828 pred_med=23.8110 target_med=24.8750
+19:26:08 [INFO]     earlystop/height raw: pred_mean=25.6607 target_mean=30.4517 pred_med=27.1413 target_med=30.7000
+19:26:08 [INFO]     earlystop/width raw: pred_mean=57.4889 target_mean=66.6874 pred_med=66.2717 target_med=76.2600
+19:26:12 [INFO]     earlystop@ 25: failure_rate=16.30% (no accept; best=5.70%, min_delta=1.0%)
+19:26:16 [INFO]   Epoch  30/100  train=4.5045(imit=0.066,spec=2.568,phys=0.035,invalid=0.129,manifold=0.358)  val=0.0000(imit=0.065,spec=2.722,phys=0.036,invalid=0.134,manifold=0.371)  lr=8.15e-04
+19:26:16 [INFO]     earlystop@ 30: failure_rate=15.70% (no accept; best=5.70%, min_delta=1.0%)
+19:26:16 [INFO]     earlystop/power: mean=0.0364 median=0.0000 p90=0.0572 degrade_rate=3.8%
+19:26:16 [INFO]     earlystop/jitter: mean=0.1188 median=0.0428 p90=0.3006 degrade_rate=21.4%
+19:26:16 [INFO]     earlystop/height: mean=0.1421 median=0.0667 p90=0.4124 degrade_rate=23.3%
+19:26:16 [INFO]     earlystop/width: mean=0.1256 median=0.0337 p90=0.4679 degrade_rate=17.0%
+19:26:16 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.66 failure_rate=15.7%
+19:26:16 [INFO]     earlystop/validity: invalid_rate=5.6%
+19:26:16 [INFO]     earlystop/power raw: pred_mean=0.0050 target_mean=0.0078 pred_med=0.0036 target_med=0.0045
+19:26:16 [INFO]     earlystop/jitter raw: pred_mean=29.4115 target_mean=35.4828 pred_med=25.3391 target_med=24.8750
+19:26:16 [INFO]     earlystop/height raw: pred_mean=27.4110 target_mean=30.4517 pred_med=29.7184 target_med=30.7000
+19:26:16 [INFO]     earlystop/width raw: pred_mean=59.1452 target_mean=66.6874 pred_med=69.5419 target_med=76.2600
+19:26:20 [INFO]     earlystop@ 35: failure_rate=13.70% (no accept; best=5.70%, min_delta=1.0%)
+19:26:25 [INFO]   Epoch  40/100  train=4.4359(imit=0.065,spec=2.534,phys=0.036,invalid=0.124,manifold=0.348)  val=0.0000(imit=0.066,spec=2.686,phys=0.035,invalid=0.128,manifold=0.372)  lr=6.89e-04
+19:26:25 [INFO]     earlystop@ 40: failure_rate=11.80% (no accept; best=5.70%, min_delta=1.0%)
+19:26:25 [INFO]     earlystop/power: mean=0.0559 median=0.0165 p90=0.1046 degrade_rate=3.9%
+19:26:25 [INFO]     earlystop/jitter: mean=0.0472 median=0.0000 p90=0.0947 degrade_rate=6.8%
+19:26:25 [INFO]     earlystop/height: mean=0.1068 median=0.0000 p90=0.3331 degrade_rate=18.3%
+19:26:25 [INFO]     earlystop/width: mean=0.0872 median=0.0027 p90=0.3108 degrade_rate=13.0%
+19:26:25 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.42 failure_rate=11.8%
+19:26:25 [INFO]     earlystop/validity: invalid_rate=4.8%
+19:26:25 [INFO]     earlystop/power raw: pred_mean=0.0056 target_mean=0.0078 pred_med=0.0038 target_med=0.0045
+19:26:25 [INFO]     earlystop/jitter raw: pred_mean=27.2832 target_mean=35.4828 pred_med=21.3655 target_med=24.8750
+19:26:25 [INFO]     earlystop/height raw: pred_mean=29.0845 target_mean=30.4517 pred_med=32.9933 target_med=30.7000
+19:26:25 [INFO]     earlystop/width raw: pred_mean=62.4910 target_mean=66.6874 pred_med=74.0503 target_med=76.2600
+19:26:29 [INFO]     earlystop@ 45: failure_rate=12.10% (no accept; best=5.70%, min_delta=1.0%)
+19:26:33 [INFO]   Epoch  50/100  train=4.4284(imit=0.066,spec=2.521,phys=0.034,invalid=0.124,manifold=0.361)  val=0.0000(imit=0.066,spec=2.662,phys=0.035,invalid=0.133,manifold=0.370)  lr=5.50e-04
+19:26:33 [INFO]     earlystop@ 50: failure_rate=15.00% (no accept; best=5.70%, min_delta=1.0%)
+19:26:33 [INFO]     earlystop/power: mean=0.0501 median=0.0124 p90=0.0903 degrade_rate=3.7%
+19:26:33 [INFO]     earlystop/jitter: mean=0.0661 median=0.0000 p90=0.1609 degrade_rate=8.3%
+19:26:33 [INFO]     earlystop/height: mean=0.1459 median=0.0737 p90=0.4036 degrade_rate=24.8%
+19:26:33 [INFO]     earlystop/width: mean=0.1160 median=0.0262 p90=0.4132 degrade_rate=16.4%
+19:26:33 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.53 failure_rate=15.0%
+19:26:33 [INFO]     earlystop/validity: invalid_rate=5.0%
+19:26:33 [INFO]     earlystop/power raw: pred_mean=0.0057 target_mean=0.0078 pred_med=0.0037 target_med=0.0045
+19:26:33 [INFO]     earlystop/jitter raw: pred_mean=29.2440 target_mean=35.4828 pred_med=23.8199 target_med=24.8750
+19:26:33 [INFO]     earlystop/height raw: pred_mean=26.7608 target_mean=30.4517 pred_med=28.9132 target_med=30.7000
+19:26:33 [INFO]     earlystop/width raw: pred_mean=59.5938 target_mean=66.6874 pred_med=69.3328 target_med=76.2600
+19:26:37 [INFO]     earlystop@ 55: failure_rate=13.80% (no accept; best=5.70%, min_delta=1.0%)
+19:26:41 [INFO]   Epoch  60/100  train=4.4462(imit=0.067,spec=2.529,phys=0.035,invalid=0.125,manifold=0.362)  val=0.0000(imit=0.065,spec=2.653,phys=0.035,invalid=0.129,manifold=0.372)  lr=4.11e-04
+19:26:41 [INFO]     earlystop@ 60: failure_rate=11.30% (no accept; best=5.70%, min_delta=1.0%)
+19:26:41 [INFO]     earlystop/power: mean=0.0655 median=0.0331 p90=0.1229 degrade_rate=3.8%
+19:26:41 [INFO]     earlystop/jitter: mean=0.0443 median=0.0000 p90=0.1006 degrade_rate=6.0%
+19:26:41 [INFO]     earlystop/height: mean=0.1156 median=0.0292 p90=0.3444 degrade_rate=18.5%
+19:26:41 [INFO]     earlystop/width: mean=0.0984 median=0.0167 p90=0.3299 degrade_rate=14.5%
+19:26:41 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.43 failure_rate=11.3%
+19:26:41 [INFO]     earlystop/validity: invalid_rate=5.4%
+19:26:41 [INFO]     earlystop/power raw: pred_mean=0.0058 target_mean=0.0078 pred_med=0.0038 target_med=0.0045
+19:26:41 [INFO]     earlystop/jitter raw: pred_mean=28.5901 target_mean=35.4828 pred_med=22.8544 target_med=24.8750
+19:26:41 [INFO]     earlystop/height raw: pred_mean=28.1156 target_mean=30.4517 pred_med=30.0602 target_med=30.7000
+19:26:41 [INFO]     earlystop/width raw: pred_mean=60.9668 target_mean=66.6874 pred_med=71.3363 target_med=76.2600
+19:26:46 [INFO]     earlystop@ 65: failure_rate=11.40% (no accept; best=5.70%, min_delta=1.0%)
+19:26:51 [INFO]   Epoch  70/100  train=4.3110(imit=0.066,spec=2.457,phys=0.033,invalid=0.120,manifold=0.348)  val=0.0000(imit=0.066,spec=2.616,phys=0.035,invalid=0.128,manifold=0.367)  lr=2.85e-04
+19:26:51 [INFO]     earlystop@ 70: failure_rate=12.00% (no accept; best=5.70%, min_delta=1.0%)
+19:26:51 [INFO]     earlystop/power: mean=0.0396 median=0.0000 p90=0.0745 degrade_rate=3.3%
+19:26:51 [INFO]     earlystop/jitter: mean=0.0630 median=0.0000 p90=0.1701 degrade_rate=8.6%
+19:26:51 [INFO]     earlystop/height: mean=0.1177 median=0.0486 p90=0.3279 degrade_rate=18.7%
+19:26:51 [INFO]     earlystop/width: mean=0.0998 median=0.0230 p90=0.3106 degrade_rate=13.7%
+19:26:51 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.44 failure_rate=12.0%
+19:26:51 [INFO]     earlystop/validity: invalid_rate=4.4%
+19:26:51 [INFO]     earlystop/power raw: pred_mean=0.0055 target_mean=0.0078 pred_med=0.0036 target_med=0.0045
+19:26:51 [INFO]     earlystop/jitter raw: pred_mean=29.4133 target_mean=35.4828 pred_med=24.3893 target_med=24.8750
+19:26:51 [INFO]     earlystop/height raw: pred_mean=27.3488 target_mean=30.4517 pred_med=28.2761 target_med=30.7000
+19:26:51 [INFO]     earlystop/width raw: pred_mean=60.7123 target_mean=66.6874 pred_med=69.5188 target_med=76.2600
+19:26:55 [INFO]     earlystop@ 75: failure_rate=11.30% (no accept; best=5.70%, min_delta=1.0%)
+19:26:59 [INFO]   Epoch  80/100  train=4.3742(imit=0.067,spec=2.489,phys=0.034,invalid=0.122,manifold=0.357)  val=0.0000(imit=0.066,spec=2.611,phys=0.035,invalid=0.128,manifold=0.363)  lr=1.86e-04
+19:26:59 [INFO]     earlystop@ 80: failure_rate=9.30% (no accept; best=5.70%, min_delta=1.0%)
+19:26:59 [INFO]     earlystop/power: mean=0.0421 median=0.0000 p90=0.0810 degrade_rate=3.4%
+19:26:59 [INFO]     earlystop/jitter: mean=0.0475 median=0.0000 p90=0.1191 degrade_rate=6.9%
+19:26:59 [INFO]     earlystop/height: mean=0.0959 median=0.0119 p90=0.2612 degrade_rate=14.0%
+19:26:59 [INFO]     earlystop/width: mean=0.0838 median=0.0143 p90=0.2656 degrade_rate=12.1%
+19:26:59 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.36 failure_rate=9.3%
+19:26:59 [INFO]     earlystop/validity: invalid_rate=3.9%
+19:26:59 [INFO]     earlystop/power raw: pred_mean=0.0055 target_mean=0.0078 pred_med=0.0037 target_med=0.0045
+19:26:59 [INFO]     earlystop/jitter raw: pred_mean=28.8703 target_mean=35.4828 pred_med=22.8289 target_med=24.8750
+19:26:59 [INFO]     earlystop/height raw: pred_mean=28.6006 target_mean=30.4517 pred_med=29.7175 target_med=30.7000
+19:26:59 [INFO]     earlystop/width raw: pred_mean=62.0048 target_mean=66.6874 pred_med=72.0453 target_med=76.2600
+19:27:04 [INFO]     earlystop@ 85: failure_rate=8.70% (no accept; best=5.70%, min_delta=1.0%)
+19:27:08 [INFO]   Epoch  90/100  train=4.3700(imit=0.066,spec=2.492,phys=0.035,invalid=0.119,manifold=0.353)  val=0.0000(imit=0.066,spec=2.637,phys=0.034,invalid=0.126,manifold=0.367)  lr=1.22e-04
+19:27:08 [INFO]     earlystop@ 90: failure_rate=9.60% (no accept; best=5.70%, min_delta=1.0%)
+19:27:08 [INFO]     earlystop/power: mean=0.0436 median=0.0004 p90=0.0851 degrade_rate=3.3%
+19:27:08 [INFO]     earlystop/jitter: mean=0.0457 median=0.0000 p90=0.1154 degrade_rate=6.4%
+19:27:08 [INFO]     earlystop/height: mean=0.0937 median=0.0125 p90=0.2446 degrade_rate=14.2%
+19:27:08 [INFO]     earlystop/width: mean=0.0814 median=0.0106 p90=0.2550 degrade_rate=12.0%
+19:27:08 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.36 failure_rate=9.6%
+19:27:08 [INFO]     earlystop/validity: invalid_rate=3.6%
+19:27:08 [INFO]     earlystop/power raw: pred_mean=0.0056 target_mean=0.0078 pred_med=0.0037 target_med=0.0045
+19:27:08 [INFO]     earlystop/jitter raw: pred_mean=28.6188 target_mean=35.4828 pred_med=22.4723 target_med=24.8750
+19:27:08 [INFO]     earlystop/height raw: pred_mean=28.1889 target_mean=30.4517 pred_med=29.0589 target_med=30.7000
+19:27:08 [INFO]     earlystop/width raw: pred_mean=62.2923 target_mean=66.6874 pred_med=71.8558 target_med=76.2600
+19:27:12 [INFO]     earlystop@ 95: failure_rate=10.40% (no accept; best=5.70%, min_delta=1.0%)
+19:27:16 [INFO]   Epoch 100/100  train=4.2690(imit=0.067,spec=2.420,phys=0.034,invalid=0.119,manifold=0.359)  val=0.0000(imit=0.066,spec=2.634,phys=0.034,invalid=0.126,manifold=0.367)  lr=1.00e-04
+19:27:16 [INFO]     earlystop@100: failure_rate=9.50% (no accept; best=5.70%, min_delta=1.0%)
+19:27:16 [INFO]     earlystop/power: mean=0.0440 median=0.0057 p90=0.0831 degrade_rate=3.3%
+19:27:16 [INFO]     earlystop/jitter: mean=0.0544 median=0.0000 p90=0.1404 degrade_rate=7.4%
+19:27:16 [INFO]     earlystop/height: mean=0.1005 median=0.0305 p90=0.2733 degrade_rate=14.4%
+19:27:16 [INFO]     earlystop/width: mean=0.0858 median=0.0197 p90=0.2616 degrade_rate=12.4%
+19:27:16 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.38 failure_rate=9.5%
+19:27:16 [INFO]     earlystop/validity: invalid_rate=3.4%
+19:27:16 [INFO]     earlystop/power raw: pred_mean=0.0056 target_mean=0.0078 pred_med=0.0037 target_med=0.0045
+19:27:16 [INFO]     earlystop/jitter raw: pred_mean=29.3358 target_mean=35.4828 pred_med=23.8275 target_med=24.8750
+19:27:16 [INFO]     earlystop/height raw: pred_mean=27.7378 target_mean=30.4517 pred_med=28.2721 target_med=30.7000
+19:27:16 [INFO]     earlystop/width raw: pred_mean=61.7184 target_mean=66.6874 pred_med=71.1951 target_med=76.2600
+19:27:16 [WARNING]   Carry-forward: iteration 3 no >=1.0% improvement (prev=5.70% -> best=5.70%); kept carried-forward model
+19:27:16 [INFO] Validation failure rate: 5.7%  (57/1000 specs)
+19:27:16 [INFO]   boundary: 9.0%  interior: 2.4%
+19:27:16 [INFO]   val/power: mean=0.0554 median=0.0118 p90=0.0917 degrade_rate=4.1%
+19:27:16 [INFO]   val/jitter: mean=0.0519 median=0.0000 p90=0.1411 degrade_rate=7.4%
+19:27:16 [INFO]   val/height: mean=0.0744 median=0.0009 p90=0.2079 degrade_rate=10.7%
+19:27:16 [INFO]   val/width: mean=0.0491 median=0.0000 p90=0.1223 degrade_rate=7.3%
+19:27:16 [INFO]   val/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.29 failure_rate=5.7%
+19:27:16 [INFO]   val/validity: invalid_rate=1.7%
+19:27:16 [INFO]   val/power raw: pred_mean=0.0056 target_mean=0.0078 pred_med=0.0039 target_med=0.0045
+19:27:16 [INFO]   val/jitter raw: pred_mean=27.6317 target_mean=35.4828 pred_med=21.2528 target_med=24.8750
+19:27:16 [INFO]   val/height raw: pred_mean=28.8270 target_mean=30.4517 pred_med=29.5678 target_med=30.7000
+19:27:16 [INFO]   val/width raw: pred_mean=66.0844 target_mean=66.6874 pred_med=76.6239 target_med=76.2600
+19:27:16 [INFO]   Iter 3 final=5.70% vs prev=5.70% (delta +0.00 pts) -> fallback_prev
+19:27:16 [INFO]   Iter 3 loss summary: train_total=4.792(imit=0.065,spec=2.773,phys=0.033,invalid=0.124,manifold=0.359)  val_total=0.000(imit=0.066,spec=2.634,phys=0.034,invalid=0.126,manifold=0.367)
+19:27:16 [INFO]   LR reset to 1.00e-03; cosine scheduler restarted for next iteration
+19:27:16 [INFO]   Querying teacher for 57 failed specs ...
+19:27:16 [INFO]   Interior specs (12): using flow teacher
+19:27:16 [INFO]   filter_by_zig_validity: 12/12 passed (threshold=0.5)
+19:27:16 [INFO]   label_batch: 12/12 passed validity gate (threshold=0.5)
+19:27:16 [INFO]   filter_by_zig_validity: 12/12 passed (threshold=0.5)
+19:27:16 [INFO]   Boundary specs (45): high-budget flow + k-NN fallback
+19:27:18 [INFO]   filter_by_zig_validity: 45/45 passed (threshold=0.5)
+19:27:18 [INFO]   label_batch: 45/45 passed validity gate (threshold=0.5)
+19:27:18 [INFO]   filter_by_zig_validity: 45/45 passed (threshold=0.5)
+19:27:18 [INFO]   Teacher labels: flow=57, k-NN=0, total=57/57
+19:27:18 [INFO]   filter_by_zig_validity: 57/57 passed (threshold=0.5)
+19:27:18 [INFO]   filter_by_zig_consistency: 36/57 passed  (boundary=45, interior=12)
+19:27:18 [INFO]   filter_by_zig_consistency_relaxed: 36/57 passed  (boundary=45, interior=12)
+19:27:18 [INFO]   DAgger labels: validity@0.5=100.0%  strict_consistency=63.2%  relaxed_consistency=63.2%
+19:27:18 [INFO]   Added 57 labeled failures.  Dataset now: 20182
+19:27:18 [INFO] ============================================================
+19:27:18 [INFO]   DAgger Iteration 4/8
+19:27:18 [INFO] ============================================================
+19:27:18 [INFO] Dataset size: 20182
+19:27:18 [INFO]   Prev-iter baseline: prev_failure_rate=5.70% on COMMON_EVAL_SPECS (n=1000)
+19:27:18 [INFO]   Shared eval set (COMMON_EVAL_SPECS): n=1000 specs (seed=24681012, every=5ep, log_every=10ep, skip_first=5ep)
+19:27:19 [INFO]   Epoch   1/100  train=0.0350(imit=0.035,spec=0.000,phys=0.000,invalid=0.000,manifold=0.354)  val=0.0000(imit=0.027,spec=0.000,phys=0.000,invalid=0.000,manifold=0.357)  lr=1.00e-03
+19:27:22 [INFO]     earlystop@  5: failure_rate=15.50% (skipped, epoch 5 <= EARLYSTOP_SKIP_EPOCHS=5)
+19:27:26 [INFO]   Epoch  10/100  train=4.4903(imit=0.068,spec=2.577,phys=0.031,invalid=0.128,manifold=0.335)  val=0.0000(imit=0.067,spec=2.971,phys=0.032,invalid=0.123,manifold=0.356)  lr=9.78e-04
+19:27:26 [INFO]     earlystop@ 10: failure_rate=6.80% (no accept; best=5.70%, min_delta=1.0%)
+19:27:26 [INFO]     earlystop/power: mean=0.0736 median=0.0344 p90=0.1363 degrade_rate=5.6%
+19:27:26 [INFO]     earlystop/jitter: mean=0.0600 median=0.0000 p90=0.1774 degrade_rate=9.1%
+19:27:26 [INFO]     earlystop/height: mean=0.0591 median=0.0000 p90=0.1782 degrade_rate=8.0%
+19:27:26 [INFO]     earlystop/width: mean=0.0587 median=0.0000 p90=0.1449 degrade_rate=8.3%
+19:27:26 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.31 failure_rate=6.8%
+19:27:26 [INFO]     earlystop/validity: invalid_rate=2.1%
+19:27:26 [INFO]     earlystop/power raw: pred_mean=0.0059 target_mean=0.0078 pred_med=0.0039 target_med=0.0045
+19:27:26 [INFO]     earlystop/jitter raw: pred_mean=27.5903 target_mean=35.4828 pred_med=22.3156 target_med=24.8750
+19:27:26 [INFO]     earlystop/height raw: pred_mean=29.9970 target_mean=30.4517 pred_med=31.7171 target_med=30.7000
+19:27:26 [INFO]     earlystop/width raw: pred_mean=65.8398 target_mean=66.6874 pred_med=75.3406 target_med=76.2600
+19:27:31 [INFO]     earlystop@ 15: failure_rate=9.90% (no accept; best=5.70%, min_delta=1.0%)
+19:27:35 [INFO]   Epoch  20/100  train=4.3216(imit=0.069,spec=2.469,phys=0.030,invalid=0.121,manifold=0.337)  val=0.0000(imit=0.068,spec=2.686,phys=0.032,invalid=0.129,manifold=0.356)  lr=9.14e-04
+19:27:35 [INFO]     earlystop@ 20: failure_rate=12.70% (no accept; best=5.70%, min_delta=1.0%)
+19:27:35 [INFO]     earlystop/power: mean=0.0394 median=0.0000 p90=0.0705 degrade_rate=3.7%
+19:27:35 [INFO]     earlystop/jitter: mean=0.0521 median=0.0000 p90=0.1554 degrade_rate=7.8%
+19:27:35 [INFO]     earlystop/height: mean=0.1606 median=0.1073 p90=0.3703 degrade_rate=29.9%
+19:27:35 [INFO]     earlystop/width: mean=0.0868 median=0.0003 p90=0.3150 degrade_rate=12.2%
+19:27:35 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.54 failure_rate=12.7%
+19:27:35 [INFO]     earlystop/validity: invalid_rate=5.9%
+19:27:35 [INFO]     earlystop/power raw: pred_mean=0.0055 target_mean=0.0078 pred_med=0.0037 target_med=0.0045
+19:27:35 [INFO]     earlystop/jitter raw: pred_mean=28.0110 target_mean=35.4828 pred_med=21.7915 target_med=24.8750
+19:27:35 [INFO]     earlystop/height raw: pred_mean=25.3209 target_mean=30.4517 pred_med=26.2780 target_med=30.7000
+19:27:35 [INFO]     earlystop/width raw: pred_mean=62.2414 target_mean=66.6874 pred_med=72.1706 target_med=76.2600
+19:27:39 [INFO]     earlystop@ 25: failure_rate=6.20% (no accept; best=5.70%, min_delta=1.0%)
+19:27:43 [INFO]   Epoch  30/100  train=4.3475(imit=0.070,spec=2.483,phys=0.030,invalid=0.122,manifold=0.340)  val=0.0000(imit=0.069,spec=2.594,phys=0.032,invalid=0.122,manifold=0.354)  lr=8.15e-04
+19:27:43 [INFO]     earlystop@ 30: failure_rate=6.80% (no accept; best=5.70%, min_delta=1.0%)
+19:27:43 [INFO]     earlystop/power: mean=0.0453 median=0.0000 p90=0.0908 degrade_rate=3.9%
+19:27:43 [INFO]     earlystop/jitter: mean=0.0477 median=0.0000 p90=0.1328 degrade_rate=7.1%
+19:27:43 [INFO]     earlystop/height: mean=0.0931 median=0.0442 p90=0.2308 degrade_rate=14.0%
+19:27:43 [INFO]     earlystop/width: mean=0.0554 median=0.0007 p90=0.1269 degrade_rate=7.8%
+19:27:43 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.33 failure_rate=6.8%
+19:27:43 [INFO]     earlystop/validity: invalid_rate=2.5%
+19:27:43 [INFO]     earlystop/power raw: pred_mean=0.0057 target_mean=0.0078 pred_med=0.0038 target_med=0.0045
+19:27:43 [INFO]     earlystop/jitter raw: pred_mean=28.6060 target_mean=35.4828 pred_med=22.5231 target_med=24.8750
+19:27:43 [INFO]     earlystop/height raw: pred_mean=27.5045 target_mean=30.4517 pred_med=27.7434 target_med=30.7000
+19:27:43 [INFO]     earlystop/width raw: pred_mean=64.8883 target_mean=66.6874 pred_med=74.8940 target_med=76.2600
+19:27:47 [INFO]     earlystop@ 35: failure_rate=7.00% (no accept; best=5.70%, min_delta=1.0%)
+19:27:52 [INFO]   Epoch  40/100  train=4.2743(imit=0.069,spec=2.445,phys=0.029,invalid=0.120,manifold=0.328)  val=0.0000(imit=0.070,spec=2.576,phys=0.032,invalid=0.120,manifold=0.360)  lr=6.89e-04
+19:27:52 [INFO]     earlystop@ 40: failure_rate=6.10% (no accept; best=5.70%, min_delta=1.0%)
+19:27:52 [INFO]     earlystop/power: mean=0.0387 median=0.0000 p90=0.0742 degrade_rate=3.5%
+19:27:52 [INFO]     earlystop/jitter: mean=0.0423 median=0.0000 p90=0.1193 degrade_rate=6.9%
+19:27:52 [INFO]     earlystop/height: mean=0.1035 median=0.0670 p90=0.2350 degrade_rate=15.4%
+19:27:52 [INFO]     earlystop/width: mean=0.0540 median=0.0000 p90=0.1329 degrade_rate=7.1%
+19:27:52 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.33 failure_rate=6.1%
+19:27:52 [INFO]     earlystop/validity: invalid_rate=1.9%
+19:27:52 [INFO]     earlystop/power raw: pred_mean=0.0055 target_mean=0.0078 pred_med=0.0037 target_med=0.0045
+19:27:52 [INFO]     earlystop/jitter raw: pred_mean=28.8629 target_mean=35.4828 pred_med=22.2309 target_med=24.8750
+19:27:52 [INFO]     earlystop/height raw: pred_mean=27.2759 target_mean=30.4517 pred_med=27.1593 target_med=30.7000
+19:27:52 [INFO]     earlystop/width raw: pred_mean=64.8975 target_mean=66.6874 pred_med=75.3068 target_med=76.2600
+19:27:56 [INFO]     earlystop@ 45: failure_rate=5.30% (no accept; best=5.70%, min_delta=1.0%)
+19:28:00 [INFO]   Epoch  50/100  train=4.2675(imit=0.069,spec=2.437,phys=0.031,invalid=0.116,manifold=0.339)  val=0.0000(imit=0.069,spec=2.551,phys=0.031,invalid=0.123,manifold=0.362)  lr=5.50e-04
+19:28:00 [INFO]     earlystop@ 50: failure_rate=5.50% (no accept; best=5.70%, min_delta=1.0%)
+19:28:00 [INFO]     earlystop/power: mean=0.0515 median=0.0059 p90=0.1061 degrade_rate=4.0%
+19:28:00 [INFO]     earlystop/jitter: mean=0.0457 median=0.0000 p90=0.1434 degrade_rate=6.7%
+19:28:00 [INFO]     earlystop/height: mean=0.0931 median=0.0479 p90=0.2276 degrade_rate=14.2%
+19:28:00 [INFO]     earlystop/width: mean=0.0519 median=0.0055 p90=0.1117 degrade_rate=7.0%
+19:28:00 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.32 failure_rate=5.5%
+19:28:00 [INFO]     earlystop/validity: invalid_rate=1.9%
+19:28:00 [INFO]     earlystop/power raw: pred_mean=0.0058 target_mean=0.0078 pred_med=0.0039 target_med=0.0045
+19:28:00 [INFO]     earlystop/jitter raw: pred_mean=29.0312 target_mean=35.4828 pred_med=23.0018 target_med=24.8750
+19:28:00 [INFO]     earlystop/height raw: pred_mean=27.7156 target_mean=30.4517 pred_med=27.1477 target_med=30.7000
+19:28:00 [INFO]     earlystop/width raw: pred_mean=65.1814 target_mean=66.6874 pred_med=74.2382 target_med=76.2600
+19:28:04 [INFO]     earlystop@ 55: failure_rate=5.30% (no accept; best=5.70%, min_delta=1.0%)
+19:28:09 [INFO]   Epoch  60/100  train=4.2045(imit=0.070,spec=2.398,phys=0.031,invalid=0.114,manifold=0.335)  val=0.0000(imit=0.069,spec=2.547,phys=0.032,invalid=0.117,manifold=0.364)  lr=4.11e-04
+19:28:09 [INFO]     earlystop@ 60: failure_rate=4.90% (no accept; best=5.70%, min_delta=1.0%)
+19:28:09 [INFO]     earlystop/power: mean=0.0430 median=0.0000 p90=0.0802 degrade_rate=3.5%
+19:28:09 [INFO]     earlystop/jitter: mean=0.0449 median=0.0000 p90=0.1445 degrade_rate=6.9%
+19:28:09 [INFO]     earlystop/height: mean=0.0929 median=0.0502 p90=0.2410 degrade_rate=14.6%
+19:28:09 [INFO]     earlystop/width: mean=0.0463 median=0.0000 p90=0.0922 degrade_rate=6.1%
+19:28:09 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.31 failure_rate=4.9%
+19:28:09 [INFO]     earlystop/validity: invalid_rate=1.4%
+19:28:09 [INFO]     earlystop/power raw: pred_mean=0.0057 target_mean=0.0078 pred_med=0.0037 target_med=0.0045
+19:28:09 [INFO]     earlystop/jitter raw: pred_mean=29.3433 target_mean=35.4828 pred_med=22.8945 target_med=24.8750
+19:28:09 [INFO]     earlystop/height raw: pred_mean=27.9273 target_mean=30.4517 pred_med=27.7029 target_med=30.7000
+19:28:09 [INFO]     earlystop/width raw: pred_mean=65.4327 target_mean=66.6874 pred_med=74.5566 target_med=76.2600
+19:28:13 [INFO]     earlystop@ 65: failure_rate=5.30% (no accept; best=5.70%, min_delta=1.0%)
+19:28:18 [INFO]   Epoch  70/100  train=4.3401(imit=0.071,spec=2.484,phys=0.029,invalid=0.119,manifold=0.336)  val=0.0000(imit=0.069,spec=2.600,phys=0.032,invalid=0.119,manifold=0.365)  lr=2.85e-04
+19:28:18 [INFO]     earlystop@ 70: failure_rate=5.40% (no accept; best=5.70%, min_delta=1.0%)
+19:28:18 [INFO]     earlystop/power: mean=0.0495 median=0.0098 p90=0.0946 degrade_rate=3.4%
+19:28:18 [INFO]     earlystop/jitter: mean=0.0393 median=0.0000 p90=0.1189 degrade_rate=6.3%
+19:28:18 [INFO]     earlystop/height: mean=0.0946 median=0.0502 p90=0.2319 degrade_rate=13.4%
+19:28:18 [INFO]     earlystop/width: mean=0.0477 median=0.0000 p90=0.0942 degrade_rate=6.4%
+19:28:18 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.29 failure_rate=5.4%
+19:28:18 [INFO]     earlystop/validity: invalid_rate=1.8%
+19:28:18 [INFO]     earlystop/power raw: pred_mean=0.0058 target_mean=0.0078 pred_med=0.0037 target_med=0.0045
+19:28:18 [INFO]     earlystop/jitter raw: pred_mean=29.0534 target_mean=35.4828 pred_med=22.6525 target_med=24.8750
+19:28:18 [INFO]     earlystop/height raw: pred_mean=27.5817 target_mean=30.4517 pred_med=27.2862 target_med=30.7000
+19:28:18 [INFO]     earlystop/width raw: pred_mean=65.4234 target_mean=66.6874 pred_med=74.8109 target_med=76.2600
+19:28:22 [INFO]     earlystop@ 75: failure_rate=5.10% (no accept; best=5.70%, min_delta=1.0%)
+19:28:26 [INFO]   Epoch  80/100  train=4.2417(imit=0.071,spec=2.418,phys=0.029,invalid=0.117,manifold=0.340)  val=0.0000(imit=0.069,spec=2.596,phys=0.032,invalid=0.115,manifold=0.365)  lr=1.86e-04
+19:28:26 [INFO]     earlystop@ 80: failure_rate=5.70% (no accept; best=5.70%, min_delta=1.0%)
+19:28:26 [INFO]     earlystop/power: mean=0.0375 median=0.0000 p90=0.0678 degrade_rate=3.4%
+19:28:26 [INFO]     earlystop/jitter: mean=0.0488 median=0.0000 p90=0.1403 degrade_rate=7.0%
+19:28:26 [INFO]     earlystop/height: mean=0.0841 median=0.0234 p90=0.2146 degrade_rate=12.1%
+19:28:26 [INFO]     earlystop/width: mean=0.0484 median=0.0062 p90=0.0887 degrade_rate=6.6%
+19:28:26 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.29 failure_rate=5.7%
+19:28:26 [INFO]     earlystop/validity: invalid_rate=1.7%
+19:28:26 [INFO]     earlystop/power raw: pred_mean=0.0057 target_mean=0.0078 pred_med=0.0037 target_med=0.0045
+19:28:26 [INFO]     earlystop/jitter raw: pred_mean=29.3148 target_mean=35.4828 pred_med=23.0255 target_med=24.8750
+19:28:26 [INFO]     earlystop/height raw: pred_mean=28.2492 target_mean=30.4517 pred_med=27.4246 target_med=30.7000
+19:28:26 [INFO]     earlystop/width raw: pred_mean=65.3359 target_mean=66.6874 pred_med=74.3081 target_med=76.2600
+19:28:30 [INFO]     earlystop@ 85: failure_rate=4.90% (no accept; best=5.70%, min_delta=1.0%)
+19:28:35 [INFO]   Epoch  90/100  train=4.1429(imit=0.070,spec=2.356,phys=0.028,invalid=0.113,manifold=0.341)  val=0.0000(imit=0.069,spec=2.575,phys=0.031,invalid=0.119,manifold=0.365)  lr=1.22e-04
+19:28:35 [INFO]     earlystop@ 90: failure_rate=5.20% (no accept; best=5.70%, min_delta=1.0%)
+19:28:35 [INFO]     earlystop/power: mean=0.0425 median=0.0000 p90=0.0814 degrade_rate=3.4%
+19:28:35 [INFO]     earlystop/jitter: mean=0.0448 median=0.0000 p90=0.1353 degrade_rate=6.6%
+19:28:35 [INFO]     earlystop/height: mean=0.1011 median=0.0651 p90=0.2412 degrade_rate=14.4%
+19:28:35 [INFO]     earlystop/width: mean=0.0487 median=0.0041 p90=0.1011 degrade_rate=6.6%
+19:28:35 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.31 failure_rate=5.2%
+19:28:35 [INFO]     earlystop/validity: invalid_rate=1.7%
+19:28:35 [INFO]     earlystop/power raw: pred_mean=0.0058 target_mean=0.0078 pred_med=0.0037 target_med=0.0045
+19:28:35 [INFO]     earlystop/jitter raw: pred_mean=29.4118 target_mean=35.4828 pred_med=23.3309 target_med=24.8750
+19:28:35 [INFO]     earlystop/height raw: pred_mean=27.3741 target_mean=30.4517 pred_med=26.9030 target_med=30.7000
+19:28:35 [INFO]     earlystop/width raw: pred_mean=64.9585 target_mean=66.6874 pred_med=73.4551 target_med=76.2600
+19:28:39 [INFO]     earlystop@ 95: failure_rate=4.80% (no accept; best=5.70%, min_delta=1.0%)
+19:28:44 [INFO]   Epoch 100/100  train=4.2967(imit=0.070,spec=2.456,phys=0.030,invalid=0.118,manifold=0.336)  val=0.0000(imit=0.069,spec=2.577,phys=0.031,invalid=0.120,manifold=0.363)  lr=1.00e-04
+19:28:44 [INFO]     earlystop@100: failure_rate=5.00% (no accept; best=5.70%, min_delta=1.0%)
+19:28:44 [INFO]     earlystop/power: mean=0.0414 median=0.0000 p90=0.0735 degrade_rate=3.4%
+19:28:44 [INFO]     earlystop/jitter: mean=0.0437 median=0.0000 p90=0.1305 degrade_rate=6.7%
+19:28:44 [INFO]     earlystop/height: mean=0.0861 median=0.0356 p90=0.2202 degrade_rate=12.0%
+19:28:44 [INFO]     earlystop/width: mean=0.0471 median=0.0026 p90=0.0912 degrade_rate=6.3%
+19:28:44 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.28 failure_rate=5.0%
+19:28:44 [INFO]     earlystop/validity: invalid_rate=1.7%
+19:28:44 [INFO]     earlystop/power raw: pred_mean=0.0058 target_mean=0.0078 pred_med=0.0037 target_med=0.0045
+19:28:44 [INFO]     earlystop/jitter raw: pred_mean=29.2046 target_mean=35.4828 pred_med=22.9975 target_med=24.8750
+19:28:44 [INFO]     earlystop/height raw: pred_mean=28.0394 target_mean=30.4517 pred_med=27.5907 target_med=30.7000
+19:28:44 [INFO]     earlystop/width raw: pred_mean=65.2856 target_mean=66.6874 pred_med=74.3559 target_med=76.2600
+19:28:44 [WARNING]   Carry-forward: iteration 4 no >=1.0% improvement (prev=5.70% -> best=5.70%); kept carried-forward model
+19:28:44 [INFO] Validation failure rate: 5.7%  (57/1000 specs)
+19:28:44 [INFO]   boundary: 9.0%  interior: 2.4%
+19:28:44 [INFO]   val/power: mean=0.0554 median=0.0118 p90=0.0917 degrade_rate=4.1%
+19:28:44 [INFO]   val/jitter: mean=0.0519 median=0.0000 p90=0.1411 degrade_rate=7.4%
+19:28:44 [INFO]   val/height: mean=0.0744 median=0.0009 p90=0.2079 degrade_rate=10.7%
+19:28:44 [INFO]   val/width: mean=0.0491 median=0.0000 p90=0.1223 degrade_rate=7.3%
+19:28:44 [INFO]   val/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.29 failure_rate=5.7%
+19:28:44 [INFO]   val/validity: invalid_rate=1.7%
+19:28:44 [INFO]   val/power raw: pred_mean=0.0056 target_mean=0.0078 pred_med=0.0039 target_med=0.0045
+19:28:44 [INFO]   val/jitter raw: pred_mean=27.6317 target_mean=35.4828 pred_med=21.2528 target_med=24.8750
+19:28:44 [INFO]   val/height raw: pred_mean=28.8270 target_mean=30.4517 pred_med=29.5678 target_med=30.7000
+19:28:44 [INFO]   val/width raw: pred_mean=66.0844 target_mean=66.6874 pred_med=76.6239 target_med=76.2600
+19:28:44 [INFO]   Iter 4 final=5.70% vs prev=5.70% (delta +0.00 pts) -> fallback_prev
+19:28:44 [INFO]   Iter 4 loss summary: train_total=4.765(imit=0.069,spec=2.777,phys=0.029,invalid=0.117,manifold=0.338)  val_total=0.000(imit=0.069,spec=2.577,phys=0.031,invalid=0.120,manifold=0.363)
+19:28:44 [INFO]   LR reset to 1.00e-03; cosine scheduler restarted for next iteration
+19:28:44 [INFO]   Querying teacher for 57 failed specs ...
+19:28:44 [INFO]   Interior specs (12): using flow teacher
+19:28:44 [INFO]   filter_by_zig_validity: 12/12 passed (threshold=0.5)
+19:28:44 [INFO]   label_batch: 12/12 passed validity gate (threshold=0.5)
+19:28:44 [INFO]   filter_by_zig_validity: 12/12 passed (threshold=0.5)
+19:28:44 [INFO]   Boundary specs (45): high-budget flow + k-NN fallback
+19:28:45 [INFO]   filter_by_zig_validity: 45/45 passed (threshold=0.5)
+19:28:45 [INFO]   label_batch: 45/45 passed validity gate (threshold=0.5)
+19:28:45 [INFO]   filter_by_zig_validity: 45/45 passed (threshold=0.5)
+19:28:45 [INFO]   Teacher labels: flow=57, k-NN=0, total=57/57
+19:28:45 [INFO]   filter_by_zig_validity: 57/57 passed (threshold=0.5)
+19:28:45 [INFO]   filter_by_zig_consistency: 34/57 passed  (boundary=45, interior=12)
+19:28:45 [INFO]   filter_by_zig_consistency_relaxed: 34/57 passed  (boundary=45, interior=12)
+19:28:45 [INFO]   DAgger labels: validity@0.5=100.0%  strict_consistency=59.6%  relaxed_consistency=59.6%
+19:28:45 [INFO]   Added 57 labeled failures.  Dataset now: 20239
+19:28:45 [INFO] ============================================================
+19:28:45 [INFO]   DAgger Iteration 5/8
+19:28:45 [INFO] ============================================================
+19:28:45 [INFO] Dataset size: 20239
+19:28:45 [INFO]   Prev-iter baseline: prev_failure_rate=5.70% on COMMON_EVAL_SPECS (n=1000)
+19:28:45 [INFO]   Shared eval set (COMMON_EVAL_SPECS): n=1000 specs (seed=24681012, every=5ep, log_every=10ep, skip_first=5ep)
+19:28:46 [INFO]   Epoch   1/100  train=0.0352(imit=0.035,spec=0.000,phys=0.000,invalid=0.000,manifold=0.344)  val=0.0000(imit=0.027,spec=0.000,phys=0.000,invalid=0.000,manifold=0.359)  lr=1.00e-03
+19:28:50 [INFO]     earlystop@  5: failure_rate=13.50% (skipped, epoch 5 <= EARLYSTOP_SKIP_EPOCHS=5)
+19:28:54 [INFO]   Epoch  10/100  train=4.9707(imit=0.066,spec=2.851,phys=0.034,invalid=0.146,manifold=0.375)  val=0.0000(imit=0.066,spec=3.010,phys=0.036,invalid=0.156,manifold=0.379)  lr=9.78e-04
+19:28:54 [INFO]     earlystop@ 10: failure_rate=18.40% (no accept; best=5.70%, min_delta=1.0%)
+19:28:54 [INFO]     earlystop/power: mean=0.0557 median=0.0000 p90=0.1157 degrade_rate=4.6%
+19:28:54 [INFO]     earlystop/jitter: mean=0.0479 median=0.0000 p90=0.1187 degrade_rate=7.3%
+19:28:54 [INFO]     earlystop/height: mean=0.1399 median=0.0401 p90=0.4309 degrade_rate=26.5%
+19:28:54 [INFO]     earlystop/width: mean=0.1367 median=0.0091 p90=0.5795 degrade_rate=22.1%
+19:28:54 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.60 failure_rate=18.4%
+19:28:54 [INFO]     earlystop/validity: invalid_rate=7.7%
+19:28:54 [INFO]     earlystop/power raw: pred_mean=0.0054 target_mean=0.0078 pred_med=0.0039 target_med=0.0045
+19:28:54 [INFO]     earlystop/jitter raw: pred_mean=25.8803 target_mean=35.4828 pred_med=20.8791 target_med=24.8750
+19:28:54 [INFO]     earlystop/height raw: pred_mean=27.2835 target_mean=30.4517 pred_med=29.8351 target_med=30.7000
+19:28:54 [INFO]     earlystop/width raw: pred_mean=59.9830 target_mean=66.6874 pred_med=71.1468 target_med=76.2600
+19:28:58 [INFO]     earlystop@ 15: failure_rate=20.30% (no accept; best=5.70%, min_delta=1.0%)
+19:29:02 [INFO]   Epoch  20/100  train=4.8274(imit=0.065,spec=2.774,phys=0.034,invalid=0.142,manifold=0.355)  val=0.0000(imit=0.063,spec=2.906,phys=0.036,invalid=0.140,manifold=0.376)  lr=9.14e-04
+19:29:02 [INFO]     earlystop@ 20: failure_rate=16.00% (no accept; best=5.70%, min_delta=1.0%)
+19:29:02 [INFO]     earlystop/power: mean=0.0584 median=0.0018 p90=0.1075 degrade_rate=4.5%
+19:29:02 [INFO]     earlystop/jitter: mean=0.0676 median=0.0000 p90=0.1969 degrade_rate=9.8%
+19:29:02 [INFO]     earlystop/height: mean=0.1186 median=0.0137 p90=0.3808 degrade_rate=19.7%
+19:29:02 [INFO]     earlystop/width: mean=0.1229 median=0.0178 p90=0.5560 degrade_rate=18.9%
+19:29:02 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.53 failure_rate=16.0%
+19:29:02 [INFO]     earlystop/validity: invalid_rate=6.4%
+19:29:02 [INFO]     earlystop/power raw: pred_mean=0.0055 target_mean=0.0078 pred_med=0.0038 target_med=0.0045
+19:29:02 [INFO]     earlystop/jitter raw: pred_mean=26.6327 target_mean=35.4828 pred_med=21.1249 target_med=24.8750
+19:29:02 [INFO]     earlystop/height raw: pred_mean=28.7363 target_mean=30.4517 pred_med=31.9724 target_med=30.7000
+19:29:02 [INFO]     earlystop/width raw: pred_mean=60.9499 target_mean=66.6874 pred_med=73.2014 target_med=76.2600
+19:29:06 [INFO]     earlystop@ 25: failure_rate=19.00% (no accept; best=5.70%, min_delta=1.0%)
+19:29:11 [INFO]   Epoch  30/100  train=4.7233(imit=0.067,spec=2.706,phys=0.035,invalid=0.138,manifold=0.355)  val=0.0000(imit=0.067,spec=2.867,phys=0.035,invalid=0.143,manifold=0.367)  lr=8.15e-04
+19:29:11 [INFO]     earlystop@ 30: failure_rate=17.10% (no accept; best=5.70%, min_delta=1.0%)
+19:29:11 [INFO]     earlystop/power: mean=0.0468 median=0.0000 p90=0.0828 degrade_rate=3.8%
+19:29:11 [INFO]     earlystop/jitter: mean=0.0462 median=0.0000 p90=0.1263 degrade_rate=5.9%
+19:29:11 [INFO]     earlystop/height: mean=0.1544 median=0.0715 p90=0.4611 degrade_rate=25.6%
+19:29:11 [INFO]     earlystop/width: mean=0.1380 median=0.0178 p90=0.5883 degrade_rate=20.8%
+19:29:11 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.56 failure_rate=17.1%
+19:29:11 [INFO]     earlystop/validity: invalid_rate=7.1%
+19:29:11 [INFO]     earlystop/power raw: pred_mean=0.0053 target_mean=0.0078 pred_med=0.0037 target_med=0.0045
+19:29:11 [INFO]     earlystop/jitter raw: pred_mean=27.4371 target_mean=35.4828 pred_med=23.0103 target_med=24.8750
+19:29:11 [INFO]     earlystop/height raw: pred_mean=26.9442 target_mean=30.4517 pred_med=29.0069 target_med=30.7000
+19:29:11 [INFO]     earlystop/width raw: pred_mean=59.0869 target_mean=66.6874 pred_med=69.2549 target_med=76.2600
+19:29:15 [INFO]     earlystop@ 35: failure_rate=15.50% (no accept; best=5.70%, min_delta=1.0%)
+19:29:19 [INFO]   Epoch  40/100  train=4.4235(imit=0.066,spec=2.516,phys=0.035,invalid=0.131,manifold=0.351)  val=0.0000(imit=0.067,spec=2.806,phys=0.036,invalid=0.146,manifold=0.369)  lr=6.89e-04
+19:29:19 [INFO]     earlystop@ 40: failure_rate=13.60% (no accept; best=5.70%, min_delta=1.0%)
+19:29:19 [INFO]     earlystop/power: mean=0.0573 median=0.0173 p90=0.1025 degrade_rate=3.6%
+19:29:19 [INFO]     earlystop/jitter: mean=0.0449 median=0.0000 p90=0.1087 degrade_rate=6.0%
+19:29:19 [INFO]     earlystop/height: mean=0.1308 median=0.0239 p90=0.4161 degrade_rate=22.6%
+19:29:19 [INFO]     earlystop/width: mean=0.1074 median=0.0096 p90=0.4654 degrade_rate=15.4%
+19:29:19 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.48 failure_rate=13.6%
+19:29:19 [INFO]     earlystop/validity: invalid_rate=6.0%
+19:29:19 [INFO]     earlystop/power raw: pred_mean=0.0055 target_mean=0.0078 pred_med=0.0037 target_med=0.0045
+19:29:19 [INFO]     earlystop/jitter raw: pred_mean=27.4500 target_mean=35.4828 pred_med=21.9920 target_med=24.8750
+19:29:19 [INFO]     earlystop/height raw: pred_mean=28.1362 target_mean=30.4517 pred_med=31.6636 target_med=30.7000
+19:29:19 [INFO]     earlystop/width raw: pred_mean=60.8750 target_mean=66.6874 pred_med=73.0866 target_med=76.2600
+19:29:23 [INFO]     earlystop@ 45: failure_rate=14.90% (no accept; best=5.70%, min_delta=1.0%)
+19:29:27 [INFO]   Epoch  50/100  train=4.5296(imit=0.068,spec=2.582,phys=0.034,invalid=0.136,manifold=0.351)  val=0.0000(imit=0.066,spec=2.710,phys=0.035,invalid=0.136,manifold=0.362)  lr=5.50e-04
+19:29:27 [INFO]     earlystop@ 50: failure_rate=12.10% (no accept; best=5.70%, min_delta=1.0%)
+19:29:27 [INFO]     earlystop/power: mean=0.0658 median=0.0332 p90=0.1111 degrade_rate=3.8%
+19:29:27 [INFO]     earlystop/jitter: mean=0.0415 median=0.0000 p90=0.1083 degrade_rate=6.0%
+19:29:27 [INFO]     earlystop/height: mean=0.1065 median=0.0000 p90=0.3237 degrade_rate=17.5%
+19:29:27 [INFO]     earlystop/width: mean=0.0982 median=0.0122 p90=0.3224 degrade_rate=15.9%
+19:29:27 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.43 failure_rate=12.1%
+19:29:27 [INFO]     earlystop/validity: invalid_rate=5.4%
+19:29:27 [INFO]     earlystop/power raw: pred_mean=0.0055 target_mean=0.0078 pred_med=0.0038 target_med=0.0045
+19:29:27 [INFO]     earlystop/jitter raw: pred_mean=27.8931 target_mean=35.4828 pred_med=22.1717 target_med=24.8750
+19:29:27 [INFO]     earlystop/height raw: pred_mean=29.1653 target_mean=30.4517 pred_med=32.8285 target_med=30.7000
+19:29:27 [INFO]     earlystop/width raw: pred_mean=61.7420 target_mean=66.6874 pred_med=73.4455 target_med=76.2600
+19:29:32 [INFO]     earlystop@ 55: failure_rate=13.20% (no accept; best=5.70%, min_delta=1.0%)
+19:29:36 [INFO]   Epoch  60/100  train=4.4171(imit=0.067,spec=2.517,phys=0.035,invalid=0.128,manifold=0.348)  val=0.0000(imit=0.067,spec=2.686,phys=0.034,invalid=0.141,manifold=0.364)  lr=4.11e-04
+19:29:36 [INFO]     earlystop@ 60: failure_rate=11.80% (no accept; best=5.70%, min_delta=1.0%)
+19:29:36 [INFO]     earlystop/power: mean=0.0421 median=0.0000 p90=0.0711 degrade_rate=3.4%
+19:29:36 [INFO]     earlystop/jitter: mean=0.0607 median=0.0000 p90=0.1617 degrade_rate=7.5%
+19:29:36 [INFO]     earlystop/height: mean=0.1265 median=0.0391 p90=0.3986 degrade_rate=19.5%
+19:29:36 [INFO]     earlystop/width: mean=0.1061 median=0.0221 p90=0.3533 degrade_rate=13.7%
+19:29:36 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.44 failure_rate=11.8%
+19:29:36 [INFO]     earlystop/validity: invalid_rate=4.9%
+19:29:36 [INFO]     earlystop/power raw: pred_mean=0.0054 target_mean=0.0078 pred_med=0.0037 target_med=0.0045
+19:29:36 [INFO]     earlystop/jitter raw: pred_mean=28.9533 target_mean=35.4828 pred_med=23.8759 target_med=24.8750
+19:29:36 [INFO]     earlystop/height raw: pred_mean=28.1211 target_mean=30.4517 pred_med=30.3631 target_med=30.7000
+19:29:36 [INFO]     earlystop/width raw: pred_mean=60.3967 target_mean=66.6874 pred_med=70.8031 target_med=76.2600
+19:29:40 [INFO]     earlystop@ 65: failure_rate=12.70% (no accept; best=5.70%, min_delta=1.0%)
+19:29:45 [INFO]   Epoch  70/100  train=4.4625(imit=0.068,spec=2.544,phys=0.033,invalid=0.128,manifold=0.352)  val=0.0000(imit=0.067,spec=2.676,phys=0.034,invalid=0.137,manifold=0.359)  lr=2.85e-04
+19:29:45 [INFO]     earlystop@ 70: failure_rate=11.50% (no accept; best=5.70%, min_delta=1.0%)
+19:29:45 [INFO]     earlystop/power: mean=0.0380 median=0.0000 p90=0.0636 degrade_rate=3.3%
+19:29:45 [INFO]     earlystop/jitter: mean=0.0452 median=0.0000 p90=0.1242 degrade_rate=6.7%
+19:29:45 [INFO]     earlystop/height: mean=0.1146 median=0.0355 p90=0.3041 degrade_rate=19.1%
+19:29:45 [INFO]     earlystop/width: mean=0.0895 median=0.0133 p90=0.3071 degrade_rate=13.6%
+19:29:45 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.43 failure_rate=11.5%
+19:29:45 [INFO]     earlystop/validity: invalid_rate=4.3%
+19:29:45 [INFO]     earlystop/power raw: pred_mean=0.0055 target_mean=0.0078 pred_med=0.0037 target_med=0.0045
+19:29:45 [INFO]     earlystop/jitter raw: pred_mean=28.4979 target_mean=35.4828 pred_med=23.0144 target_med=24.8750
+19:29:45 [INFO]     earlystop/height raw: pred_mean=27.6195 target_mean=30.4517 pred_med=30.0173 target_med=30.7000
+19:29:45 [INFO]     earlystop/width raw: pred_mean=61.6410 target_mean=66.6874 pred_med=71.6385 target_med=76.2600
+19:29:49 [INFO]     earlystop@ 75: failure_rate=10.70% (no accept; best=5.70%, min_delta=1.0%)
+19:29:54 [INFO]   Epoch  80/100  train=4.3585(imit=0.066,spec=2.479,phys=0.033,invalid=0.126,manifold=0.352)  val=0.0000(imit=0.067,spec=2.880,phys=0.034,invalid=0.130,manifold=0.365)  lr=1.86e-04
+19:29:54 [INFO]     earlystop@ 80: failure_rate=9.90% (no accept; best=5.70%, min_delta=1.0%)
+19:29:54 [INFO]     earlystop/power: mean=0.0401 median=0.0000 p90=0.0668 degrade_rate=3.3%
+19:29:54 [INFO]     earlystop/jitter: mean=0.0529 median=0.0000 p90=0.1505 degrade_rate=7.5%
+19:29:54 [INFO]     earlystop/height: mean=0.0911 median=0.0000 p90=0.2626 degrade_rate=13.4%
+19:29:54 [INFO]     earlystop/width: mean=0.0798 median=0.0129 p90=0.2529 degrade_rate=11.9%
+19:29:54 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.36 failure_rate=9.9%
+19:29:54 [INFO]     earlystop/validity: invalid_rate=3.2%
+19:29:54 [INFO]     earlystop/power raw: pred_mean=0.0056 target_mean=0.0078 pred_med=0.0037 target_med=0.0045
+19:29:54 [INFO]     earlystop/jitter raw: pred_mean=28.6501 target_mean=35.4828 pred_med=23.3586 target_med=24.8750
+19:29:54 [INFO]     earlystop/height raw: pred_mean=29.0123 target_mean=30.4517 pred_med=30.9940 target_med=30.7000
+19:29:54 [INFO]     earlystop/width raw: pred_mean=62.3288 target_mean=66.6874 pred_med=72.4448 target_med=76.2600
+19:29:58 [INFO]     earlystop@ 85: failure_rate=9.80% (no accept; best=5.70%, min_delta=1.0%)
+19:30:02 [INFO]   Epoch  90/100  train=4.3482(imit=0.067,spec=2.473,phys=0.033,invalid=0.126,manifold=0.349)  val=0.0000(imit=0.066,spec=2.671,phys=0.034,invalid=0.131,manifold=0.363)  lr=1.22e-04
+19:30:02 [INFO]     earlystop@ 90: failure_rate=8.60% (no accept; best=5.70%, min_delta=1.0%)
+19:30:02 [INFO]     earlystop/power: mean=0.0403 median=0.0000 p90=0.0729 degrade_rate=3.2%
+19:30:02 [INFO]     earlystop/jitter: mean=0.0480 median=0.0000 p90=0.1216 degrade_rate=6.5%
+19:30:02 [INFO]     earlystop/height: mean=0.0929 median=0.0021 p90=0.2823 degrade_rate=12.9%
+19:30:02 [INFO]     earlystop/width: mean=0.0823 median=0.0135 p90=0.2494 degrade_rate=11.6%
+19:30:02 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.34 failure_rate=8.6%
+19:30:02 [INFO]     earlystop/validity: invalid_rate=3.9%
+19:30:02 [INFO]     earlystop/power raw: pred_mean=0.0055 target_mean=0.0078 pred_med=0.0037 target_med=0.0045
+19:30:02 [INFO]     earlystop/jitter raw: pred_mean=28.8142 target_mean=35.4828 pred_med=23.2826 target_med=24.8750
+19:30:02 [INFO]     earlystop/height raw: pred_mean=28.9026 target_mean=30.4517 pred_med=30.3999 target_med=30.7000
+19:30:02 [INFO]     earlystop/width raw: pred_mean=62.0722 target_mean=66.6874 pred_med=72.1592 target_med=76.2600
+19:30:06 [INFO]     earlystop@ 95: failure_rate=9.60% (no accept; best=5.70%, min_delta=1.0%)
+19:30:10 [INFO]   Epoch 100/100  train=4.3117(imit=0.066,spec=2.456,phys=0.033,invalid=0.125,manifold=0.341)  val=0.0000(imit=0.066,spec=2.658,phys=0.034,invalid=0.132,manifold=0.364)  lr=1.00e-04
+19:30:10 [INFO]     earlystop@100: failure_rate=9.00% (no accept; best=5.70%, min_delta=1.0%)
+19:30:10 [INFO]     earlystop/power: mean=0.0440 median=0.0025 p90=0.0821 degrade_rate=3.2%
+19:30:10 [INFO]     earlystop/jitter: mean=0.0544 median=0.0000 p90=0.1410 degrade_rate=6.7%
+19:30:10 [INFO]     earlystop/height: mean=0.1009 median=0.0266 p90=0.2859 degrade_rate=14.5%
+19:30:10 [INFO]     earlystop/width: mean=0.0856 median=0.0187 p90=0.2572 degrade_rate=11.7%
+19:30:10 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.36 failure_rate=9.0%
+19:30:10 [INFO]     earlystop/validity: invalid_rate=3.4%
+19:30:10 [INFO]     earlystop/power raw: pred_mean=0.0056 target_mean=0.0078 pred_med=0.0037 target_med=0.0045
+19:30:10 [INFO]     earlystop/jitter raw: pred_mean=29.2353 target_mean=35.4828 pred_med=23.9584 target_med=24.8750
+19:30:10 [INFO]     earlystop/height raw: pred_mean=27.9975 target_mean=30.4517 pred_med=29.1667 target_med=30.7000
+19:30:10 [INFO]     earlystop/width raw: pred_mean=61.6750 target_mean=66.6874 pred_med=71.1821 target_med=76.2600
+19:30:10 [WARNING]   Carry-forward: iteration 5 no >=1.0% improvement (prev=5.70% -> best=5.70%); kept carried-forward model
+19:30:10 [INFO] Validation failure rate: 5.7%  (57/1000 specs)
+19:30:10 [INFO]   boundary: 9.0%  interior: 2.4%
+19:30:10 [INFO]   val/power: mean=0.0554 median=0.0118 p90=0.0917 degrade_rate=4.1%
+19:30:10 [INFO]   val/jitter: mean=0.0519 median=0.0000 p90=0.1411 degrade_rate=7.4%
+19:30:10 [INFO]   val/height: mean=0.0744 median=0.0009 p90=0.2079 degrade_rate=10.7%
+19:30:10 [INFO]   val/width: mean=0.0491 median=0.0000 p90=0.1223 degrade_rate=7.3%
+19:30:10 [INFO]   val/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.29 failure_rate=5.7%
+19:30:10 [INFO]   val/validity: invalid_rate=1.7%
+19:30:10 [INFO]   val/power raw: pred_mean=0.0056 target_mean=0.0078 pred_med=0.0039 target_med=0.0045
+19:30:10 [INFO]   val/jitter raw: pred_mean=27.6317 target_mean=35.4828 pred_med=21.2528 target_med=24.8750
+19:30:10 [INFO]   val/height raw: pred_mean=28.8270 target_mean=30.4517 pred_med=29.5678 target_med=30.7000
+19:30:10 [INFO]   val/width raw: pred_mean=66.0844 target_mean=66.6874 pred_med=76.6239 target_med=76.2600
+19:30:10 [INFO]   Iter 5 final=5.70% vs prev=5.70% (delta +0.00 pts) -> fallback_prev
+19:30:10 [INFO]   Iter 5 loss summary: train_total=4.933(imit=0.065,spec=2.866,phys=0.032,invalid=0.131,manifold=0.351)  val_total=0.000(imit=0.066,spec=2.658,phys=0.034,invalid=0.132,manifold=0.364)
+19:30:10 [INFO]   LR reset to 5.00e-04; cosine scheduler restarted for next iteration
+19:30:10 [INFO]   Querying teacher for 57 failed specs ...
+19:30:10 [INFO]   Interior specs (12): using flow teacher
+19:30:11 [INFO]   filter_by_zig_validity: 12/12 passed (threshold=0.5)
+19:30:11 [INFO]   label_batch: 12/12 passed validity gate (threshold=0.5)
+19:30:11 [INFO]   filter_by_zig_validity: 12/12 passed (threshold=0.5)
+19:30:11 [INFO]   Boundary specs (45): high-budget flow + k-NN fallback
+19:30:12 [INFO]   filter_by_zig_validity: 45/45 passed (threshold=0.5)
+19:30:12 [INFO]   label_batch: 45/45 passed validity gate (threshold=0.5)
+19:30:12 [INFO]   filter_by_zig_validity: 45/45 passed (threshold=0.5)
+19:30:12 [INFO]   Teacher labels: flow=57, k-NN=0, total=57/57
+19:30:12 [INFO]   filter_by_zig_validity: 57/57 passed (threshold=0.5)
+19:30:12 [INFO]   filter_by_zig_consistency: 32/57 passed  (boundary=45, interior=12)
+19:30:12 [INFO]   filter_by_zig_consistency_relaxed: 32/57 passed  (boundary=45, interior=12)
+19:30:12 [INFO]   DAgger labels: validity@0.5=100.0%  strict_consistency=56.1%  relaxed_consistency=56.1%
+19:30:12 [INFO]   Added 57 labeled failures.  Dataset now: 20296
+19:30:12 [INFO] ============================================================
+19:30:12 [INFO]   DAgger Iteration 6/8
+19:30:12 [INFO] ============================================================
+19:30:12 [INFO] Dataset size: 20296
+19:30:12 [INFO]   Prev-iter baseline: prev_failure_rate=5.70% on COMMON_EVAL_SPECS (n=1000)
+19:30:12 [INFO]   Shared eval set (COMMON_EVAL_SPECS): n=1000 specs (seed=24681012, every=5ep, log_every=10ep, skip_first=5ep)
+19:30:13 [INFO]   Epoch   1/100  train=0.0394(imit=0.039,spec=0.000,phys=0.000,invalid=0.000,manifold=0.338)  val=0.0000(imit=0.029,spec=0.000,phys=0.000,invalid=0.000,manifold=0.355)  lr=5.00e-04
+19:30:16 [INFO]     earlystop@  5: failure_rate=23.90% (skipped, epoch 5 <= EARLYSTOP_SKIP_EPOCHS=5)
+19:30:20 [INFO]   Epoch  10/100  train=3.7727(imit=0.049,spec=2.067,phys=0.007,invalid=0.195,manifold=0.323)  val=0.0000(imit=0.046,spec=2.476,phys=0.005,invalid=0.197,manifold=0.330)  lr=4.90e-04
+19:30:20 [INFO]     earlystop@ 10: failure_rate=21.00% (no accept; best=5.70%, min_delta=1.0%)
+19:30:20 [INFO]     earlystop/power: mean=0.0701 median=0.0042 p90=0.1224 degrade_rate=7.4%
+19:30:20 [INFO]     earlystop/jitter: mean=0.0595 median=0.0000 p90=0.1614 degrade_rate=7.9%
+19:30:20 [INFO]     earlystop/height: mean=0.1495 median=0.0335 p90=0.5387 degrade_rate=24.4%
+19:30:20 [INFO]     earlystop/width: mean=0.1540 median=0.0220 p90=0.6467 degrade_rate=22.9%
+19:30:20 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.63 failure_rate=21.0%
+19:30:20 [INFO]     earlystop/validity: invalid_rate=11.5%
+19:30:20 [INFO]     earlystop/power raw: pred_mean=0.0060 target_mean=0.0078 pred_med=0.0047 target_med=0.0045
+19:30:20 [INFO]     earlystop/jitter raw: pred_mean=24.3375 target_mean=35.4828 pred_med=19.7076 target_med=24.8750
+19:30:20 [INFO]     earlystop/height raw: pred_mean=28.2296 target_mean=30.4517 pred_med=31.1987 target_med=30.7000
+19:30:20 [INFO]     earlystop/width raw: pred_mean=58.9854 target_mean=66.6874 pred_med=71.8056 target_med=76.2600
+19:30:25 [INFO]     earlystop@ 15: failure_rate=20.40% (no accept; best=5.70%, min_delta=1.0%)
+19:30:29 [INFO]   Epoch  20/100  train=3.9332(imit=0.050,spec=2.201,phys=0.007,invalid=0.178,manifold=0.306)  val=0.0000(imit=0.048,spec=2.396,phys=0.006,invalid=0.191,manifold=0.317)  lr=4.62e-04
+19:30:29 [INFO]     earlystop@ 20: failure_rate=25.40% (no accept; best=5.70%, min_delta=1.0%)
+19:30:29 [INFO]     earlystop/power: mean=0.0672 median=0.0025 p90=0.1298 degrade_rate=7.0%
+19:30:29 [INFO]     earlystop/jitter: mean=0.1073 median=0.0313 p90=0.2511 degrade_rate=17.2%
+19:30:29 [INFO]     earlystop/height: mean=0.1688 median=0.0947 p90=0.4847 degrade_rate=30.5%
+19:30:29 [INFO]     earlystop/width: mean=0.1557 median=0.0386 p90=0.6007 degrade_rate=22.5%
+19:30:29 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.77 failure_rate=25.4%
+19:30:29 [INFO]     earlystop/validity: invalid_rate=9.9%
+19:30:29 [INFO]     earlystop/power raw: pred_mean=0.0059 target_mean=0.0078 pred_med=0.0048 target_med=0.0045
+19:30:29 [INFO]     earlystop/jitter raw: pred_mean=26.4721 target_mean=35.4828 pred_med=23.3839 target_med=24.8750
+19:30:29 [INFO]     earlystop/height raw: pred_mean=26.0256 target_mean=30.4517 pred_med=28.3955 target_med=30.7000
+19:30:29 [INFO]     earlystop/width raw: pred_mean=57.8488 target_mean=66.6874 pred_med=67.5270 target_med=76.2600
+19:30:33 [INFO]     earlystop@ 25: failure_rate=19.00% (no accept; best=5.70%, min_delta=1.0%)
+19:30:38 [INFO]   Epoch  30/100  train=3.7580(imit=0.050,spec=2.086,phys=0.007,invalid=0.177,manifold=0.307)  val=0.0000(imit=0.049,spec=2.440,phys=0.006,invalid=0.184,manifold=0.315)  lr=4.18e-04
+19:30:38 [INFO]     earlystop@ 30: failure_rate=18.00% (no accept; best=5.70%, min_delta=1.0%)
+19:30:38 [INFO]     earlystop/power: mean=0.0644 median=0.0000 p90=0.1192 degrade_rate=6.7%
+19:30:38 [INFO]     earlystop/jitter: mean=0.0853 median=0.0270 p90=0.2172 degrade_rate=11.4%
+19:30:38 [INFO]     earlystop/height: mean=0.1443 median=0.0574 p90=0.4183 degrade_rate=26.1%
+19:30:38 [INFO]     earlystop/width: mean=0.1355 median=0.0297 p90=0.5525 degrade_rate=19.3%
+19:30:38 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.64 failure_rate=18.0%
+19:30:38 [INFO]     earlystop/validity: invalid_rate=7.5%
+19:30:38 [INFO]     earlystop/power raw: pred_mean=0.0058 target_mean=0.0078 pred_med=0.0048 target_med=0.0045
+19:30:38 [INFO]     earlystop/jitter raw: pred_mean=26.7095 target_mean=35.4828 pred_med=24.2891 target_med=24.8750
+19:30:38 [INFO]     earlystop/height raw: pred_mean=27.1213 target_mean=30.4517 pred_med=29.7790 target_med=30.7000
+19:30:38 [INFO]     earlystop/width raw: pred_mean=59.3620 target_mean=66.6874 pred_med=68.8694 target_med=76.2600
+19:30:42 [INFO]     earlystop@ 35: failure_rate=17.20% (no accept; best=5.70%, min_delta=1.0%)
+19:30:46 [INFO]   Epoch  40/100  train=3.6459(imit=0.052,spec=2.018,phys=0.007,invalid=0.173,manifold=0.301)  val=0.0000(imit=0.050,spec=2.086,phys=0.006,invalid=0.184,manifold=0.312)  lr=3.62e-04
+19:30:46 [INFO]     earlystop@ 40: failure_rate=15.70% (no accept; best=5.70%, min_delta=1.0%)
+19:30:46 [INFO]     earlystop/power: mean=0.0688 median=0.0009 p90=0.1130 degrade_rate=7.4%
+19:30:46 [INFO]     earlystop/jitter: mean=0.0452 median=0.0000 p90=0.1012 degrade_rate=6.6%
+19:30:46 [INFO]     earlystop/height: mean=0.1347 median=0.0488 p90=0.3622 degrade_rate=25.2%
+19:30:46 [INFO]     earlystop/width: mean=0.1133 median=0.0083 p90=0.4894 degrade_rate=18.0%
+19:30:46 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.57 failure_rate=15.7%
+19:30:46 [INFO]     earlystop/validity: invalid_rate=6.9%
+19:30:46 [INFO]     earlystop/power raw: pred_mean=0.0059 target_mean=0.0078 pred_med=0.0048 target_med=0.0045
+19:30:46 [INFO]     earlystop/jitter raw: pred_mean=25.5475 target_mean=35.4828 pred_med=21.8654 target_med=24.8750
+19:30:46 [INFO]     earlystop/height raw: pred_mean=27.2772 target_mean=30.4517 pred_med=30.0563 target_med=30.7000
+19:30:46 [INFO]     earlystop/width raw: pred_mean=61.1509 target_mean=66.6874 pred_med=71.0256 target_med=76.2600
+19:30:50 [INFO]     earlystop@ 45: failure_rate=13.80% (no accept; best=5.70%, min_delta=1.0%)
+19:30:55 [INFO]   Epoch  50/100  train=3.6966(imit=0.051,spec=2.064,phys=0.007,invalid=0.165,manifold=0.295)  val=0.0000(imit=0.050,spec=2.166,phys=0.006,invalid=0.177,manifold=0.311)  lr=3.00e-04
+19:30:55 [INFO]     earlystop@ 50: failure_rate=14.10% (no accept; best=5.70%, min_delta=1.0%)
+19:30:55 [INFO]     earlystop/power: mean=0.0693 median=0.0000 p90=0.1336 degrade_rate=7.2%
+19:30:55 [INFO]     earlystop/jitter: mean=0.0556 median=0.0000 p90=0.1442 degrade_rate=7.4%
+19:30:55 [INFO]     earlystop/height: mean=0.1238 median=0.0394 p90=0.3473 degrade_rate=22.7%
+19:30:55 [INFO]     earlystop/width: mean=0.1069 median=0.0177 p90=0.4218 degrade_rate=16.6%
+19:30:55 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.54 failure_rate=14.1%
+19:30:55 [INFO]     earlystop/validity: invalid_rate=6.2%
+19:30:55 [INFO]     earlystop/power raw: pred_mean=0.0059 target_mean=0.0078 pred_med=0.0047 target_med=0.0045
+19:30:55 [INFO]     earlystop/jitter raw: pred_mean=26.2049 target_mean=35.4828 pred_med=22.7223 target_med=24.8750
+19:30:55 [INFO]     earlystop/height raw: pred_mean=27.3682 target_mean=30.4517 pred_med=29.7718 target_med=30.7000
+19:30:55 [INFO]     earlystop/width raw: pred_mean=61.3214 target_mean=66.6874 pred_med=70.8818 target_med=76.2600
+19:30:59 [INFO]     earlystop@ 55: failure_rate=13.10% (no accept; best=5.70%, min_delta=1.0%)
+19:31:03 [INFO]   Epoch  60/100  train=3.6473(imit=0.051,spec=2.037,phys=0.007,invalid=0.163,manifold=0.289)  val=0.0000(imit=0.051,spec=2.332,phys=0.007,invalid=0.175,manifold=0.309)  lr=2.38e-04
+19:31:03 [INFO]     earlystop@ 60: failure_rate=13.70% (no accept; best=5.70%, min_delta=1.0%)
+19:31:03 [INFO]     earlystop/power: mean=0.0671 median=0.0000 p90=0.1273 degrade_rate=7.4%
+19:31:03 [INFO]     earlystop/jitter: mean=0.0429 median=0.0000 p90=0.1216 degrade_rate=6.0%
+19:31:03 [INFO]     earlystop/height: mean=0.1282 median=0.0555 p90=0.3501 degrade_rate=24.1%
+19:31:03 [INFO]     earlystop/width: mean=0.1082 median=0.0163 p90=0.4253 degrade_rate=16.9%
+19:31:03 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.54 failure_rate=13.7%
+19:31:03 [INFO]     earlystop/validity: invalid_rate=6.4%
+19:31:03 [INFO]     earlystop/power raw: pred_mean=0.0058 target_mean=0.0078 pred_med=0.0046 target_med=0.0045
+19:31:03 [INFO]     earlystop/jitter raw: pred_mean=26.2941 target_mean=35.4828 pred_med=23.0352 target_med=24.8750
+19:31:03 [INFO]     earlystop/height raw: pred_mean=26.8602 target_mean=30.4517 pred_med=28.5212 target_med=30.7000
+19:31:03 [INFO]     earlystop/width raw: pred_mean=61.0368 target_mean=66.6874 pred_med=70.2448 target_med=76.2600
+19:31:07 [INFO]     earlystop@ 65: failure_rate=13.50% (no accept; best=5.70%, min_delta=1.0%)
+19:31:12 [INFO]   Epoch  70/100  train=4.6881(imit=0.064,spec=2.707,phys=0.029,invalid=0.135,manifold=0.330)  val=0.0000(imit=0.064,spec=2.927,phys=0.029,invalid=0.140,manifold=0.345)  lr=1.82e-04
+19:31:12 [INFO]     earlystop@ 70: failure_rate=10.40% (no accept; best=5.70%, min_delta=1.0%)
+19:31:12 [INFO]     earlystop/power: mean=0.0537 median=0.0103 p90=0.0974 degrade_rate=4.3%
+19:31:12 [INFO]     earlystop/jitter: mean=0.0528 median=0.0000 p90=0.1502 degrade_rate=7.0%
+19:31:12 [INFO]     earlystop/height: mean=0.0912 median=0.0078 p90=0.2430 degrade_rate=14.2%
+19:31:12 [INFO]     earlystop/width: mean=0.0938 median=0.0149 p90=0.3461 degrade_rate=14.9%
+19:31:12 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.40 failure_rate=10.4%
+19:31:12 [INFO]     earlystop/validity: invalid_rate=3.7%
+19:31:12 [INFO]     earlystop/power raw: pred_mean=0.0056 target_mean=0.0078 pred_med=0.0037 target_med=0.0045
+19:31:12 [INFO]     earlystop/jitter raw: pred_mean=27.6682 target_mean=35.4828 pred_med=23.3027 target_med=24.8750
+19:31:12 [INFO]     earlystop/height raw: pred_mean=28.8406 target_mean=30.4517 pred_med=30.7308 target_med=30.7000
+19:31:12 [INFO]     earlystop/width raw: pred_mean=62.0329 target_mean=66.6874 pred_med=72.5023 target_med=76.2600
+19:31:17 [INFO]     earlystop@ 75: failure_rate=11.70% (no accept; best=5.70%, min_delta=1.0%)
+19:31:21 [INFO]   Epoch  80/100  train=4.6727(imit=0.065,spec=2.702,phys=0.032,invalid=0.130,manifold=0.327)  val=0.0000(imit=0.064,spec=2.891,phys=0.031,invalid=0.133,manifold=0.343)  lr=1.38e-04
+19:31:21 [INFO]     earlystop@ 80: failure_rate=10.80% (no accept; best=5.70%, min_delta=1.0%)
+19:31:21 [INFO]     earlystop/power: mean=0.0432 median=0.0000 p90=0.0724 degrade_rate=4.0%
+19:31:21 [INFO]     earlystop/jitter: mean=0.0539 median=0.0000 p90=0.1440 degrade_rate=7.5%
+19:31:21 [INFO]     earlystop/height: mean=0.0962 median=0.0158 p90=0.2551 degrade_rate=17.0%
+19:31:21 [INFO]     earlystop/width: mean=0.0889 median=0.0146 p90=0.3138 degrade_rate=14.0%
+19:31:21 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.42 failure_rate=10.8%
+19:31:21 [INFO]     earlystop/validity: invalid_rate=3.8%
+19:31:21 [INFO]     earlystop/power raw: pred_mean=0.0056 target_mean=0.0078 pred_med=0.0036 target_med=0.0045
+19:31:21 [INFO]     earlystop/jitter raw: pred_mean=27.5652 target_mean=35.4828 pred_med=23.0947 target_med=24.8750
+19:31:21 [INFO]     earlystop/height raw: pred_mean=28.0503 target_mean=30.4517 pred_med=29.6718 target_med=30.7000
+19:31:21 [INFO]     earlystop/width raw: pred_mean=62.3182 target_mean=66.6874 pred_med=71.3313 target_med=76.2600
+19:31:25 [INFO]     earlystop@ 85: failure_rate=11.20% (no accept; best=5.70%, min_delta=1.0%)
+19:31:29 [INFO]   Epoch  90/100  train=4.5797(imit=0.066,spec=2.642,phys=0.030,invalid=0.130,manifold=0.326)  val=0.0000(imit=0.065,spec=2.815,phys=0.031,invalid=0.143,manifold=0.343)  lr=1.10e-04
+19:31:29 [INFO]     earlystop@ 90: failure_rate=12.10% (no accept; best=5.70%, min_delta=1.0%)
+19:31:29 [INFO]     earlystop/power: mean=0.0421 median=0.0000 p90=0.0689 degrade_rate=4.0%
+19:31:29 [INFO]     earlystop/jitter: mean=0.0561 median=0.0000 p90=0.1639 degrade_rate=8.0%
+19:31:29 [INFO]     earlystop/height: mean=0.1140 median=0.0550 p90=0.2770 degrade_rate=19.1%
+19:31:29 [INFO]     earlystop/width: mean=0.1024 median=0.0208 p90=0.3677 degrade_rate=16.0%
+19:31:29 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.47 failure_rate=12.1%
+19:31:29 [INFO]     earlystop/validity: invalid_rate=4.2%
+19:31:29 [INFO]     earlystop/power raw: pred_mean=0.0056 target_mean=0.0078 pred_med=0.0036 target_med=0.0045
+19:31:29 [INFO]     earlystop/jitter raw: pred_mean=27.9371 target_mean=35.4828 pred_med=23.8852 target_med=24.8750
+19:31:29 [INFO]     earlystop/height raw: pred_mean=27.0967 target_mean=30.4517 pred_med=28.1267 target_med=30.7000
+19:31:29 [INFO]     earlystop/width raw: pred_mean=60.9581 target_mean=66.6874 pred_med=69.3348 target_med=76.2600
+19:31:33 [INFO]     earlystop@ 95: failure_rate=10.50% (no accept; best=5.70%, min_delta=1.0%)
+19:31:38 [INFO]   Epoch 100/100  train=4.5574(imit=0.067,spec=2.625,phys=0.032,invalid=0.131,manifold=0.325)  val=0.0000(imit=0.065,spec=2.850,phys=0.031,invalid=0.133,manifold=0.340)  lr=1.00e-04
+19:31:38 [INFO]     earlystop@100: failure_rate=10.90% (no accept; best=5.70%, min_delta=1.0%)
+19:31:38 [INFO]     earlystop/power: mean=0.0455 median=0.0000 p90=0.0816 degrade_rate=4.2%
+19:31:38 [INFO]     earlystop/jitter: mean=0.0576 median=0.0000 p90=0.1609 degrade_rate=8.1%
+19:31:38 [INFO]     earlystop/height: mean=0.0950 median=0.0246 p90=0.2536 degrade_rate=15.7%
+19:31:38 [INFO]     earlystop/width: mean=0.0907 median=0.0180 p90=0.3313 degrade_rate=14.3%
+19:31:38 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.42 failure_rate=10.9%
+19:31:38 [INFO]     earlystop/validity: invalid_rate=3.3%
+19:31:38 [INFO]     earlystop/power raw: pred_mean=0.0055 target_mean=0.0078 pred_med=0.0036 target_med=0.0045
+19:31:38 [INFO]     earlystop/jitter raw: pred_mean=27.9124 target_mean=35.4828 pred_med=23.4166 target_med=24.8750
+19:31:38 [INFO]     earlystop/height raw: pred_mean=28.0312 target_mean=30.4517 pred_med=29.3752 target_med=30.7000
+19:31:38 [INFO]     earlystop/width raw: pred_mean=62.0816 target_mean=66.6874 pred_med=70.8514 target_med=76.2600
+19:31:38 [WARNING]   Carry-forward: iteration 6 no >=1.0% improvement (prev=5.70% -> best=5.70%); kept carried-forward model
+19:31:38 [INFO] Validation failure rate: 5.7%  (57/1000 specs)
+19:31:38 [INFO]   boundary: 9.0%  interior: 2.4%
+19:31:38 [INFO]   val/power: mean=0.0554 median=0.0118 p90=0.0917 degrade_rate=4.1%
+19:31:38 [INFO]   val/jitter: mean=0.0519 median=0.0000 p90=0.1411 degrade_rate=7.4%
+19:31:38 [INFO]   val/height: mean=0.0744 median=0.0009 p90=0.2079 degrade_rate=10.7%
+19:31:38 [INFO]   val/width: mean=0.0491 median=0.0000 p90=0.1223 degrade_rate=7.3%
+19:31:38 [INFO]   val/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.29 failure_rate=5.7%
+19:31:38 [INFO]   val/validity: invalid_rate=1.7%
+19:31:38 [INFO]   val/power raw: pred_mean=0.0056 target_mean=0.0078 pred_med=0.0039 target_med=0.0045
+19:31:38 [INFO]   val/jitter raw: pred_mean=27.6317 target_mean=35.4828 pred_med=21.2528 target_med=24.8750
+19:31:38 [INFO]   val/height raw: pred_mean=28.8270 target_mean=30.4517 pred_med=29.5678 target_med=30.7000
+19:31:38 [INFO]   val/width raw: pred_mean=66.0844 target_mean=66.6874 pred_med=76.6239 target_med=76.2600
+19:31:38 [INFO]   Iter 6 final=5.70% vs prev=5.70% (delta +0.00 pts) -> fallback_prev
+19:31:38 [INFO]   Iter 6 loss summary: train_total=4.492(imit=0.056,spec=2.589,phys=0.015,invalid=0.157,manifold=0.313)  val_total=0.000(imit=0.065,spec=2.850,phys=0.031,invalid=0.133,manifold=0.340)
+19:31:38 [INFO]   LR reset to 2.50e-04; cosine scheduler restarted for next iteration
+19:31:38 [INFO]   Querying teacher for 57 failed specs ...
+19:31:38 [INFO]   Interior specs (12): using flow teacher
+19:31:38 [INFO]   filter_by_zig_validity: 12/12 passed (threshold=0.5)
+19:31:38 [INFO]   label_batch: 12/12 passed validity gate (threshold=0.5)
+19:31:38 [INFO]   filter_by_zig_validity: 12/12 passed (threshold=0.5)
+19:31:38 [INFO]   Boundary specs (45): high-budget flow + k-NN fallback
+19:31:39 [INFO]   filter_by_zig_validity: 45/45 passed (threshold=0.5)
+19:31:39 [INFO]   label_batch: 45/45 passed validity gate (threshold=0.5)
+19:31:39 [INFO]   filter_by_zig_validity: 45/45 passed (threshold=0.5)
+19:31:39 [INFO]   Teacher labels: flow=57, k-NN=0, total=57/57
+19:31:39 [INFO]   filter_by_zig_validity: 57/57 passed (threshold=0.5)
+19:31:39 [INFO]   filter_by_zig_consistency: 30/57 passed  (boundary=45, interior=12)
+19:31:39 [INFO]   filter_by_zig_consistency_relaxed: 30/57 passed  (boundary=45, interior=12)
+19:31:39 [INFO]   DAgger labels: validity@0.5=100.0%  strict_consistency=52.6%  relaxed_consistency=52.6%
+19:31:39 [INFO]   Added 57 labeled failures.  Dataset now: 20353
+19:31:39 [INFO] ============================================================
+19:31:39 [INFO]   DAgger Iteration 7/8
+19:31:39 [INFO] ============================================================
+19:31:39 [INFO] Dataset size: 20353
+19:31:39 [INFO]   Prev-iter baseline: prev_failure_rate=5.70% on COMMON_EVAL_SPECS (n=1000)
+19:31:39 [INFO]   Shared eval set (COMMON_EVAL_SPECS): n=1000 specs (seed=24681012, every=5ep, log_every=10ep, skip_first=5ep)
+19:31:40 [INFO]   Epoch   1/100  train=0.0462(imit=0.046,spec=0.000,phys=0.000,invalid=0.000,manifold=0.331)  val=0.0000(imit=0.035,spec=0.000,phys=0.000,invalid=0.000,manifold=0.361)  lr=2.50e-04
+19:31:43 [INFO]     earlystop@  5: failure_rate=15.80% (skipped, epoch 5 <= EARLYSTOP_SKIP_EPOCHS=5)
+19:31:48 [INFO]   Epoch  10/100  train=4.9421(imit=0.067,spec=2.850,phys=0.035,invalid=0.146,manifold=0.347)  val=0.0000(imit=0.065,spec=3.031,phys=0.035,invalid=0.147,manifold=0.364)  lr=2.46e-04
+19:31:48 [INFO]     earlystop@ 10: failure_rate=17.60% (no accept; best=5.70%, min_delta=1.0%)
+19:31:48 [INFO]     earlystop/power: mean=0.0444 median=0.0000 p90=0.0672 degrade_rate=4.4%
+19:31:48 [INFO]     earlystop/jitter: mean=0.0584 median=0.0000 p90=0.1580 degrade_rate=8.1%
+19:31:48 [INFO]     earlystop/height: mean=0.1266 median=0.0197 p90=0.4075 degrade_rate=22.5%
+19:31:48 [INFO]     earlystop/width: mean=0.1362 median=0.0148 p90=0.5893 degrade_rate=21.5%
+19:31:48 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.56 failure_rate=17.6%
+19:31:48 [INFO]     earlystop/validity: invalid_rate=7.2%
+19:31:48 [INFO]     earlystop/power raw: pred_mean=0.0055 target_mean=0.0078 pred_med=0.0036 target_med=0.0045
+19:31:48 [INFO]     earlystop/jitter raw: pred_mean=26.3360 target_mean=35.4828 pred_med=21.8545 target_med=24.8750
+19:31:48 [INFO]     earlystop/height raw: pred_mean=28.1760 target_mean=30.4517 pred_med=31.2753 target_med=30.7000
+19:31:48 [INFO]     earlystop/width raw: pred_mean=60.1002 target_mean=66.6874 pred_med=72.7126 target_med=76.2600
+19:31:52 [INFO]     earlystop@ 15: failure_rate=17.40% (no accept; best=5.70%, min_delta=1.0%)
+19:31:56 [INFO]   Epoch  20/100  train=4.6581(imit=0.065,spec=2.671,phys=0.034,invalid=0.137,manifold=0.347)  val=0.0000(imit=0.064,spec=2.937,phys=0.034,invalid=0.141,manifold=0.364)  lr=2.36e-04
+19:31:56 [INFO]     earlystop@ 20: failure_rate=15.50% (no accept; best=5.70%, min_delta=1.0%)
+19:31:56 [INFO]     earlystop/power: mean=0.0479 median=0.0000 p90=0.0871 degrade_rate=4.4%
+19:31:56 [INFO]     earlystop/jitter: mean=0.0547 median=0.0000 p90=0.1242 degrade_rate=7.0%
+19:31:56 [INFO]     earlystop/height: mean=0.1205 median=0.0207 p90=0.3687 degrade_rate=21.4%
+19:31:56 [INFO]     earlystop/width: mean=0.1205 median=0.0128 p90=0.5297 degrade_rate=19.4%
+19:31:56 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.52 failure_rate=15.5%
+19:31:56 [INFO]     earlystop/validity: invalid_rate=6.5%
+19:31:56 [INFO]     earlystop/power raw: pred_mean=0.0055 target_mean=0.0078 pred_med=0.0037 target_med=0.0045
+19:31:56 [INFO]     earlystop/jitter raw: pred_mean=26.4355 target_mean=35.4828 pred_med=21.9370 target_med=24.8750
+19:31:56 [INFO]     earlystop/height raw: pred_mean=28.1698 target_mean=30.4517 pred_med=30.7289 target_med=30.7000
+19:31:56 [INFO]     earlystop/width raw: pred_mean=60.9280 target_mean=66.6874 pred_med=72.6585 target_med=76.2600
+19:32:00 [INFO]     earlystop@ 25: failure_rate=15.40% (no accept; best=5.70%, min_delta=1.0%)
+19:32:04 [INFO]   Epoch  30/100  train=4.7014(imit=0.065,spec=2.703,phys=0.032,invalid=0.136,manifold=0.345)  val=0.0000(imit=0.066,spec=2.891,phys=0.034,invalid=0.140,manifold=0.361)  lr=2.19e-04
+19:32:04 [INFO]     earlystop@ 30: failure_rate=15.80% (no accept; best=5.70%, min_delta=1.0%)
+19:32:04 [INFO]     earlystop/power: mean=0.0491 median=0.0000 p90=0.1023 degrade_rate=4.5%
+19:32:04 [INFO]     earlystop/jitter: mean=0.0639 median=0.0000 p90=0.1717 degrade_rate=8.0%
+19:32:04 [INFO]     earlystop/height: mean=0.1223 median=0.0351 p90=0.3396 degrade_rate=21.7%
+19:32:04 [INFO]     earlystop/width: mean=0.1173 median=0.0199 p90=0.4661 degrade_rate=17.6%
+19:32:04 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.52 failure_rate=15.8%
+19:32:04 [INFO]     earlystop/validity: invalid_rate=6.0%
+19:32:04 [INFO]     earlystop/power raw: pred_mean=0.0056 target_mean=0.0078 pred_med=0.0037 target_med=0.0045
+19:32:04 [INFO]     earlystop/jitter raw: pred_mean=27.0823 target_mean=35.4828 pred_med=22.6301 target_med=24.8750
+19:32:04 [INFO]     earlystop/height raw: pred_mean=27.8333 target_mean=30.4517 pred_med=30.4026 target_med=30.7000
+19:32:04 [INFO]     earlystop/width raw: pred_mean=60.7559 target_mean=66.6874 pred_med=71.5651 target_med=76.2600
+19:32:09 [INFO]     earlystop@ 35: failure_rate=15.30% (no accept; best=5.70%, min_delta=1.0%)
+19:32:13 [INFO]   Epoch  40/100  train=4.6102(imit=0.067,spec=2.643,phys=0.032,invalid=0.137,manifold=0.343)  val=0.0000(imit=0.067,spec=2.867,phys=0.033,invalid=0.140,manifold=0.358)  lr=1.98e-04
+19:32:13 [INFO]     earlystop@ 40: failure_rate=15.10% (no accept; best=5.70%, min_delta=1.0%)
+19:32:13 [INFO]     earlystop/power: mean=0.0437 median=0.0000 p90=0.0790 degrade_rate=4.2%
+19:32:13 [INFO]     earlystop/jitter: mean=0.0632 median=0.0000 p90=0.1618 degrade_rate=7.4%
+19:32:13 [INFO]     earlystop/height: mean=0.1236 median=0.0335 p90=0.3667 degrade_rate=22.9%
+19:32:13 [INFO]     earlystop/width: mean=0.1158 median=0.0200 p90=0.4318 degrade_rate=18.0%
+19:32:13 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.53 failure_rate=15.1%
+19:32:13 [INFO]     earlystop/validity: invalid_rate=5.7%
+19:32:13 [INFO]     earlystop/power raw: pred_mean=0.0056 target_mean=0.0078 pred_med=0.0037 target_med=0.0045
+19:32:13 [INFO]     earlystop/jitter raw: pred_mean=27.4843 target_mean=35.4828 pred_med=23.5117 target_med=24.8750
+19:32:13 [INFO]     earlystop/height raw: pred_mean=27.6311 target_mean=30.4517 pred_med=29.8411 target_med=30.7000
+19:32:13 [INFO]     earlystop/width raw: pred_mean=60.4465 target_mean=66.6874 pred_med=69.9724 target_med=76.2600
+19:32:17 [INFO]     earlystop@ 45: failure_rate=14.50% (no accept; best=5.70%, min_delta=1.0%)
+19:32:21 [INFO]   Epoch  50/100  train=4.6175(imit=0.067,spec=2.650,phys=0.032,invalid=0.135,manifold=0.342)  val=0.0000(imit=0.066,spec=2.871,phys=0.032,invalid=0.138,manifold=0.357)  lr=1.75e-04
+19:32:21 [INFO]     earlystop@ 50: failure_rate=13.40% (no accept; best=5.70%, min_delta=1.0%)
+19:32:21 [INFO]     earlystop/power: mean=0.0563 median=0.0076 p90=0.1069 degrade_rate=4.6%
+19:32:21 [INFO]     earlystop/jitter: mean=0.0723 median=0.0000 p90=0.1868 degrade_rate=8.7%
+19:32:21 [INFO]     earlystop/height: mean=0.1093 median=0.0202 p90=0.3193 degrade_rate=18.6%
+19:32:21 [INFO]     earlystop/width: mean=0.1082 median=0.0243 p90=0.4053 degrade_rate=16.1%
+19:32:21 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.48 failure_rate=13.4%
+19:32:21 [INFO]     earlystop/validity: invalid_rate=4.7%
+19:32:21 [INFO]     earlystop/power raw: pred_mean=0.0058 target_mean=0.0078 pred_med=0.0039 target_med=0.0045
+19:32:21 [INFO]     earlystop/jitter raw: pred_mean=27.9870 target_mean=35.4828 pred_med=24.1219 target_med=24.8750
+19:32:21 [INFO]     earlystop/height raw: pred_mean=28.2668 target_mean=30.4517 pred_med=30.2104 target_med=30.7000
+19:32:21 [INFO]     earlystop/width raw: pred_mean=60.8840 target_mean=66.6874 pred_med=70.4812 target_med=76.2600
+19:32:25 [INFO]     earlystop@ 55: failure_rate=12.80% (no accept; best=5.70%, min_delta=1.0%)
+19:32:30 [INFO]   Epoch  60/100  train=4.5029(imit=0.067,spec=2.585,phys=0.031,invalid=0.130,manifold=0.332)  val=0.0000(imit=0.067,spec=2.850,phys=0.033,invalid=0.138,manifold=0.352)  lr=1.52e-04
+19:32:30 [INFO]     earlystop@ 60: failure_rate=13.20% (no accept; best=5.70%, min_delta=1.0%)
+19:32:30 [INFO]     earlystop/power: mean=0.0499 median=0.0024 p90=0.0921 degrade_rate=4.6%
+19:32:30 [INFO]     earlystop/jitter: mean=0.0652 median=0.0000 p90=0.1689 degrade_rate=7.9%
+19:32:30 [INFO]     earlystop/height: mean=0.1096 median=0.0360 p90=0.3051 degrade_rate=19.3%
+19:32:30 [INFO]     earlystop/width: mean=0.1000 median=0.0207 p90=0.3729 degrade_rate=14.8%
+19:32:30 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.47 failure_rate=13.2%
+19:32:30 [INFO]     earlystop/validity: invalid_rate=4.1%
+19:32:30 [INFO]     earlystop/power raw: pred_mean=0.0057 target_mean=0.0078 pred_med=0.0037 target_med=0.0045
+19:32:30 [INFO]     earlystop/jitter raw: pred_mean=27.8315 target_mean=35.4828 pred_med=23.8645 target_med=24.8750
+19:32:30 [INFO]     earlystop/height raw: pred_mean=27.7801 target_mean=30.4517 pred_med=29.4968 target_med=30.7000
+19:32:30 [INFO]     earlystop/width raw: pred_mean=61.4671 target_mean=66.6874 pred_med=71.2797 target_med=76.2600
+19:32:34 [INFO]     earlystop@ 65: failure_rate=12.30% (no accept; best=5.70%, min_delta=1.0%)
+19:32:39 [INFO]   Epoch  70/100  train=4.6046(imit=0.069,spec=2.644,phys=0.033,invalid=0.135,manifold=0.335)  val=0.0000(imit=0.067,spec=2.824,phys=0.032,invalid=0.141,manifold=0.351)  lr=1.31e-04
+19:32:39 [INFO]     earlystop@ 70: failure_rate=13.80% (no accept; best=5.70%, min_delta=1.0%)
+19:32:39 [INFO]     earlystop/power: mean=0.0447 median=0.0000 p90=0.0841 degrade_rate=4.6%
+19:32:39 [INFO]     earlystop/jitter: mean=0.0579 median=0.0000 p90=0.1534 degrade_rate=7.0%
+19:32:39 [INFO]     earlystop/height: mean=0.1137 median=0.0456 p90=0.3148 degrade_rate=20.3%
+19:32:39 [INFO]     earlystop/width: mean=0.1030 median=0.0185 p90=0.3995 degrade_rate=15.6%
+19:32:39 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.47 failure_rate=13.8%
+19:32:39 [INFO]     earlystop/validity: invalid_rate=4.4%
+19:32:39 [INFO]     earlystop/power raw: pred_mean=0.0057 target_mean=0.0078 pred_med=0.0037 target_med=0.0045
+19:32:39 [INFO]     earlystop/jitter raw: pred_mean=27.5700 target_mean=35.4828 pred_med=23.3812 target_med=24.8750
+19:32:39 [INFO]     earlystop/height raw: pred_mean=27.4794 target_mean=30.4517 pred_med=29.0825 target_med=30.7000
+19:32:39 [INFO]     earlystop/width raw: pred_mean=61.3456 target_mean=66.6874 pred_med=70.7888 target_med=76.2600
+19:32:43 [INFO]     earlystop@ 75: failure_rate=10.80% (no accept; best=5.70%, min_delta=1.0%)
+19:32:46 [INFO]   Epoch  80/100  train=4.5038(imit=0.067,spec=2.581,phys=0.031,invalid=0.133,manifold=0.336)  val=0.0000(imit=0.067,spec=2.815,phys=0.032,invalid=0.140,manifold=0.350)  lr=1.14e-04
+19:32:46 [INFO]     earlystop@ 80: failure_rate=12.30% (no accept; best=5.70%, min_delta=1.0%)
+19:32:46 [INFO]     earlystop/power: mean=0.0499 median=0.0045 p90=0.0930 degrade_rate=4.4%
+19:32:46 [INFO]     earlystop/jitter: mean=0.0559 median=0.0000 p90=0.1437 degrade_rate=6.7%
+19:32:46 [INFO]     earlystop/height: mean=0.1126 median=0.0430 p90=0.3228 degrade_rate=18.5%
+19:32:46 [INFO]     earlystop/width: mean=0.1025 median=0.0188 p90=0.4089 degrade_rate=15.8%
+19:32:46 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.45 failure_rate=12.3%
+19:32:46 [INFO]     earlystop/validity: invalid_rate=5.4%
+19:32:46 [INFO]     earlystop/power raw: pred_mean=0.0057 target_mean=0.0078 pred_med=0.0037 target_med=0.0045
+19:32:46 [INFO]     earlystop/jitter raw: pred_mean=27.5037 target_mean=35.4828 pred_med=23.2023 target_med=24.8750
+19:32:46 [INFO]     earlystop/height raw: pred_mean=27.3777 target_mean=30.4517 pred_med=27.7142 target_med=30.7000
+19:32:46 [INFO]     earlystop/width raw: pred_mean=61.1977 target_mean=66.6874 pred_med=69.4891 target_med=76.2600
+19:32:50 [INFO]     earlystop@ 85: failure_rate=11.20% (no accept; best=5.70%, min_delta=1.0%)
+19:32:53 [INFO]   Epoch  90/100  train=4.5158(imit=0.067,spec=2.591,phys=0.031,invalid=0.131,manifold=0.335)  val=0.0000(imit=0.067,spec=2.812,phys=0.033,invalid=0.139,manifold=0.349)  lr=1.04e-04
+19:32:53 [INFO]     earlystop@ 90: failure_rate=12.20% (no accept; best=5.70%, min_delta=1.0%)
+19:32:53 [INFO]     earlystop/power: mean=0.0507 median=0.0060 p90=0.1013 degrade_rate=4.3%
+19:32:53 [INFO]     earlystop/jitter: mean=0.0569 median=0.0000 p90=0.1515 degrade_rate=7.0%
+19:32:53 [INFO]     earlystop/height: mean=0.1132 median=0.0526 p90=0.2969 degrade_rate=18.8%
+19:32:53 [INFO]     earlystop/width: mean=0.1017 median=0.0209 p90=0.3958 degrade_rate=15.5%
+19:32:53 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.46 failure_rate=12.2%
+19:32:53 [INFO]     earlystop/validity: invalid_rate=4.7%
+19:32:53 [INFO]     earlystop/power raw: pred_mean=0.0057 target_mean=0.0078 pred_med=0.0037 target_med=0.0045
+19:32:53 [INFO]     earlystop/jitter raw: pred_mean=27.7770 target_mean=35.4828 pred_med=23.2672 target_med=24.8750
+19:32:53 [INFO]     earlystop/height raw: pred_mean=27.3192 target_mean=30.4517 pred_med=27.7595 target_med=30.7000
+19:32:53 [INFO]     earlystop/width raw: pred_mean=61.2316 target_mean=66.6874 pred_med=70.0721 target_med=76.2600
+19:32:56 [INFO]     earlystop@ 95: failure_rate=12.30% (no accept; best=5.70%, min_delta=1.0%)
+19:33:00 [INFO]   Epoch 100/100  train=4.5120(imit=0.068,spec=2.586,phys=0.032,invalid=0.132,manifold=0.336)  val=0.0000(imit=0.067,spec=2.807,phys=0.032,invalid=0.136,manifold=0.349)  lr=1.00e-04
+19:33:00 [INFO]     earlystop@100: failure_rate=11.00% (no accept; best=5.70%, min_delta=1.0%)
+19:33:00 [INFO]     earlystop/power: mean=0.0468 median=0.0037 p90=0.0817 degrade_rate=4.3%
+19:33:00 [INFO]     earlystop/jitter: mean=0.0620 median=0.0000 p90=0.1575 degrade_rate=8.1%
+19:33:00 [INFO]     earlystop/height: mean=0.1006 median=0.0254 p90=0.2736 degrade_rate=14.8%
+19:33:00 [INFO]     earlystop/width: mean=0.0939 median=0.0189 p90=0.3538 degrade_rate=14.3%
+19:33:00 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.41 failure_rate=11.0%
+19:33:00 [INFO]     earlystop/validity: invalid_rate=4.1%
+19:33:00 [INFO]     earlystop/power raw: pred_mean=0.0057 target_mean=0.0078 pred_med=0.0037 target_med=0.0045
+19:33:00 [INFO]     earlystop/jitter raw: pred_mean=27.8032 target_mean=35.4828 pred_med=23.4446 target_med=24.8750
+19:33:00 [INFO]     earlystop/height raw: pred_mean=28.0766 target_mean=30.4517 pred_med=28.7290 target_med=30.7000
+19:33:00 [INFO]     earlystop/width raw: pred_mean=61.9155 target_mean=66.6874 pred_med=71.4639 target_med=76.2600
+19:33:00 [WARNING]   Carry-forward: iteration 7 no >=1.0% improvement (prev=5.70% -> best=5.70%); kept carried-forward model
+19:33:00 [INFO] Validation failure rate: 5.7%  (57/1000 specs)
+19:33:00 [INFO]   boundary: 9.0%  interior: 2.4%
+19:33:00 [INFO]   val/power: mean=0.0554 median=0.0118 p90=0.0917 degrade_rate=4.1%
+19:33:00 [INFO]   val/jitter: mean=0.0519 median=0.0000 p90=0.1411 degrade_rate=7.4%
+19:33:00 [INFO]   val/height: mean=0.0744 median=0.0009 p90=0.2079 degrade_rate=10.7%
+19:33:00 [INFO]   val/width: mean=0.0491 median=0.0000 p90=0.1223 degrade_rate=7.3%
+19:33:00 [INFO]   val/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.29 failure_rate=5.7%
+19:33:00 [INFO]   val/validity: invalid_rate=1.7%
+19:33:00 [INFO]   val/power raw: pred_mean=0.0056 target_mean=0.0078 pred_med=0.0039 target_med=0.0045
+19:33:00 [INFO]   val/jitter raw: pred_mean=27.6317 target_mean=35.4828 pred_med=21.2528 target_med=24.8750
+19:33:00 [INFO]   val/height raw: pred_mean=28.8270 target_mean=30.4517 pred_med=29.5678 target_med=30.7000
+19:33:00 [INFO]   val/width raw: pred_mean=66.0844 target_mean=66.6874 pred_med=76.6239 target_med=76.2600
+19:33:00 [INFO]   Iter 7 final=5.70% vs prev=5.70% (delta +0.00 pts) -> fallback_prev
+19:33:00 [INFO]   Iter 7 loss summary: train_total=4.626(imit=0.066,spec=2.668,phys=0.031,invalid=0.133,manifold=0.338)  val_total=0.000(imit=0.067,spec=2.807,phys=0.032,invalid=0.136,manifold=0.349)
+19:33:00 [INFO]   LR reset to 1.25e-04; cosine scheduler restarted for next iteration
+19:33:00 [INFO]   Querying teacher for 57 failed specs ...
+19:33:00 [INFO]   Interior specs (12): using flow teacher
+19:33:00 [INFO]   filter_by_zig_validity: 12/12 passed (threshold=0.5)
+19:33:00 [INFO]   label_batch: 12/12 passed validity gate (threshold=0.5)
+19:33:00 [INFO]   filter_by_zig_validity: 12/12 passed (threshold=0.5)
+19:33:00 [INFO]   Boundary specs (45): high-budget flow + k-NN fallback
+19:33:01 [INFO]   filter_by_zig_validity: 45/45 passed (threshold=0.5)
+19:33:01 [INFO]   label_batch: 45/45 passed validity gate (threshold=0.5)
+19:33:01 [INFO]   filter_by_zig_validity: 45/45 passed (threshold=0.5)
+19:33:01 [INFO]   Teacher labels: flow=57, k-NN=0, total=57/57
+19:33:01 [INFO]   filter_by_zig_validity: 57/57 passed (threshold=0.5)
+19:33:01 [INFO]   filter_by_zig_consistency: 33/57 passed  (boundary=45, interior=12)
+19:33:01 [INFO]   filter_by_zig_consistency_relaxed: 33/57 passed  (boundary=45, interior=12)
+19:33:01 [INFO]   DAgger labels: validity@0.5=100.0%  strict_consistency=57.9%  relaxed_consistency=57.9%
+19:33:01 [INFO]   Added 57 labeled failures.  Dataset now: 20410
+19:33:01 [INFO] ============================================================
+19:33:01 [INFO]   DAgger Iteration 8/8
+19:33:01 [INFO] ============================================================
+19:33:01 [INFO] Dataset size: 20410
+19:33:01 [INFO]   Prev-iter baseline: prev_failure_rate=5.70% on COMMON_EVAL_SPECS (n=1000)
+19:33:01 [INFO]   Shared eval set (COMMON_EVAL_SPECS): n=1000 specs (seed=24681012, every=5ep, log_every=10ep, skip_first=5ep)
+19:33:02 [INFO]   Epoch   1/100  train=0.0516(imit=0.052,spec=0.000,phys=0.000,invalid=0.000,manifold=0.342)  val=0.0000(imit=0.041,spec=0.000,phys=0.000,invalid=0.000,manifold=0.359)  lr=1.25e-04
+19:33:05 [INFO]     earlystop@  5: failure_rate=7.50% (skipped, epoch 5 <= EARLYSTOP_SKIP_EPOCHS=5)
+19:33:08 [INFO]   Epoch  10/100  train=4.3748(imit=0.070,spec=2.507,phys=0.034,invalid=0.120,manifold=0.331)  val=0.0000(imit=0.070,spec=2.704,phys=0.034,invalid=0.124,manifold=0.345)  lr=1.24e-04
+19:33:08 [INFO]     earlystop@ 10: failure_rate=7.20% (no accept; best=5.70%, min_delta=1.0%)
+19:33:08 [INFO]     earlystop/power: mean=0.0530 median=0.0085 p90=0.0937 degrade_rate=3.8%
+19:33:08 [INFO]     earlystop/jitter: mean=0.0604 median=0.0000 p90=0.1569 degrade_rate=8.0%
+19:33:08 [INFO]     earlystop/height: mean=0.0926 median=0.0403 p90=0.2447 degrade_rate=14.9%
+19:33:08 [INFO]     earlystop/width: mean=0.0578 median=0.0096 p90=0.1054 degrade_rate=7.9%
+19:33:08 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.35 failure_rate=7.2%
+19:33:08 [INFO]     earlystop/validity: invalid_rate=2.5%
+19:33:08 [INFO]     earlystop/power raw: pred_mean=0.0057 target_mean=0.0078 pred_med=0.0039 target_med=0.0045
+19:33:08 [INFO]     earlystop/jitter raw: pred_mean=28.3714 target_mean=35.4828 pred_med=22.6088 target_med=24.8750
+19:33:08 [INFO]     earlystop/height raw: pred_mean=27.8826 target_mean=30.4517 pred_med=27.9078 target_med=30.7000
+19:33:08 [INFO]     earlystop/width raw: pred_mean=64.7423 target_mean=66.6874 pred_med=74.1022 target_med=76.2600
+19:33:11 [INFO]     earlystop@ 15: failure_rate=6.00% (no accept; best=5.70%, min_delta=1.0%)
+19:33:15 [INFO]   Epoch  20/100  train=4.3619(imit=0.071,spec=2.494,phys=0.034,invalid=0.122,manifold=0.332)  val=0.0000(imit=0.070,spec=2.620,phys=0.034,invalid=0.125,manifold=0.342)  lr=1.23e-04
+19:33:15 [INFO]     earlystop@ 20: failure_rate=6.40% (no accept; best=5.70%, min_delta=1.0%)
+19:33:15 [INFO]     earlystop/power: mean=0.0462 median=0.0000 p90=0.0780 degrade_rate=3.8%
+19:33:15 [INFO]     earlystop/jitter: mean=0.0562 median=0.0000 p90=0.1432 degrade_rate=7.4%
+19:33:15 [INFO]     earlystop/height: mean=0.0976 median=0.0439 p90=0.2443 degrade_rate=16.7%
+19:33:15 [INFO]     earlystop/width: mean=0.0566 median=0.0032 p90=0.1262 degrade_rate=7.7%
+19:33:15 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.36 failure_rate=6.4%
+19:33:15 [INFO]     earlystop/validity: invalid_rate=2.1%
+19:33:15 [INFO]     earlystop/power raw: pred_mean=0.0056 target_mean=0.0078 pred_med=0.0038 target_med=0.0045
+19:33:15 [INFO]     earlystop/jitter raw: pred_mean=28.4602 target_mean=35.4828 pred_med=22.0972 target_med=24.8750
+19:33:15 [INFO]     earlystop/height raw: pred_mean=27.6808 target_mean=30.4517 pred_med=27.3346 target_med=30.7000
+19:33:15 [INFO]     earlystop/width raw: pred_mean=64.7209 target_mean=66.6874 pred_med=74.6346 target_med=76.2600
+19:33:18 [INFO]     earlystop@ 25: failure_rate=5.80% (no accept; best=5.70%, min_delta=1.0%)
+19:33:22 [INFO]   Epoch  30/100  train=4.4220(imit=0.071,spec=2.542,phys=0.032,invalid=0.123,manifold=0.321)  val=0.0000(imit=0.070,spec=2.680,phys=0.034,invalid=0.123,manifold=0.339)  lr=1.20e-04
+19:33:22 [INFO]     earlystop@ 30: failure_rate=6.30% (no accept; best=5.70%, min_delta=1.0%)
+19:33:22 [INFO]     earlystop/power: mean=0.0431 median=0.0000 p90=0.0768 degrade_rate=3.7%
+19:33:22 [INFO]     earlystop/jitter: mean=0.0513 median=0.0000 p90=0.1207 degrade_rate=7.2%
+19:33:22 [INFO]     earlystop/height: mean=0.0940 median=0.0395 p90=0.2430 degrade_rate=16.2%
+19:33:22 [INFO]     earlystop/width: mean=0.0531 median=0.0005 p90=0.1254 degrade_rate=7.6%
+19:33:22 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.35 failure_rate=6.3%
+19:33:22 [INFO]     earlystop/validity: invalid_rate=2.2%
+19:33:22 [INFO]     earlystop/power raw: pred_mean=0.0056 target_mean=0.0078 pred_med=0.0038 target_med=0.0045
+19:33:22 [INFO]     earlystop/jitter raw: pred_mean=28.3226 target_mean=35.4828 pred_med=22.0664 target_med=24.8750
+19:33:22 [INFO]     earlystop/height raw: pred_mean=27.7685 target_mean=30.4517 pred_med=27.5553 target_med=30.7000
+19:33:22 [INFO]     earlystop/width raw: pred_mean=65.1117 target_mean=66.6874 pred_med=75.0211 target_med=76.2600
+19:33:25 [INFO]     earlystop@ 35: failure_rate=6.30% (no accept; best=5.70%, min_delta=1.0%)
+19:33:29 [INFO]   Epoch  40/100  train=4.3218(imit=0.070,spec=2.479,phys=0.031,invalid=0.123,manifold=0.318)  val=0.0000(imit=0.070,spec=2.655,phys=0.033,invalid=0.123,manifold=0.338)  lr=1.16e-04
+19:33:29 [INFO]     earlystop@ 40: failure_rate=5.70% (no accept; best=5.70%, min_delta=1.0%)
+19:33:29 [INFO]     earlystop/power: mean=0.0451 median=0.0000 p90=0.0793 degrade_rate=3.7%
+19:33:29 [INFO]     earlystop/jitter: mean=0.0498 median=0.0000 p90=0.1264 degrade_rate=7.1%
+19:33:29 [INFO]     earlystop/height: mean=0.0858 median=0.0274 p90=0.2328 degrade_rate=14.5%
+19:33:29 [INFO]     earlystop/width: mean=0.0497 median=0.0000 p90=0.1184 degrade_rate=7.2%
+19:33:29 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.33 failure_rate=5.7%
+19:33:29 [INFO]     earlystop/validity: invalid_rate=1.9%
+19:33:29 [INFO]     earlystop/power raw: pred_mean=0.0056 target_mean=0.0078 pred_med=0.0038 target_med=0.0045
+19:33:29 [INFO]     earlystop/jitter raw: pred_mean=28.2994 target_mean=35.4828 pred_med=22.0267 target_med=24.8750
+19:33:29 [INFO]     earlystop/height raw: pred_mean=28.1706 target_mean=30.4517 pred_med=28.2687 target_med=30.7000
+19:33:29 [INFO]     earlystop/width raw: pred_mean=65.5046 target_mean=66.6874 pred_med=75.2891 target_med=76.2600
+19:33:32 [INFO]     earlystop@ 45: failure_rate=5.90% (no accept; best=5.70%, min_delta=1.0%)
+19:33:35 [INFO]   Epoch  50/100  train=4.3913(imit=0.071,spec=2.523,phys=0.031,invalid=0.124,manifold=0.320)  val=0.0000(imit=0.071,spec=2.643,phys=0.032,invalid=0.127,manifold=0.335)  lr=1.13e-04
+19:33:35 [INFO]     earlystop@ 50: failure_rate=6.30% (no accept; best=5.70%, min_delta=1.0%)
+19:33:35 [INFO]     earlystop/power: mean=0.0442 median=0.0000 p90=0.0786 degrade_rate=3.4%
+19:33:35 [INFO]     earlystop/jitter: mean=0.0596 median=0.0000 p90=0.1657 degrade_rate=8.4%
+19:33:35 [INFO]     earlystop/height: mean=0.0965 median=0.0467 p90=0.2427 degrade_rate=16.4%
+19:33:35 [INFO]     earlystop/width: mean=0.0556 median=0.0072 p90=0.1318 degrade_rate=8.0%
+19:33:35 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.36 failure_rate=6.3%
+19:33:35 [INFO]     earlystop/validity: invalid_rate=2.0%
+19:33:35 [INFO]     earlystop/power raw: pred_mean=0.0057 target_mean=0.0078 pred_med=0.0038 target_med=0.0045
+19:33:35 [INFO]     earlystop/jitter raw: pred_mean=28.7524 target_mean=35.4828 pred_med=22.3377 target_med=24.8750
+19:33:35 [INFO]     earlystop/height raw: pred_mean=27.6781 target_mean=30.4517 pred_med=27.3331 target_med=30.7000
+19:33:35 [INFO]     earlystop/width raw: pred_mean=64.7569 target_mean=66.6874 pred_med=74.3675 target_med=76.2600
+19:33:39 [INFO]     earlystop@ 55: failure_rate=6.50% (no accept; best=5.70%, min_delta=1.0%)
+19:33:42 [INFO]   Epoch  60/100  train=4.2154(imit=0.072,spec=2.413,phys=0.030,invalid=0.124,manifold=0.309)  val=0.0000(imit=0.071,spec=2.637,phys=0.033,invalid=0.125,manifold=0.332)  lr=1.09e-04
+19:33:42 [INFO]     earlystop@ 60: failure_rate=6.70% (no accept; best=5.70%, min_delta=1.0%)
+19:33:42 [INFO]     earlystop/power: mean=0.0402 median=0.0000 p90=0.0658 degrade_rate=3.3%
+19:33:42 [INFO]     earlystop/jitter: mean=0.0542 median=0.0000 p90=0.1484 degrade_rate=7.9%
+19:33:42 [INFO]     earlystop/height: mean=0.0933 median=0.0411 p90=0.2373 degrade_rate=15.9%
+19:33:42 [INFO]     earlystop/width: mean=0.0542 median=0.0044 p90=0.1392 degrade_rate=7.9%
+19:33:42 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.35 failure_rate=6.7%
+19:33:42 [INFO]     earlystop/validity: invalid_rate=1.8%
+19:33:42 [INFO]     earlystop/power raw: pred_mean=0.0056 target_mean=0.0078 pred_med=0.0037 target_med=0.0045
+19:33:42 [INFO]     earlystop/jitter raw: pred_mean=28.6743 target_mean=35.4828 pred_med=22.5317 target_med=24.8750
+19:33:42 [INFO]     earlystop/height raw: pred_mean=27.7754 target_mean=30.4517 pred_med=27.6931 target_med=30.7000
+19:33:42 [INFO]     earlystop/width raw: pred_mean=64.9031 target_mean=66.6874 pred_med=74.1850 target_med=76.2600
+19:33:46 [INFO]     earlystop@ 65: failure_rate=7.00% (no accept; best=5.70%, min_delta=1.0%)
+19:33:49 [INFO]   Epoch  70/100  train=4.3659(imit=0.072,spec=2.511,phys=0.031,invalid=0.124,manifold=0.309)  val=0.0000(imit=0.071,spec=2.645,phys=0.032,invalid=0.126,manifold=0.334)  lr=1.05e-04
+19:33:49 [INFO]     earlystop@ 70: failure_rate=6.70% (no accept; best=5.70%, min_delta=1.0%)
+19:33:49 [INFO]     earlystop/power: mean=0.0447 median=0.0000 p90=0.0818 degrade_rate=3.7%
+19:33:49 [INFO]     earlystop/jitter: mean=0.0562 median=0.0000 p90=0.1541 degrade_rate=7.2%
+19:33:49 [INFO]     earlystop/height: mean=0.0981 median=0.0531 p90=0.2460 degrade_rate=17.1%
+19:33:49 [INFO]     earlystop/width: mean=0.0572 median=0.0075 p90=0.1308 degrade_rate=7.8%
+19:33:49 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.36 failure_rate=6.7%
+19:33:49 [INFO]     earlystop/validity: invalid_rate=1.9%
+19:33:49 [INFO]     earlystop/power raw: pred_mean=0.0057 target_mean=0.0078 pred_med=0.0038 target_med=0.0045
+19:33:49 [INFO]     earlystop/jitter raw: pred_mean=28.9734 target_mean=35.4828 pred_med=23.1134 target_med=24.8750
+19:33:49 [INFO]     earlystop/height raw: pred_mean=27.4343 target_mean=30.4517 pred_med=26.9052 target_med=30.7000
+19:33:49 [INFO]     earlystop/width raw: pred_mean=64.6077 target_mean=66.6874 pred_med=73.5969 target_med=76.2600
+19:33:53 [INFO]     earlystop@ 75: failure_rate=5.60% (no accept; best=5.70%, min_delta=1.0%)
+19:33:56 [INFO]   Epoch  80/100  train=4.2933(imit=0.072,spec=2.465,phys=0.031,invalid=0.124,manifold=0.308)  val=0.0000(imit=0.071,spec=2.632,phys=0.032,invalid=0.127,manifold=0.333)  lr=1.02e-04
+19:33:56 [INFO]     earlystop@ 80: failure_rate=6.80% (no accept; best=5.70%, min_delta=1.0%)
+19:33:56 [INFO]     earlystop/power: mean=0.0426 median=0.0000 p90=0.0770 degrade_rate=3.6%
+19:33:56 [INFO]     earlystop/jitter: mean=0.0583 median=0.0000 p90=0.1619 degrade_rate=8.1%
+19:33:56 [INFO]     earlystop/height: mean=0.0958 median=0.0473 p90=0.2429 degrade_rate=16.1%
+19:33:56 [INFO]     earlystop/width: mean=0.0576 median=0.0086 p90=0.1376 degrade_rate=7.9%
+19:33:56 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.36 failure_rate=6.8%
+19:33:56 [INFO]     earlystop/validity: invalid_rate=2.0%
+19:33:56 [INFO]     earlystop/power raw: pred_mean=0.0057 target_mean=0.0078 pred_med=0.0038 target_med=0.0045
+19:33:56 [INFO]     earlystop/jitter raw: pred_mean=28.9552 target_mean=35.4828 pred_med=22.8910 target_med=24.8750
+19:33:56 [INFO]     earlystop/height raw: pred_mean=27.7387 target_mean=30.4517 pred_med=27.3963 target_med=30.7000
+19:33:56 [INFO]     earlystop/width raw: pred_mean=64.4357 target_mean=66.6874 pred_med=73.8769 target_med=76.2600
+19:34:00 [INFO]     earlystop@ 85: failure_rate=6.30% (no accept; best=5.70%, min_delta=1.0%)
+19:34:03 [INFO]   Epoch  90/100  train=4.4516(imit=0.072,spec=2.558,phys=0.031,invalid=0.126,manifold=0.323)  val=0.0000(imit=0.071,spec=2.620,phys=0.032,invalid=0.126,manifold=0.332)  lr=1.01e-04
+19:34:03 [INFO]     earlystop@ 90: failure_rate=6.10% (no accept; best=5.70%, min_delta=1.0%)
+19:34:03 [INFO]     earlystop/power: mean=0.0488 median=0.0065 p90=0.0870 degrade_rate=3.6%
+19:34:03 [INFO]     earlystop/jitter: mean=0.0487 median=0.0000 p90=0.1347 degrade_rate=6.9%
+19:34:03 [INFO]     earlystop/height: mean=0.0810 median=0.0213 p90=0.2231 degrade_rate=12.8%
+19:34:03 [INFO]     earlystop/width: mean=0.0499 median=0.0000 p90=0.0983 degrade_rate=7.3%
+19:34:03 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.31 failure_rate=6.1%
+19:34:03 [INFO]     earlystop/validity: invalid_rate=2.0%
+19:34:03 [INFO]     earlystop/power raw: pred_mean=0.0058 target_mean=0.0078 pred_med=0.0038 target_med=0.0045
+19:34:03 [INFO]     earlystop/jitter raw: pred_mean=28.3080 target_mean=35.4828 pred_med=22.1380 target_med=24.8750
+19:34:03 [INFO]     earlystop/height raw: pred_mean=28.3408 target_mean=30.4517 pred_med=28.6290 target_med=30.7000
+19:34:03 [INFO]     earlystop/width raw: pred_mean=65.5843 target_mean=66.6874 pred_med=75.5055 target_med=76.2600
+19:34:06 [INFO]     earlystop@ 95: failure_rate=5.30% (no accept; best=5.70%, min_delta=1.0%)
+19:34:10 [INFO]   Epoch 100/100  train=4.2623(imit=0.072,spec=2.435,phys=0.030,invalid=0.124,manifold=0.322)  val=0.0000(imit=0.071,spec=2.742,phys=0.032,invalid=0.126,manifold=0.331)  lr=1.00e-04
+19:34:10 [INFO]     earlystop@100: failure_rate=5.50% (no accept; best=5.70%, min_delta=1.0%)
+19:34:10 [INFO]     earlystop/power: mean=0.0479 median=0.0043 p90=0.0870 degrade_rate=3.6%
+19:34:10 [INFO]     earlystop/jitter: mean=0.0514 median=0.0000 p90=0.1432 degrade_rate=7.2%
+19:34:10 [INFO]     earlystop/height: mean=0.0805 median=0.0199 p90=0.2204 degrade_rate=12.2%
+19:34:10 [INFO]     earlystop/width: mean=0.0523 median=0.0047 p90=0.1112 degrade_rate=7.4%
+19:34:10 [INFO]     earlystop/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.30 failure_rate=5.5%
+19:34:10 [INFO]     earlystop/validity: invalid_rate=2.1%
+19:34:10 [INFO]     earlystop/power raw: pred_mean=0.0057 target_mean=0.0078 pred_med=0.0038 target_med=0.0045
+19:34:10 [INFO]     earlystop/jitter raw: pred_mean=28.6809 target_mean=35.4828 pred_med=22.5974 target_med=24.8750
+19:34:10 [INFO]     earlystop/height raw: pred_mean=28.4280 target_mean=30.4517 pred_med=28.1100 target_med=30.7000
+19:34:10 [INFO]     earlystop/width raw: pred_mean=65.2654 target_mean=66.6874 pred_med=74.8653 target_med=76.2600
+19:34:10 [WARNING]   Carry-forward: iteration 8 no >=1.0% improvement (prev=5.70% -> best=5.70%); kept carried-forward model
+19:34:10 [INFO] Validation failure rate: 5.7%  (57/1000 specs)
+19:34:10 [INFO]   boundary: 9.0%  interior: 2.4%
+19:34:10 [INFO]   val/power: mean=0.0554 median=0.0118 p90=0.0917 degrade_rate=4.1%
+19:34:10 [INFO]   val/jitter: mean=0.0519 median=0.0000 p90=0.1411 degrade_rate=7.4%
+19:34:10 [INFO]   val/height: mean=0.0744 median=0.0009 p90=0.2079 degrade_rate=10.7%
+19:34:10 [INFO]   val/width: mean=0.0491 median=0.0000 p90=0.1223 degrade_rate=7.3%
+19:34:10 [INFO]   val/adaptive: valid_threshold=0.50 degrade_threshold=20% min_bad_dims=2 mean_bad_dims=0.29 failure_rate=5.7%
+19:34:10 [INFO]   val/validity: invalid_rate=1.7%
+19:34:10 [INFO]   val/power raw: pred_mean=0.0056 target_mean=0.0078 pred_med=0.0039 target_med=0.0045
+19:34:10 [INFO]   val/jitter raw: pred_mean=27.6317 target_mean=35.4828 pred_med=21.2528 target_med=24.8750
+19:34:10 [INFO]   val/height raw: pred_mean=28.8270 target_mean=30.4517 pred_med=29.5678 target_med=30.7000
+19:34:10 [INFO]   val/width raw: pred_mean=66.0844 target_mean=66.6874 pred_med=76.6239 target_med=76.2600
+19:34:10 [INFO]   Iter 8 final=5.70% vs prev=5.70% (delta +0.00 pts) -> fallback_prev
+19:34:10 [INFO]   Iter 8 loss summary: train_total=4.269(imit=0.070,spec=2.452,phys=0.031,invalid=0.120,manifold=0.319)  val_total=0.000(imit=0.071,spec=2.742,phys=0.032,invalid=0.126,manifold=0.331)
+19:34:10 [INFO]   LR reset to 1.00e-04; cosine scheduler restarted for next iteration
+19:34:10 [INFO]   Querying teacher for 57 failed specs ...
+19:34:10 [INFO]   Interior specs (12): using flow teacher
+19:34:10 [INFO]   filter_by_zig_validity: 12/12 passed (threshold=0.5)
+19:34:10 [INFO]   label_batch: 12/12 passed validity gate (threshold=0.5)
+19:34:10 [INFO]   filter_by_zig_validity: 12/12 passed (threshold=0.5)
+19:34:10 [INFO]   Boundary specs (45): high-budget flow + k-NN fallback
+19:34:11 [INFO]   filter_by_zig_validity: 45/45 passed (threshold=0.5)
+19:34:11 [INFO]   label_batch: 45/45 passed validity gate (threshold=0.5)
+19:34:11 [INFO]   filter_by_zig_validity: 45/45 passed (threshold=0.5)
+19:34:11 [INFO]   Teacher labels: flow=57, k-NN=0, total=57/57
+19:34:11 [INFO]   filter_by_zig_validity: 57/57 passed (threshold=0.5)
+19:34:11 [INFO]   filter_by_zig_consistency: 34/57 passed  (boundary=45, interior=12)
+19:34:11 [INFO]   filter_by_zig_consistency_relaxed: 34/57 passed  (boundary=45, interior=12)
+19:34:11 [INFO]   DAgger labels: validity@0.5=100.0%  strict_consistency=59.6%  relaxed_consistency=59.6%
+19:34:11 [INFO]   Added 57 labeled failures.  Dataset now: 20467
+19:34:11 [INFO] DAgger training complete
+19:34:12 [INFO] DAgger training curves saved.
+19:34:12 [INFO] Test failure rate: 4.80%  (48/1000 specs)
+19:34:12 [INFO]   boundary: 8.90%  interior: 2.71%
+19:34:12 [INFO]   Mean errors - power: 0.0535, jitter: 0.0774, height: 0.0724, width: 0.0400
+19:34:12 [INFO] Saved student + scalers to /home/annaik/Documents/kirchhoffnet_realistic/outputs/generative_plain_bayes_opt/plain_knet_budget25000_fproxy/trial_0019
+19:34:12 [INFO] Test predictions CSV saved to /home/annaik/Documents/kirchhoffnet_realistic/outputs/generative_plain_bayes_opt/plain_knet_budget25000_fproxy/trial_0019/dagger_student_plain_predictions.csv
+19:34:12 [INFO] ================================================================================
+19:34:12 [INFO]               Target Specs               | Student Predicted Parameters (7 CTO parameters)
+19:34:12 [INFO]  0.01044   37.910   21.140   62.430 |   4.3779e-06   3.3547e-03   1.7802e-09   7.8826e+01   1.3286e-12   2.2787e+02   1.1814e+00
+19:34:12 [INFO]  0.00709   11.450   33.330   88.680 |   2.8628e-06   2.0307e-03   1.9792e-09   1.5125e+02   1.1856e-12   2.5715e+02   1.1260e+00
+19:34:12 [INFO]  0.01107    8.790   29.370   91.690 |   2.8111e-06   2.8713e-03   1.8723e-09   1.3579e+02   1.1818e-12   2.5596e+02   1.1614e+00
+19:34:12 [INFO]  0.00607   16.590   60.290   83.900 |   3.1954e-06   1.7076e-03   2.2830e-09   2.1179e+02   1.1205e-12   2.5382e+02   1.0307e+00
+19:34:12 [INFO]  0.00229   29.610    4.440   70.820 |   3.5534e-06   8.9091e-04   4.7089e-09   7.1949e+01   3.1970e-12   2.9564e+02   1.0717e+00
+19:34:12 [INFO]  0.00235   27.550   20.230   72.580 |   3.0470e-06   8.8334e-04   2.0486e-09   1.2907e+02   1.4848e-12   3.5637e+02   1.0630e+00
+19:34:12 [INFO] ================================================================================
+19:34:12 [INFO] [TIMER] plain-mlp DAgger training done (1432.4s)
+19:34:12 [INFO] ================================================================================
+19:34:12 [INFO] Final test failure rate: 4.80%
+19:34:12 [INFO]   boundary: 8.90%
+19:34:12 [INFO]   interior: 2.71%
+19:34:12 [INFO]   trainable params: 20,359
+19:34:12 [INFO]   output: /home/annaik/Documents/kirchhoffnet_realistic/outputs/generative_plain_bayes_opt/plain_knet_budget25000_fproxy/trial_0019
+19:34:12 [INFO]   predictions: /home/annaik/Documents/kirchhoffnet_realistic/outputs/generative_plain_bayes_opt/plain_knet_budget25000_fproxy/trial_0019/dagger_student_plain_predictions.csv
+19:34:12 [INFO] ================================================================================
+19:34:12 [INFO] Wrote teacher_config.json (v2) -> /home/annaik/Documents/kirchhoffnet_realistic/outputs/generative_plain_bayes_opt/plain_knet_budget25000_fproxy/trial_0019/teacher_config.json

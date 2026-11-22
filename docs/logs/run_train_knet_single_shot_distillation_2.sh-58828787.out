@@ -1,0 +1,295 @@
+/localscratch/spool/slurmd/job58828787/slurm_script: line 11: canonical: command not found
+The following modules were not unloaded:
+  (Use "module --force purge" to unload all):
+
+  1) CCconfig        6)  ucx/1.14.1         11) flexiblas/3.3.1
+  2) gentoo/2023     7)  libfabric/1.18.0   12) aocl-blas/5.1
+  3) gcccore/.12.3   8)  pmix/4.2.4         13) aocl-lapack/5.1
+  4) gcc/12.3        9)  ucc/1.2.0          14) StdEnv/2023
+  5) hwloc/2.9.1     10) openmpi/4.1.5
+23:33:19 [INFO] ================================================================================
+23:33:19 [INFO] === Run started 2026-09-08 23:33:19 (pid 2471846, platform=linux) ===
+23:33:19 [INFO] git_commit=5c6a4f4
+23:33:19 [INFO] log_file=/home/annaik/Documents/dagger_output/dagger_training.log
+23:33:19 [INFO] ================================================================================
+23:33:19 [INFO] Using device: cuda:0
+23:33:19 [INFO] Teacher artifacts loaded
+23:33:19 [INFO]   flow scaler_X mean: [-5.22107447 -2.65785535 -8.41856601]...
+23:33:19 [INFO]   zig scaler_X mean: [-5.22107447 -2.65785535 -8.41856601]...
+23:33:19 [INFO]   flow scaler_y_p: mean=-2.0538, scale=0.7406
+23:33:19 [INFO]   zig scaler_y_p:  mean=-2.0538, scale=0.7406
+23:33:19 [INFO]   eye_scale_h (Q75 scale): 47.099998
+23:33:19 [INFO]   eye_scale_w (Q75 scale): 87.529999
+23:33:19 [INFO]   eye_scale_j (Q75 scale): 46.720001
+23:33:19 [INFO]   per_target_hurdle: False
+23:33:19 [INFO] NOTE: scaler_X/scaler_y_p overridden to ZIG's scalers for ZIG operations.
+23:33:19 [INFO]   eye_scale_height: flow=48.230000 zig=47.099998 rel_diff=2.399e-02
+23:33:19 [WARNING]   eye_scale_height differs between flow_scaler_C and zig_config
+23:33:19 [INFO]   eye_scale_width: flow=87.880000 zig=87.529999 rel_diff=3.999e-03
+23:33:19 [WARNING]   eye_scale_width differs between flow_scaler_C and zig_config
+23:33:19 [INFO]   eye_scale_jitter: flow=44.205000 zig=46.720001 rel_diff=5.383e-02
+23:33:19 [WARNING]   eye_scale_jitter differs between flow_scaler_C and zig_config
+23:33:21 [INFO] HybridHurdleModel (ZIG) loaded from checkpoint
+23:33:21 [INFO] Parameter log bounds defined:
+23:33:21 [INFO]   fW: [-6.00, 1.00] -> [10^-6.0, 10^1.0]
+23:33:21 [INFO]   current: [-3.30, 0.40] -> [10^-3.3, 10^0.4]
+23:33:21 [INFO]   ind: [-12.00, 0.48] -> [10^-12.0, 10^0.5]
+23:33:21 [INFO]   Rd: [1.00, 3.18] -> [10^1.0, 10^3.2]
+23:33:21 [INFO]   Cs: [-15.00, -9.00] -> [10^-15.0, 10^-9.0]
+23:33:21 [INFO]   Rs: [1.00, 3.18] -> [10^1.0, 10^3.2]
+23:33:21 [INFO]   VDD: [-0.22, 0.08] -> [10^-0.2, 10^0.1]
+23:33:22 [INFO] Total rows: 23854
+23:33:22 [INFO] Columns: ['batch', 'tb', 'fW', 'current', 'ind', 'Rd', 'Cs', 'Rs', 'VDD', 'eye_maxHeight_norm Vout_1 56G']...
+23:33:22 [INFO] Filtered rows: 11161
+23:33:22 [INFO] power: n=11161, min=0.0003, max=0.2172, median=0.0057
+23:33:22 [INFO] stage_2_eye_max_height: n=11161, min=0.0028, max=80.5100, median=31.9100
+23:33:22 [INFO] stage_2_eye_max_width: n=11161, min=0.0631, max=100.0000, median=77.4100
+23:33:22 [INFO] stage_2_jitter: n=11161, min=0.0176, max=99.9800, median=23.5700
+23:33:22 [INFO] KN input log bound [power]: [1.9031e-04, 3.0370e-01] (log10 [-3.721, -0.518])
+23:33:22 [INFO] KN input log bound [jitter]: [1.1451e-02, 1.5402e+02] (log10 [-1.941, 2.188])
+23:33:22 [INFO] KN input log bound [height]: [1.6934e-03, 1.3445e+02] (log10 [-2.771, 2.129])
+23:33:22 [INFO] KN input log bound [width]: [4.3633e-02, 1.4455e+02] (log10 [-1.360, 2.160])
+23:33:22 [INFO] Regime-aware loss defined (Q75 + HybridHurdleModel)
+23:33:22 [INFO] Training functions defined (two-phase)
+23:33:23 [INFO] Student VCA config: enabled=True, rank=3, core=True, bias=False, gate_shunt=False, separate_core_bus=True (mirrors train_script.py --vca/--vca-core/--vca-gate-shunt/--vca-separate-core-bus)
+23:33:23 [INFO] Student readout family: kn_readout=shared-x2 (tail=on; mirrors train_script.py --readout)
+23:33:23 [INFO] Student (Local KirchhoffNet): encoder=0, circuit=4828, projector=35, total=4,863 params  (num_stages=6, num_hidden=11, small_world_k=2, small_world_p=0.2, edge_repeats=2, cell_library=tanh_free, leak_mode=non-programmable, interstage_activation=residual-relu-tanh, freeze_read=True, temporal_readout=True, input_rail=4.0, x_max=4.0, gm_max=4.24197, isat_max=28.68855, learnable_clip=True, gln_rails=True, gln_B=4, gln_rank=2, gln_families=boundary,readout)
+23:33:23 [INFO] Student trainable params: 4,863
+23:33:23 [INFO] Student param breakdown:
+  input_mapper         :              0
+  output_mapper        :             35
+  drive_mappers        :              0
+  gln_rails            :            100
+  stage_0:
+    cell_lib:                       154
+    ── stage total: 770
+    z_logits:                        22
+    ── stage total: 770
+    u_logits:                        18
+    ── stage total: 770
+    ── stage total: 770
+    ── stage total: 770
+    boundary_cell_lib:                        56
+    ── stage total: 770
+    boundary_z_logits:                         8
+    ── stage total: 770
+    ── stage total: 770
+    ── stage total: 770
+    ── stage total: 770
+    ── stage total: 770
+    ── stage total: 770
+    readout_sense_z_logits:                        22
+    ── stage total: 770
+    readout_sense_cell_lib:                       154
+    ── stage total: 770
+    readout_crossbar:                       154
+    ── stage total: 770
+    raw_vref_sense:                         1
+    ── stage total: 770
+    vca_W   :                        24
+    ── stage total: 770
+    vca_v   :                       156
+    ── stage total: 770
+    other   :                         1
+    ── stage total: 770
+  stage_1:
+    cell_lib:                       154
+    ── stage total: 714
+    z_logits:                        22
+    ── stage total: 714
+    u_logits:                        18
+    ── stage total: 714
+    ── stage total: 714
+    ── stage total: 714
+    ── stage total: 714
+    boundary_z_logits:                         8
+    ── stage total: 714
+    ── stage total: 714
+    ── stage total: 714
+    ── stage total: 714
+    ── stage total: 714
+    ── stage total: 714
+    readout_sense_z_logits:                        22
+    ── stage total: 714
+    readout_sense_cell_lib:                       154
+    ── stage total: 714
+    readout_crossbar:                       154
+    ── stage total: 714
+    raw_vref_sense:                         1
+    ── stage total: 714
+    vca_W   :                        24
+    ── stage total: 714
+    vca_v   :                       156
+    ── stage total: 714
+    other   :                         1
+    ── stage total: 714
+  stage_2:
+    cell_lib:                       154
+    ── stage total: 714
+    z_logits:                        22
+    ── stage total: 714
+    u_logits:                        18
+    ── stage total: 714
+    ── stage total: 714
+    ── stage total: 714
+    ── stage total: 714
+    boundary_z_logits:                         8
+    ── stage total: 714
+    ── stage total: 714
+    ── stage total: 714
+    ── stage total: 714
+    ── stage total: 714
+    ── stage total: 714
+    readout_sense_z_logits:                        22
+    ── stage total: 714
+    readout_sense_cell_lib:                       154
+    ── stage total: 714
+    readout_crossbar:                       154
+    ── stage total: 714
+    raw_vref_sense:                         1
+    ── stage total: 714
+    vca_W   :                        24
+    ── stage total: 714
+    vca_v   :                       156
+    ── stage total: 714
+    other   :                         1
+    ── stage total: 714
+  stage_3:
+    cell_lib:                       154
+    ── stage total: 714
+    z_logits:                        22
+    ── stage total: 714
+    u_logits:                        18
+    ── stage total: 714
+    ── stage total: 714
+    ── stage total: 714
+    ── stage total: 714
+    boundary_z_logits:                         8
+    ── stage total: 714
+    ── stage total: 714
+    ── stage total: 714
+    ── stage total: 714
+    ── stage total: 714
+    ── stage total: 714
+    readout_sense_z_logits:                        22
+    ── stage total: 714
+    readout_sense_cell_lib:                       154
+    ── stage total: 714
+    readout_crossbar:                       154
+    ── stage total: 714
+    raw_vref_sense:                         1
+    ── stage total: 714
+    vca_W   :                        24
+    ── stage total: 714
+    vca_v   :                       156
+    ── stage total: 714
+    other   :                         1
+    ── stage total: 714
+  stage_4:
+    cell_lib:                       154
+    ── stage total: 714
+    z_logits:                        22
+    ── stage total: 714
+    u_logits:                        18
+    ── stage total: 714
+    ── stage total: 714
+    ── stage total: 714
+    ── stage total: 714
+    boundary_z_logits:                         8
+    ── stage total: 714
+    ── stage total: 714
+    ── stage total: 714
+    ── stage total: 714
+    ── stage total: 714
+    ── stage total: 714
+    readout_sense_z_logits:                        22
+    ── stage total: 714
+    readout_sense_cell_lib:                       154
+    ── stage total: 714
+    readout_crossbar:                       154
+    ── stage total: 714
+    raw_vref_sense:                         1
+    ── stage total: 714
+    vca_W   :                        24
+    ── stage total: 714
+    vca_v   :                       156
+    ── stage total: 714
+    other   :                         1
+    ── stage total: 714
+  stage_5:
+    cell_lib:                       154
+    ── stage total: 714
+    z_logits:                        22
+    ── stage total: 714
+    u_logits:                        18
+    ── stage total: 714
+    ── stage total: 714
+    ── stage total: 714
+    ── stage total: 714
+    boundary_z_logits:                         8
+    ── stage total: 714
+    ── stage total: 714
+    ── stage total: 714
+    ── stage total: 714
+    ── stage total: 714
+    ── stage total: 714
+    readout_sense_z_logits:                        22
+    ── stage total: 714
+    readout_sense_cell_lib:                       154
+    ── stage total: 714
+    readout_crossbar:                       154
+    ── stage total: 714
+    raw_vref_sense:                         1
+    ── stage total: 714
+    vca_W   :                        24
+    ── stage total: 714
+    vca_v   :                       156
+    ── stage total: 714
+    other   :                         1
+    ── stage total: 714
+  ─────────────────────────────────────
+  total:                  4863
+23:33:23 [INFO] [OPT] Param groups: other=3582 (148 tensors, lr=7.07e-03); mapper=63 (9 tensors, lr=7.07e-03); struct=1212 (36 tensors, lr=2.83e-02); dyn=6 (6 tensors, lr=7.07e-03)
+23:33:59 [INFO] [MLP-TEACHER] loaded teacher_config.json: W=96 L=3 act=silu LN=True prep=knet
+23:33:59 [INFO] [MLP-TEACHER] auto-attached scaler from v2 config (prep=knet)
+23:33:59 [INFO] [MLP-TEACHER] Loaded PlainMLP teacher from /home/annaik/Documents/kirchhoffnet_realistic/outputs/generative_plain_bayes_opt/plain_knet_budget25000_fproxy/trial_0019/dagger_student_plain.pt: W=96 L=3 act=SiLU LN=True input_preprocessing=knet
+23:33:59 [INFO] [phaseA] frozen MLP teacher loaded: /home/annaik/Documents/kirchhoffnet_realistic/outputs/generative_plain_bayes_opt/plain_knet_budget25000_fproxy/trial_0019/dagger_student_plain.pt (id=trial_0019:fa7391fc70be8818)
+23:33:59 [INFO] [phaseA] OutputAffine bias initialised to train-label means: fW=-2.504, current=-2.287, ind=-1.085, Rd=+0.004, Cs=+0.012, Rs=+0.381, VDD=-0.365
+23:33:59 [INFO] [phaseA] canonical-dataset gate engaged: 20000 specs, epochs=300, batch=512, lr=7.07e-03, diff-LR scales mapper/struct/dyn=1.0/4.0/1.0, validity_w=0.300 ramp=[10+30] mlp_w=1.0 fwd_w=1.0 power_w=0.0005
+23:33:59 [INFO] [phaseA] split sizes: train=16000 val=2000 test=2000 epochs=300 batch=512 lr=7.07e-03
+23:33:59 [INFO] [phaseA] MLP-guided loss enabled: mlp_w=1.0 fwd_w=1.0 power_w=0.0005 validity_w=0.3 power_norm_const=0.00734274 schema_rev=2
+23:34:03 [INFO] [phaseA] epoch-1 term magnitudes: mse_mlp=1.262, fwd_mse=0.3833, power_norm=0.4797, nll=0 | weighted contributions: mlp=1.262 (76.7%), fwd=0.3833 (23.3%), power=0.0002399 (0.0%), validity=0 (0.0%)
+23:34:24 [INFO] [phaseA] epoch   1/300  train_mse_mlp=0.9259  valid_nll=  nan  w_valid=0.000  val_huber=1.9213  val_fail=  --% (no ZIG eval this epoch) patience=0/200  mlp_mse=0.9259  fwd_mse=0.2336  power=0.00407 (0.554x train-mean)
+23:37:17 [INFO] [phaseA] epoch  10/300  train_mse_mlp=0.0661  valid_nll=  nan  w_valid=0.000  val_huber=1.9776  val_fail=21.45% (bnd=31.95% int=11.24%) best=21.45% patience=0/200  mlp_mse=0.0661  fwd_mse=0.0457  power=0.007635 (1.040x train-mean)
+23:40:30 [INFO] [phaseA] epoch  20/300  train_mse_mlp=0.0422  valid_nll=0.0130  w_valid=0.100  val_huber=1.9735  val_fail=11.65% (bnd=18.15% int= 5.33%) best=11.65% patience=0/200  mlp_mse=0.0422  fwd_mse=0.0381  power=0.007657 (1.043x train-mean)
+23:43:43 [INFO] [phaseA] epoch  30/300  train_mse_mlp=0.0349  valid_nll=0.0100  w_valid=0.200  val_huber=1.9824  val_fail=14.50% (bnd=23.02% int= 6.21%) best=10.65% patience=1/200  mlp_mse=0.0349  fwd_mse=0.0378  power=0.007755 (1.056x train-mean)
+23:46:56 [INFO] [phaseA] epoch  40/300  train_mse_mlp=0.0331  valid_nll=0.0074  w_valid=0.300  val_huber=1.9763  val_fail=13.75% (bnd=22.52% int= 5.23%) best= 8.75% patience=1/200  mlp_mse=0.0331  fwd_mse=0.0373  power=0.007819 (1.065x train-mean)
+23:50:09 [INFO] [phaseA] epoch  50/300  train_mse_mlp=0.0333  valid_nll=0.0079  w_valid=0.300  val_huber=1.9761  val_fail=11.00% (bnd=17.44% int= 4.73%) best= 8.75% patience=3/200  mlp_mse=0.0333  fwd_mse=0.0378  power=0.007762 (1.057x train-mean)
+23:53:21 [INFO] [phaseA] epoch  60/300  train_mse_mlp=0.0321  valid_nll=0.0073  w_valid=0.300  val_huber=1.9780  val_fail=14.10% (bnd=21.30% int= 7.10%) best= 8.75% patience=5/200  mlp_mse=0.0321  fwd_mse=0.0360  power=0.007862 (1.071x train-mean)
+23:56:33 [INFO] [phaseA] epoch  70/300  train_mse_mlp=0.0314  valid_nll=0.0074  w_valid=0.300  val_huber=1.9787  val_fail=11.10% (bnd=18.36% int= 4.04%) best= 8.75% patience=7/200  mlp_mse=0.0314  fwd_mse=0.0354  power=0.007856 (1.070x train-mean)
+23:59:46 [INFO] [phaseA] epoch  80/300  train_mse_mlp=0.0318  valid_nll=0.0075  w_valid=0.300  val_huber=1.9787  val_fail=15.85% (bnd=20.89% int=10.95%) best= 8.75% patience=9/200  mlp_mse=0.0318  fwd_mse=0.0359  power=0.007894 (1.075x train-mean)
+00:02:58 [INFO] [phaseA] epoch  90/300  train_mse_mlp=0.0315  valid_nll=0.0075  w_valid=0.300  val_huber=1.9738  val_fail=10.55% (bnd=15.82% int= 5.42%) best= 8.75% patience=11/200  mlp_mse=0.0315  fwd_mse=0.0353  power=0.007843 (1.068x train-mean)
+00:06:10 [INFO] [phaseA] epoch 100/300  train_mse_mlp=0.0314  valid_nll=0.0076  w_valid=0.300  val_huber=1.9784  val_fail=11.25% (bnd=19.07% int= 3.65%) best= 8.75% patience=13/200  mlp_mse=0.0314  fwd_mse=0.0358  power=0.007797 (1.062x train-mean)
+00:09:23 [INFO] [phaseA] epoch 110/300  train_mse_mlp=0.0311  valid_nll=0.0077  w_valid=0.300  val_huber=1.9820  val_fail=17.75% (bnd=27.79% int= 7.99%) best= 8.75% patience=15/200  mlp_mse=0.0311  fwd_mse=0.0352  power=0.007767 (1.058x train-mean)
+00:12:36 [INFO] [phaseA] epoch 120/300  train_mse_mlp=0.0306  valid_nll=0.0074  w_valid=0.300  val_huber=1.9806  val_fail=11.75% (bnd=19.27% int= 4.44%) best= 8.75% patience=17/200  mlp_mse=0.0306  fwd_mse=0.0344  power=0.007866 (1.071x train-mean)
+00:15:49 [INFO] [phaseA] epoch 130/300  train_mse_mlp=0.0307  valid_nll=0.0075  w_valid=0.300  val_huber=1.9785  val_fail=11.50% (bnd=18.76% int= 4.44%) best= 8.75% patience=19/200  mlp_mse=0.0307  fwd_mse=0.0346  power=0.007874 (1.072x train-mean)
+00:19:02 [INFO] [phaseA] epoch 140/300  train_mse_mlp=0.0311  valid_nll=0.0077  w_valid=0.300  val_huber=1.9805  val_fail=11.70% (bnd=17.95% int= 5.62%) best= 8.75% patience=21/200  mlp_mse=0.0311  fwd_mse=0.0353  power=0.007819 (1.065x train-mean)
+00:22:14 [INFO] [phaseA] epoch 150/300  train_mse_mlp=0.0305  valid_nll=0.0073  w_valid=0.300  val_huber=1.9748  val_fail=11.00% (bnd=17.34% int= 4.83%) best= 8.75% patience=23/200  mlp_mse=0.0305  fwd_mse=0.0340  power=0.007893 (1.075x train-mean)
+00:25:26 [INFO] [phaseA] epoch 160/300  train_mse_mlp=0.0305  valid_nll=0.0074  w_valid=0.300  val_huber=1.9746  val_fail=11.05% (bnd=15.72% int= 6.51%) best= 8.75% patience=25/200  mlp_mse=0.0305  fwd_mse=0.0341  power=0.007878 (1.073x train-mean)
+00:28:40 [INFO] [phaseA] epoch 170/300  train_mse_mlp=0.0307  valid_nll=0.0074  w_valid=0.300  val_huber=1.9772  val_fail=11.45% (bnd=18.56% int= 4.54%) best= 8.75% patience=27/200  mlp_mse=0.0307  fwd_mse=0.0343  power=0.007903 (1.076x train-mean)
+00:31:53 [INFO] [phaseA] epoch 180/300  train_mse_mlp=0.0309  valid_nll=0.0073  w_valid=0.300  val_huber=1.9757  val_fail=10.50% (bnd=16.73% int= 4.44%) best= 8.75% patience=29/200  mlp_mse=0.0309  fwd_mse=0.0342  power=0.007889 (1.074x train-mean)
+00:35:06 [INFO] [phaseA] epoch 190/300  train_mse_mlp=0.0306  valid_nll=0.0074  w_valid=0.300  val_huber=1.9771  val_fail=10.10% (bnd=16.33% int= 4.04%) best= 8.75% patience=31/200  mlp_mse=0.0306  fwd_mse=0.0338  power=0.007905 (1.077x train-mean)
+00:38:20 [INFO] [phaseA] epoch 200/300  train_mse_mlp=0.0308  valid_nll=0.0074  w_valid=0.300  val_huber=1.9785  val_fail= 9.95% (bnd=16.63% int= 3.45%) best= 8.75% patience=33/200  mlp_mse=0.0308  fwd_mse=0.0339  power=0.007904 (1.076x train-mean)
+00:41:32 [INFO] [phaseA] epoch 210/300  train_mse_mlp=0.0306  valid_nll=0.0073  w_valid=0.300  val_huber=1.9777  val_fail=11.00% (bnd=17.14% int= 5.03%) best= 8.75% patience=35/200  mlp_mse=0.0306  fwd_mse=0.0335  power=0.007898 (1.076x train-mean)
+00:44:45 [INFO] [phaseA] epoch 220/300  train_mse_mlp=0.0305  valid_nll=0.0074  w_valid=0.300  val_huber=1.9779  val_fail=10.80% (bnd=17.24% int= 4.54%) best= 8.75% patience=37/200  mlp_mse=0.0305  fwd_mse=0.0334  power=0.007893 (1.075x train-mean)
+00:48:02 [INFO] [phaseA] epoch 230/300  train_mse_mlp=0.0304  valid_nll=0.0074  w_valid=0.300  val_huber=1.9783  val_fail=11.90% (bnd=19.37% int= 4.64%) best= 8.75% patience=39/200  mlp_mse=0.0304  fwd_mse=0.0335  power=0.007903 (1.076x train-mean)
+00:51:21 [INFO] [phaseA] epoch 240/300  train_mse_mlp=0.0307  valid_nll=0.0074  w_valid=0.300  val_huber=1.9776  val_fail=11.10% (bnd=18.05% int= 4.34%) best= 8.75% patience=41/200  mlp_mse=0.0307  fwd_mse=0.0337  power=0.007948 (1.082x train-mean)
+00:54:35 [INFO] [phaseA] epoch 250/300  train_mse_mlp=0.0306  valid_nll=0.0073  w_valid=0.300  val_huber=1.9779  val_fail=11.20% (bnd=18.26% int= 4.34%) best= 8.75% patience=43/200  mlp_mse=0.0306  fwd_mse=0.0337  power=0.007921 (1.079x train-mean)
+00:57:49 [INFO] [phaseA] epoch 260/300  train_mse_mlp=0.0303  valid_nll=0.0073  w_valid=0.300  val_huber=1.9795  val_fail=11.75% (bnd=19.37% int= 4.34%) best= 8.75% patience=45/200  mlp_mse=0.0303  fwd_mse=0.0333  power=0.007946 (1.082x train-mean)
+01:01:11 [INFO] [phaseA] epoch 270/300  train_mse_mlp=0.0303  valid_nll=0.0074  w_valid=0.300  val_huber=1.9784  val_fail=11.15% (bnd=18.26% int= 4.24%) best= 8.75% patience=47/200  mlp_mse=0.0303  fwd_mse=0.0330  power=0.007918 (1.078x train-mean)
+01:04:23 [INFO] [phaseA] epoch 280/300  train_mse_mlp=0.0304  valid_nll=0.0073  w_valid=0.300  val_huber=1.9775  val_fail=11.30% (bnd=18.46% int= 4.34%) best= 8.75% patience=49/200  mlp_mse=0.0304  fwd_mse=0.0333  power=0.007916 (1.078x train-mean)
+01:07:36 [INFO] [phaseA] epoch 290/300  train_mse_mlp=0.0306  valid_nll=0.0074  w_valid=0.300  val_huber=1.9778  val_fail=11.15% (bnd=18.15% int= 4.34%) best= 8.75% patience=51/200  mlp_mse=0.0306  fwd_mse=0.0334  power=0.007905 (1.077x train-mean)
+01:10:49 [INFO] [phaseA] epoch 300/300  train_mse_mlp=0.0307  valid_nll=0.0073  w_valid=0.300  val_huber=1.9781  val_fail=11.25% (bnd=18.36% int= 4.34%) best= 8.75% patience=53/200  mlp_mse=0.0307  fwd_mse=0.0335  power=0.007944 (1.082x train-mean)
+01:10:53 [INFO] [phaseA] wrote /home/annaik/Documents/kirchhoffnet_realistic/outputs/manual_knet_distillation_mix_trials/trial_0008/phase_a_history.json
+01:10:53 [INFO] [phaseA] final failure: train= 8.59% val= 8.75% test= 9.70%
+01:10:53 [INFO] [phaseA] canonical-dataset gate: training complete; exiting before DAgger body

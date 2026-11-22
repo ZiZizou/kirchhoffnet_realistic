@@ -34,6 +34,8 @@ from gating.vca import isat_eff_scale, vca_edge_gain
 from hw.constraints import (
     acc_compliance,
     compliance_legs,
+    vref_map,
+    xbar_map,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle
@@ -669,6 +671,36 @@ output_ode_src: list[int] | None = None,
         c = self.hw_constraints
         return c is not None and c.hw_compliance
 
+    def sense_vref(self) -> torch.Tensor:
+        """The shared-sense reference rail ``Vref`` (Phase 3a 3.6).
+
+        Legacy: ``sigmoid(raw_vref_sense) * x_max`` (range [0, x_max]).  With
+        ``hw_vref_symmetric`` it is ``x_max * tanh(raw_vref_sense)`` (range
+        [-x_max, x_max], Vcm at the unchanged init raw = 0); ``hw_vref_bits``
+        adds the stage DAC (uniform STE quantisation over the active range,
+        also applicable to the legacy sigmoid range).
+        """
+        c = self.hw_constraints
+        if c is None or not (c.hw_vref_symmetric or c.hw_vref_bits is not None):
+            return torch.sigmoid(self.raw_vref_sense) * self.x_max
+        return vref_map(self.raw_vref_sense, self.x_max, bits=c.hw_vref_bits,
+                        symmetric=bool(c.hw_vref_symmetric))
+
+    def crossbar_weights(self) -> torch.Tensor:
+        """Effective readout crossbar ``W`` ``[d_out, n_sense]`` (Phase 3a 3.7).
+
+        Legacy: the raw ``readout_crossbar_W``.  ``hw_xbar_bound`` maps it to
+        ``W_max * tanh(W / W_max)``; ``hw_xbar_bits`` quantises it in the
+        ``hw_xbar_mode`` representation (sign-magnitude, offset-binary or
+        differential columns; identical without quantisation).
+        """
+        W = self.readout_crossbar_W
+        c = self.hw_constraints
+        if c is None or not (c.hw_xbar_bound or c.hw_xbar_bits is not None):
+            return W
+        return xbar_map(W, mode=c.hw_xbar_mode, bits=c.hw_xbar_bits,
+                        bound=bool(c.hw_xbar_bound))
+
     def _hw_vca_bits(self) -> int | None:
         """3.10: the width of the VCA logit DAC (``None`` = no quantisation)."""
         c = self.hw_constraints
@@ -908,7 +940,7 @@ output_ode_src: list[int] | None = None,
         # Sense destination is the private Vref rail (an ideal voltage
         # source held constant during integration). Pass it as the
         # FreeTanh ``x_dst`` argument so the cell is reused exactly.
-        vref = torch.sigmoid(self.raw_vref_sense) * self.x_max
+        vref = self.sense_vref()
         x_dst0 = vref.to(x0.dtype).view(1, 1).expand_as(x_src0)
         if self._hw_compliance_on():
             # 3.4 + freeze_temporal_read: freeze the leg currents of the sense
@@ -1409,10 +1441,10 @@ output_ode_src: list[int] | None = None,
         # the crossbar ``W`` is a plain dense weight (no gate, no VCA). VCA
         # gates the sense currents only.
         if self._has_shared_readout and self.readout_sense_src.numel() > 0:
-            W = self.readout_crossbar_W                    # [d_out, n_sense]
+            W = self.crossbar_weights()                    # [d_out, n_sense]
             sense_mask = torch.sigmoid(self.readout_sense_z_logits)  # [n_sense]
             x_j = x[:, self.readout_sense_src]             # [B, n_sense]
-            vref = (torch.sigmoid(self.raw_vref_sense) * self.x_max).to(x.dtype)
+            vref = self.sense_vref().to(x.dtype)
             x_dst_s = vref.view(1, 1).expand_as(x_j)
             if i_readout_const is None and self._hw_compliance_on():
                 # 3.4: the sense OTA drives the Vref rail (an ideal voltage

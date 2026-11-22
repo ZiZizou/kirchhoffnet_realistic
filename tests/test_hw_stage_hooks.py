@@ -243,3 +243,113 @@ def test_clamp_transfer_forward_backward_is_finite():
     y, grads, _ = toy_forward_backward(hw_of(hw_clamp_transfer=True))
     assert torch.isfinite(y).all()
     assert all(torch.isfinite(g).all() for g in grads.values() if g is not None)
+
+
+# ---------------------------------------------------------------------------
+# 3.6 readout sense Vref
+# ---------------------------------------------------------------------------
+def _sense_stages(net):
+    st = [s for s in net.core.stages if getattr(s, "raw_vref_sense", None) is not None]
+    assert st, "toy net has no shared-sense readout"
+    return st
+
+
+def test_vref_symmetric_is_a_tanh_map_centred_on_vcm():
+    net = build_toy(hw_of(hw_vref_symmetric=True))
+    for st in _sense_stages(net):
+        with torch.no_grad():
+            st.raw_vref_sense.zero_()
+        assert float(st.sense_vref()) == 0.0               # init raw = 0 -> Vcm
+        with torch.no_grad():
+            st.raw_vref_sense.fill_(-50.0)
+        assert float(st.sense_vref()) == pytest.approx(-st.x_max)
+        with torch.no_grad():
+            st.raw_vref_sense.fill_(0.3)
+        assert float(st.sense_vref()) == pytest.approx(st.x_max * math.tanh(0.3), abs=1e-12)
+
+
+def test_vref_symmetric_reparametrisation_reproduces_the_legacy_net():
+    """Setting raw_sym = atanh(sigmoid(raw)) gives the legacy Vref and the legacy output."""
+    plain = build_toy(None)
+    hw_net = build_toy(hw_of(hw_vref_symmetric=True))
+    hw_net.load_state_dict(plain.state_dict())
+    for st in _sense_stages(hw_net):
+        with torch.no_grad():
+            st.raw_vref_sense.copy_(torch.atanh(torch.sigmoid(st.raw_vref_sense)))
+    x = mg.make_inputs(dict(mg.TOY_NET))
+    plain.eval(), hw_net.eval()
+    with torch.no_grad():
+        torch.testing.assert_close(mg.model_forward(hw_net, x), mg.model_forward(plain, x),
+                                   rtol=1e-10, atol=1e-10)
+
+
+@pytest.mark.parametrize("symmetric", [False, True])
+def test_vref_bits_put_vref_on_the_dac_grid(symmetric):
+    bits = 6
+    net = build_toy(hw_of(hw_vref_symmetric=symmetric, hw_vref_bits=bits))
+    st = _sense_stages(net)[0]
+    lo = -st.x_max if symmetric else 0.0
+    span = st.x_max - lo
+    levels = 2 ** bits - 1
+    for r in (-1.3, -0.2, 0.0, 0.41, 2.2):
+        with torch.no_grad():
+            st.raw_vref_sense.fill_(r)
+        v = st.sense_vref()
+        code = (float(v) - lo) / span * levels
+        assert abs(code - round(code)) < 1e-9
+        ideal = st.x_max * math.tanh(r) if symmetric else st.x_max / (1.0 + math.exp(-r))
+        assert abs(float(v) - ideal) <= 0.5 * span / levels + 1e-12
+        g, = torch.autograd.grad(v.sum(), st.raw_vref_sense)
+        assert float(g.abs().sum()) > 0.0                  # straight-through
+
+
+# ---------------------------------------------------------------------------
+# 3.7 readout crossbar
+# ---------------------------------------------------------------------------
+def _xbar_stage(net):
+    st = [s for s in net.core.stages if getattr(s, "readout_crossbar_W", None) is not None]
+    assert st
+    return st[0]
+
+
+def test_xbar_bound_caps_the_mirror_ratio():
+    from hw.constraints import W_MAX
+    net = build_toy(hw_of(hw_xbar_bound=True))
+    st = _xbar_stage(net)
+    with torch.no_grad():
+        st.readout_crossbar_W.mul_(100.0)
+    W = st.crossbar_weights()
+    assert float(W.abs().max()) <= W_MAX
+    torch.testing.assert_close(W, W_MAX * torch.tanh(st.readout_crossbar_W / W_MAX))
+    plain = build_toy(None)
+    assert _xbar_stage(plain).crossbar_weights() is _xbar_stage(plain).readout_crossbar_W
+
+
+@pytest.mark.parametrize("bits", [3, 5])
+def test_xbar_signed_and_offset_binary_give_the_same_product(bits):
+    from hw.constraints import W_MAX
+    lsb = 2.0 * W_MAX / (2 ** bits - 1)
+    nets = {m: build_toy(hw_of(hw_xbar_bound=True, hw_xbar_bits=bits, hw_xbar_mode=m))
+            for m in ("signed", "offset_binary")}
+    torch.manual_seed(5)
+    W_raw = torch.randn_like(_xbar_stage(nets["signed"]).readout_crossbar_W) * 1.5
+    for net in nets.values():
+        with torch.no_grad():
+            _xbar_stage(net).readout_crossbar_W.copy_(W_raw)
+    Ws = _xbar_stage(nets["signed"]).crossbar_weights()
+    Wo = _xbar_stage(nets["offset_binary"]).crossbar_weights()
+    W_ideal = W_MAX * torch.tanh(W_raw / W_MAX)
+    i_k = torch.randn(16, W_raw.shape[1], dtype=D)
+    bound = 0.5 * lsb * i_k.abs().sum(1, keepdim=True)     # per accumulator, per sample
+    for W in (Ws, Wo):
+        assert float((W - W_ideal).abs().max()) <= 0.5 * lsb + 1e-12
+        assert bool(((i_k @ W.T - i_k @ W_ideal.T).abs() <= bound + 1e-12).all())
+    assert bool(((i_k @ Ws.T - i_k @ Wo.T).abs() <= 2 * bound + 1e-12).all())
+    # and through the model: the two representations give the same network output
+    x = mg.make_inputs(dict(mg.TOY_NET))
+    outs = {}
+    for m, net in nets.items():
+        net.eval()
+        with torch.no_grad():
+            outs[m] = mg.model_forward(net, x)
+    torch.testing.assert_close(outs["signed"], outs["offset_binary"], rtol=1e-9, atol=1e-9)

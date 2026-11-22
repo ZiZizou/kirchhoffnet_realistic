@@ -1252,11 +1252,14 @@ output_ode_src: list[int] | None = None,
         traj : torch.Tensor or None
             ``[batch, num_nodes, num_steps+1]`` when ``store_trajectory``.
         """
+        # ``x_hold`` is forwarded only when set, so the legacy call signature
+        # of ``_forward_heun`` (and test hooks that wrap it) is unchanged.
+        extra = {} if x_hold is None else {"x_hold": x_hold}
         return self._forward_heun(
             x0=x0, t_span=t_span, num_steps=num_steps,
             store_trajectory=store_trajectory,
             u=u,
-            x_hold=x_hold,
+            **extra,
         )
 
     def _forward_heun(

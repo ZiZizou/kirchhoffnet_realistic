@@ -174,13 +174,16 @@ class KirchhoffNet(nn.Module):
             # stage of this forward then sees the same epsilons.
             self.mismatch.new_batch()
         for i, stage in enumerate(self.stages):
+            # ``x_hold`` is passed only when the S&H boundary produced one,
+            # so the legacy stage call (and wrappers of it) is unchanged.
+            extra = {} if x_hold is None else {"x_hold": x_hold}
             x, traj = stage(
                 x0=x,
                 t_span=self.stage_times[i],
                 num_steps=self.stage_steps[i],
                 store_trajectory=store_trajectory,
                 u=u,
-                x_hold=x_hold,
+                **extra,
             )
             stage_outputs.append(x.detach())
             if store_trajectory and traj is not None:

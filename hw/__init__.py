@@ -80,6 +80,13 @@ class HWConfig:
     constraints: HWConstraints = field(default_factory=HWConstraints)
     timemux: Optional[TimeMuxConfig] = None
 
+    def __post_init__(self):
+        # accept a plain mapping for ``timemux`` (the JSON form) and coerce it
+        # to the real TimeMuxConfig, so ``HWConfig(timemux={...})`` compares
+        # equal to its JSON round trip.
+        if isinstance(self.timemux, dict):
+            self.timemux = _timemux_from_any(self.timemux)
+
     # ------------------------------------------------------------------
     def is_off(self) -> bool:
         """True only when every constraint flag is at its default and time-multiplexing is off."""

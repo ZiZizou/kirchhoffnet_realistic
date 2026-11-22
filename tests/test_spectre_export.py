@@ -1,3 +1,4 @@
+import ast
 import json
 from pathlib import Path
 import pytest
@@ -75,3 +76,15 @@ def test_standalone_interp_matches_paper_forward():
     assert err <= 1e-6, f"logit max absolute error {err:.3g}"
     state_err=max((a-b).abs().max().item() for a,b in zip(got["stage_states"],captured))
     assert state_err <= 1e-6, f"per-stage final-state max absolute error {state_err:.3g}"
+
+
+def test_interpreter_has_no_model_imports():
+    source=(ROOT/"export/netlist_interp.py").read_text()
+    tree=ast.parse(source)
+    forbidden={"checkpoints","differential_stage","cell_library","gating","config","kirchhoff_net"}
+    imported=set()
+    for node in ast.walk(tree):
+        if isinstance(node,ast.Import): imported.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node,ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+    assert not (forbidden & imported), f"forbidden model imports: {sorted(forbidden & imported)}"

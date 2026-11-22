@@ -571,7 +571,7 @@ class KirchhoffNetWithIO(nn.Module):
         + output_ode_count]`` (i.e. the full stage width). This is the
         entry point for sequential/streaming workloads (NARMA, CTLE
         symbol-by-symbol, etc.) where the fabric state must carry across
-        calls. See ``narma_experiment.py`` for the canonical usage.
+        calls.
 
         When ``return_final_state`` is True the final ODE state (after
         integration) is returned as a third tuple element so the caller

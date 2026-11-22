@@ -1170,7 +1170,7 @@ PRESET_FRIEDMAN3 = make_friedman3_preset()
 # integration budget that lets the boundary drive actually evolve state).
 #
 # The freeze_read flag is configurable per-experiment: this preset does NOT
-# pin it; the experiment script (narma_experiment.py) sets it explicitly.
+# pin it; the experiment script sets it explicitly.
 
 def make_narma_preset(
     order: int = 10,

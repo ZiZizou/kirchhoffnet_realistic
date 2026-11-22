@@ -37,6 +37,14 @@ def test_unmapped_state_key_fails(monkeypatch,tmp_path):
         spectre_export.export("ignored",tmp_path)
 
 
+def test_unconsumed_known_name_fails(monkeypatch,tmp_path):
+    class Fake:
+        net=type("Net",(),{"config":{}})()
+        def state_dict(self): return {"net.core.stages.0.unused.z_logits":torch.tensor(1.)}
+    monkeypatch.setattr(spectre_export,"load_paper_checkpoint",lambda *a,**k:Fake())
+    with pytest.raises(ValueError,match="unmapped state_dict key"):
+        spectre_export.export("ignored",tmp_path)
+
 def test_stage_rhs_matches_model_call_path():
     model=load_paper_checkpoint(CKPT,dtype=torch.float64)
     table=json.loads(json.dumps(spectre_export.build_param_table(model)))

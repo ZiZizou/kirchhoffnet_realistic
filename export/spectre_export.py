@@ -178,6 +178,21 @@ def build_param_table(model, mode="legacy", hw=None) -> dict:
             "post_transfer":{"activation":post.activation,"residual_w1":_tensor(post.residual_w1),"residual_w2":_tensor(post.residual_w2),
                 "residual_w3":_tensor(post.residual_w3),"residual_vth":_tensor(post.residual_vth)}}}
 
+def _consumed_parameter_key(key):
+    """Whitelist state-dict locations read by the resolved table builder."""
+    parts = key.split(".")
+    leaf = parts[-1]
+    if leaf in {"a_raw", "b_raw", "r_raw", "cap_a_raw", "cap_b_raw", "s_raw", "gm_raw", "isat_raw", "theta_raw", "g_resistive_raw"}:
+        return len(parts) >= 5 and parts[:3] == ["net", "core", "stages"] and parts[4] in {
+            "cell_lib", "boundary_cell_lib", "readout_sense_cell_lib", "output_ode_cell_lib"}
+    if leaf in {"z_logits", "boundary_z_logits", "readout_sense_z_logits", "output_ode_z_logits", "clip_sharpness_raw", "raw_vref_sense", "readout_crossbar_W", "vca_W", "vca_W_core", "vca_v_boundary", "vca_v_readout", "vca_v_core", "vca_b_core", "vca_b_boundary", "vca_b_readout"}:
+        return len(parts) == 5 and parts[:3] == ["net", "core", "stages"]
+    if leaf in {"residual_w1", "residual_w2", "residual_w3", "residual_vth"}:
+        return len(parts) >= 5 and (parts[:3] == ["net", "core", "transfers"] or parts[:2] == ["net", "post_readout_transfer"])
+    if leaf in {"a", "c", "alpha_raw", "P", "Q"}:
+        return parts[:2] == ["net", "gln_rails"]
+    return False
+
 def export_model(model, out, mode="legacy", fabric="timemux", specs=16, hw_config=None, hw=None):
     """Export an already-built KirchhoffNetWithIO (paper or custom architecture)."""
     if mode not in {"legacy", "hw"} or fabric not in {"timemux", "copies"}:
@@ -194,7 +209,7 @@ def export_model(model, out, mode="legacy", fabric="timemux", specs=16, hw_confi
             entries[key] = {"kind":"digital_offchip", "value":_tensor(value)}
         elif leaf in topology_leaves:
             topology.append(key); entries[key] = {"kind":"topology", "value":_tensor(value)}
-        elif leaf in param_leaves and (key.startswith("net.core.stages.") or key.startswith("net.core.transfers.") or key.startswith("net.gln_rails.")):
+        elif leaf in param_leaves and _consumed_parameter_key(key):
             entries[key] = {"kind":"parameter", "value":_tensor(value)}; mapped.append(key)
         else:
             raise ValueError(f"unmapped state_dict key: {key}")

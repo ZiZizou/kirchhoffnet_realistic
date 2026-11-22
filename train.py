@@ -22,7 +22,6 @@ import torch.nn.functional as F
 from config import (
     LAMBDAS,
     OPTIM,
-    SCHEDULE_FOUR_PHASE,
     SCHEDULE_THREE_PHASE,
     SOLVER,
     TAU,
@@ -43,10 +42,6 @@ __all__ = [
     "phase_boundaries",
     "three_phase_tau",
     "three_phase_lambdas",
-    "four_phase_boundaries",
-    "phase_for_epoch_four",
-    "four_phase_tau",
-    "four_phase_lambdas",
     "make_optimizer",
     "apply_ablation",
     "train_epoch",
@@ -549,195 +544,6 @@ def three_phase_lambdas(
     return out
 
 
-# ---------- four-phase schedule (four-phase-redesign plan) ----------
-
-def four_phase_boundaries(
-    total_epochs: int, schedule_cfg: dict | None = None
-) -> tuple[int, int, int, int]:
-    """Compute (a_end, b1_end, b2_end, c_end) epoch boundaries for the
-    four-phase schedule (four-phase-redesign/Phase 3b).
-
-    Phase fractions must sum to 1.0 (frac_a + frac_b1 + frac_b2 + frac_c = 1).
-    Each end is computed by rounding total_epochs * cumulative_frac, with
-    the constraint that adjacent phases differ by at least 1 epoch.
-
-    Returns (a_end, b1_end, b2_end, c_end) with
-    ``0 < a_end < b1_end < b2_end < c_end == total_epochs``.
-    """
-    if schedule_cfg is None:
-        schedule_cfg = SCHEDULE_FOUR_PHASE
-    frac_a = float(schedule_cfg.get("frac_a", 0.25))
-    frac_b1 = float(schedule_cfg.get("frac_b1", 0.20))
-    frac_b2 = float(schedule_cfg.get("frac_b2", 0.25))
-    frac_c = float(schedule_cfg.get("frac_c", 0.30))
-    total_frac = frac_a + frac_b1 + frac_b2 + frac_c
-    if abs(total_frac - 1.0) > 1e-6:
-        raise ValueError(
-            f"four_phase schedule fractions must sum to 1.0, got {total_frac} "
-            f"(frac_a={frac_a}, frac_b1={frac_b1}, frac_b2={frac_b2}, frac_c={frac_c})"
-        )
-    a_end = int(round(total_epochs * frac_a))
-    b1_end = int(round(total_epochs * (frac_a + frac_b1)))
-    b2_end = int(round(total_epochs * (frac_a + frac_b1 + frac_b2)))
-    c_end = total_epochs
-    if a_end < 1:
-        a_end = 1
-    if b1_end < a_end + 1:
-        b1_end = a_end + 1
-    if b2_end < b1_end + 1:
-        b2_end = b1_end + 1
-    return (a_end, b1_end, b2_end, c_end)
-
-
-def phase_for_epoch_four(
-    epoch: int, total_epochs: int, schedule_cfg: dict | None = None
-) -> str:
-    """Return the active phase name for the four-phase schedule.
-
-    Returns one of: 'A', 'B1', 'B2', 'C'.
-    Boundary semantics:
-      - Phase A:  ``0 <= epoch < a_end``
-      - Phase B1: ``a_end <= epoch < b1_end``
-      - Phase B2: ``b1_end <= epoch < b2_end``
-      - Phase C:  ``b2_end <= epoch < c_end`` (c_end == total_epochs)
-    """
-    a_end, b1_end, b2_end, _ = four_phase_boundaries(total_epochs, schedule_cfg)
-    if epoch < a_end:
-        return "A"
-    if epoch < b1_end:
-        return "B1"
-    if epoch < b2_end:
-        return "B2"
-    return "C"
-
-
-def four_phase_tau(
-    epoch: int, total_epochs: int, schedule_cfg: dict | None = None
-) -> float:
-    """Tau value for the current epoch under the four-phase schedule.
-
-    Phase A:  fixed at ``tau_a`` (default 1.0).
-    Phase B1: anneals ``tau_b1_init`` -> ``tau_b1_final`` (1.0 -> 0.6).
-    Phase B2: anneals ``tau_b2_init`` -> ``tau_b2_final`` (0.6 -> 0.4).
-    Phase C:  anneals ``tau_c_init`` -> ``tau_c_final`` (0.4 -> 0.1).
-
-    Tau is continuous at all phase boundaries (end of B1 == start of B2
-    at 0.6; end of B2 == start of C at 0.4 by construction).
-    """
-    if schedule_cfg is None:
-        schedule_cfg = SCHEDULE_FOUR_PHASE
-    a_end, b1_end, b2_end, _ = four_phase_boundaries(total_epochs, schedule_cfg)
-
-    if epoch < a_end:
-        return float(schedule_cfg.get("tau_a", 1.0))
-
-    if epoch < b1_end:
-        tau_init = float(schedule_cfg.get("tau_b1_init", 1.0))
-        tau_final = float(schedule_cfg.get("tau_b1_final", 0.6))
-        local_epoch = epoch - a_end
-        local_total = max(1, b1_end - a_end)
-        return tau_for_epoch(local_epoch, total_epochs=local_total,
-                             tau_init=tau_init, tau_final=tau_final)
-
-    if epoch < b2_end:
-        tau_init = float(schedule_cfg.get("tau_b2_init", 0.6))
-        tau_final = float(schedule_cfg.get("tau_b2_final", 0.4))
-        local_epoch = epoch - b1_end
-        local_total = max(1, b2_end - b1_end)
-        return tau_for_epoch(local_epoch, total_epochs=local_total,
-                             tau_init=tau_init, tau_final=tau_final)
-
-    tau_init = float(schedule_cfg.get("tau_c_init", 0.4))
-    tau_final = float(schedule_cfg.get("tau_c_final", 0.1))
-    local_epoch = epoch - b2_end
-    local_total = max(1, total_epochs - b2_end)
-    return tau_for_epoch(local_epoch, total_epochs=local_total,
-                         tau_init=tau_init, tau_final=tau_final)
-
-
-def four_phase_lambdas(
-    epoch: int,
-    total_epochs: int,
-    base_lambdas: dict,
-    schedule_cfg: dict | None = None,
-) -> dict:
-    """Effective lambda dict for the current epoch under the four-phase
-    schedule (four-phase-redesign/Phase 3b).
-
-    Phase A:  all structural lambdas = 0. ``rail`` preserved.
-    Phase B1: lambdas_b1 ramped from 0 to full over warmup_frac_b1.
-    Phase B2: lambdas_b2 ramped from 0 to full over warmup_frac_b2.
-    Phase C:  lambdas_c at full strength (no warmup).
-
-    The output dict always includes ``rail`` from ``base_lambdas``.
-    Returns a fresh dict; ``base_lambdas`` is not mutated.
-    """
-    if schedule_cfg is None:
-        schedule_cfg = SCHEDULE_FOUR_PHASE
-    a_end, b1_end, b2_end, _ = four_phase_boundaries(total_epochs, schedule_cfg)
-    rail_val = float(base_lambdas.get("rail", 0.0))
-    out = {"rail": rail_val}
-
-    if epoch < a_end:
-        for k in _REG_KEYS:
-            out[k] = 0.0
-        return out
-
-    if epoch < b1_end:
-        lambdas_b1 = schedule_cfg.get("lambdas_b1", {})
-        warmup_frac = float(schedule_cfg.get("warmup_frac_b1", 0.25))
-        local_epoch = epoch - a_end
-        local_total = max(1, b1_end - a_end)
-        warmup_epochs = max(1, int(round(warmup_frac * local_total)))
-        if local_epoch < warmup_epochs:
-            scale = float(local_epoch + 1) / float(warmup_epochs)
-        else:
-            scale = 1.0
-        for k in _REG_KEYS:
-            out[k] = float(lambdas_b1.get(k, 0.0)) * scale
-        return out
-
-    if epoch < b2_end:
-        lambdas_b2 = schedule_cfg.get("lambdas_b2", {})
-        warmup_frac = float(schedule_cfg.get("warmup_frac_b2", 0.25))
-        local_epoch = epoch - b1_end
-        local_total = max(1, b2_end - b1_end)
-        warmup_epochs = max(1, int(round(warmup_frac * local_total)))
-        if local_epoch < warmup_epochs:
-            scale = float(local_epoch + 1) / float(warmup_epochs)
-        else:
-            scale = 1.0
-        for k in _REG_KEYS:
-            out[k] = float(lambdas_b2.get(k, 0.0)) * scale
-        return out
-
-    lambdas_c = schedule_cfg.get("lambdas_c", {})
-    for k in _REG_KEYS:
-        out[k] = float(lambdas_c.get(k, 0.0))
-    return out
-
-
-def four_phase_kd_active(
-    epoch: int,
-    total_epochs: int,
-    schedule_cfg: dict | None = None,
-) -> bool:
-    """Whether teacher distillation should be active for the current epoch
-    (four-phase-redesign/Phase 3c).
-
-    KD is active in Phase B1 and B2 only (not A, not C). During Phase A
-    we are fitting the soft teacher; during Phase C we are retraining the
-    pruned compact model and want to fit the task directly.
-    """
-    phase = phase_for_epoch_four(epoch, total_epochs, schedule_cfg)
-    return phase in ("B1", "B2")
-
-
-# ---------- readiness-based prune trigger (four-phase-redesign) ----------
-
-
-
-
 def compute_loss(
     net: KirchhoffNetWithIO | KirchhoffNet,
     x0: torch.Tensor,
@@ -748,11 +554,9 @@ def compute_loss(
     amp: bool = False,
     amp_dtype: torch.dtype = torch.float16,
     reg_scale: float = 1.0,
-    teacher: KirchhoffNetWithIO | KirchhoffNet | None = None,
-    kd_lambda: float = 0.0,
     device_l2_lambda: float = 0.0,
 ):
-    """Compute total loss = task (optionally + KD) + regularizers.
+    """Compute total loss = task + regularizers.
 
     If net is a KirchhoffNetWithIO, x0 is the raw input u. If it is a plain
     KirchhoffNet, x0 is the already-bounded initial differential state.
@@ -764,8 +568,6 @@ def compute_loss(
     If `amp` is True, wraps forward+loss in torch.cuda.amp.autocast for
     mixed-precision training. Caller is responsible for GradScaler.
 
-    When ``teacher`` is not None, adds a knowledge-distillation term
-    ``kd_lambda * MSE(student_out, teacher_out)`` to the task loss.
     """
     if lambdas is None:
         lambdas = LAMBDAS
@@ -780,12 +582,6 @@ def compute_loss(
             out, trajs = net(x0, store_trajectory=True)
 
         loss_task = task_fn(out, target)
-
-        if teacher is not None:
-            with torch.no_grad():
-                teacher_out, _ = teacher(x0)
-            loss_kd = kd_lambda * F.mse_loss(out, teacher_out.detach())
-            loss_task = loss_task + loss_kd
 
         if trajs is None:
             zero = loss_task.new_zeros((), requires_grad=True)

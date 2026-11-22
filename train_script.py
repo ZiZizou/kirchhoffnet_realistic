@@ -78,7 +78,6 @@ from config import (
     OPTIM,
     PRESETS,
     LAMBDAS,
-    SCHEDULE_FOUR_PHASE,
     SOLVER,
     TAU,
     VCA,
@@ -96,11 +95,6 @@ from train import (
     phase_for_epoch,
     three_phase_tau,
     three_phase_lambdas,
-    four_phase_boundaries,
-    phase_for_epoch_four,
-    four_phase_tau,
-    four_phase_lambdas,
-    four_phase_kd_active,
     )
 from io_mapper import (
     FanOutInputMapper,
@@ -176,7 +170,7 @@ def _resolve_schedule(problem: str, cli_value: str | None) -> str:
     if cli_value is not None:
         return cli_value
     preset_val = PRESETS[problem].get("schedule")
-    if preset_val in ("legacy", "three_phase", "four_phase"):
+    if preset_val in ("legacy", "three_phase"):
         return preset_val
     return "legacy"
 
@@ -233,12 +227,6 @@ def _apply_ablation_set(args, schedule_mode: str) -> None:
         for k in ("sparsity", "edge_gate", "power", "tanh_sat"):
             if k in SCHEDULE_THREE_PHASE.get("lambdas_b", {}):
                 SCHEDULE_THREE_PHASE["lambdas_b"][k] = 0.0
-        from config import SCHEDULE_FOUR_PHASE
-        for phase_key in ("lambdas_b1", "lambdas_b2"):
-            if phase_key in SCHEDULE_FOUR_PHASE:
-                for k in ("sparsity", "edge_gate", "power", "tanh_sat"):
-                    if k in SCHEDULE_FOUR_PHASE[phase_key]:
-                        SCHEDULE_FOUR_PHASE[phase_key][k] = 0.0
         print(
             "[ablation-set=tau-only] structural regularizers zeroed in B/B1/B2, "
             "tau anneals normally, --prune disabled"
@@ -253,7 +241,6 @@ def _apply_ablation_set(args, schedule_mode: str) -> None:
         _set_if_unset("retrain_mapper_lr_scale", 1.0)
         _set_if_unset("struct_lr_scale", 1.0)
         _set_if_unset("dyn_lr_scale", 1.0)
-        _set_if_unset("freeze_mappers", False)
         print(
             "[ablation-set=edge-only] node-gate pruning permanently disabled "
             "(deprecate-node-gates), edge threshold 0.05, "
@@ -654,7 +641,6 @@ def _save_config_snapshot(out_dir: Path, problem: str, args, lambdas: dict,
             f.write(f"  dyn_lr_scale: {args.dyn_lr_scale}\n")
             f.write(f"  retrain_stage_lr_scale: {args.retrain_stage_lr_scale}\n")
             f.write(f"  retrain_mapper_lr_scale: {args.retrain_mapper_lr_scale}\n")
-            f.write(f"  freeze_mappers: {args.freeze_mappers}\n")
         else:
             f.write(f"  write_mode: {args.write_mode}\n")
             f.write(f"  read_mode: {args.read_mode}\n")
@@ -1734,13 +1720,6 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "(default: config PHYS['clip_sharpness_max']=0.2). "
              "Must be > --clip-sharpness-min.")
     parser.add_argument(
-        "--freeze-mappers", dest="freeze_mappers", action="store_true", default=False,
-        help="Freeze mapper requires_grad during the first half of the combined "
-             "B1+B2 duration (four_phase schedule only). Mappers train normally "
-             "in Phase A, freeze at B1 start, unfreeze at the midpoint. After "
-             "unfreeze mappers resume at the --mapper-lr-scale rate. "
-             "Ignored for three_phase and legacy schedules.")
-    parser.add_argument(
         "--device", default=None,
         help="Device 'cpu' or 'cuda' (default: auto-detect)")
     parser.add_argument(
@@ -1863,15 +1842,12 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "operating-point measures (vca_gates.txt). No-op when no stage "
              "has core VCA enabled (default: off).")
     parser.add_argument(
-        "--schedule", choices=["legacy", "three_phase", "four_phase"], default=None,
+        "--schedule", choices=["legacy", "three_phase"], default=None,
         help="Training schedule mode (default: from preset['schedule'], "
              "fallback 'legacy'). 'three_phase' implements the phased "
              "fit-compress-prune pipeline (Phase A: fit with no structure "
              "pressure, Phase B: compress via gate penalties, Phase C: "
-             "auto-prune + retrain). 'four_phase' adds a cell-commitment "
-             "Phase B1 (no pruning), readiness-gated Phase B2 (edge "
-             "pruning), and a KD-anchored retrain Phase C. See "
-             "spec/four-phase-schedule.md.")
+             "auto-prune + retrain).")
 
     parser.add_argument(
         "--ablation-set",
@@ -1892,7 +1868,7 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
              "uses one cell per edge in the forward pass (argmax) with "
              "straight-through soft gradients in the backward pass. "
              "'auto' uses 'soft' for Phase A and 'ste' for B/C (only "
-             "meaningful with --schedule three_phase / four_phase).")
+             "meaningful with --schedule three_phase).")
 
     parser.add_argument(
         "--write-fan-out", type=str, default=None, dest="write_fan_out",
@@ -2439,20 +2415,15 @@ def main():
     if args.no_edge_gates:
         lambdas["edge_gate"] = 0.0
         lambdas["sparsity"] = 0.0
-        from config import SCHEDULE_THREE_PHASE, SCHEDULE_FOUR_PHASE
+        from config import SCHEDULE_THREE_PHASE
         for k in ("sparsity", "edge_gate"):
             if k in SCHEDULE_THREE_PHASE.get("lambdas_b", {}):
                 SCHEDULE_THREE_PHASE["lambdas_b"][k] = 0.0
-        for phase_key in ("lambdas_b1", "lambdas_b2"):
-            if phase_key in SCHEDULE_FOUR_PHASE:
-                for k in ("sparsity", "edge_gate"):
-                    if k in SCHEDULE_FOUR_PHASE[phase_key]:
-                        SCHEDULE_FOUR_PHASE[phase_key][k] = 0.0
     if getattr(args, "tanh_sat_lambda", None) is not None:
         lambdas["tanh_sat"] = float(args.tanh_sat_lambda)
         print(f"[train] tanh_sat lambda overridden via CLI: {lambdas['tanh_sat']}")
     # sparsity/entropy lambda CLI overrides (kn-bayes-opt dims). The schedule
-    # functions (three_phase_lambdas / four_phase_lambdas) read sparsity and
+    # functions (three_phase_lambdas) read sparsity and
     # entropy from the schedule config's lambdas_b/b1/b2/c, NOT from the base
     # lambdas dict. To make the CLI value effective under every schedule, we
     # patch the base lambdas AND the schedule phase targets.
@@ -2462,7 +2433,7 @@ def main():
             _v = float(getattr(args, _cli_name))
             lambdas[_reg_key] = _v
             print(f"[train] {_reg_key} lambda overridden via CLI: {_v}")
-            from config import SCHEDULE_THREE_PHASE, SCHEDULE_FOUR_PHASE
+            from config import SCHEDULE_THREE_PHASE
             for _phase_key, _map in (
                 ("lambdas_b", SCHEDULE_THREE_PHASE),
                 ("lambdas_c", SCHEDULE_THREE_PHASE),
@@ -2470,10 +2441,6 @@ def main():
                 if _phase_key in _map:
                     _map[_phase_key].setdefault(_reg_key, 0.0)
                     _map[_phase_key][_reg_key] = _v
-            for _phase_key in ("lambdas_b1", "lambdas_b2", "lambdas_c"):
-                if _phase_key in SCHEDULE_FOUR_PHASE:
-                    SCHEDULE_FOUR_PHASE[_phase_key].setdefault(_reg_key, 0.0)
-                    SCHEDULE_FOUR_PHASE[_phase_key][_reg_key] = _v
     schedule_mode = _resolve_schedule(args.problem, args.schedule)
     # four-phase-redesign/Phase 1c: apply diagnostic ablation preset
     # overrides BEFORE any other flag is consumed (e.g. before the
@@ -2488,29 +2455,6 @@ def main():
         print(
             f"[train] three_phase schedule: A=[0,{a_end}) B=[{a_end},{b_end}) "
             f"C=[{b_end},{c_end}) (total={epochs})"
-        )
-    elif schedule_mode == "four_phase":
-        fp_a_end, fp_b1_end, fp_b2_end, fp_c_end = four_phase_boundaries(epochs)
-        print(
-            f"[train] four_phase schedule: A=[0,{fp_a_end}) "
-            f"B1=[{fp_a_end},{fp_b1_end}) "
-            f"B2=[{fp_b1_end},{fp_b2_end}) "
-            f"C=[{fp_b2_end},{fp_c_end}) (total={epochs})"
-        )
-        if args.freeze_mappers:
-            mapper_unfreeze_epoch = fp_a_end + (fp_b2_end - fp_a_end) // 2
-            print(
-                f"[train] four_phase freeze_mappers: freeze at epoch {fp_a_end}, "
-                f"unfreeze at epoch {mapper_unfreeze_epoch}"
-            )
-        else:
-            mapper_unfreeze_epoch = -1
-    else:
-        mapper_unfreeze_epoch = -1
-    if args.freeze_mappers and schedule_mode != "four_phase":
-        print(
-            f"[train] WARNING: --freeze-mappers ignored for schedule_mode={schedule_mode} "
-            f"(only supported for four_phase)"
         )
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if args.device is not None:
@@ -3034,25 +2978,16 @@ def main():
     grad_log_path = out_dir / "grad_norms.txt" if args.grad_log else None
     update_norms_path = out_dir / "update_norms.txt" if args.grad_log else None
     vca_gates_path = out_dir / "vca_gates.txt" if getattr(args, "vca_diag", False) else None
-    solid_log_path = out_dir / "solidification_metrics.txt" if schedule_mode in ("three_phase", "four_phase") else None
+    solid_log_path = out_dir / "solidification_metrics.txt" if schedule_mode == "three_phase" else None
 
     # ---------- Determine effective training scope ----------
     # Three-phase: Phase A+B use the overcomplete network (epochs 0..b_end).
-    # Four-phase: Phase A+B1+B2 use the overcomplete network (epochs 0..b2_end).
-    # Legacy: single phase over all epochs.
+        # Legacy: single phase over all epochs.
     if schedule_mode == "three_phase":
         a_end, b_end, _ = phase_boundaries(epochs)
         ab_total = b_end  # Phase A+B epoch count
         c_total = max(1, epochs - b_end)
         needs_prune = True  # three_phase always prunes at the B→C boundary
-    elif schedule_mode == "four_phase":
-        fp_a_end, fp_b1_end, fp_b2_end, _ = four_phase_boundaries(epochs)
-        a_end = fp_a_end
-        b1_end = fp_b1_end
-        b2_end = fp_b2_end
-        ab_total = b2_end  # Phase A+B1+B2 epoch count
-        c_total = max(1, epochs - b2_end)
-        needs_prune = False  # four_phase handles pruning inline during B2
     else:
         ab_total = epochs
         c_total = 0
@@ -3068,14 +3003,6 @@ def main():
     epochs_without_improve = 0
     stop_training = False
 
-    # four-phase-redesign: teacher distillation state
-    teacher_net = None
-    teacher_frozen = False
-    # Readiness tracking for four_phase B2
-    readiness_histories: dict = {}
-    readiness_prune_fired = False
-    readiness_prune_epoch = -1
-
     # ---- Phase A + B: overcomplete training ----
     tau_anneal_enabled = PRESETS[args.problem].get("tau_anneal", True)
     if schedule_mode == "legacy" and tau_anneal_enabled:
@@ -3084,26 +3011,19 @@ def main():
             tau_kwargs["tau_final"] = float(TAU.get("final_pretrain", TAU["final"]))
     if schedule_mode == "three_phase":
         ab_desc = f"train {args.problem} [A+B]"
-    elif schedule_mode == "four_phase":
-        ab_desc = f"train {args.problem} [A+B1+B2]"
     else:
         ab_desc = f"train {args.problem} [ablation={args.ablation}]"
     ab_iter = (
         tqdm(range(ab_total), desc=ab_desc, unit="epoch")
         if tqdm is not None else range(ab_total)
     )
-    # four-phase-redesign: solidification metrics stored for readiness check
-    solid_metrics_history: list[dict] = []
-    # Validate-only histories (matching cadence of solid_metrics_history)
-    # Avoids duplicate entries on non-validate epochs for the readiness check.
+    # Validate-only histories.
     val_v_history: list[float] = []
     val_argmax_history = None
     val_argmax_v_history = None
     # housing_grid: per-epoch dicts of {val, mae_orig, rmse_orig} for
     # logging in original housing-price units (USD x 100k).
     val_orig_history: list[dict] = [] if inverse_stats is not None else None
-    # mapper-lr-control: freeze state for --freeze-mappers (four_phase only)
-    mappers_frozen = False
 
     train_start_time = time.time()
 
@@ -3112,60 +3032,7 @@ def main():
             break
         net.train()
 
-        if schedule_mode == "four_phase":
-            tau = four_phase_tau(epoch, epochs)
-            phase = phase_for_epoch_four(epoch, epochs)
-            effective_lambdas = four_phase_lambdas(epoch, epochs, lambdas)
-            reg_scale = 1.0  # four_phase_lambdas already includes warmup
-
-            # Teacher cloning at phase transition A -> B1.
-            if phase in ("B1", "B2") and not teacher_frozen and best_state is not None:
-                # Deep-copy the architecture and load the best Phase A
-                # checkpoint into the frozen teacher.
-                import copy as _copy
-                raw = net.module if isinstance(net, torch.nn.DataParallel) else net
-                teacher_net = _copy.deepcopy(raw)
-                teacher_net.load_state_dict(best_state)
-                teacher_net.requires_grad_(False)
-                teacher_net.eval()
-                teacher_net.to(device)
-                teacher_frozen = True
-                print(
-                    f"[teacher] cloned best Phase A state (epoch {best_epoch}, "
-                    f"{best_metric_name}={best_val:.4f}) as frozen teacher"
-                )
-
-            # mapper-lr-control: freeze mappers at A->B1 boundary, unfreeze
-            # at the midpoint of the combined B1+B2 duration. Only when
-            # --freeze-mappers is set and schedule_mode is four_phase.
-            if args.freeze_mappers:
-                raw = net.module if isinstance(net, torch.nn.DataParallel) else net
-                if epoch == fp_a_end and not mappers_frozen:
-                    raw.input_mapper.requires_grad_(False)
-                    raw.output_mapper.requires_grad_(False)
-                    mappers_frozen = True
-                    print(
-                        f"[mapper] frozen mappers at epoch {epoch} "
-                        f"(unfreeze at {mapper_unfreeze_epoch})"
-                    )
-                elif epoch == mapper_unfreeze_epoch and mappers_frozen:
-                    raw.input_mapper.requires_grad_(True)
-                    raw.output_mapper.requires_grad_(True)
-                    mappers_frozen = False
-                    print(
-                        f"[mapper] unfrozen mappers at epoch {epoch} "
-                        f"(lr_scale={args.mapper_lr_scale})"
-                    )
-
-            # If readiness triggered on a previous validate step, stop here.
-            if phase == "B2" and readiness_prune_fired:
-                print(
-                    f"[four_phase] readiness pruning triggered at epoch {epoch} "
-                    f"(B2 cut short, was scheduled for {b2_end})"
-                )
-                break
-
-        elif schedule_mode == "three_phase":
+        if schedule_mode == "three_phase":
             tau = three_phase_tau(epoch, epochs)
             phase = phase_for_epoch(epoch, epochs)
             effective_lambdas = three_phase_lambdas(epoch, epochs, lambdas)
@@ -3195,18 +3062,11 @@ def main():
             u, target = batch
             u = u.to(device)
             target = target.to(device)
-            # four-phase-redesign/Phase 3c: pass teacher for KD when active.
-            kd_teacher = None
-            kd_lambda = 0.0
-            if schedule_mode == "four_phase" and teacher_frozen and four_phase_kd_active(epoch, epochs):
-                kd_teacher = teacher_net
-                kd_lambda = float(SCHEDULE_FOUR_PHASE.get("lambda_kd", 1.0))
             loss_task, loss_structural, _ = compute_loss(
                 net,
                 u, target, task_fn,
                 lambdas=effective_lambdas, return_parts=True,
                 amp=amp_enabled, amp_dtype=amp_dtype, reg_scale=reg_scale,
-                teacher=kd_teacher, kd_lambda=kd_lambda,
                 device_l2_lambda=args.device_l2_lambda)
             if scaler is not None and scaler._enabled:
                 ( scaler.scale(loss_task) + scaler.scale(loss_structural) ).backward()
@@ -3243,9 +3103,6 @@ def main():
             # Argmax validation for phased schedules
             if solid_log_path is not None and phase in ("A", "B", "B1", "B2"):
                 _log_solidification(solid_log_path, epoch, {})
-                # Store for four_phase readiness check.
-                if schedule_mode == "four_phase":
-                    solid_metrics_history.append(metrics)
 
         else:
             val_loss = val_history[-1] if val_history else avg_train
@@ -3316,35 +3173,6 @@ def main():
             f"[phase] A+B complete (epoch {b_end}), best {best_metric_name}={best_val:.4f} "
             f"@ epoch {best_epoch}"
         )
-    elif schedule_mode == "four_phase":
-        if stop_training and not teacher_frozen:
-            # Early stopped in Phase A — no pruning, just save.
-            print(
-                f"[four_phase] early stop in Phase A at epoch {epoch}, "
-                f"skipping prune+retrain"
-            )
-        else:
-            if readiness_prune_fired:
-                print(
-                    f"[four_phase] A+B1+B2 complete, prune triggered at epoch "
-                    f"{readiness_prune_epoch}, best {best_metric_name}={best_val:.4f} "
-                    f"@ epoch {best_epoch}"
-                )
-            elif stop_training and teacher_frozen:
-                # Early stop during B1/B2 — still prune since compression
-                # has already begun.
-                print(
-                    f"[four_phase] early stop at epoch {epoch} during "
-                    f"B1/B2, pruning anyway"
-                )
-            else:
-                print(
-                    f"[four_phase] A+B1+B2 complete (fallback prune at epoch {b2_end}), "
-                    f"best {best_metric_name}={best_val:.4f} @ epoch {best_epoch}"
-                )
-                readiness_prune_fired = True
-            needs_prune = True
-
     history_path = out_dir / "loss_history.txt"
     with open(history_path, "w") as f:
         has_orig = val_orig_history is not None and len(val_orig_history) == len(val_history)
@@ -3353,8 +3181,6 @@ def main():
             for i, (t, v, m) in enumerate(zip(history, val_history, val_orig_history)):
                 if schedule_mode == "three_phase":
                     p = phase_for_epoch(i, epochs)
-                elif schedule_mode == "four_phase":
-                    p = phase_for_epoch_four(i, epochs)
                 else:
                     p = "A"
                 f.write(f"{i}\t{t}\t{v}\t{m['mae_orig']:.6f}\t{m['rmse_orig']:.6f}\t{m['mse_orig']:.6f}\t{m['mape_orig']:.6f}\t{p}\n")
@@ -3363,8 +3189,6 @@ def main():
             for i, (t, v) in enumerate(zip(history, val_history)):
                 if schedule_mode == "three_phase":
                     p = phase_for_epoch(i, epochs)
-                elif schedule_mode == "four_phase":
-                    p = phase_for_epoch_four(i, epochs)
                 else:
                     p = "A"
                 f.write(f"{i}\t{t}\t{v}\t{p}\n")
@@ -3462,9 +3286,7 @@ def main():
         # For phased schedules, use schedule-specific thresholds;
         # CLI override takes precedence.
         if args.prune_edge_threshold is None:
-            if schedule_mode == "four_phase":
-                edge_thresh = float(SCHEDULE_FOUR_PHASE.get("prune_edge_threshold", 0.05))
-            elif schedule_mode == "three_phase":
+            if schedule_mode == "three_phase":
                 edge_thresh = float(SCHEDULE_THREE_PHASE.get("prune_edge_threshold", 0.1))
             else:
                 edge_thresh = float(PRUNE["edge_threshold"])
@@ -3654,7 +3476,7 @@ def main():
             )
             retrain_enabled = False
         if retrain_enabled:
-            if schedule_mode in ("three_phase", "four_phase"):
+            if schedule_mode == "three_phase":
                 c_epochs = c_total
                 c_lr = args.retrain_lr if args.retrain_lr is not None else lr
             else:
@@ -3742,13 +3564,6 @@ def main():
                     effective_c_lambdas = three_phase_lambdas(global_epoch, epochs, lambdas)
                     reg_r = 1.0
                     # Solidification metrics during Phase C.
-                    if solid_log_path is not None and repoch % args.validate_every == 0:
-                        _log_solidification(solid_log_path, global_epoch, c_metrics)
-                elif schedule_mode == "four_phase":
-                    global_epoch = b2_end + repoch
-                    tau_r = four_phase_tau(global_epoch, epochs)
-                    effective_c_lambdas = four_phase_lambdas(global_epoch, epochs, lambdas)
-                    reg_r = 1.0
                     if solid_log_path is not None and repoch % args.validate_every == 0:
                         _log_solidification(solid_log_path, global_epoch, c_metrics)
                 else:
@@ -3845,7 +3660,7 @@ def main():
                             retrain_orig_history[-1] if retrain_orig_history
                             else {"val": avg, "mae_orig": float("nan"), "rmse_orig": float("nan")}
                         )
-                phase_tag = " [C]" if schedule_mode in ("three_phase", "four_phase") else ""
+                phase_tag = " [C]" if schedule_mode == "three_phase" else ""
                 print(
                     f"  {'retrain' if schedule_mode == 'legacy' else 'phase-C'} epoch {repoch:4d}{phase_tag}  "
                         f"train={avg:.4e}  "
@@ -3861,8 +3676,8 @@ def main():
                     f"(epoch {best_epoch_pruned}, {best_metric_name_c}={best_val_pruned:.4f})"
                 )
 
-            if schedule_mode in ("three_phase", "four_phase"):
-                phase_c_start = b_end if schedule_mode == "three_phase" else b2_end
+            if schedule_mode == "three_phase":
+                phase_c_start = b_end
                 with open(history_path, "r") as f:
                     header = f.readline().strip()
                 has_orig = "mae_orig" in header

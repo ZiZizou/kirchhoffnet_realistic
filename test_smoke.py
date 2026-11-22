@@ -1898,11 +1898,8 @@ def main():
     test_mapper_lr_scale_separate_group()        # MLR-1: mapper-only group
     test_mapper_lr_scale_combined_with_stage_lr_scale()  # MLR-2: stage+ mapper together
     test_mapper_lr_scale_backward_compat()        # MLR-3: backward compat
-    test_freeze_mappers_cli_flag_parsed()         # MLR-4: freeze flag
     test_mapper_lr_scale_cli_flag_parsed()        # MLR-5: mapper-lr-scale flag
     test_mapper_lr_scale_rejects_zero_or_negative()  # MLR-6: validation
-    test_mapper_unfreeze_epoch_midpoint()         # MLR-7: midpoint
-    test_freeze_mappers_requires_grad_toggle()    # MLR-8: requires_grad toggle
 
     # LR param group tests (lr-param-groups plan)
     test_lrp_struct_dyn_groups_created()          # LRP-1
@@ -2969,37 +2966,6 @@ def test_mapper_lr_scale_rejects_zero_or_negative():
     check("MLR-6: mapper_lr_scale=-0.1 raises ValueError", raised)
 
 
-def test_freeze_mappers_cli_flag_parsed():
-    """MLR-4: --freeze-mappers CLI flag is parsed correctly."""
-    print("\nTest MLR-4: --freeze-mappers CLI flag")
-    import subprocess
-    import sys
-    script = (
-        "import sys; sys.path.insert(0, '.'); "
-        "from train_script import _add_argparse_args; "
-        "import argparse; "
-        "p = argparse.ArgumentParser(); "
-        "_add_argparse_args(p); "
-        "args = p.parse_args(['--problem', 'sinx']); "
-        "print('freeze_mappers_default:', args.freeze_mappers); "
-        "args2 = p.parse_args(['--problem', 'sinx', '--freeze-mappers']); "
-        "print('freeze_mappers_set:', args2.freeze_mappers)"
-    )
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        cwd=THIS_DIR,
-        capture_output=True, text=True, timeout=60,
-    )
-    check("MLR-4: subprocess returns 0", result.returncode == 0,
-          f"stderr: {result.stderr}")
-    check("MLR-4: default freeze_mappers is False",
-          "freeze_mappers_default: False" in result.stdout,
-          f"stdout: {result.stdout}")
-    check("MLR-4: --freeze-mappers sets flag to True",
-          "freeze_mappers_set: True" in result.stdout,
-          f"stdout: {result.stdout}")
-
-
 def test_mapper_lr_scale_cli_flag_parsed():
     """MLR-5: --mapper-lr-scale CLI flag is parsed correctly."""
     print("\nTest MLR-5: --mapper-lr-scale CLI flag")
@@ -3029,26 +2995,6 @@ def test_mapper_lr_scale_cli_flag_parsed():
     check("MLR-5: --mapper-lr-scale 0.1 parsed",
           "set: 0.1" in result.stdout,
           f"stdout: {result.stdout}")
-
-
-def test_mapper_unfreeze_epoch_midpoint():
-    """MLR-7: mapper_unfreeze_epoch = fp_a_end + (fp_b2_end - fp_a_end) // 2."""
-    print("\nTest MLR-7: mapper unfreeze epoch = midpoint of B1+B2")
-    from train import four_phase_boundaries
-
-    for total in [120, 240, 400]:
-        a_end, b1_end, b2_end, _ = four_phase_boundaries(total)
-        midpoint = a_end + (b2_end - a_end) // 2
-        # Verify it's strictly between a_end and b2_end, closer to a_end
-        # (since integer division truncates).
-        check(f"MLR-7: midpoint in (a_end, b2_end) for {total} epochs",
-              a_end < midpoint < b2_end,
-              f"a_end={a_end}, b2_end={b2_end}, midpoint={midpoint}")
-        # Verify it's the floor of the arithmetic mean.
-        arithmetic_mean = (a_end + b2_end) / 2
-        check(f"MLR-7: midpoint == floor(mean) for {total} epochs",
-              midpoint == int(arithmetic_mean),
-              f"midpoint={midpoint}, floor(mean)={int(arithmetic_mean)}")
 
 
 # ---- LR param groups tests (lr-param-groups plan) ----
@@ -3384,38 +3330,6 @@ def test_lrp_mapper_lr_scale_new_default():
     check("LRP-10: dyn_lr_scale default is 1.0",
           "dyn: 1.0" in output,
           f"stdout: {output}")
-
-
-def test_freeze_mappers_requires_grad_toggle():
-    """MLR-8: requires_grad_(False) on input/output_mapper, then (True), works as expected."""
-    print("\nTest MLR-8: requires_grad toggle on mappers")
-    from topology import build_net_from_preset
-    from cell_library import make_cell_library
-
-    cell_lib = make_cell_library('tanh_free')
-    net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
-    raw = net.module if hasattr(net, "module") else net
-
-    in_p = list(raw.input_mapper.parameters())
-    out_p = list(raw.output_mapper.parameters())
-    check("MLR-8: input_mapper has params", len(in_p) > 0)
-    check("MLR-8: output_mapper has params", len(out_p) > 0)
-
-    raw.input_mapper.requires_grad_(False)
-    raw.output_mapper.requires_grad_(False)
-    in_all_false = all(not p.requires_grad for p in in_p)
-    out_all_false = all(not p.requires_grad for p in out_p)
-    check("MLR-8: all mapper params have requires_grad=False after freeze",
-          in_all_false and out_all_false,
-          f"in_all_false={in_all_false}, out_all_false={out_all_false}")
-
-    raw.input_mapper.requires_grad_(True)
-    raw.output_mapper.requires_grad_(True)
-    in_all_true = all(p.requires_grad for p in in_p)
-    out_all_true = all(p.requires_grad for p in out_p)
-    check("MLR-8: all mapper params have requires_grad=True after unfreeze",
-          in_all_true and out_all_true,
-          f"in_all_true={in_all_true}, out_all_true={out_all_true}")
 
 
 # ============================================================================

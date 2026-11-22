@@ -71,7 +71,9 @@ class KirchhoffCircuit(nn.Module):
     """
     def __init__(self, src: torch.Tensor, dst: torch.Tensor, *, num_nodes: int, activation: str, x_max: float,
                  clip_current: float, clip_softness: float, leak_init: float,
-                 c_eff: float) -> None:
+                 c_eff: float, bounded_edge_parameters: bool = False,
+                 edge_weight_max: float = 1.0, edge_bias_max: float = 1.0,
+                 fixed_leak: bool = False) -> None:
         super().__init__()
         self.register_buffer("src", src.long())
         self.register_buffer("dst", dst.long())
@@ -81,10 +83,23 @@ class KirchhoffCircuit(nn.Module):
         self.edge = nn.Parameter(torch.empty(3, len(src)))
         nn.init.normal_(self.edge, std=0.08)
         self.activation = {"tanh": torch.tanh, "relu": F.relu}[activation]
-        # Positive programmable leakage, initialized to the constrained KNet
-        # default (0.0486). It is counted in the architecture budget.
-        raw_leak = float(np.log(np.expm1(leak_init)))
-        self.raw_leak = nn.Parameter(torch.full((self.num_nodes,), raw_leak))
+        # ``edge`` remains the three raw per-edge degrees of freedom.  With
+        # --bounded-edge-parameters they are mapped into finite physical-like
+        # slope/bias ranges before being used by the device.
+        self.bounded_edge_parameters = bool(bounded_edge_parameters)
+        self.edge_weight_max = float(edge_weight_max)
+        self.edge_bias_max = float(edge_bias_max)
+        if self.edge_weight_max <= 0 or self.edge_bias_max <= 0:
+            raise ValueError("edge parameter bounds must be positive")
+        self.fixed_leak_enabled = bool(fixed_leak)
+        if self.fixed_leak_enabled:
+            self.register_buffer("fixed_leak", torch.full((self.num_nodes,), float(leak_init)))
+            self.raw_leak = None
+        else:
+            # Positive programmable leakage, initialized to the constrained
+            # KNet default. It is counted in the architecture budget.
+            raw_leak = float(np.log(np.expm1(leak_init)))
+            self.raw_leak = nn.Parameter(torch.full((self.num_nodes,), raw_leak))
         self.x_max, self.clip_current = float(x_max), float(clip_current)
         self.clip_softness, self.c_eff = float(clip_softness), float(c_eff)
         self.nfe = 0
@@ -97,8 +112,14 @@ class KirchhoffCircuit(nn.Module):
         # Ground is fixed to zero. Device activation is selected per BO trial.
         bounded = self.x_max * torch.tanh(voltage / self.x_max)
         with_ground = torch.cat((torch.zeros_like(bounded[:, :1]), bounded), dim=1)
-        current = self.activation(self.edge[0] * with_ground[:, self.src]
-                                  + self.edge[1] * with_ground[:, self.dst] + self.edge[2])
+        if self.bounded_edge_parameters:
+            edge_src = self.edge_weight_max * torch.tanh(self.edge[0])
+            edge_dst = self.edge_weight_max * torch.tanh(self.edge[1])
+            edge_bias = self.edge_bias_max * torch.tanh(self.edge[2])
+        else:
+            edge_src, edge_dst, edge_bias = self.edge[0], self.edge[1], self.edge[2]
+        current = self.activation(edge_src * with_ground[:, self.src]
+                                  + edge_dst * with_ground[:, self.dst] + edge_bias)
         derivative = torch.zeros_like(with_ground)
         derivative.scatter_add_(1, self.src.expand_as(current), -current)
         derivative.scatter_add_(1, self.dst.expand_as(current), current)
@@ -106,23 +127,55 @@ class KirchhoffCircuit(nn.Module):
             torch.sigmoid((voltage - self.x_max) / self.clip_softness)
             - torch.sigmoid((-voltage - self.x_max) / self.clip_softness)
         )
-        leak = F.softplus(self.raw_leak).unsqueeze(0) * voltage
+        leak_value = self.fixed_leak if self.fixed_leak_enabled else F.softplus(self.raw_leak)
+        leak = leak_value.unsqueeze(0) * voltage
         return (derivative[:, 1:] - leak - soft_rail) / self.c_eff
+
+
+class FixedSparseLinear(nn.Module):
+    """A fixed wiring-pattern affine map with only its live connections stored.
+
+    It is deliberately not a masked dense matrix: inactive entries do not
+    exist as trainable parameters and therefore do not consume the BO budget.
+    """
+    def __init__(self, in_features: int, out_features: int, fan_in: int, seed: int) -> None:
+        super().__init__()
+        if not 1 <= fan_in <= in_features:
+            raise ValueError(f"fan_in must lie in [1, {in_features}], got {fan_in}")
+        rng = np.random.default_rng(seed)
+        indices = np.stack([rng.choice(in_features, fan_in, replace=False) for _ in range(out_features)])
+        self.register_buffer("indices", torch.tensor(indices, dtype=torch.long))
+        self.weight = nn.Parameter(torch.empty(out_features, fan_in))
+        self.bias = nn.Parameter(torch.empty(out_features))
+        nn.init.kaiming_uniform_(self.weight, a=np.sqrt(5.0))
+        bound = 1.0 / np.sqrt(fan_in)
+        nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return (x[:, self.indices] * self.weight.unsqueeze(0)).sum(dim=-1) + self.bias
 
 
 class CTLEKirchhoffNet(nn.Module):
     """4-spec encoder -> Kirchhoff ODE -> 7 CTLE logits."""
     def __init__(self, nodes: int, edge_count: int, activation: str, topology_seed: int, t_end: float,
                  rtol: float, *, x_max: float, clip_current: float,
-                 clip_softness: float, leak_init: float, c_eff: float) -> None:
+                 clip_softness: float, leak_init: float, c_eff: float,
+                 bounded_edge_parameters: bool = False, edge_weight_max: float = 1.0,
+                 edge_bias_max: float = 1.0, fixed_leak: bool = False,
+                 input_mapper_fan_in: int = 0, output_mapper_fan_in: int = 0) -> None:
         super().__init__()
         src, dst = make_topology(nodes, edge_count, topology_seed)
         # Names intentionally match the existing Phase-A differential-LR
         # grouping and OutputAffine-bias initialisation conventions.
-        self.input_mapper = nn.Linear(4, nodes)
+        self.input_mapper = (FixedSparseLinear(4, nodes, min(input_mapper_fan_in, 4), topology_seed + 101)
+                             if input_mapper_fan_in > 0 else nn.Linear(4, nodes))
         self.circuit = KirchhoffCircuit(src, dst, num_nodes=nodes, activation=activation, x_max=x_max, clip_current=clip_current,
-                                        clip_softness=clip_softness, leak_init=leak_init, c_eff=c_eff)
-        self.output_mapper = nn.Linear(nodes, 7)
+                                        clip_softness=clip_softness, leak_init=leak_init, c_eff=c_eff,
+                                        bounded_edge_parameters=bounded_edge_parameters,
+                                        edge_weight_max=edge_weight_max, edge_bias_max=edge_bias_max,
+                                        fixed_leak=fixed_leak)
+        self.output_mapper = (FixedSparseLinear(nodes, 7, min(output_mapper_fan_in, nodes), topology_seed + 211)
+                              if output_mapper_fan_in > 0 else nn.Linear(nodes, 7))
         self.t_end, self.rtol = float(t_end), float(rtol)
         self.x_max = float(x_max)
         lo = torch.as_tensor(PARAM_LOG_BOUNDS[:, 0], dtype=torch.float32)
@@ -166,22 +219,42 @@ def make_topology(nodes: int, edge_count: int, seed: int) -> tuple[torch.Tensor,
             torch.tensor([pairs[i][1] for i in selected]))
 
 
-def parameter_count(nodes: int, edges: int) -> int:
-    # encoder (4N+N bias), three/device, programmable per-node leak, readout.
-    return 13 * nodes + 3 * edges + 7
+def parameter_count(nodes: int, edges: int, *, fixed_leak: bool = False,
+                    input_mapper_fan_in: int = 0, output_mapper_fan_in: int = 0) -> int:
+    """Count exactly the live trainable tensors for this architecture."""
+    input_n = nodes * ((min(input_mapper_fan_in, 4) if input_mapper_fan_in else 4) + 1)
+    output_n = 7 * ((min(output_mapper_fan_in, nodes) if output_mapper_fan_in else nodes) + 1)
+    return input_n + 3 * edges + (0 if fixed_leak else nodes) + output_n
 
 
-def circuit_candidates(budget: int, tolerance: float) -> list[tuple[int, int]]:
+def circuit_candidates(budget: int, tolerance: float, *, fixed_leak: bool = False,
+                       input_mapper_fan_in: int = 0, output_mapper_fan_in: int = 0,
+                       fixed_nodes: int | None = None, fixed_edges: int | None = None,
+                       max_edge_density: float | None = None) -> list[tuple[int, int]]:
     result = []
-    for nodes in range(16, 65):
+    node_range = [fixed_nodes] if fixed_nodes is not None else range(16, 65)
+    for nodes in node_range:
+        if nodes is None or nodes < 1:
+            raise ValueError("--fixed-nodes must be positive")
         max_edges = nodes * (nodes + 1)
-        target_edges = round((budget - 12 * nodes - 7) / 3)
+        fixed_parameter_n = parameter_count(nodes, 0, fixed_leak=fixed_leak,
+                                            input_mapper_fan_in=input_mapper_fan_in,
+                                            output_mapper_fan_in=output_mapper_fan_in)
+        target_edges = round((budget - fixed_parameter_n) / 3)
         # Nearby counts make edge density a genuine BO-controlled architecture choice.
-        for edges in range(max(1, target_edges - 120), min(max_edges, target_edges + 120) + 1, 30):
-            count = parameter_count(nodes, edges)
+        edge_range = [fixed_edges] if fixed_edges is not None else range(max(1, target_edges - 120), min(max_edges, target_edges + 120) + 1, 30)
+        for edges in edge_range:
+            if edges is None or not 1 <= edges <= max_edges:
+                continue
+            if max_edge_density is not None and edges / max_edges > max_edge_density:
+                continue
+            count = parameter_count(nodes, edges, fixed_leak=fixed_leak,
+                                    input_mapper_fan_in=input_mapper_fan_in,
+                                    output_mapper_fan_in=output_mapper_fan_in)
             if abs(count - budget) <= budget * tolerance:
                 result.append((nodes, edges))
-    if not result: raise ValueError("No directed Kirchhoff topology meets --param-budget/tolerance")
+    if not result:
+        raise ValueError("No directed Kirchhoff topology meets the budget/tolerance and requested fixed/sparse constraints")
     return result
 
 
@@ -208,6 +281,41 @@ def batch_size_choices(value: str) -> list[int]:
     if not choices or min(choices) < 1:
         raise ValueError("--batch-size-choices must be a nonempty comma-separated list of positive integers")
     return choices
+
+
+def selected_parameter_count(nodes: int, edges: int, args: argparse.Namespace) -> int:
+    return parameter_count(nodes, edges, fixed_leak=args.fixed_leak,
+                           input_mapper_fan_in=args.input_mapper_fan_in,
+                           output_mapper_fan_in=args.output_mapper_fan_in)
+
+
+def select_architecture(trial: optuna.Trial, candidates: list[tuple[int, int]]) -> tuple[int, int]:
+    """Avoid a meaningless Optuna dimension when capacity is fully fixed."""
+    if len(candidates) == 1:
+        return candidates[0]
+    return candidates[trial.suggest_int("circuit_architecture", 0, len(candidates) - 1)]
+
+
+def select_trial_value(trial: optuna.Trial, name: str, choices: list[Any], fixed: Any | None) -> Any:
+    """Use a fixed CLI value verbatim, otherwise make the value a BO dimension."""
+    return fixed if fixed is not None else trial.suggest_categorical(name, choices)
+
+
+def trial_topology_seed(args: argparse.Namespace, trial: optuna.Trial) -> int:
+    return int(args.topology_seed if args.topology_seed is not None else args.seed + trial.number)
+
+
+def build_student(nodes: int, edges: int, activation: str, t_end: float, rtol: float,
+                  args: argparse.Namespace, trial: optuna.Trial) -> CTLEKirchhoffNet:
+    return CTLEKirchhoffNet(
+        nodes, edges, activation, trial_topology_seed(args, trial), t_end, rtol,
+        x_max=args.x_max, clip_current=args.clip_current,
+        clip_softness=args.clip_softness, leak_init=args.leak_init, c_eff=args.c_eff,
+        bounded_edge_parameters=args.bounded_edge_parameters,
+        edge_weight_max=args.edge_weight_max, edge_bias_max=args.edge_bias_max,
+        fixed_leak=args.fixed_leak, input_mapper_fan_in=args.input_mapper_fan_in,
+        output_mapper_fan_in=args.output_mapper_fan_in,
+    )
 
 
 def trial_train(trial: optuna.Trial, data: dict[str, Any], args: argparse.Namespace, device: torch.device,
@@ -323,19 +431,16 @@ def build_phase_a_context(args: argparse.Namespace, output: Path) -> tuple[Any, 
 def phase_a_trial(trial: optuna.Trial, phase: Any, base_ctx: dict[str, Any], canonical: dict[str, Any],
                   args: argparse.Namespace, candidates: list[tuple[int, int]], output: Path) -> float:
     """Run the existing Phase-A loop unchanged, substituting only the student."""
-    nodes, edges = candidates[trial.suggest_int("circuit_architecture", 0, len(candidates) - 1)]
-    activation = trial.suggest_categorical("device_activation", ["tanh", "relu"])
-    t_end = trial.suggest_categorical("t_end", [.25, .5, 1.])
-    rtol = trial.suggest_categorical("rtol", [1e-3, 3e-4])
+    nodes, edges = select_architecture(trial, candidates)
+    activation = "tanh" if args.tanh_only else trial.suggest_categorical("device_activation", ["tanh", "relu"])
+    t_end = select_trial_value(trial, "t_end", [.25, .5, 1.], args.fixed_t_end)
+    rtol = select_trial_value(trial, "rtol", [1e-3, 3e-4], args.fixed_rtol)
     lr = trial.suggest_float("lr", args.lr_min, args.lr_max, log=True)
     wd = trial.suggest_float("weight_decay", 1e-7, 1e-3, log=True)
     batch_size = trial.suggest_categorical("batch_size", batch_size_choices(args.batch_size_choices))
     trial_dir = output / f"trial_{trial.number:04d}"
     trial_dir.mkdir(parents=True, exist_ok=True)
-    student = CTLEKirchhoffNet(nodes, edges, activation, args.seed + trial.number, t_end, rtol,
-                               x_max=args.x_max, clip_current=args.clip_current,
-                               clip_softness=args.clip_softness, leak_init=args.leak_init,
-                               c_eff=args.c_eff)
+    student = build_student(nodes, edges, activation, t_end, rtol, args, trial)
     # Align this wrapper's fixed physical decode bounds with the shared phase
     # harness, rather than relying on a duplicated local constant.
     bounds = list(phase.PARAM_LOG_BOUNDS.values())
@@ -345,8 +450,16 @@ def phase_a_trial(trial: optuna.Trial, phase: Any, base_ctx: dict[str, Any], can
     phase.init_output_affine_bias_from_labels(
         student, canonical["params"][np.asarray(canonical["train_idx"], dtype=np.int64)], phase.PARAM_LOG_BOUNDS)
     trial.set_user_attr("nodes", nodes); trial.set_user_attr("edges", edges)
-    trial.set_user_attr("parameter_count", parameter_count(nodes, edges))
+    trial.set_user_attr("parameter_count", selected_parameter_count(nodes, edges, args))
     trial.set_user_attr("phase_a_framework", "ctle_dagger_common.run_phase_a_training")
+    trial.set_user_attr("constraints", {
+        "tanh_only": args.tanh_only, "fixed_leak": args.fixed_leak,
+        "bounded_edge_parameters": args.bounded_edge_parameters,
+        "edge_weight_max": args.edge_weight_max, "edge_bias_max": args.edge_bias_max,
+        "input_mapper_fan_in": args.input_mapper_fan_in,
+        "output_mapper_fan_in": args.output_mapper_fan_in,
+        "topology_seed": args.topology_seed,
+    })
     ctx = dict(base_ctx)
     ctx.update({
         "canonical_dataset": canonical, "epochs": args.epochs, "batch_size": batch_size,
@@ -362,7 +475,11 @@ def phase_a_trial(trial: optuna.Trial, phase: Any, base_ctx: dict[str, Any], can
     })
     log_path = trial_dir / "log.txt"
     log_path.write_text("# Original KirchhoffNet transplanted into the shared CTLE Phase-A framework\n"
-                        f"# BO params: {json.dumps(trial.params, sort_keys=True)}\n", encoding="utf-8")
+                        f"# BO params: {json.dumps(trial.params, sort_keys=True)}\n"
+                        f"# Constraints: {json.dumps(trial.user_attrs['constraints'], sort_keys=True)}\n"
+                        f"# Architecture: nodes={nodes} edges={edges} trainable_params={selected_parameter_count(nodes, edges, args)} "
+                        f"topology_seed={trial_topology_seed(args, trial)} activation={activation} t_end={t_end} rtol={rtol}\n",
+                        encoding="utf-8")
     handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
     handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"))
     phase._logger.addHandler(handler)
@@ -371,7 +488,7 @@ def phase_a_trial(trial: optuna.Trial, phase: Any, base_ctx: dict[str, Any], can
     except Exception as exc:
         trial.set_user_attr("error", repr(exc))
         append_trial_summary(output, {"trial": trial.number, "state": "FAIL", "nodes": nodes, "edges": edges,
-            "parameter_count": parameter_count(nodes, edges), "activation": activation, "t_end": t_end, "rtol": rtol,
+            "parameter_count": selected_parameter_count(nodes, edges, args), "activation": activation, "t_end": t_end, "rtol": rtol,
             "lr": lr, "weight_decay": wd, "error": repr(exc)})
         raise
     finally:
@@ -403,7 +520,7 @@ def phase_a_trial(trial: optuna.Trial, phase: Any, base_ctx: dict[str, Any], can
     # diagnostics and never participates in the Optuna objective.
     append_trial_summary(output, {"trial": trial.number, "state": "COMPLETE", "objective_validation_loss": objective,
         "best_validation_loss": float(result["best_val_failure_rate"]), "test_loss": test_failure,
-        "failure_rate": val_failure, "nodes": nodes, "edges": edges, "parameter_count": parameter_count(nodes, edges),
+        "failure_rate": val_failure, "nodes": nodes, "edges": edges, "parameter_count": selected_parameter_count(nodes, edges, args),
         "activation": activation, "t_end": t_end, "rtol": rtol, "lr": lr, "weight_decay": wd,
         "epochs_completed": len(result["history"]["epoch"])})
     trial.report(objective, step=len(result["history"]["epoch"]))
@@ -415,11 +532,28 @@ def run(args: argparse.Namespace) -> None:
     if args.ctle_canonical_dataset is None or args.output is None or args.param_budget is None: raise ValueError("canonical dataset, output, and parameter budget are required")
     if args.device == "cuda" and not torch.cuda.is_available(): raise ValueError("CUDA requested but unavailable")
     seed_everything(args.seed)
-    output = args.output.resolve(); output.mkdir(parents=True, exist_ok=True); candidates = circuit_candidates(args.param_budget, args.param_tolerance)
+    if args.max_edge_density is not None and not 0 < args.max_edge_density <= 1:
+        raise ValueError("--max-edge-density must lie in (0, 1]")
+    if args.input_mapper_fan_in < 0 or args.output_mapper_fan_in < 0:
+        raise ValueError("mapper fan-in constraints must be nonnegative (0 means dense)")
+    if args.input_mapper_fan_in > 4:
+        raise ValueError("--input-mapper-fan-in cannot exceed the four CTLE input features")
+    if args.fixed_t_end is not None and args.fixed_t_end <= 0:
+        raise ValueError("--fixed-t-end must be positive")
+    if args.fixed_rtol is not None and args.fixed_rtol <= 0:
+        raise ValueError("--fixed-rtol must be positive")
+    output = args.output.resolve(); output.mkdir(parents=True, exist_ok=True)
+    candidates = circuit_candidates(
+        args.param_budget, args.param_tolerance, fixed_leak=args.fixed_leak,
+        input_mapper_fan_in=args.input_mapper_fan_in, output_mapper_fan_in=args.output_mapper_fan_in,
+        fixed_nodes=args.fixed_nodes, fixed_edges=args.fixed_edges,
+        max_edge_density=args.max_edge_density,
+    )
     phase, base_ctx, canonical = build_phase_a_context(args, output)
     if args.ctle_phase_a_mlp_weight > 0 and "mlp_logits_trial0019" not in canonical:
         raise ValueError("Teacher distillation needs schema-2 data with mlp_logits_trial0019")
-    (output / "run_config.json").write_text(json.dumps({**vars(args), "fingerprint": str(np.asarray(canonical["fingerprint"]).item()), "candidate_count": len(candidates), "solver": "odeint_adjoint/dopri5", "device_activation_choices": ["tanh", "relu"], "node_constraint": "bounded tanh broadcast + soft rail + positive leak", "training_framework": "ctle_dagger_common.run_phase_a_training"}, indent=2, default=str))
+    activation_choices = ["tanh"] if args.tanh_only else ["tanh", "relu"]
+    (output / "run_config.json").write_text(json.dumps({**vars(args), "fingerprint": str(np.asarray(canonical["fingerprint"]).item()), "candidate_count": len(candidates), "candidate_architectures": candidates, "solver": "odeint_adjoint/dopri5", "device_activation_choices": activation_choices, "node_constraint": "bounded tanh broadcast + soft rail + positive leak", "training_framework": "ctle_dagger_common.run_phase_a_training"}, indent=2, default=str))
     storage = f"sqlite:///{(output / 'study.db').as_posix()}"
     study = optuna.create_study(study_name="ctle_kirchhoff_bo", storage=storage, load_if_exists=args.resume,
         direction="minimize", sampler=optuna.samplers.TPESampler(seed=args.seed, multivariate=True),
@@ -448,6 +582,17 @@ def smoke_test() -> None:
     x = torch.full((4, 4), .1, dtype=torch.float32)
     loss = model(x).square().mean(); loss.backward()
     assert model.circuit.edge.grad is not None and torch.isfinite(model.circuit.edge.grad).all()
+    # Exercise the optional finite-device, fixed-leak, and truly sparse-mapper
+    # paths independently of external CTLE/ZIG assets.
+    constrained = CTLEKirchhoffNet(16, 80, "tanh", 11, .25, 1e-3, x_max=3.,
+                                   clip_current=.05, clip_softness=.02, leak_init=.0486, c_eff=1.,
+                                   bounded_edge_parameters=True, fixed_leak=True,
+                                   input_mapper_fan_in=2, output_mapper_fan_in=3)
+    constrained.attach_scaler(input_log_min=np.full(4, -2., dtype=np.float32),
+                               input_log_max=np.full(4, 2., dtype=np.float32))
+    constrained(x).square().mean().backward()
+    assert constrained.circuit.raw_leak is None
+    assert constrained.circuit.edge.grad is not None and torch.isfinite(constrained.circuit.edge.grad).all()
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -468,6 +613,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--mapper-lr-scale", type=float, default=1.0)
     p.add_argument("--struct-lr-scale", type=float, default=4.0)
     p.add_argument("--dyn-lr-scale", type=float, default=1.0)
+    constraints = p.add_argument_group("optional fairness constraints (each independent)")
+    constraints.add_argument("--tanh-only", action="store_true",
+                             help="Disable the ReLU BO choice and use tanh devices only.")
+    constraints.add_argument("--fixed-leak", action="store_true",
+                             help="Make every node leak exactly --leak-init rather than trainable.")
+    constraints.add_argument("--bounded-edge-parameters", action="store_true",
+                             help="Map all three raw edge coefficients through tanh into finite ranges.")
+    constraints.add_argument("--edge-weight-max", type=float, default=1.0,
+                             help="Absolute source/destination coefficient bound with --bounded-edge-parameters.")
+    constraints.add_argument("--edge-bias-max", type=float, default=1.0,
+                             help="Absolute edge-bias bound with --bounded-edge-parameters.")
+    constraints.add_argument("--fixed-nodes", type=int, default=None,
+                             help="Fix circuit node count; omit to let BO choose it.")
+    constraints.add_argument("--fixed-edges", type=int, default=None,
+                             help="Fix directed edge count; omit to let BO choose it.")
+    constraints.add_argument("--max-edge-density", type=float, default=None,
+                             help="Keep only graphs with E / (N*(N+1)) no greater than this value.")
+    constraints.add_argument("--topology-seed", type=int, default=None,
+                             help="Use this one deterministic graph seed for every trial (default: a different seed per trial).")
+    constraints.add_argument("--input-mapper-fan-in", type=int, default=0,
+                             help="Connections per circuit node in the 4->N encoder; 0 retains dense mapping.")
+    constraints.add_argument("--output-mapper-fan-in", type=int, default=0,
+                             help="Connections per output in the N->7 readout; 0 retains dense mapping.")
+    constraints.add_argument("--fixed-t-end", type=float, default=None,
+                             help="Fix ODE integration horizon and remove t_end from BO.")
+    constraints.add_argument("--fixed-rtol", type=float, default=None,
+                             help="Fix Dopri5 rtol and remove rtol from BO.")
     p.add_argument("--x-max", type=float, default=3.0, help="Fixed differential node-voltage rail.")
     p.add_argument("--clip-current", type=float, default=0.05, help="Fixed soft-rail restoring-current magnitude.")
     p.add_argument("--clip-softness", type=float, default=0.02, help="Fixed soft-rail transition width.")

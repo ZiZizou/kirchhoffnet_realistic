@@ -41,6 +41,8 @@ IGNORED_KEYS: list[str] = [
     "*core.transfers.*._drive_mask",
     "post_readout_transfer._drive_mask",
     "net.post_readout_transfer._drive_mask",
+    # surgery B5: node gates removed (u_logits never received a gradient and was unused in rhs)
+    "*core.stages.*.u_logits",
     # surgery B3: reference edges removed (empty int buffer, never populated)
     "*core.stages.*.ref_dst",
 ]

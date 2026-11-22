@@ -100,21 +100,14 @@ TAU = {
 # (CP: complexity-regularized pruning decomposition. Replaces the single
 # merged "complexity" proxy with four per-component terms:
 #   edge_gate     : λ_E · Σ_e σ(z_logits)             (active edge count)
-#   node_gate     : λ_N · Σ_j σ(u_logits)             (DEPRECATED: always 0)
 #   power         : λ_P · Σ_e z_e · m_e · Σ_q w_q·gm_q (static power proxy)
-#   capacitance   : λ_C · C_eff · Σ_j u_j             (DEPRECATED: always 0)
 # RR-D: per-preset overrides live on each PRESET entry as a "lambdas" dict
 # and are merged over this global LAMBDAS by train_script.
-# deprecate-node-gates: node_gate and capacitance lambdas are hardcoded to
-# 0.0 in every config — nodes are pruned by connectivity only, and the
-# C_eff·Σu proxy would be a constant per stage if node_mask were 1.0.
 LAMBDAS = {
     "sparsity": 0,
     "rail": 0.1,
     "edge_gate": 0,
-    "node_gate": 0.0,       # DEPRECATED (deprecate-node-gates)
     "power": 1e-6,
-    "capacitance": 0.0,     # DEPRECATED (deprecate-node-gates)
     "entropy": 1e-4,
     # tanh saturation penalty for FreeTanhLibrary edges: mean(tanh(u)^2) over edges,
     # penalizes edges operating in the saturated region of tanh.
@@ -125,15 +118,9 @@ LAMBDAS = {
 # (three-phase-schedule: updated to higher defaults — 0.01 was too forgiving
 # for the new gate-trained regime. 0.1 for edges, 0.05 for nodes gives a
 # usable Pareto frontier when gates have been pushed by Phase B regularizers.)
-# deprecate-node-gates: prune_nodes_by_gate is now hardcoded to False in
-# every config (PRUNE, SCHEDULE_*, presets). The flag is preserved on the
-# function signature of prune_stage / prune_network for backward compat
-# but has no effect; CLI flags --prune-nodes-by-gate / --no-prune-nodes-by-gate
-# are kept as deprecated no-ops.
+# Nodes are pruned by connectivity only (no node gates).
 PRUNE = {
     "edge_threshold": 0.001,
-    "node_threshold": 0.05,
-    "prune_nodes_by_gate": False,  # DEPRECATED (deprecate-node-gates): always False
 }
 
 # Three-phase training schedule (three-phase-schedule plan, refined by four-phase-redesign).
@@ -145,9 +132,6 @@ PRUNE = {
 #
 # four-phase-redesign/Phase 1a updates:
 #   - prune_edge_threshold 0.1 -> 0.05 (less violent pruning at B->C)
-#   - prune_nodes_by_gate True -> False (nodes only die via connectivity backstop)
-#   - node_gate in lambdas_b 1e-5 -> 0.0 (node_gate is too destructive when
-#     used in concert with edge_gate; remove the regularizer from B entirely)
 SCHEDULE_THREE_PHASE = {
     # Fraction of total epochs allocated to each phase.
     "frac_a": 0.3,            # Phase A: fit (no structure pressure)
@@ -162,14 +146,10 @@ SCHEDULE_THREE_PHASE = {
     # Lambda warmup within Phase B: ramp from 0 to full over this fraction.
     "warmup_frac_b": 1.0 / 2.0,
     # Phase B target lambdas (Strategy 2: gate pruning first, tiny Z pressure).
-    # deprecate-node-gates: node_gate=0, capacitance=0 (both regularizers
-    # are no-ops; node pruning is connectivity-only).
     "lambdas_b": {
         "sparsity": 0,
         "edge_gate": 0,
-        "node_gate": 0.0,        # DEPRECATED (deprecate-node-gates)
         "power": 1e-5,
-        "capacitance": 0.0,      # DEPRECATED (deprecate-node-gates)
         "tanh_sat": 0.0,
     },
     # Phase C retrain lambdas: gate penalties off (irrelevant post-prune),
@@ -177,19 +157,13 @@ SCHEDULE_THREE_PHASE = {
     "lambdas_c": {
         "sparsity": 0,
         "edge_gate": 0.0,
-        "node_gate": 0.0,        # DEPRECATED (deprecate-node-gates)
         "power": 1e-7,
-        "capacitance": 0.0,      # DEPRECATED (deprecate-node-gates)
         "tanh_sat": 0.0,
     },
     # Prune thresholds used at the Phase B->C boundary.
     # four-phase-redesign/1a: edge 0.1 -> 0.05 (gentler cut, retains more
     # edges so the retrain has material to work with).
     "prune_edge_threshold": 0.001,
-    "prune_node_threshold": 0.001,
-    # deprecate-node-gates: always False (node gates are bypassed; nodes
-    # only die via the connectivity backstop).
-    "prune_nodes_by_gate": False,  # DEPRECATED (deprecate-node-gates)
 }
 
 # Four-phase training schedule (four-phase-redesign/Phase 3a).
@@ -211,13 +185,12 @@ SCHEDULE_FOUR_PHASE = {
     "tau_c_init": 0.4,         # Tau at start of retrain
     "tau_c_final": 0.1,        # Tau at end of retrain
     # Phase B1 lambdas: cell commitment only, NO edge gate.
-    # deprecate-node-gates: node_gate/capacitance default to 0.0 via .get.
     "lambdas_b1": {
         "sparsity": 5e-5,
         "power": 1e-4,
         "tanh_sat": 0.0,
     },
-    # Phase B2 lambdas: sparsity + edge_gate. No node_gate (DEPRECATED).
+    # Phase B2 lambdas: sparsity + edge_gate.
     "lambdas_b2": {
         "sparsity": 5e-5,
         "edge_gate": 0,
@@ -244,8 +217,6 @@ SCHEDULE_FOUR_PHASE = {
     # Prune thresholds (used at the B2->C boundary, whether readiness-gated
     # or fallback).
     "prune_edge_threshold": 0.01,
-    "prune_node_threshold": 0.01,
-    "prune_nodes_by_gate": False,  # DEPRECATED (deprecate-node-gates)
 }
 
 # Fixed-step Heun solver
@@ -293,7 +264,7 @@ VCA = {
 # with tau annealing 1.0→0.1, was amplified to ~99.99% by the end of
 # training — stage0_logits gradient (~6e-6) was 5M× too small to overcome
 # the +1.0 logit bias within 100 epochs.
-# Gates: z_logit_init=0.0, u_logit_init=0.0 → σ=0.5, dσ/dz=0.25. This
+# Gates: z_logit_init=0.0 → σ=0.5, dσ/dz=0.25. This
 # sits at the maximum-gradient point of the sigmoid, giving gates 2.4×
 # more sensitivity to regularization than z=2.0 (σ≈0.88, dσ/dz≈0.10).
 # Prior value of 2.0 caused 0 edges to ever prune (frac_sigma_z_below_0.1
@@ -313,7 +284,6 @@ INIT = {
     "leak_constant": 0.0486,  # softplus(-3.0), fixed leak when --leak non-programmable
     "gain_scale": 1.0,
     "z_logit_init": 0.0,
-    "u_logit_init": 0.0,
 }
 
 
@@ -429,8 +399,7 @@ PRESET_SMOOTH2D = {
 # Caller formula for exact topology layout is documented in
 # spec/grid-size-cli.md.
 #
-# Fit-first: structural regularizers (edge_gate, node_gate, power,
-# capacitance) are zeroed in the preset's 'lambdas' override. The
+# Fit-first: structural regularizers (edge_gate, power) are zeroed in the preset's 'lambdas' override. The
 # --prune flag can still be passed for retrain experiments, but
 # gates do not receive any gradient pressure during pre-prune fit.
 
@@ -517,9 +486,7 @@ def make_smooth2d_grid_preset(
         "lambdas": {
             "sparsity": 1e-6,
             "edge_gate": 0,
-            "node_gate": 0.0,        # DEPRECATED (deprecate-node-gates)
             "power": 1e-6,
-            "capacitance": 0.0,      # DEPRECATED (deprecate-node-gates)
             "rail": 0.1,
         },
         "tau_anneal": True,
@@ -615,9 +582,7 @@ def make_housing_grid_preset(
         "lambdas": {
             "sparsity": 1e-5,
             "edge_gate": 0,
-            "node_gate": 0.0,        # DEPRECATED (deprecate-node-gates)
             "power": 1e-5,
-            "capacitance": 0.0,      # DEPRECATED (deprecate-node-gates)
             "rail": 0.1,
         },
         "tau_anneal": True,

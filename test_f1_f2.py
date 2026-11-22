@@ -285,7 +285,11 @@ def test_gln_prune_fails_loud():
 
 
 def test_count_params_agreement_phase0_arch():
-    """Pins the Phase-0 arch counts: N0, +clip, +gln, both (analytic == built)."""
+    """Pins the Phase-0 arch counts: N0, +clip, +gln, both (analytic == built).
+
+    N0 was 2445 before surgery B5; the 44 dead per-node u_logits parameters
+    (4 stages x 11 nodes) were removed, so it is now 2401.
+    """
     import bo_param_sampling as bps
     from gln_rails import gln_param_count
     n0 = bps.knet_param_count(
@@ -293,14 +297,14 @@ def test_count_params_agreement_phase0_arch():
         use_robust_input=False, dagger=False,
         readout_mode="shared_sense", readout_senses=1,
     )
-    assert n0 == 2445, n0
+    assert n0 == 2401, n0
     n_clip = bps.knet_param_count(
         10, 4, 4, 2, in_dim=4, out_dim=1, fanout_count=2,
         use_robust_input=False, dagger=False,
         readout_mode="shared_sense", readout_senses=1,
         learnable_clip=True,
     )
-    assert n_clip == 2445 + 4, n_clip
+    assert n_clip == 2401 + 4, n_clip
     n_gln = bps.knet_param_count(
         10, 4, 4, 2, in_dim=4, out_dim=1, fanout_count=2,
         use_robust_input=False, dagger=False,
@@ -311,7 +315,7 @@ def test_count_params_agreement_phase0_arch():
         in_dim=4, e_bound=8, e_read=10, B=4, rank=2,
         share_rails=True, share_edge_mix_across_stages=True, num_stages=4,
     )
-    assert n_gln == 2445 + expected_gln, (n_gln, 2445 + expected_gln)
+    assert n_gln == 2401 + expected_gln, (n_gln, 2401 + expected_gln)
     n_both = bps.knet_param_count(
         10, 4, 4, 2, in_dim=4, out_dim=1, fanout_count=2,
         use_robust_input=False, dagger=False,

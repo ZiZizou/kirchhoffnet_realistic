@@ -63,25 +63,6 @@ def _stage_edge_gates(stage) -> torch.Tensor:
     return torch.sigmoid(stage.z_logits)
 
 
-def _stage_node_gates(stage) -> torch.Tensor:
-    """Node gate values u_j = σ(u_logits), shape [N].
-
-    DEPRECATED (deprecate-node-gates): node gates are no longer used in
-    the forward pass, in any regularizer, or in pruning. Returns an
-    all-ones tensor so any stray caller gets a no-op result instead of
-    corrupting the dynamics.
-    """
-    import warnings as _warnings
-    _warnings.warn(
-        "train._stage_node_gates() is deprecated (deprecate-node-gates); "
-        "node gates are no longer used. Returns an all-ones tensor.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return torch.ones(stage.num_nodes, device=stage.u_logits.device,
-                       dtype=stage.u_logits.dtype)
-
-
 def _stage_rail_loss(stage, traj: torch.Tensor) -> torch.Tensor:
     """Mean over (batch, node, time) of ReLU^2(|x| - x_max).
 
@@ -519,8 +500,7 @@ def three_phase_lambdas(
 ) -> dict:
     """Effective lambda dict for the current epoch under the three-phase schedule.
 
-    Phase A: all structural lambdas (sparsity, edge_gate, node_gate, power,
-      capacitance) are zeroed. ``rail`` is left at its base value as a
+    Phase A: all structural lambdas (sparsity, edge_gate, power) are zeroed. ``rail`` is left at its base value as a
       safety net. No warmup.
 
     Phase B: the Phase B target lambdas (``lambdas_b`` in the schedule

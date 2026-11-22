@@ -39,7 +39,6 @@ def format_parameter_breakdown(breakdown: dict) -> str:
         stage_0:
           cell_lib:            320
           z_logits:             64
-          u_logits:             16
           raw_leak:             16
           ── stage total:      420
         ───────────────────────
@@ -63,7 +62,7 @@ def format_parameter_breakdown(breakdown: dict) -> str:
         lines.append(f"  {stage_key}:")
         bucket = per_stage[stage_key]
         for sub_name in (
-            "cell_lib", "z_logits", "u_logits", "raw_leak",
+            "cell_lib", "z_logits", "raw_leak",
             "boundary_cell_lib", "boundary_z_logits",
             "output_ode_cell_lib", "output_ode_z_logits",
             "readout_sense_z_logits", "readout_sense_cell_lib",
@@ -427,7 +426,6 @@ class KirchhoffNetWithIO(nn.Module):
           - ``output_mapper.*``
           - ``post_readout_transfer.*``  (post-OutputMapper residual-relu-tanh)
           - ``core.stages.N.z_logits``  (structural)
-          - ``core.stages.N.u_logits``  (structural, deprecated)
           - ``core.stages.N.raw_leak``  (dynamical)
           - ``core.stages.N.cell_lib.*``  (per-edge device params)
 
@@ -466,7 +464,6 @@ class KirchhoffNetWithIO(nn.Module):
                 stage_bucket = per_stage.setdefault(stage_key, {
                     "cell_lib": 0,
                     "z_logits": 0,
-                    "u_logits": 0,
                     "raw_leak": 0,
                     "boundary_z_logits": 0,
                     "boundary_cell_lib": 0,
@@ -483,8 +480,6 @@ class KirchhoffNetWithIO(nn.Module):
                 matched = False
                 if tail == "z_logits":
                     stage_bucket["z_logits"] += n; matched = True
-                elif tail == "u_logits":
-                    stage_bucket["u_logits"] += n; matched = True
                 elif tail == "raw_leak":
                     stage_bucket["raw_leak"] += n; matched = True
                 elif tail == "boundary_z_logits":

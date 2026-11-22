@@ -244,13 +244,13 @@ def _apply_ablation_set(args, schedule_mode: str) -> None:
         # we mutate the schedule dict in place for the run duration
         # (a non-invasive in-memory override).
         from config import SCHEDULE_THREE_PHASE
-        for k in ("sparsity", "edge_gate", "node_gate", "power", "capacitance", "tanh_sat"):
+        for k in ("sparsity", "edge_gate", "power", "tanh_sat"):
             if k in SCHEDULE_THREE_PHASE.get("lambdas_b", {}):
                 SCHEDULE_THREE_PHASE["lambdas_b"][k] = 0.0
         from config import SCHEDULE_FOUR_PHASE
         for phase_key in ("lambdas_b1", "lambdas_b2"):
             if phase_key in SCHEDULE_FOUR_PHASE:
-                for k in ("sparsity", "edge_gate", "power", "capacitance", "tanh_sat"):
+                for k in ("sparsity", "edge_gate", "power", "tanh_sat"):
                     if k in SCHEDULE_FOUR_PHASE[phase_key]:
                         SCHEDULE_FOUR_PHASE[phase_key][k] = 0.0
         print(
@@ -1191,7 +1191,7 @@ def collect_gradient_norms(raw_net):
     per-group L2 gradient norms.
 
     Returns: dict with keys
-      stage{i}_raw_leak, stage{i}_z_logits, stage{i}_u_logits
+      stage{i}_raw_leak, stage{i}_z_logits
       (one entry per stage)
       stage_transfer
       in_mapper
@@ -1200,7 +1200,7 @@ def collect_gradient_norms(raw_net):
     no parameter or no gradient.
     """
     stage_sq = {}
-    stage_components = ("raw_leak", "z_logits", "u_logits")
+    stage_components = ("raw_leak", "z_logits")
     # Per-edge device parameter suffixes of FreeTanhLibrary (a_raw, b_raw,
     # s_raw, gm_raw, isat_raw, theta_raw); all contribute to the same
     # `device_param` gradient-norm metric per stage.
@@ -1835,20 +1835,6 @@ def _add_argparse_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--prune-edge-threshold", type=float, default=None,
         help="Override config.PRUNE['edge_threshold'] for pruning.")
-    parser.add_argument(
-        "--prune-node-threshold", type=float, default=None,
-        help="Override config.PRUNE['node_threshold'] for pruning.")
-    parser.add_argument(
-        "--prune-nodes-by-gate", dest="prune_nodes_by_gate",
-        action="store_true", default=None,
-        help="DEPRECATED (deprecate-node-gates): no-op, kept for backward "
-             "compat. Node pruning is now connectivity-only regardless of "
-             "this flag. Use --no-prune-nodes-by-gate to silence the warning.")
-    parser.add_argument(
-        "--no-prune-nodes-by-gate", dest="prune_nodes_by_gate",
-        action="store_false",
-        help="DEPRECATED (deprecate-node-gates): no-op, kept for backward "
-             "compat. Nodes are pruned by connectivity only.")
     parser.add_argument(
         "--retrain-epochs", type=int, default=None,
         help="Number of epochs to retrain the compact network (default: "
@@ -3488,40 +3474,22 @@ def main():
         from config import SCHEDULE_THREE_PHASE
 
         # For phased schedules, use schedule-specific thresholds;
-        # CLI overrides take precedence.
-        if args.prune_edge_threshold is None and args.prune_node_threshold is None:
+        # CLI override takes precedence.
+        if args.prune_edge_threshold is None:
             if schedule_mode == "four_phase":
-                _scfg = SCHEDULE_FOUR_PHASE
-                edge_thresh = float(_scfg.get("prune_edge_threshold", 0.05))
-                node_thresh = float(_scfg.get("prune_node_threshold", 0.05))
+                edge_thresh = float(SCHEDULE_FOUR_PHASE.get("prune_edge_threshold", 0.05))
             elif schedule_mode == "three_phase":
-                _scfg = SCHEDULE_THREE_PHASE
-                edge_thresh = float(_scfg.get("prune_edge_threshold", 0.1))
-                node_thresh = float(_scfg.get("prune_node_threshold", 0.05))
+                edge_thresh = float(SCHEDULE_THREE_PHASE.get("prune_edge_threshold", 0.1))
             else:
                 edge_thresh = float(PRUNE["edge_threshold"])
-                node_thresh = float(PRUNE["node_threshold"])
         else:
-            edge_thresh = args.prune_edge_threshold if args.prune_edge_threshold is not None else float(PRUNE["edge_threshold"])
-            node_thresh = args.prune_node_threshold if args.prune_node_threshold is not None else float(PRUNE["node_threshold"])
-
-        # DEPRECATED (deprecate-node-gates): prune_nodes_by_gate is always
-        # False; the CLI flag is kept as a deprecated no-op.
-        if args.prune_nodes_by_gate is not None:
-            import warnings
-            warnings.warn(
-                "--prune-nodes-by-gate / --no-prune-nodes-by-gate is deprecated "
-                "(deprecate-node-gates); node pruning is connectivity-only "
-                "regardless of this flag.",
-                DeprecationWarning,
-                stacklevel=2)
-        pnbg = False
+            edge_thresh = float(args.prune_edge_threshold)
 
         pre_edges = sum(s.num_edges() for s in raw_net.core.stages)
         pre_nodes = sum(s.num_nodes for s in raw_net.core.stages)
         print(
             f"[prune] pre-prune: {pre_edges} edges, {pre_nodes} nodes "
-            f"(edge_thresh={edge_thresh}, prune_nodes_by_gate={pnbg})"
+            f"(edge_thresh={edge_thresh})"
         )
 
         # retrain-oom-fix/REQ-4: log memory state right before pruning.
@@ -3530,11 +3498,9 @@ def main():
         pruned_core, stage_remaps = prune_network(
             raw_net.core,
             edge_threshold=edge_thresh,
-            node_threshold=node_thresh,
             transfer_params=not args.fresh_init,
             write_idx=list(raw_net.write_idx) if raw_net.write_idx is not None else None,
-            read_idx=list(raw_net.read_idx) if raw_net.read_idx is not None else None,
-            prune_nodes_by_gate=pnbg)
+            read_idx=list(raw_net.read_idx) if raw_net.read_idx is not None else None)
 
         post_edges = sum(s.num_edges() for s in pruned_core.stages)
         post_nodes = sum(s.num_nodes for s in pruned_core.stages)
@@ -3928,7 +3894,7 @@ def main():
                 with open(history_path, "a") as f:
                     f.write(
                         f"\n[prune] pre-prune: {pre_edges} edges, {pre_nodes} nodes "
-                        f"(edge_thresh={edge_thresh}, node_thresh={node_thresh})\n"
+                        f"(edge_thresh={edge_thresh})\n"
                     )
                     f.write(
                         f"[prune] post-prune: {post_edges} edges, {post_nodes} nodes "
@@ -3969,7 +3935,6 @@ def main():
         # Write a pruning summary file.
         with open(out_dir / "prune_summary.txt", "w") as f:
             f.write(f"edge_threshold: {edge_thresh}\n")
-            f.write(f"node_threshold: {node_thresh}\n")
             f.write(f"pre_edges: {pre_edges}\n")
             f.write(f"post_edges: {post_edges}\n")
             f.write(f"pre_nodes: {pre_nodes}\n")

@@ -276,19 +276,9 @@ output_ode_src: list[int] | None = None,
         else:
             self.leak_constant = float(leak_constant if leak_constant is not None else INIT["leak_constant"])
 
-        # Gate parameters for complexity-regularized pruning (CP-1, CP-2).
-        # z_e = sigmoid(z_logits) is the edge gate: multiplies the edge current.
-        # u_j = sigmoid(u_logits) is the node gate: gates the node voltage.
-        # Initialized to a large positive value so all edges/nodes are active at start.
+        # Edge gate: z_e = sigmoid(z_logits) multiplies the edge current.
         z_init = float(INIT.get("z_logit_init", 5.0))
-        u_init = float(INIT.get("u_logit_init", 5.0))
         self.z_logits = nn.Parameter(torch.full((len(src),), z_init))
-        # DEPRECATED (deprecate-node-gates): u_logits is no longer used in the
-        # forward pass (see ``rhs``) or in any regularizer; nodes are pruned
-        # only by connectivity. The parameter is retained for backward
-        # compatibility with existing checkpoints — the optimizer still has
-        # it as a no-op parameter and its state_dict entry persists.
-        self.u_logits = nn.Parameter(torch.full((num_nodes,), u_init))
 
         # Parallel resistive shunt (FreeTanhLibrary): if the cell library
         # exposes a ``resistive_current(x_src, x_dst)`` method, route an
@@ -1322,50 +1312,9 @@ output_ode_src: list[int] | None = None,
         """Return edge gate values z_e = σ(z_logits), shape [E]."""
         return torch.sigmoid(self.z_logits)
 
-    def node_gates(self) -> torch.Tensor:
-        """Return node gate values u_j = σ(u_logits), shape [N].
-
-        DEPRECATED (deprecate-node-gates): node gates are no longer used
-        in the forward pass or in pruning. The values are vestigial and
-        will be constant (sigmoid of the un-trained ``u_logits`` parameter)
-        in practice. Returns an all-ones tensor (or, if you want the raw
-        sigmoid value, call :func:`torch.sigmoid` on ``self.u_logits``
-        directly) so that any caller that accidentally uses this method
-        will not corrupt the dynamics.
-        """
-        import warnings as _warnings
-        _warnings.warn(
-            "DifferentialStage.node_gates() is deprecated (deprecate-node-gates); "
-            "node gates are no longer used in the forward pass or pruning. "
-            "Returns an all-ones tensor.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return torch.ones(self.num_nodes, device=self.u_logits.device,
-                           dtype=self.u_logits.dtype)
-
     def active_edge_mask(self, threshold: float = 0.01) -> torch.Tensor:
         """Boolean mask of edges that survive pruning at the given threshold."""
         return self.edge_gates() > threshold
-
-    def active_node_mask(self, threshold: float = 0.01) -> torch.Tensor:
-        """Boolean mask of nodes that survive pruning at the given threshold.
-
-        DEPRECATED (deprecate-node-gates): always returns an all-True
-        tensor. Node pruning is now connectivity-only — see
-        ``topology.prune_stage`` dead-island purge and the I/O
-        connectivity backstop for the only mechanisms that remove nodes.
-        """
-        import warnings as _warnings
-        _warnings.warn(
-            "DifferentialStage.active_node_mask() is deprecated "
-            "(deprecate-node-gates); node pruning is connectivity-only. "
-            "Returns an all-True tensor.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return torch.ones(self.num_nodes, dtype=torch.bool,
-                           device=self.u_logits.device)
 
     def parameter_breakdown(self) -> dict:
         """Return parameter counts including gate parameters (for diagnostics)."""
@@ -1484,7 +1433,6 @@ output_ode_src: list[int] | None = None,
         return {
             "raw_leak": raw_leak_n,
             "z_logits": int(self.z_logits.numel()),
-            "u_logits": int(self.u_logits.numel()),
             "device_param": device_n,
             "boundary_z_logits": bz,
             "boundary_device_param": bdev,
@@ -1500,7 +1448,6 @@ output_ode_src: list[int] | None = None,
             "total": (
                 raw_leak_n
                 + int(self.z_logits.numel())
-                + int(self.u_logits.numel())
                 + device_n
                 + bz
                 + bdev

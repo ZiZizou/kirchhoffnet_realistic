@@ -262,12 +262,8 @@ def test_smooth2d_grid_preset():
           s.get("proj_pattern") == "all_to_all")
     check("smooth2d_grid: legacy preset lambdas edge_gate=5e-6",
           cfg.get("lambdas", {}).get("edge_gate") == 5e-6)
-    check("smooth2d_grid: legacy preset lambdas node_gate=0.0 (deprecate-node-gates)",
-          cfg.get("lambdas", {}).get("node_gate") == 0.0)
     check("smooth2d_grid: legacy preset lambdas power=1e-5",
           cfg.get("lambdas", {}).get("power") == 1e-5)
-    check("smooth2d_grid: legacy preset lambdas capacitance=0.0 (deprecate-node-gates)",
-          cfg.get("lambdas", {}).get("capacitance") == 0.0)
 
     cell_lib = make_cell_library('tanh_free')
     net = build_net_from_preset("smooth2d_grid", cell_lib=cell_lib)
@@ -396,12 +392,8 @@ def test_housing_grid_preset():
           and cfg["read_idx"][5:] == [25, 26, 27])
     check("housing_grid: preset lambdas edge_gate=5e-6",
           cfg.get("lambdas", {}).get("edge_gate") == 5e-6)
-    check("housing_grid: preset lambdas node_gate=0.0 (deprecate-node-gates)",
-          cfg.get("lambdas", {}).get("node_gate") == 0.0)
     check("housing_grid: preset lambdas power=1e-5",
           cfg.get("lambdas", {}).get("power") == 1e-5)
-    check("housing_grid: preset lambdas capacitance=0.0 (deprecate-node-gates)",
-          cfg.get("lambdas", {}).get("capacitance") == 0.0)
     check("housing_grid: preset lambdas rail=0.1",
           cfg.get("lambdas", {}).get("rail") == 0.1)
 
@@ -835,7 +827,7 @@ def test_parameter_breakdown_aggregates_components():
 
     # Each stage bucket has all expected sub-keys.
     for sk, bucket in bd["per_stage"].items():
-        for sub in ("cell_lib", "z_logits", "u_logits", "raw_leak",
+        for sub in ("cell_lib", "z_logits", "raw_leak",
                     "other"):
             check(f"PBD-1: {sk} has {sub} sub-key",
                   sub in bucket,

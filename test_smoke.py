@@ -266,14 +266,10 @@ def test_compute_loss_finite():
     check("task loss finite", math.isfinite(parts["task"]))
     check("sparsity loss finite", math.isfinite(parts["sparsity"]))
     check("edge_gate loss finite (CP: Σ z_e)", math.isfinite(parts["edge_gate"]))
-    check("node_gate loss finite (CP: Σ u_j)", math.isfinite(parts["node_gate"]))
     check("power loss finite (CP: static power proxy)", math.isfinite(parts["power"]))
-    check("capacitance loss finite (CP: cap area proxy)", math.isfinite(parts["capacitance"]))
     check("rail loss finite", math.isfinite(parts["rail"]))
     check("edge_gate loss >= 0", parts["edge_gate"] >= 0.0)
-    check("node_gate loss >= 0", parts["node_gate"] >= 0.0)
     check("power loss >= 0", parts["power"] >= 0.0)
-    check("capacitance loss >= 0", parts["capacitance"] >= 0.0)
     check("sparsity loss >= 0", parts["sparsity"] >= 0.0)
     check("rail loss >= 0", parts["rail"] >= 0.0)
     check("reg_scale reported (RR-A)", "reg_scale" in parts)
@@ -787,12 +783,8 @@ def test_reg_schedule_curve():
           f"got {scaled['rail']}")
     check("apply_reg_schedule(0): edge_gate=0 (free phase)",
           scaled["edge_gate"] == 0.0)
-    check("apply_reg_schedule(0): node_gate=0 (free phase)",
-          scaled["node_gate"] == 0.0)
     check("apply_reg_schedule(0): power=0 (free phase)",
           scaled["power"] == 0.0)
-    check("apply_reg_schedule(0): capacitance=0 (free phase)",
-          scaled["capacitance"] == 0.0)
     full = apply_reg_schedule(base, epoch=warmup + anneal + 10)
     check("apply_reg_schedule(late): sparsity == LAMBDAS['sparsity']",
           abs(full["sparsity"] - base["sparsity"]) < 1e-12)
@@ -818,15 +810,9 @@ def test_smooth2d_grid_sparsity_zero_override():
     check("smooth2d-grid: preset legacy lambdas edge_gate=5e-6",
           abs(sg_lambdas["edge_gate"] - 5e-6) < 1e-12,
           f"got {sg_lambdas['edge_gate']}")
-    check("smooth2d-grid: preset legacy lambdas node_gate=0.0 (deprecate-node-gates)",
-          abs(sg_lambdas["node_gate"] - 0.0) < 1e-12,
-          f"got {sg_lambdas['node_gate']}")
     check("smooth2d-grid: preset legacy lambdas power=1e-5",
           abs(sg_lambdas["power"] - 1e-5) < 1e-12,
           f"got {sg_lambdas['power']}")
-    check("smooth2d-grid: preset legacy lambdas capacitance=0.0 (deprecate-node-gates)",
-          abs(sg_lambdas["capacitance"] - 0.0) < 1e-12,
-          f"got {sg_lambdas['capacitance']}")
     check("smooth2d-grid: Phase B schedule sparsity=5e-5",
           abs(float(SCHEDULE_THREE_PHASE["lambdas_b"]["sparsity"]) - 5e-5) < 1e-12,
           f"got {SCHEDULE_THREE_PHASE['lambdas_b']['sparsity']}")
@@ -946,72 +932,18 @@ def test_gate_initialization():
     stage, _, _ = topology_to_stage(topo, cell_lib=cell_lib)
 
     check("CP-1: stage has z_logits parameter", hasattr(stage, "z_logits"))
-    check("CP-1: stage has u_logits parameter", hasattr(stage, "u_logits"))
     check("CP-1: z_logits shape == (E,)", stage.z_logits.shape == torch.Size([stage.num_edges()]))
-    check("CP-1: u_logits shape == (N,)", stage.u_logits.shape == torch.Size([stage.num_nodes]))
 
     z = stage.edge_gates()
-    u = stage.node_gates()
     check("CP-1: edge_gates() returns σ(z_logits)",
           z.shape == (stage.num_edges(),))
-    check("CP-1 (deprecate-node-gates): node_gates() returns all-ones",
-          u.shape == (stage.num_nodes,))
     check("grid7-gate0: σ(z_logit_init=0) = 0.5 (50% open gates, max gradient)",
           abs(float(z[0].item()) - 0.5) < 1e-3,
           f"got {float(z[0].item()):.4f}")
-    check("grid7-gate0 (deprecate-node-gates): node_gates returns all-ones",
-          abs(float(u[0].item()) - 1.0) < 1e-6,
-          f"got {float(u[0].item()):.4f}")
     expected_grad = 0.5 * (1 - 0.5)
     check("grid7-gate0: σ'(z_logit=0) = 0.25 (max gradient sensitivity, 2.4x z=2.0)",
           abs(float((z * (1 - z))[0].item()) - expected_grad) < 1e-3,
           f"got {float((z * (1 - z))[0].item()):.4f}")
-
-
-def test_gate_application_in_rhs():
-    print("\nTest 47: gates applied in DifferentialStage.rhs (CP-2, deprecate-node-gates)")
-    from cell_library import make_cell_library
-    from topology import ring_graph, StageTopologyBuilder, topology_to_stage
-    import torch
-
-    cell_lib = make_cell_library('tanh_free')
-    hid = ring_graph(3, radius=1)
-    builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
-    topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
-                         proj_pattern="all_to_all")
-    stage, _, _ = topology_to_stage(topo, cell_lib=cell_lib)
-
-    # DEPRECATED (deprecate-node-gates): node gates are bypassed — the mask
-    # is always 1.0 in rhs(). Setting u_logits to -10 has NO effect on rhs.
-    # Only edge gates (z_logits) still affect the output.
-    with torch.no_grad():
-        stage.z_logits.fill_(-10.0)
-        stage.u_logits.fill_(-10.0)
-
-    x = torch.randn(2, 3) * 0.1
-    dx = stage.rhs(x, tau=1.0)
-
-    # With edge gates closed (z~0), i_edge ~ 0, dx = (0 - leak - clip) / C.
-    # Leak is F.softplus(-3) ~ 0.05, so leak_term ~ 0.005, clip ~ 0 for small x.
-    # Therefore dx ~ small but finite. Check it's different from the edge-gates-open case.
-    with torch.no_grad():
-        stage.z_logits.fill_(5.0)
-        # u_logits stays -10 — node gates are bypassed so this shouldn't affect rhs.
-    dx_open_edge = stage.rhs(x, tau=1.0)
-
-    diff = (dx - dx_open_edge).abs().max().item()
-    check("CP-2: edge gates modify RHS output (closed vs open differ)",
-          diff > 1e-3,
-          f"max abs diff = {diff:.4e}")
-
-    # Verify node gates have NO effect in rhs.
-    with torch.no_grad():
-        stage.u_logits.fill_(5.0)
-    dx_u_open = stage.rhs(x, tau=1.0)
-    diff_u = (dx_open_edge - dx_u_open).abs().max().item()
-    check("CP-2 (deprecate-node-gates): node gate changes do NOT affect RHS output",
-          diff_u < 1e-6,
-          f"max abs diff with u_logits = {diff_u:.4e}")
 
 
 def test_complexity_regularizers():
@@ -1020,7 +952,7 @@ def test_complexity_regularizers():
     from topology import ring_graph, StageTopologyBuilder, topology_to_stage
     from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
     from io_mapper import InputMapper, OutputMapper
-    from train import _stage_edge_gates, _stage_node_gates, _stage_multiplicities
+    from train import _stage_edge_gates, _stage_multiplicities
     import torch
 
     cell_lib = make_cell_library('tanh_free')
@@ -1039,14 +971,6 @@ def test_complexity_regularizers():
           abs(float(z.sum().item()) - expected_z) < 1e-2,
           f"got {float(z.sum().item()):.4f}, expected {expected_z:.4f}")
 
-    # DEPRECATED (deprecate-node-gates): _stage_node_gates now returns
-    # all-ones (node gates are bypassed). The raw sigmoid of u_logits
-    # is no longer the correct node gate proxy.
-    u = _stage_node_gates(stage)
-    check("CP-4: node_gate is deprecated — returns all-ones",
-          abs(float(u.sum().item()) - stage.num_nodes) < 1e-6,
-          f"got {float(u.sum().item()):.4f}, expected {stage.num_nodes}")
-
     # Force all edge gates to zero; verify power and edge_gate go to zero.
     with torch.no_grad():
         stage.z_logits.fill_(-10.0)
@@ -1054,17 +978,6 @@ def test_complexity_regularizers():
     check("CP-4: when all z_logits -> -∞, edge_gate -> 0",
           float(z_closed.sum().item()) < 1e-3,
           f"got {float(z_closed.sum().item()):.4e}")
-
-    # DEPRECATED: node gate raw sigmoid still responds to u_logits changes,
-    # but the regularizer uses the deprecated all-ones return. Verify the
-    # deprecated API still works (returns all-ones).
-    with torch.no_grad():
-        stage.u_logits.fill_(-10.0)
-    u_closed = _stage_node_gates(stage)
-    check("CP-4 (deprecate-node-gates): _stage_node_gates returns all-ones "
-          "regardless of u_logits values",
-          abs(float(u_closed.sum().item()) - stage.num_nodes) < 1e-6,
-          f"got {float(u_closed.sum().item()):.4e}")
 
 
 def test_prune_stage():
@@ -1088,7 +1001,7 @@ def test_prune_stage():
         stage.z_logits.data[0] = -10.0  # edge 0 is below threshold
         stage.z_logits.data[2] = -10.0  # edge 2 is below threshold
 
-    pruned, _remap = prune_stage(stage, edge_threshold=0.01, node_threshold=0.01)
+    pruned, _remap = prune_stage(stage, edge_threshold=0.01)
 
     check("CP-5: pruned stage has fewer edges (2 edges removed)",
           pruned.num_edges() < pre_edges,
@@ -1145,12 +1058,8 @@ def test_prune_stage_transfer_params():
             stage.raw_leak.data[0] = 0.0
             stage.raw_leak.data[1] = 1.0
             stage.raw_leak.data[2] = 2.0
-        # Set unique u_logits for surviving nodes
-        stage.u_logits.data[0] = 0.5
-        stage.u_logits.data[1] = 1.5
-        stage.u_logits.data[2] = 2.5
 
-    pruned, _remap = prune_stage(stage, edge_threshold=0.01, node_threshold=0.01, transfer_params=True)
+    pruned, _remap = prune_stage(stage, edge_threshold=0.01, transfer_params=True)
 
     if pruned.num_edges() >= 2:
         check("CP-5: transferred logits match (edge 1)",
@@ -1166,11 +1075,6 @@ def test_prune_stage_transfer_params():
               abs(float(pruned.raw_leak[0].item()) - 0.0) < 1e-5)
         check("CP-5: transferred raw_leak matches (node 1)",
               abs(float(pruned.raw_leak[1].item()) - 1.0) < 1e-5)
-    if pruned.num_nodes >= 3:
-        check("CP-5: transferred u_logits match (node 0)",
-              abs(float(pruned.u_logits[0].item()) - 0.5) < 1e-5)
-        check("CP-5: transferred u_logits match (node 1)",
-              abs(float(pruned.u_logits[1].item()) - 1.5) < 1e-5)
 
 
 def test_prune_stage_all_removed_raises():
@@ -1191,7 +1095,7 @@ def test_prune_stage_all_removed_raises():
         stage.z_logits.fill_(-10.0)
 
     try:
-        prune_stage(stage, edge_threshold=0.01, node_threshold=0.01)
+        prune_stage(stage, edge_threshold=0.01)
         check("CP-5: raises ValueError when all edges removed", False,
               "did not raise")
     except ValueError:
@@ -1217,7 +1121,7 @@ def test_prune_network():
         # DEPRECATED: u_logits has no effect on pruning.
 
     core = KirchhoffNet(stages=[stage], transfers=[], stage_times=[0.3], stage_steps=[5])
-    pruned_core, _remaps = prune_network(core, edge_threshold=0.01, node_threshold=0.01)
+    pruned_core, _remaps = prune_network(core, edge_threshold=0.01)
 
     pre_edges = sum(s.num_edges() for s in core.stages)
     post_edges = sum(s.num_edges() for s in pruned_core.stages)
@@ -1298,10 +1202,9 @@ def test_joint_prune_z_dominant():
         stage.logits.data[2, 0] = -5.0
         # All gates fully open
         stage.z_logits.fill_(5.0)
-        stage.u_logits.fill_(5.0)
 
     pre_edges = stage.num_edges()
-    pruned, _remap = prune_stage(stage, edge_threshold=0.3, node_threshold=0.01,
+    pruned, _remap = prune_stage(stage, edge_threshold=0.3,
                          write_idx=[0], read_idx=[2])
     # Edges 0,1 survive (effective score ≈ 0.95 > 0.3)
     check("PT-2: Z-dominant edge pruned",
@@ -1331,9 +1234,8 @@ def test_prune_dead_island_removed():
     )
     with torch.no_grad():
         stage.z_logits.fill_(5.0)  # all edges active
-        stage.u_logits.fill_(5.0)  # all nodes active
 
-    pruned, _remap = prune_stage(stage, edge_threshold=0.01, node_threshold=0.01,
+    pruned, _remap = prune_stage(stage, edge_threshold=0.01,
                          write_idx=[0], read_idx=[2])
     # Should keep only nodes {0,1,2}
     check("PT-3: dead island removed after pruning",
@@ -1360,10 +1262,9 @@ def test_prune_disconnected_io_raises():
     )
     with torch.no_grad():
         stage.z_logits.fill_(5.0)
-        stage.u_logits.fill_(5.0)
 
     try:
-        prune_stage(stage, edge_threshold=0.01, node_threshold=0.01,
+        prune_stage(stage, edge_threshold=0.01,
                     write_idx=[0], read_idx=[3])
         check("PT-3: disconnected I/O after pruning raises", False, "did not raise")
     except ValueError:
@@ -1383,7 +1284,6 @@ build_net_from_preset, prune_network
     pruned_core, stage_remaps = prune_network(
         net.core,
         edge_threshold=float(PRUNE["edge_threshold"]),
-        node_threshold=float(PRUNE["node_threshold"]),
         transfer_params=True,
     )
     check("PIT-1: stage_remaps is a list", isinstance(stage_remaps, list))
@@ -1411,7 +1311,6 @@ def test_prune_io_mappers_transferred_when_zero_nodes_removed():
     pruned_core, stage_remaps = prune_network(
         net.core,
         edge_threshold=float(PRUNE["edge_threshold"]),
-        node_threshold=float(PRUNE["node_threshold"]),
         transfer_params=True,
     )
     post_nodes = sum(s.num_nodes for s in pruned_core.stages)
@@ -1454,7 +1353,6 @@ def test_prune_io_forward_pass_preserved_when_zero_edges_removed():
     pruned_core, stage_remaps = prune_network(
         net.core,
         edge_threshold=float(PRUNE["edge_threshold"]),
-        node_threshold=float(PRUNE["node_threshold"]),
         transfer_params=True,
     )
     post_edges = sum(s.num_edges() for s in pruned_core.stages)
@@ -1533,15 +1431,11 @@ def test_prune_stage_protects_write_target():
     )
     with torch.no_grad():
         stage.z_logits.fill_(5.0)  # all edges strongly non-Z
-        stage.u_logits.fill_(5.0)  # all nodes strongly alive
 
     # Force node 0 (write target) to be "dead" by gate, but protect it.
-    with torch.no_grad():
-        stage.u_logits.data[0] = -10.0  # gate -> 0
     new_stage, remap = prune_stage(
         stage,
         edge_threshold=0.01,
-        node_threshold=0.01,
         protected_nodes={0},
     )
     check("PIO-1: protected write target survives pruning",
@@ -1575,7 +1469,7 @@ def test_prune_stage_min_read_nodes_guard():
         stage.z_logits.fill_(5.0)
 
     try:
-        prune_stage(stage, edge_threshold=0.1, node_threshold=0.05,
+        prune_stage(stage, edge_threshold=0.1,
                     read_idx=[1, 2], min_read_nodes=1)
         check("PIO-3: prune with all reads disconnected raises ValueError", False, "did not raise")
     except ValueError as e:
@@ -1603,12 +1497,10 @@ def test_prune_stage_min_read_nodes_one_survives():
     )
     with torch.no_grad():
         stage.z_logits.fill_(5.0)
-        stage.u_logits.fill_(5.0)
 
     new_stage, remap = prune_stage(
         stage,
         edge_threshold=0.01,
-        node_threshold=0.01,
         write_idx=[0],
         read_idx=[1, 2],
     )
@@ -1667,7 +1559,6 @@ def test_prune_network_multi_stage_protects_write():
     pruned_core, stage_remaps = prune_network(
         net.core,
         edge_threshold=float(PRUNE["edge_threshold"]),
-        node_threshold=float(PRUNE["node_threshold"]),
         transfer_params=True,
         write_idx=list(net.write_idx) if net.write_idx is not None else None,
         read_idx=list(net.read_idx) if net.read_idx is not None else None,
@@ -1713,11 +1604,9 @@ def test_prune_stage_edge_only_keeps_low_u_node_with_incident_edge():
         stage.logits.data[2, 0] = -5.0
         stage.z_logits.fill_(5.0)
         # u_logits values have no effect on pruning
-        stage.u_logits.data[1] = -10.0
-        stage.u_logits.data[2] = -10.0
 
     pruned, _ = prune_stage(
-        stage, edge_threshold=0.1, node_threshold=0.05,
+        stage, edge_threshold=0.1,
     )
     # Nodes 0,1,2 survive via edges 0->1, 1->2. Node 3 is a dead island
     # (edge 2->3 pruned via Z-dominance, no other incident edge).
@@ -1755,7 +1644,7 @@ def test_prune_stage_edge_only_disconnected_node_removed():
         stage.z_logits.fill_(5.0)
 
     pruned, _remap = prune_stage(
-        stage, edge_threshold=0.1, node_threshold=0.05,
+        stage, edge_threshold=0.1,
     )
     # Nodes 0 and 1 are fully disconnected. Nodes 2 and 3 stay alive.
     check("EOP-2: prunes disconnected nodes (0, 1); keeps 2,3",
@@ -1794,10 +1683,9 @@ def test_prune_stage_edge_only_matches_legacy_when_no_node_collateral():
         stage.logits.data[2, 3] = -5.0
         stage.z_logits.fill_(5.0)
         # u_logits values have no effect on pruning
-        stage.u_logits.fill_(-10.0)
 
     pruned, _ = prune_stage(
-        stage, edge_threshold=0.1, node_threshold=0.05,
+        stage, edge_threshold=0.1,
     )
     # Nodes 2, 3 stay alive (edge 2->3 survives). Nodes 0, 1 are dead islands.
     check("EOP-3: retains nodes 2, 3 (edge 2->3 active)",
@@ -1833,7 +1721,7 @@ def test_prune_network_edge_only_preserves_more_capacity():
         stage.logits.data[:, 3] = -5.0  # P(Z) ≈ 0
 
     pruned, _ = prune_stage(
-        stage, edge_threshold=0.1, node_threshold=0.05,
+        stage, edge_threshold=0.1,
         write_idx=[0], read_idx=[3],
     )
     # Nodes 0, 1, 3 stay alive (I/O path via edges 0->1, 1->3).
@@ -1844,22 +1732,6 @@ def test_prune_network_edge_only_preserves_more_capacity():
     check("EOP-4: 2 surviving edges (0->1 and 1->3)",
           pruned.num_edges() == 2,
           f"got {pruned.num_edges()} edges, expected 2")
-
-
-def test_prune_nodes_by_gate_config_default():
-    print("\nTest 62j: PRUNE['prune_nodes_by_gate'] is False everywhere (deprecate-node-gates)")
-    from config import PRUNE
-    check("deprecate-node-gates: PRUNE['prune_nodes_by_gate'] is False",
-          PRUNE.get("prune_nodes_by_gate", True) is False,
-          f"got {PRUNE.get('prune_nodes_by_gate', True)}")
-    from config import SCHEDULE_THREE_PHASE
-    check("deprecate-node-gates: SCHEDULE_THREE_PHASE['prune_nodes_by_gate'] is False",
-          SCHEDULE_THREE_PHASE.get("prune_nodes_by_gate", True) is False,
-          f"got {SCHEDULE_THREE_PHASE.get('prune_nodes_by_gate', True)}")
-    from config import SCHEDULE_FOUR_PHASE
-    check("deprecate-node-gates: SCHEDULE_FOUR_PHASE['prune_nodes_by_gate'] is False",
-          SCHEDULE_FOUR_PHASE.get("prune_nodes_by_gate", True) is False,
-          f"got {SCHEDULE_FOUR_PHASE.get('prune_nodes_by_gate', True)}")
 
 
 def test_reg_defaults_topology_fix():
@@ -1946,10 +1818,9 @@ def test_normalized_units_in_config():
           "C" not in config.LAMBDAS)
     check("CP: LAMBDAS no longer has the single 'complexity' key (decomposed into 4 terms)",
           "complexity" not in config.LAMBDAS)
-    check("CP: LAMBDAS has 'edge_gate', 'node_gate', 'power', 'capacitance'",
-          all(k in config.LAMBDAS for k in ("edge_gate", "node_gate", "power", "capacitance")))
-    check("CP: PRUNE has 'edge_threshold' and 'node_threshold'",
-          "edge_threshold" in config.PRUNE and "node_threshold" in config.PRUNE)
+    check("CP: LAMBDAS has 'edge_gate' and 'power'",
+          all(k in config.LAMBDAS for k in ("edge_gate", "power")))
+    check("CP: PRUNE has 'edge_threshold'", "edge_threshold" in config.PRUNE)
 
 
 def test_apply_ablation():
@@ -2180,7 +2051,6 @@ def main():
     test_tau_override_endpoints()
     test_tau_override_backward_compat()
     test_gate_initialization()
-    test_gate_application_in_rhs()
     test_complexity_regularizers()
     test_prune_stage()
     test_prune_stage_transfer_params()
@@ -2205,7 +2075,6 @@ def main():
     test_prune_stage_edge_only_disconnected_node_removed()
     test_prune_stage_edge_only_matches_legacy_when_no_node_collateral()
     test_prune_network_edge_only_preserves_more_capacity()
-    test_prune_nodes_by_gate_config_default()
     test_reg_defaults_topology_fix()
 
     test_scheduler_config_entries()
@@ -2331,7 +2200,6 @@ def main():
     test_seed_everything_seeds_numpy()           # SEED-2: NumPy RNG
     test_seed_everything_seeds_python_random()   # SEED-3: Python random
 
-    test_deprecate_node_gates_warnings()         # DNG-1: deprecation warnings
 
     test_leak_non_programmable()                  # LMC-1: non-prog leak mode
     test_leak_non_programmable_prune_transfer()   # LMC-2: prune raw_leak transfer
@@ -2828,7 +2696,6 @@ def test_loss_history_appends_retrain():
     pruned, _remaps = prune_network(
         net.core,
         edge_threshold=float(PRUNE["edge_threshold"]),
-        node_threshold=float(PRUNE["node_threshold"]),
         transfer_params=True,
     )
     post_edges = sum(s.num_edges() for s in pruned.stages)
@@ -2896,7 +2763,6 @@ def test_gradient_norms_collect():
     check("GG-2: stage0_raw_mult key exists", "stage0_raw_mult" in norms, "")
     check("GG-2: stage0_raw_leak key exists", "stage0_raw_leak" in norms, "")
     check("GG-2: stage0_z_logits key exists", "stage0_z_logits" in norms, "")
-    check("GG-2: stage0_u_logits key exists", "stage0_u_logits" in norms, "")
     check("GG-2: in_mapper key exists", "in_mapper" in norms, "")
     check("GG-2: out_mapper key exists", "out_mapper" in norms, "")
     check("GG-2: stage_transfer key exists (maybe None)",
@@ -2948,13 +2814,8 @@ def test_grad_log_file_output():
         header = lines[0].split("\t")[1:]
         vals = lines[1].split("\t")[1:]
         skip_keys = {"stage_transfer"}
-        # u_logits keys have no gradient (deprecated, bypassed in rhs)
-        skip_keys.update(k for k in header if k.endswith("_u_logits"))
         for k, v in zip(header, vals):
             if k in skip_keys:
-                if k.endswith("_u_logits"):
-                    check(f"GG-3: {k} is dash (no gradient, deprecated)",
-                          v == "-", f"got {v}")
                 continue
             check(f"GG-3: {k} has numeric value (not dash)",
                   v != "-", f"got dash for {k}")
@@ -3032,9 +2893,6 @@ def test_rectifier_cell():
     check("P-7: z_logit_init == 0.0 (grid7-gate0: 50% open gates, was 2.0)",
           INIT["z_logit_init"] == 0.0,
           f"got {INIT['z_logit_init']}")
-    check("P-8: u_logit_init == 0.0 (grid7-gate0: 50% open gates, was 2.0)",
-          INIT["u_logit_init"] == 0.0,
-          f"got {INIT['u_logit_init']}")
 
 
 # ---- v1.5 expanded cell library tests (expanded-cell-library plan) ----
@@ -3841,8 +3699,8 @@ def test_three_phase_lambdas():
     print("\nTest TP-4: three_phase_lambdas phase-dependent values")
     from train import three_phase_lambdas, _REG_KEYS
     from config import SCHEDULE_THREE_PHASE
-    base = {"sparsity": 100.0, "edge_gate": 200.0, "node_gate": 300.0,
-            "power": 400.0, "capacitance": 500.0, "rail": 0.1}
+    base = {"sparsity": 100.0, "edge_gate": 200.0,
+            "power": 400.0, "rail": 0.1}
     total = 100
     a_lams = three_phase_lambdas(0, total, base)
     check("TP-4: Phase A sparsity = 0", a_lams["sparsity"] == 0.0,
@@ -3875,8 +3733,8 @@ def test_three_phase_lambdas_warmup():
     print("\nTest TP-5: three_phase_lambdas Phase B warmup")
     from train import three_phase_lambdas
     from config import SCHEDULE_THREE_PHASE
-    base = {"sparsity": 1e3, "edge_gate": 2e3, "node_gate": 3e3,
-            "power": 4e3, "capacitance": 5e3, "rail": 0.1}
+    base = {"sparsity": 1e3, "edge_gate": 2e3,
+            "power": 4e3, "rail": 0.1}
     total = 100  # a=30, b=70, c=100, b warmup ≈ 40/6 ≈ 7 epochs
     b_first = three_phase_lambdas(31, total, base)
     # At epoch 31 (just 1 epoch past Phase A), the scale should be ~ 1/7
@@ -5207,8 +5065,6 @@ def test_free_tanh_construction():
     check("FT-1: grad z_logits", stage.z_logits.grad is not None)
     if hasattr(stage, "raw_leak"):
         check("FT-1: grad raw_leak", stage.raw_leak.grad is not None)
-    check("FT-1 deprecate-node-gates: u_logits no grad",
-          stage.u_logits.grad is None, f"got {stage.u_logits.grad}")
 
 
 def test_free_tanh_prune():
@@ -5229,7 +5085,7 @@ def test_free_tanh_prune():
             n = stage.z_logits.numel()
             stage.z_logits[:n // 2] = -3.0
 
-    pruned_core, _ = prune_network(net.core, edge_threshold=0.5, prune_nodes_by_gate=False)
+    pruned_core, _ = prune_network(net.core, edge_threshold=0.5)
     check("FT-2: pruned has fewer edges",
           sum(s.num_edges() for s in pruned_core.stages) < sum(s.num_edges() for s in net.core.stages))
     for i, stage in enumerate(pruned_core.stages):
@@ -5254,7 +5110,7 @@ def test_free_tanh_prune():
                 stage.z_logits.fill_(2.0)
                 n = stage.z_logits.numel()
                 stage.z_logits[:n // 2] = -3.0
-        pruned_b, _ = prune_network(net_b.core, edge_threshold=0.5, prune_nodes_by_gate=False)
+        pruned_b, _ = prune_network(net_b.core, edge_threshold=0.5)
         for i, stage in enumerate(pruned_b.stages):
             check(f"FT-2 bias: stage {i} theta_raw present",
                   hasattr(stage.cell_lib, "theta_raw"))
@@ -5268,44 +5124,6 @@ def test_free_tanh_prune():
 # ============================================================================
 # Fixed seed tests (fixed-seed plan)
 # ============================================================================
-
-def test_deprecate_node_gates_warnings():
-    print("\nTest DNG-1: deprecate-node-gates warnings")
-    import warnings
-    from cell_library import make_cell_library
-    from differential_stage import DifferentialStage
-    from topology import prune_stage
-    from train import _stage_node_gates
-
-    cell_lib = make_cell_library('tanh_free')
-    stage = DifferentialStage(num_nodes=2, src=[0], dst=[1], cell_lib=cell_lib)
-
-    # 1) prune_stage with prune_nodes_by_gate=True emits DeprecationWarning
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
-        prune_stage(stage, edge_threshold=0.0, prune_nodes_by_gate=True)
-        dw = [x for x in w if issubclass(x.category, DeprecationWarning)]
-        check("DNG-1: prune_stage(True) emits DeprecationWarning",
-              any("deprecated" in str(x.message).lower() for x in dw),
-              f"got {[str(x.message) for x in dw]}")
-
-    # 2) _stage_node_gates emits DeprecationWarning
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
-        _stage_node_gates(stage)
-        dw = [x for x in w if issubclass(x.category, DeprecationWarning)]
-        check("DNG-1: _stage_node_gates emits DeprecationWarning",
-              any("deprecated" in str(x.message).lower() for x in dw),
-              f"got {[str(x.message) for x in dw]}")
-
-    # 3) active_node_mask emits DeprecationWarning
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
-        _ = stage.active_node_mask()
-        dw = [x for x in w if issubclass(x.category, DeprecationWarning)]
-        check("DNG-1: active_node_mask emits DeprecationWarning",
-              any("deprecated" in str(x.message).lower() for x in dw),
-              f"got {[str(x.message) for x in dw]}")
 
 
 def test_seed_everything_deterministic():

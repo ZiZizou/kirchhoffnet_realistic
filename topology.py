@@ -16,6 +16,7 @@ All presets come from config.PRESETS.
 
 from __future__ import annotations
 
+import copy
 import random
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Iterable
@@ -1008,6 +1009,16 @@ def prune_network(
             ``stage_remaps[-1]`` is used to remap read targets.
     """
     from kirchhoff_net import KirchhoffNet
+
+    # A keep-all request is an exact identity transformation. Rebuilding the
+    # stages would otherwise discard stage-owned boundary/output-ODE/readout
+    # libraries (and the VCA/GLN state attached to the enclosing core).
+    # Preserve the complete module tree and return identity node maps.
+    if all(bool((s.edge_gates().detach() > edge_threshold).all())
+           for s in net.stages):
+        return copy.deepcopy(net), [
+            {i: i for i in range(s.num_nodes)} for s in net.stages
+        ]
 
     n_stages = len(net.stages)
     new_stages = []

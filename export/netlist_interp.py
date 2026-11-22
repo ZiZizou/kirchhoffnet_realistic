@@ -226,16 +226,71 @@ def _transfer(x, t, clamp_x_hard=None):
         out = torch.clamp(out.detach(), -float(clamp_x_hard), float(clamp_x_hard)) + (out - out.detach())
     return out
 
-def simulate(table, x):
+def _uniform_quant(x, bits, lo, hi):
+    if bits is None or int(bits) <= 0 or hi <= lo:
+        return x
+    step = (float(hi) - float(lo)) / (2 ** int(bits) - 1)
+    return torch.round((x.clamp(float(lo), float(hi)) - float(lo)) / step) * step + float(lo)
+
+def _timemux_transfer(x, t, cfg, clamp_x_hard=None):
+    mode = cfg.get("xfer_mode", "full")
+    n = int(t["in_nodes"])
+    if t["out_nodes"] < n: x = x[:, :int(t["out_nodes"])]
+    elif t["out_nodes"] > n: x = torch.cat((x, x.new_zeros(x.shape[0], int(t["out_nodes"])-n)), dim=1)
+    if any(t.get(k) is None for k in ("residual_w1", "residual_w2", "residual_w3", "residual_vth")):
+        return _transfer(x, t, clamp_x_hard=clamp_x_hard)
+    w1, w2, w3, vth = (_t(t[k], x) for k in ("residual_w1", "residual_w2", "residual_w3", "residual_vth"))
+    def finish(y):
+        return y if clamp_x_hard is None else y.clamp(-float(clamp_x_hard), float(clamp_x_hard))
+    if mode == "shared_vth" and vth.numel() > 1:
+        vth = vth.mean()
+    elif mode == "quant":
+        bits = cfg.get("param_bits")
+        if bits:
+            w1, w2, w3, vth = (_uniform_quant(v, bits, -2.0, 2.0) for v in (w1, w2, w3, vth))
+    if mode == "no_tanh": return finish(w1*x + w3*torch.relu(x-vth))
+    if mode == "no_relu": return finish(w1*x + w2*torch.tanh(x))
+    if mode == "kick": return finish(x + (w1-1.0)*x + w2*torch.tanh(x) + w3*torch.relu(x-vth))
+    if mode not in ("full", "shared_vth", "quant"):
+        raise ValueError(f"unknown timemux xfer_mode {mode!r}")
+    return finish(w1*x + w2*torch.tanh(x) + w3*torch.relu(x-vth))
+
+def _timemux_boundary(x, cfg, units, boundary_idx, noise=None):
+    if noise is not None:
+        x = x + _t(noise, x) * float(units.get("ktc_rms_units", 0.0))
+    vu = float(units["vu"])
+    if cfg.get("inject_mv", 0.0):
+        gen = torch.Generator(device="cpu").manual_seed(12345 + int(boundary_idx))
+        signs = torch.randint(0, 2, (x.shape[-1],), generator=gen, dtype=torch.float32).to(x.device)*2.0-1.0
+        x = x + signs.to(dtype=x.dtype) * (float(cfg["inject_mv"])*1e-3/vu)
+    if cfg.get("inject_gain_err", 0.0):
+        x = x * (1.0 + float(cfg["inject_gain_err"]))
+    x_transfer = x
+    x_hold = x
+    if cfg.get("droop_mv", 0.0):
+        gen = torch.Generator(device="cpu").manual_seed(12346 + int(boundary_idx))
+        signs = torch.randint(0, 2, (x.shape[-1],), generator=gen, dtype=torch.float32).to(x.device)*2.0-1.0
+        x_hold = x + signs.to(dtype=x.dtype) * (float(cfg["droop_mv"])*1e-3/vu)
+    bits = cfg.get("node_quant_bits")
+    if bits:
+        rail = float(units["x_hard"])
+        x_transfer = _uniform_quant(x_transfer, bits, -rail, rail)
+        x_hold = _uniform_quant(x_hold, bits, -rail, rail)
+    return x_hold, x_transfer
+
+def simulate(table, x, noise=None):
     resolved=_table(table)
     x=torch.as_tensor(x)
     u=(2.0*(torch.log10(x.clamp(min=1e-12))-_t(resolved["input"]["log_min"],x))/(_t(resolved["input"]["log_max"],x)-_t(resolved["input"]["log_min"],x)).clamp(min=1e-8)-1.0).clamp(min=-float(resolved["input"]["input_rail"]),max=float(resolved["input"]["input_rail"]))
     batch=x.shape[0]
     state=x.new_zeros((batch,int(resolved["stages"][0]["num_nodes"])))
     finals=[]
+    tm=resolved.get("timemux")
+    tm_enabled=bool(tm and tm.get("enable", False))
+    held_input=None
     for i,st in enumerate(resolved["stages"]):
         t=float(st["solver"]["t_span"]); steps=int(st["solver"]["num_steps"]); dt=t/steps
-        held=state
+        held=held_input if tm_enabled and i > 0 else state
         for _ in range(steps):
             k1=stage_rhs(resolved,i,state,held,u)
             pred=state+dt*k1
@@ -244,7 +299,14 @@ def simulate(table, x):
         finals.append(state)
         if i<len(resolved["transfers"]):
             clamp = resolved.get("units", {}).get("x_hard") if resolved.get("hw_flags", {}).get("hw_clamp_transfer") else None
-            state=_transfer(state,resolved["transfers"][i],clamp_x_hard=clamp)
+            if tm_enabled:
+                noise_i = None if noise is None else noise[i]
+                held_sample, transfer_sample = _timemux_boundary(state, tm, resolved.get("units", {}), i, noise_i)
+                tr = resolved["transfers"][i]
+                state = _timemux_transfer(transfer_sample, tr, tm, clamp_x_hard=clamp)
+                held_input = _timemux_transfer(held_sample, tr, tm, clamp_x_hard=clamp)
+            else:
+                state=_transfer(state,resolved["transfers"][i],clamp_x_hard=clamp)
     top=resolved["topology"]
     start=int(resolved["stages"][-1]["topology"]["readout_dst_start"])
     count=int(resolved["topology"]["readout_count"])

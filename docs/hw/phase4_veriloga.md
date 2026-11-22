@@ -50,9 +50,15 @@ The standalone interpreter resolves and reproduces the table for symmetric/6-bit
 | `phase3a_full` with `hw_compliance=false` | 0 output / 0 state | combined non-compliance flags compose exactly |
 | `phase3a_core` with `hw_compliance=true` | ≤ 1e-9 output / state | leg-wise core, boundary, shared-sense and accumulator compliance; frozen core legs |
 | `phase3a_full` | ≤ 1e-9 output / state | full preset composed with compliance |
+| `phase3a_core` + timemux, `ktc=false`, 4-bit node quantisation | 0 output / 0 state | injection, gain error, hold-only droop, boundary quantisation and full transfer |
+| `phase3b_tm` + recorded kT/C draws | 2.98e-11 output / 2.76e-10 state | full phase3a preset plus S&H; 3 samples, tested at 1e-9 |
 | temporal output mesh + compliance | rejected | mesh destination compliance is not yet mirrored |
 
-`hw_compliance` is resolved for core, boundary terminals, shared-sense readout, crossbar accumulators, live compliance factors with frozen legs, replacement of the input soft gate/soft clip, and the model's VCA-gated boundary/readout shunts. Export explicitly rejects `hw_compliance` when a temporal output mesh is present, rather than silently approximating it. Neither compliance round-trip fixture uses a temporal output mesh. `hw_isat_eff_clamp` needs per-family post-gate/VCA Isat clamping. `hw_vca_bits` needs quantized VCA logits. Stochastic mismatch needs the model's shared per-slot draws. `hw_power_lambda` is a training objective, not an inference behavior. Active timemux requires sample/hold injection, hold-only droop, optional kT/C draws, internal-capacitance settling, and transfer-mode handling; it remains rejected, including `phase3b_tm`. The current interpreter does not accept a `noise=` draw interface, so kT/C is not being approximated as deterministic. Validate flags using `HWConfig` before export.
+### Supported vs refused forward-affecting flags
+
+Supported hardware flags are the round-trip groups in the table above, including active `timemux` injection, gain error, held-branch droop, `xfer_mode`, and node quantisation. The interpreter's `simulate(table, x, noise=...)` consumes one exact standard-normal tensor per active boundary; scale is `sqrt(k_B*T/C_u)/V_u`. Without explicit draws it follows the default eval behavior, where kT/C is inactive. `param_bits` is applied to transfer coefficients when `xfer_mode='quant'`; node quantisation is tested at 4 bits. The configured `c_hold_ff`, `c_int_ff`, `isat_floor`, and `settle` currently have no effect on this repository's forward pass: `c_hold_ff` is not used by capture, while `settle_core` / `effective_isat` are utilities not called from `KirchhoffNet` or `DifferentialStage`. They are retained in the exported config without inventing behavior.
+
+Refused hardware flags remain: temporal output mesh + `hw_compliance` (mesh destination compliance is not mirrored); `hw_isat_eff_clamp` (per-family post-gate/VCA Isat clamping not resolved); `hw_vca_bits` (quantized VCA logits not resolved); stochastic mismatch (model-shared per-slot draws are not exported); and `hw_power_lambda` (training-only objective, not inference behavior). Validate flags using `HWConfig` before export.
 
 ## Validation
 

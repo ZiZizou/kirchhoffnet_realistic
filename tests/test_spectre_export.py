@@ -133,7 +133,7 @@ def test_toy_net_hw_interpreter_roundtrip(tmp_path, preset, overrides):
     import copy
     import sys
     from hw import HWConfig, load_preset
-    from tests.golden.make_golden import TOY_NET, make_model, CtleStudent, _build_net, seed_all
+    from tests.golden.make_golden import TOY_NET, CtleStudent, _build_net, seed_all
 
     config = copy.deepcopy(load_preset(preset))
     config["constraints"].update(overrides)
@@ -164,3 +164,70 @@ def test_toy_net_hw_interpreter_roundtrip(tmp_path, preset, overrides):
     print(f"{preset}: output max error={out_err:.3g}, final-state max error={state_err:.3g}")
     assert out_err <= 1e-9, f"{preset} output max error {out_err:.3g}"
     assert state_err <= 1e-9, f"{preset} state max error {state_err:.3g}"
+
+
+def _build_timemux_toy(preset, tm_overrides):
+    import copy
+    from hw import HWConfig, load_preset
+    from tests.golden.make_golden import TOY_NET, CtleStudent, _build_net, seed_all
+    raw = copy.deepcopy(load_preset(preset))
+    raw["timemux"] = {"enable": True, **tm_overrides}
+    cfg = HWConfig.from_dict(raw)
+    seed_all(20261122)
+    net = _build_net(copy.deepcopy(TOY_NET), hw=cfg).double()
+    model = CtleStudent(net, 4, 3, 4.0).double().eval()
+    gen = torch.Generator().manual_seed(7319)
+    with torch.no_grad():
+        for _, p in sorted(model.named_parameters()):
+            p.add_(0.015 * torch.randn(p.shape, generator=gen, dtype=p.dtype))
+    return model, cfg
+
+
+def _assert_tm_matches(model, cfg, inputs, noise=None):
+    table = json.loads(json.dumps(spectre_export.build_param_table(model, mode="hw", hw=cfg)))
+    if noise is not None:
+        for boundary, draw in zip(model.net.core.boundaries, noise):
+            boundary.noise_eval = True
+            boundary._randn = lambda x, generator=None, _draw=draw: _draw.to(dtype=x.dtype, device=x.device)
+    with torch.no_grad():
+        want = model(inputs)
+        states = [s.clone() for s in model.net.core.last_stage_outputs]
+    got = simulate(table, inputs, noise=noise)
+    out_err = (got["logits"] - want).abs().max().item()
+    state_err = max((a-b).abs().max().item() for a,b in zip(got["stage_states"], states))
+    print(f"timemux {cfg.timemux}: output max error={out_err:.3g}, final-state max error={state_err:.3g}")
+    assert out_err <= 1e-9, f"timemux output max error {out_err:.3g}"
+    assert state_err <= 1e-9, f"timemux state max error {state_err:.3g}"
+
+
+def test_phase3a_core_timemux_deterministic_roundtrip():
+    tm = {"ktc": False, "inject_mv": 1.0, "inject_gain_err": 0.025,
+          "droop_mv": 1.0, "xfer_mode": "full", "node_quant_bits": 4}
+    model, cfg = _build_timemux_toy("phase3a_core", tm)
+    inputs = torch.tensor([[0.08, 0.2, 0.7, 1.4], [0.12, 0.4, 0.9, 1.8],
+                           [0.16, 0.5, 1.1, 2.2]], dtype=torch.float64)
+    _assert_tm_matches(model, cfg, inputs)
+
+
+def test_phase3b_tm_roundtrip_with_captured_ktc_noise():
+    tm = {"enable": True, "c_hold_ff": 100.0, "inject_mv": 1.0,
+          "inject_gain_err": 0.0, "droop_mv": 1.0, "ktc": True,
+          "settle": False, "c_int_ff": 3.0, "isat_floor": 0.0,
+          "xfer_mode": "full", "param_bits": None, "node_quant_bits": None}
+    model, cfg = _build_timemux_toy("phase3b_tm", tm)
+    captured = []
+    for boundary in model.net.core.boundaries:
+        boundary.noise_eval = True
+        original = boundary._randn
+        def record(x, generator=None, _orig=original):
+            draw = _orig(x, generator)
+            captured.append(draw.detach().clone())
+            return draw
+        boundary._randn = record
+    inputs = torch.tensor([[0.08, 0.2, 0.7, 1.4], [0.12, 0.4, 0.9, 1.8],
+                           [0.16, 0.5, 1.1, 2.2]], dtype=torch.float64)
+    # Boundary captures are invoked in stage order; save the exact standard-normal draws.
+    with torch.no_grad():
+        model(inputs)
+    assert len(captured) == len(model.net.core.boundaries)
+    _assert_tm_matches(model, cfg, inputs, noise=captured)

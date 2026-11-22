@@ -94,8 +94,6 @@ def build_param_table(model, mode="legacy", hw=None) -> dict:
         active = [name for name, enabled in refused.items() if enabled]
         if active:
             raise ValueError("export does not support forward-affecting flags: " + ", ".join(active))
-        if getattr(hw, "timemux", None) is not None and getattr(hw.timemux, "enable", False):
-            raise ValueError("export does not support hw.timemux: S&H/timemux dynamics are not resolved")
     stages = []
     for i, s in enumerate(net.core.stages):
         n = int(s.num_nodes)
@@ -175,7 +173,8 @@ def build_param_table(model, mode="legacy", hw=None) -> dict:
     post=net.post_readout_transfer
     affine=net.output_mapper
     return {"schema":"kirchhoffnet-resolved-params-v1", "mode":mode, "hw_flags":hw_flags,
-        "units":{"x_hard":float(units.x_hard), "vu":float(units.vu), "u_t":float(units.u_t), "lambda_v":0.15, "compliance_k":2000.0},
+        "units":{"x_hard":float(units.x_hard), "vu":float(units.vu), "u_t":float(units.u_t), "temp_c":float(units.temp_c), "cu":float(units.cu), "ktc_rms_units":float(units.ktc_rms_units), "n_slope":float(units.n_slope), "lambda_v":0.15, "compliance_k":2000.0},
+        "timemux": (None if getattr(hw, "timemux", None) is None else hw.timemux.to_dict()),
         "input":{"kind":"log10_minmax", "log_min":_tensor(model.input_log_min), "log_max":_tensor(model.input_log_max),
             "input_rail":float(model.input_rail), "initial_state":"zeros", "boundary_enabled":bool(net.enable_boundary)},
         "topology":{"stages":len(stages), "hidden_nodes":int(net.hid_count), "readout_start":int(net.read_start),

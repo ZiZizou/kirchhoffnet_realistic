@@ -66,7 +66,7 @@ No Verilog-A source changes were needed to compile these modules. Spectre emitte
 
 ## Spectre-versus-reference characterization
 
-`/home/annaik/Documents/kirchhoffnet_refactor/venv/bin/python scripts/spectre/characterize.py` generates one PSFASCII DC deck with 25 parallel test cases, reads the PSFASCII operating point, converts measured branch currents to `Iu` model units, and compares to the exact formulas implemented by the Verilog-A cells. The legacy OTA set covers both signs, nonzero theta, saturation, the 0.01·u floor, and the compliance boundary; hardware cases include differential and two cap-divider code pairs. This comparison uses copied analytic formulas, not a full `FreeTanhLibrary` forward call.
+`/home/annaik/Documents/kirchhoffnet_refactor/venv/bin/python scripts/spectre/characterize.py` generates one PSFASCII DC deck with 33 parallel test cases and compares the operating point to the exact formulas implemented by the Verilog-A cells. OTA/shunt currents are converted to `Iu`; transfer voltage error is converted back to x units. The legacy OTA set covers both signs, nonzero theta, saturation, the 0.01·u floor, and the compliance boundary; hardware cases include differential and two cap-divider code pairs. VCA and GLN use rank-1 input vectors matching `gating/vca.py`'s `2*sigmoid(z)` and `gating/gln.py`'s clamped exponential tail equation. Transfer uses exact ReLU and hard ±x_hard clamp as the reference; the smooth clamp implemented in Spectre is therefore measured as a residual. These are exact copied formulas, not full framework/model forward calls.
 
 | Module / mode | Cases | Maximum absolute error | Maximum relative error |
 |---|---:|---:|---:|
@@ -78,18 +78,18 @@ No Verilog-A source changes were needed to compile these modules. Spectre emitte
 | `sample_hold` | — | not measured | not measured |
 | `boundary_sense_ota` | — | not measured | not measured |
 | `crossbar_accumulator` | — | not measured | not measured |
-| `interstage_transfer` | — | not measured | not measured |
-| `vca_bias` | — | not measured | not measured |
-| `gln_bias` | — | not measured | not measured |
+| `interstage_transfer` HW clamp | 4 | 1.11 x | 9.68e-2 |
+| `vca_bias` | 2 | 4.44e-16 gain | 4.18e-16 |
+| `gln_bias` tail trim | 2 | 0 trim | 0 |
 | `phase_ctrl` | — | not measured | not measured |
 
 The characterization result JSON and all raw runs are under `.agent_scratch/taskD2/runs/characterize_<timestamp>/`; no Cadence-generated files belong in the worktree. The Spectre-backed test is slow-marked and explicitly run with `python -m pytest tests/test_veriloga_modules.py -q -m slow -k spectre`; it skips if `tcsh`, the kit setup, or Spectre is unavailable.
 
 ## Known gaps / release status
 
-- Characterization is partial: node-cap RC transient, sample/hold capture and droop, crossbar accumulation, transfer clamp, VCA/GLN against their gating functions, boundary OTA, rail clip, and phase duration edges against `hw/timemux.py` remain to be simulated and compared. Thus this is not full module equivalence validation.
-- The exact OTA/shunt cell equations match Spectre for the tested points; there is not yet full Torch/PyTorch coverage for the core or all gating functions.
+- Characterization is partial: node-cap RC transient, sample/hold capture and droop, crossbar accumulation, boundary OTA, rail clip, and phase duration edges against `hw/timemux.py` remain to be simulated and compared. Thus this is not full module equivalence validation.
+- OTA/shunt, VCA, and GLN formulas match Spectre at sampled points to floating-point precision. The transfer's smooth tanh rail clamp differs from the exact hard-clamp reference by up to 1.11 x in the four-point sweep; decide whether that approximation is acceptable or change the implementation. This is not full Torch/PyTorch coverage.
 - The canonical A/B modes compile, but per-stage parameter arrays/indexing and complete timemux bank switching are still missing. The exporter and parameter table must drive actual instances consistently.
 - HW OTA compliance is a behavioral leg approximation and still needs comparison against `hw.constraints.leg_factors`/`compliance_legs` (including normalization and 85 °C thermal voltage). The specified Isat ceiling is not enforced inside this primitive.
 - S&H `kT/C` noise and exact acquisition/droop characterization are absent; deterministic injection/droop remain approximate circuit abstractions.
-- Transfer smoothening, event timing, crossbar polarity/reference, and phase sequencing still require cell-level validation. Do not claim full model equivalence or use for tapeout.
+- Transfer event timing, crossbar polarity/reference, and phase sequencing still require validation. Do not claim full model equivalence or use for tapeout.

@@ -60,6 +60,7 @@ LEARN_RATIO_MAX = 0.25
 SEED_SPREAD_MAX = 2.0
 R2_MIN = 0.8
 OUT = os.environ.get("HW_LEARN_OUT")
+RESULT_SCHEMA = 2  # bump when result semantics / recorded fields change
 # Parameters that legitimately get no gradient under a flag (criterion 1).
 # Under hw_compliance the soft clip term is zero (the leg roll-off is the rail),
 # so the learnable clip sharpness is dead: it is FROZEN (requires_grad=False,
@@ -168,6 +169,7 @@ def _train(task: str, preset: str, seed: int) -> dict:
     dt_rho = max(r["max_dt_rho"] for r in stiff)
     quant = quant_check(net, hw)
     return {
+        "result_schema": RESULT_SCHEMA,
         "task": task, "preset": preset, "seed": seed, "steps": STEPS, "lr": LR,
         "overrides": {},
         "n_params": sum(p.numel() for _, p in params),
@@ -194,7 +196,8 @@ def run(task: str, preset: str, seed: int) -> dict:
         if os.path.isfile(path):
             with open(path) as fh:
                 r = json.load(fh)
-            if r.get("steps") == STEPS and r.get("lr") == LR:
+            if (r.get("result_schema") == RESULT_SCHEMA
+                    and r.get("steps") == STEPS and r.get("lr") == LR):
                 return r
     torch.set_num_threads(int(os.environ.get("HW_LEARN_THREADS", 4)))
     r = _train(task, preset, seed)

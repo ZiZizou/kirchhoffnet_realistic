@@ -98,6 +98,31 @@ def cases():
     for x0 in (-4.0, -1.0, 2.0, 6.0):
         out.append({"module": "node_cap_leak", "mode": "tran", "x0": x0,
                     "params": {"c_eff": 1.0, "g_leak": 0.0486}})
+    # Four sense currents x three outputs; use the production quantizer for W.
+    import torch
+    from hw.constraints import xbar_map, acc_compliance
+    from hw.units import HWUnits
+    units = HWUnits()
+    rng = torch.Generator().manual_seed(314159)
+    for idx in range(3):
+        raw = torch.randn((3, 4), generator=rng, dtype=torch.float64) * 0.65
+        effective = xbar_map(raw, mode="signed")
+        out.append({"module": "crossbar_accumulator", "mode": f"ideal_{idx}",
+                    "weights": raw.tolist(), "effective_weights": effective.tolist(),
+                    "currents": [0.37, -0.21, 0.53, -0.42],
+                    "x_acc": [0.0, 0.0, 0.0], "hw_mode": 0, "params": {}})
+    raw = torch.tensor([[0.71, -0.84, 0.13, -0.31], [-0.66, 0.52, 0.94, -0.12],
+                        [0.28, -0.49, 0.63, -0.91]], dtype=torch.float64)
+    effective = xbar_map(raw, mode="offset_binary", bits=3, bound=True)
+    for x_acc in (-3.0, 0.0, 3.0):
+        out.append({"module": "crossbar_accumulator", "mode": "hw_offset_binary_compliance",
+                    "weights": raw.tolist(), "effective_weights": effective.tolist(),
+                    "currents": [0.37, -0.21, 0.53, -0.42],
+                    "x_acc": [x_acc, -x_acc, 0.5*x_acc], "hw_mode": 1,
+                    "params": {"hw_mode": 1, "hw_bits": 3, "hw_bound": 1,
+                               "Wmax": 4.0, "acc_compliance_en": 1,
+                               "x_hard": units.x_hard},
+                    "reference_torch": True})
     return out
 
 
@@ -174,6 +199,17 @@ def ref_value(case, values):
         # this standalone exporter primitive is its clamped log-tail equation.
         z = case["bias"] + sum(w*u for w,u in zip(case["weights"], case["u"]))
         return math.exp(max(-case["delta_max"], min(case["delta_max"], z))), 1.0, "trim"
+    if module == "crossbar_accumulator":
+        import torch
+        from hw.constraints import acc_compliance
+        from hw.units import HWUnits
+        weights = torch.tensor(case["effective_weights"], dtype=torch.float64)
+        currents = torch.tensor(case["currents"], dtype=torch.float64) * IU
+        expected = weights @ currents
+        if case["params"].get("acc_compliance_en"):
+            x_acc = torch.tensor(case["x_acc"], dtype=torch.float64)
+            expected = acc_compliance(expected, x_acc, HWUnits())
+        return expected.tolist(), IU, "Iu"
     if module == "rail_clip":
         import torch
         from cell_library import FreeTanhLibrary
@@ -285,6 +321,21 @@ def run(args):
             lines += [f"Xdut{i} ({node}) node_cap_leak " + " ".join(
                           f"{k}={v}" for k,v in c["params"].items()),
                       f"ic {node}={VCM+VU*c['x0']:.17g}"]
+        elif c["module"] == "crossbar_accumulator":
+            ports = []
+            for k, current in enumerate(c["currents"]):
+                sp, sn = f"s{k}p_{i}", f"s{k}n_{i}"
+                ports.extend((sp, sn))
+                lines.append(f"Iin{k}_{i} ({sn} {sp}) isource dc={current*IU:.17g}")
+            for j, x_acc in enumerate(c["x_acc"]):
+                acc = f"acc{j}_{i}"
+                ports.append(acc)
+                lines.append(f"Vacc{j}_{i} ({acc} 0) vsource dc={VCM+VU*x_acc:.17g}")
+            flat_w = [w for row in c["weights"] for w in row]
+            params = dict(c["params"])
+            overrides = " ".join(f"{key}={value}" for key,value in params.items())
+            w_expr = "[" + " ".join(f"{value:.17g}" for value in flat_w) + "]"
+            lines.append(f"Xdut{i} ({' '.join(ports)}) crossbar_accumulator W={w_expr} {overrides}")
         else:
             vin, en, output = f"in{i}", f"en{i}", f"out{i}"
             lines += [f"Vin{i} ({vin} 0) vsource dc={VCM+VU*c['x']:.17g}",
@@ -338,6 +389,17 @@ def run(args):
         elif module == "node_cap_leak":
             # Transient waveform is parsed from the PSFASCII tran dataset below.
             continue
+        elif module == "crossbar_accumulator":
+            expected, scale, units = ref_value(c, {})
+            for j, reference in enumerate(expected):
+                measured = nodes[f"Vacc{j}_{i}:p"]
+                abs_err = abs(measured-reference) / scale
+                rel_err = abs(measured-reference) / max(abs(reference), scale*1e-12)
+                rows.append({"module": module, "mode": c["mode"], "output": j,
+                             "error_units": units, "abs_error_model_units": abs_err,
+                             "rel_error": rel_err, "measured_model_units": measured/scale,
+                             "reference_model_units": reference/scale})
+            continue
         else:
             measured = nodes[f"out{i}"]
             values = {}
@@ -362,7 +424,7 @@ def run(args):
                      "samples": len(samples), "error_units": "x",
                      "abs_error_model_units": max_error, "rel_error": max_error / max(abs(c["x0"]), 1e-12)})
     report = {"run_dir": str(run_dir), "measured_cases": len(rows), "uncharacterized": [
-        "sample_hold", "crossbar_accumulator", "phase_ctrl"], "results": rows}
+        "sample_hold", "phase_ctrl"], "results": rows}
     out = run_dir / "characterization.json"
     out.write_text(json.dumps(report, indent=2) + "\n")
     for module in sorted({r["module"] for r in rows}):

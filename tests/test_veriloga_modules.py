@@ -16,7 +16,7 @@ MODULE_PARAMS = {
     "rail_clip": {"x_max", "sharp", "Iclip"},
     "sample_hold": {"C_hold", "R_on", "R_off", "inject_v", "droop_tau"},
     "boundary_sense_ota": {"gm", "Isat", "A", "B", "theta", "s", "z_gate"},
-    "crossbar_accumulator": {"weight", "Vref", "Gunit", "Cacc"},
+    "crossbar_accumulator": {"W", "hw_mode", "hw_bits", "hw_bound", "acc_compliance_en", "Wmax", "lambda_v", "x_hard", "Vcm", "Vu", "Ut", "k_soft"},
     "interstage_transfer": {"w1", "w2", "w3", "vth", "x_hard"},
     "vca_bias": {"w0", "w1", "w2", "w3", "bias"},
     "gln_bias": {"w0", "w1", "w2", "w3", "bias", "delta_max"},
@@ -72,11 +72,15 @@ def test_spectre_ota_and_shunt_match_analytic_reference():
                             cwd=ROOT, text=True, capture_output=True, timeout=600, check=True)
     report_path = Path(result.stdout.strip().splitlines()[-1])
     report = json.loads(report_path.read_text())
-    assert report["measured_cases"] == 64
+    assert report["measured_cases"] == 82
     assert {r["module"] for r in report["results"]} == {
         "ota_edge", "shunt", "interstage_transfer", "vca_bias", "gln_bias",
-        "node_cap_leak", "rail_clip", "boundary_sense_ota",
+        "node_cap_leak", "rail_clip", "boundary_sense_ota", "crossbar_accumulator",
     }
+    crossbar = [r for r in report["results"] if r["module"] == "crossbar_accumulator"]
+    assert len(crossbar) == 18
+    assert {r["mode"] for r in crossbar} == {"ideal_0", "ideal_1", "ideal_2", "hw_offset_binary_compliance"}
+    assert max(r["rel_error"] for r in crossbar) <= 1e-5
     boundary_sense = [r for r in report["results"] if r["module"] == "boundary_sense_ota"]
     assert len(boundary_sense) == 16
     assert {r["mode"] for r in boundary_sense} == {"boundary", "sense"}
@@ -96,7 +100,7 @@ def test_spectre_ota_and_shunt_match_analytic_reference():
         "ota_edge": 1e-5, "shunt": 1e-5, "interstage_transfer": 1e-6,
         "vca_bias": 1e-5, "gln_bias": 1e-5,
         "node_cap_leak": 1e-5, "rail_clip": 1e-6,
-        "boundary_sense_ota": 1e-5,
+        "boundary_sense_ota": 1e-5, "crossbar_accumulator": 1e-5,
     }
     for module, tolerance in tolerances.items():
         rows = [r for r in report["results"] if r["module"] == module]

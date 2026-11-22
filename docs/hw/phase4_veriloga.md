@@ -16,7 +16,7 @@ Ports are electrical. Unless otherwise noted, model-unit parameters are converte
 | `rail_clip` | `node` (inout) | `x_max,sharp,Iclip` |
 | `sample_hold` | `in,clk` (input), `out` (output) | `C_hold,R_on,R_off,inject_v,droop_tau,Vlogic` |
 | `boundary_sense_ota` | `src,dst` (inout) | `gm,Isat,A,B,theta,s,z_gate,alpha,x_max,gate_width,sigma_z` |
-| `crossbar_accumulator` | `sense` (input), `acc` (inout) | `weight,Vref,Gunit,Cacc,Vcm` |
+| `crossbar_accumulator` | `s0p,s0n,…,s3p,s3n` (sense-current branch ports), `acc0..acc2` (inout; 4×3 primitive) | `W[0:11],hw_mode,hw_bits,hw_bound,acc_compliance_en,Wmax,lambda_v,x_hard,Vcm,Vu,Ut,k_soft` |
 | `interstage_transfer` | `in,enable` (input), `out` (output) | `w1,w2,w3,vth,x_hard,Ron,Roff,smooth_width,enable_width` |
 | `vca_bias` | `u0..u3` (input), `gain` (output) | `w0..w3,bias,rank,zeta_max` |
 | `gln_bias` | `u0..u3` (input), `trim` (output) | `w0..w3,bias,delta_max` |
@@ -29,6 +29,12 @@ All module files include `hrknet_constants.vams`. The fast structural suite chec
 `ota_edge.mode=0` is the legacy path: exporter-resolved softplus A/B, `u=gm·(s·(A·xs−B·xd)+theta)`, `Isat·(tanh(u)+0.01u)`, and endpoint compliance gates. The edge is conservative and scaled by `Iu`. Hardware mode (`mode=1`) supports `ab_mode=0` legacy A/B, `1` ratio A/B, `2` differential (`A=B=1`), and `3` cap-divider. For mode 3, integer codes produce `Ahat/Bhat = 1/rmax +(1−1/rmax)·k/(2^N−1)`. The hardware OTA uses split source/sink legs, rail factors, and the `lambda_v` channel-length term; unlike legacy, each node's rail legs can draw current from/to the supplies. `g_hw`, `f_ic`, GLN and VCA multipliers are explicit real parameters. The maximum-current ceiling and fully banked time-multiplexed parameters still have to be supplied by the exporter.
 
 The primitive blocks model shunt and leak conductances, node capacitance, legacy soft rail clipping, S&H acquisition/injection/hold droop, crossbar accumulation, VCA gain (`2·sigmoid(z)`), GLN tail trim, and a transfer rewrite conductance. The transfer rewrite is a discrete stage-boundary operation, not part of the continuous ODE: its target uses exact `max(x-vth,0)` and hard `min(max(y,-x_hard),x_hard)`. Spectre's branch current is continuous in the output voltage; the target is evaluated algebraically from the input. `phase_ctrl` sequences hold → transfer/write → bank switch → evolve with explicit per-phase durations after a rising `clk`; its timing is not yet characterized.
+
+### Current-mode crossbar design
+
+`crossbar_accumulator` accepts four sense-OTA currents through four ideal zero-volt series branches (`s0p/s0n` through `s3p/s3n`) and injects the weighted current into three accumulator ports (`acc0..acc2`). The branch current direction is p→n; connect each sense OTA output/current source in series with its pair. `W[0:11]` is a flattened row-major 3×4 parameter array (`W[j*4+k]`). There is no sense-voltage conductance, local capacitor, or Vcm bleed: accumulator-node capacitance/leak is owned by `node_cap_leak`.
+
+For `hw_mode=1`, optional `hw_bound` first applies `Wmax*tanh(W/Wmax)`; `hw_bits` quantizes an offset-binary magnitude code over `[0,2*Wmax]`. The effective signed contribution is the unipolar code current minus a fixed replica-column contribution `Wmax*I_sense[k]`, exactly matching `hw.constraints.xbar_map(..., mode="offset_binary")`. With `acc_compliance_en`, each net signed output current is selected as the top leg when positive or bottom leg when negative, then multiplied by normalized `leg_factors` using `k_soft=2000`, `lambda_v`, `Ut`, `Vu`, and `x_hard`, matching `hw.constraints.acc_compliance`.
 
 ## Spectre compilation
 
@@ -62,11 +68,11 @@ The helper emits an independent tiny `ahdl_include` + DC deck per `.va` module a
 | `gln_bias` | PASS | 0 / 0 |
 | `phase_ctrl` | PASS | 0 / 0 |
 
-No Verilog-A source changes were needed to compile these modules. Spectre emitted routine notices (e.g. output filter relaxation on the compile-only DC decks), but no warnings.
+The baseline compile matrix needed no source changes; after the current-mode redesign, `crossbar_accumulator` was recompiled with 0 errors and 0 warnings. Spectre emitted routine notices (e.g. output filter relaxation on compile-only DC decks), but no warnings.
 
 ## Spectre-versus-reference characterization
 
-`/home/annaik/Documents/kirchhoffnet_refactor/venv/bin/python scripts/spectre/characterize.py` generates PSFASCII DC and transient analyses with 64 test cases. OTA/shunt/rail-clip/boundary-sense currents are converted to `Iu`; transfer voltage error and node-cap transient error are in x units. Node-cap leakage is compared against `x0·exp(−leak·t_model/c_eff)` over five RC constants. Rail clipping is evaluated via `DifferentialStage.soft_clip` in Torch at DC points spanning both rails. Boundary/sense uses the actual `FreeTanhLibrary.forward_tanh` path, with boundary `(u,node)` and sense `(node,Vref)` ordering from `DifferentialStage`. Transfer is compared with `StageTransfer` from `stage_transfer.py` (including the configured hardware clamp); VCA uses `gating.vca.vca_edge_gain`. Core OTA, shunt, and GLN values still use copied equations rather than callable framework forward paths. In this checkout, `hw.constraints.cap_divider_gain` is absent, so cap-divider code resolution remains a copied equation rather than a call to that helper.
+`/home/annaik/Documents/kirchhoffnet_refactor/venv/bin/python scripts/spectre/characterize.py` generates PSFASCII DC and transient analyses with 70 netlist cases (82 measured result rows, including per-output crossbar measurements). OTA/shunt/rail-clip/boundary-sense/crossbar currents are converted to `Iu`; transfer voltage error and node-cap transient error are in x units. Node-cap leakage is compared against `x0·exp(−leak·t_model/c_eff)` over five RC constants. Rail clipping is evaluated via `DifferentialStage.soft_clip` in Torch at DC points spanning both rails. Boundary/sense uses the actual `FreeTanhLibrary.forward_tanh` path, with boundary `(u,node)` and sense `(node,Vref)` ordering from `DifferentialStage`. Transfer is compared with `StageTransfer` from `stage_transfer.py` (including the configured hardware clamp); VCA uses `gating.vca.vca_edge_gain`. Core OTA, shunt, and GLN values still use copied equations rather than callable framework forward paths. In this checkout, `hw.constraints.cap_divider_gain` is absent, so cap-divider code resolution remains a copied equation rather than a call to that helper.
 
 | Module / mode | Cases | Maximum absolute error | Maximum relative error |
 |---|---:|---:|---:|
@@ -76,8 +82,8 @@ No Verilog-A source changes were needed to compile these modules. Spectre emitte
 | `node_cap_leak` transient | 4 | 8.71e-6 x | 1.45e-6 |
 | `rail_clip` DC (Torch `DifferentialStage.soft_clip`) | 11 | 1.39e-17 Iu | 2.78e-16 |
 | `boundary_sense_ota` boundary + sense (Torch `FreeTanhLibrary.forward_tanh`) | 16 | 7.84e-15 Iu | 3.24e-14 |
+| `crossbar_accumulator` (3 ideal W + hw offset-binary; Torch `xbar_map`/`acc_compliance`) | 18 outputs | 1.07e-6 Iu | 1.26e-6 |
 | `sample_hold` | — | not measured | not measured |
-| `crossbar_accumulator` | — | not measured | not measured |
 | `interstage_transfer` HW clamp vs `StageTransfer` | 4 | 5.72e-9 x | 5.33e-10 |
 | `vca_bias` | 2 | 4.44e-16 gain | 4.18e-16 |
 | `gln_bias` tail trim | 2 | 0 trim | 0 |
@@ -87,9 +93,9 @@ The characterization result JSON and all raw runs are under `.agent_scratch/task
 
 ## Known gaps / release status
 
-- Characterization is partial: node-cap RC transient, sample/hold capture and droop, crossbar accumulation, rail clip, and phase duration edges against `hw/timemux.py` remain to be simulated and compared. Thus this is not full module equivalence validation.
+- Characterization is partial: sample/hold capture and droop, and phase duration edges against `hw/timemux.py` remain to be simulated and compared. Crossbar DC mixing/compliance, node-cap RC transient, and rail clipping have characterized coverage, but this is not full module equivalence validation.
 - Boundary/sense OTA uses the real `FreeTanhLibrary.forward_tanh` Torch path and matches 16 Spectre points to 7.84e-15 Iu maximum absolute and 3.24e-14 maximum relative error. Core OTA/shunt/GLN references are copied formulas rather than callable paths. Transfer uses the exact piecewise stage rewrite and matches callable `StageTransfer` to 5.72e-9 x maximum absolute error; cap-divider helper resolution remains unavailable.
 - The canonical A/B modes compile, but per-stage parameter arrays/indexing and complete timemux bank switching are still missing. The exporter and parameter table must drive actual instances consistently.
 - HW OTA compliance is a behavioral leg approximation and still needs comparison against `hw.constraints.leg_factors`/`compliance_legs` (including normalization and 85 °C thermal voltage). The specified Isat ceiling is not enforced inside this primitive.
 - S&H `kT/C` noise and exact acquisition/droop characterization are absent; deterministic injection/droop remain approximate circuit abstractions.
-- Transfer event timing, crossbar polarity/reference, and phase sequencing still require validation. Do not claim full model equivalence or use for tapeout.
+- Transfer event timing and phase sequencing still require validation. Crossbar current polarity, offset-binary replica subtraction, and accumulator compliance match the selected Torch cases only; do not claim full model equivalence or use for tapeout.

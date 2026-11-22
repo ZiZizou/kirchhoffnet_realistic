@@ -26,7 +26,7 @@ PORTS = {
     "rail_clip": ("node",),
     "sample_hold": ("in", "out", "clk"),
     "boundary_sense_ota": ("src", "dst"),
-    "crossbar_accumulator": ("sense", "acc"),
+    "crossbar_accumulator": ("s0p", "s0n", "s1p", "s1n", "s2p", "s2n", "s3p", "s3n", "acc0", "acc1", "acc2"),
     "interstage_transfer": ("in", "out", "enable"),
     "vca_bias": ("u0", "u1", "u2", "u3", "gain"),
     "gln_bias": ("u0", "u1", "u2", "u3", "trim"),

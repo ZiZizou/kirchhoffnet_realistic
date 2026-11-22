@@ -24,8 +24,9 @@ Acceptance (2.4(c), thresholds as proposed in the spec):
 5. seed spread: max/min final constrained train loss <= 2.
 
 ``HW_LEARN_OUT=<dir>`` writes one JSON per (task, preset, seed) run and reuses
-an existing one instead of retraining, so the runs can be spread over several
-processes (``-k``) and the cross-run checks evaluated afterwards.
+an existing one only when its result schema, steps, and learning rate match,
+so runs can be spread over several processes (``-k``) and cross-run checks
+are evaluated afterwards.
 """
 
 from __future__ import annotations

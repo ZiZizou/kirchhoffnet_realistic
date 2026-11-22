@@ -16,7 +16,8 @@ assertion set from those fresh results after fixing the rail-check bug; the
 cache schema is now versioned so stale JSONs from an older harness cannot be
 silently reused. Corrected run summary: Friedman2 25 passed / 5 failed; Toy 17
 passed / 10 failed (42 passed, 15 failed of 57 selected tests; the two
-Friedman2 physical-build checks are included).
+Friedman2 physical-build checks are included). The default suite then passed
+**682 tests** with 57 slow tests deselected (`python -m pytest -q`; 15 warnings).
 
 Table fields: `MSE / none` is the held-out MSE divided by the *same-seed*
 unconstrained MSE (diagnostic; acceptance uses the ratio of the mean MSEs over
@@ -24,8 +25,9 @@ seeds). `Rail` is observed max |x| / 1.05·x_hard. `†` marks phase3a_core:
 that preset has no `hw_compliance`, so the rail value is diagnostic and is not
 asserted. `dt·λ` is the maximum reported value / 2. The stiffness metric samples
 32 held-out inputs. `Quant` is the largest code-grid distance; `—` means no
-quantized parameter is enabled. Nonfinite is the harness loss/gradient count;
-all rows also had finite held-out outputs.
+quantized parameter is enabled. Rows for `none` are the unconstrained reference;
+their hardware-limit columns are descriptive only. Nonfinite is the harness
+loss/gradient count; all rows also had finite held-out outputs.
 
 ## Full results (lr=0.01)
 
@@ -76,8 +78,12 @@ at the default learning rate, not a weak unconstrained reference. This was
 checked with a fair same-400-step, same-seed LR sweep at `lr=0.03` (all models,
 both tasks; prior run records in `/tmp/w5learn/lr3e-2`). The unconstrained
 Friedman2 R² remains ≥0.988 in that sweep, and all three Friedman2 constrained
-MSE ratios improve to within their proposed limits. Toy phase3a_full and
-phase3b_tm still exceed their MSE caps at lr=0.03, despite small training-loss
+MSE ratios improve to within their proposed limits. The LR=0.03 records predate
+the cache-schema fix; their only stale field was `no_grad_params` listing the
+compliance-frozen clip-sharpness values. The current builder confirms those
+parameters have `requires_grad=False`; the old run had no gradients or updates
+for them, so the reported losses/metrics remain comparable. Toy phase3a_full
+and phase3b_tm still exceed their MSE caps at lr=0.03, despite small training-loss
 ratios and a good unconstrained reference: that is a remaining constrained-model
 quality cost and/or an uncalibrated proposed cap, not a reason to loosen it
 without broader data.
@@ -119,7 +125,9 @@ and returns a deep copy of the complete network plus identity node remaps. This
 avoids rebuilding away stage-owned boundary/output-ODE/sense libraries and the
 outer GLN state in the required keep-all case. The regression test asserts the
 nonzero specialized families, full-model per-family counts, and bit-exact
-forward output for both golden nets. This is a keep-all identity fix; arbitrary
-partial pruning of shared-sense/GLN remains explicitly unsupported by the
-existing pruner. Friedman2's three-phase schedule does prune, so partial-prune
+forward output for both golden nets. The existing GLN fail-loud test now uses
+threshold 0.999 to request a real partial prune; its old threshold 0 exercised
+the newly supported keep-all identity case. This is a keep-all identity fix;
+arbitrary partial pruning of shared-sense/GLN remains explicitly unsupported by
+the existing pruner. Friedman2's three-phase schedule does prune, so partial-prune
 support for specialized Friedman2 stages remains a distinct follow-up concern.

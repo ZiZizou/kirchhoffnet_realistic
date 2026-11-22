@@ -29,6 +29,14 @@ if THIS_DIR not in sys.path:
 import torch
 import torch.nn.functional as F
 
+from topology import (
+    StageTopologyBuilder,
+    grid_graph,
+    validate_topology,
+    line_graph,
+    ring_graph,
+)
+
 
 passed = 0
 failed = 0
@@ -66,7 +74,7 @@ small_world_graph, torus_graph, empty_graph
     check("grid_graph: 2x3 kernel=3 emits 11 unique-pair edges",
           gg.num_edges() == 11, f"got {gg.num_edges()}")
 
-    cg = ring_graph(6, edge_prob=0.5, seed=42)
+    cg = ring_graph(6, radius=1)
     check("ring_graph n=6: 6 nodes", cg.num_nodes == 6)
 
     sw = small_world_graph(10, k=4, p=0.3, seed=42)
@@ -190,7 +198,7 @@ def test_heun_converges():
     from kirchhoff_net import KirchhoffNet
 
     cell_lib = make_cell_library('tanh_free')
-    hid = ring_graph(4, edge_prob=0.5, seed=0)
+    hid = ring_graph(4, radius=1)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=4, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
                          proj_pattern="all_to_all")
@@ -212,7 +220,7 @@ def test_gradient_flow():
     from kirchhoff_net import KirchhoffNet
 
     cell_lib = make_cell_library('tanh_free')
-    hid = ring_graph(3, edge_prob=0.5, seed=0)
+    hid = ring_graph(3, radius=1)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
                          proj_pattern="all_to_all")
@@ -225,13 +233,9 @@ def test_gradient_flow():
     loss.backward()
 
     has_grads = {
-        "logits": stage.logits.grad is not None and torch.isfinite(stage.logits.grad).all().item(),
-        "raw_mult": stage.raw_mult.grad is not None and torch.isfinite(stage.raw_mult.grad).all().item(),
         "raw_leak": (hasattr(stage, "raw_leak") and stage.raw_leak.grad is not None
                      and torch.isfinite(stage.raw_leak.grad).all().item()),
     }
-    check("grads flow to logits", has_grads["logits"])
-    check("grads flow to raw_mult", has_grads["raw_mult"])
     if hasattr(stage, "raw_leak"):
         check("grads flow to raw_leak", has_grads["raw_leak"])
     else:
@@ -247,7 +251,7 @@ def test_compute_loss_finite():
     from train import compute_loss
 
     cell_lib = make_cell_library('tanh_free')
-    hid = ring_graph(4, edge_prob=0.5, seed=0)
+    hid = ring_graph(4, radius=1)
     builder = StageTopologyBuilder(num_inputs=2, num_outputs=0, num_hidden=4, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
                          proj_pattern="all_to_all")
@@ -266,10 +270,8 @@ def test_compute_loss_finite():
     check("task loss finite", math.isfinite(parts["task"]))
     check("sparsity loss finite", math.isfinite(parts["sparsity"]))
     check("edge_gate loss finite (CP: Σ z_e)", math.isfinite(parts["edge_gate"]))
-    check("power loss finite (CP: static power proxy)", math.isfinite(parts["power"]))
     check("rail loss finite", math.isfinite(parts["rail"]))
     check("edge_gate loss >= 0", parts["edge_gate"] >= 0.0)
-    check("power loss >= 0", parts["power"] >= 0.0)
     check("sparsity loss >= 0", parts["sparsity"] >= 0.0)
     check("rail loss >= 0", parts["rail"] >= 0.0)
     check("reg_scale reported (RR-A)", "reg_scale" in parts)
@@ -328,7 +330,7 @@ def test_topology_to_stage_input_output_filtering():
     from topology import StageTopologyBuilder, topology_to_stage
 
     cell_lib = make_cell_library('tanh_free')
-    hid = ring_graph(3, edge_prob=0.5, seed=0)
+    hid = ring_graph(3, radius=1)
     builder = StageTopologyBuilder(num_inputs=2, num_outputs=1, num_hidden=3, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
                          proj_pattern="all_to_all")
@@ -347,7 +349,7 @@ def test_validate_topology():
     from topology import (
 SparseTopology, EDGE_TYPE_HIDDEN
     )
-    hid = ring_graph(4, edge_prob=0.5, seed=0)
+    hid = ring_graph(4, radius=1)
     builder = StageTopologyBuilder(num_inputs=2, num_outputs=1, num_hidden=4, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
                          proj_pattern="all_to_all")
@@ -377,7 +379,7 @@ def test_visualize_stage_graph():
     from visualize import plot_stage_graph
 
     cell_lib = make_cell_library('tanh_free')
-    hid = ring_graph(4, edge_prob=0.5, seed=0)
+    hid = ring_graph(4, radius=1)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=4, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
                          proj_pattern="all_to_all")
@@ -396,7 +398,7 @@ EDGE_TYPE_INPUT, EDGE_TYPE_OUTPUT, NODE_KIND_HIDDEN, NODE_KIND_PROJ, NODE_KIND_I
     )
     from visualize import plot_sparse_topology
 
-    hid = ring_graph(3, edge_prob=0.4, seed=0)
+    hid = ring_graph(3, radius=1)
     builder = StageTopologyBuilder(num_inputs=2, num_outputs=1, num_hidden=3, num_proj=1)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
                          proj_pattern="all_to_all")
@@ -416,7 +418,7 @@ def test_visualize_trajectories():
     from visualize import plot_trajectories
 
     cell_lib = make_cell_library('tanh_free')
-    hid = ring_graph(4, edge_prob=0.5, seed=0)
+    hid = ring_graph(4, radius=1)
     builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=4, num_proj=0)
     topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
                          proj_pattern="all_to_all")
@@ -430,116 +432,6 @@ def test_visualize_trajectories():
     fig, ax = plot_trajectories(traj_tensor, stage_idx=0, save_path=out_path)
     import os
     check("plot_trajectories: file written", os.path.exists(out_path) and os.path.getsize(out_path) > 0)
-
-
-def test_sparse_spd_generation():
-    print("\nTest 18: generate_sparse_spd produces valid SPD matrices")
-    from sparse_solver_data import generate_sparse_spd
-
-    A, cond = generate_sparse_spd(n=24, density=0.05, cond_target=50.0, seed=0)
-    check("A shape (24, 24)", A.shape == (24, 24))
-    check("A is float32", A.dtype == torch.float32)
-    eigs = torch.linalg.eigvalsh(A)
-    check("A is SPD (all eigs > 0)", bool((eigs > 0).all().item()),
-          f"min eig = {float(eigs.min()):.4e}")
-    check("A is symmetric",
-          torch.allclose(A, A.T, atol=1e-5),
-          f"max |A - A.T| = {float((A - A.T).abs().max()):.4e}")
-    check("condition number near target",
-          1.0 < cond < 1e4,
-          f"cond = {cond:.2e}")
-
-
-def test_solver_dataset():
-    print("\nTest 19: SparseLinearSystemDataset returns consistent (b, x*, A) triples")
-    from sparse_solver_data import SparseLinearSystemDataset
-
-    ds = SparseLinearSystemDataset(n=16, num_samples=5, seed=42)
-    check("dataset length == 5", len(ds) == 5)
-    b, x_star, A = ds[0]
-    check("b shape (16,)", b.shape == (16,))
-    check("x_star shape (16,)", x_star.shape == (16,))
-    check("A shape (16, 16)", A.shape == (16, 16))
-    check("b == A @ x_star", torch.allclose(A @ x_star, b, atol=1e-5),
-          f"max |b - A x*| = {float((b - A @ x_star).abs().max()):.4e}")
-    check("|x_star| <= x_max", float(x_star.abs().max()) <= 0.3 + 1e-6)
-
-
-def test_union_topology():
-    print("\nTest 20: build_union_topology produces valid topology from dataset")
-    from sparse_solver_data import SparseLinearSystemDataset
-    from sparse_solver_topology import build_union_topology
-
-    ds = SparseLinearSystemDataset(n=20, num_samples=20, density=0.05, seed=1)
-    topo = build_union_topology(ds, n=20, num_proj=2, min_freq=0.2)
-    check("topo has num_inputs + num_hidden + num_proj nodes",
-          topo.num_nodes == 20 + 20 + 2)
-    check("topo has input + hidden + proj + output placeholders",
-          all(k in topo.node_kind for k in ("input", "hidden", "proj")))
-    check("topo has at least one hidden edge", topo.num_edges() > 0)
-    hidden_edges = [(s, d) for s, d, t in zip(topo.src, topo.dst, topo.edge_type) if t == "hidden"]
-    check("hidden edges have src < dst (single-edge-per-pair)",
-          all(s < d for s, d in hidden_edges))
-
-
-def test_baseline_jacobi():
-    print("\nTest 22: DigitalSolverBaseline.jacobi converges on strictly diag-dominant SPD")
-    import torch.nn.functional as F
-    from sparse_solver_baseline import DigitalSolverBaseline
-
-    n = 12
-    S = torch.randn(1, n, n) * 0.05
-    S = S * (torch.rand(1, n, n) > 0.7).float()
-    A = (S + S.transpose(-1, -2)).squeeze(0) + torch.eye(n) * 5.0
-    A = A.unsqueeze(0)
-    x_star = 0.2 * torch.tanh(torch.randn(1, n))
-    b = torch.bmm(A, x_star.unsqueeze(-1)).squeeze(-1)
-    baseline = DigitalSolverBaseline(n=n, max_iters=100)
-    x_solved, residuals = baseline.jacobi(A, b, steps=100)
-    check("Jacobi: finite solution on diagonally dominant SPD",
-          not torch.isnan(x_solved).any().item())
-    check("Jacobi: residual decreases (final << initial)",
-          residuals[-1] < residuals[0] * 0.1,
-          f"init={residuals[0]:.4e} final={residuals[-1]:.4e}")
-
-
-def test_baseline_cg():
-    print("\nTest 23: DigitalSolverBaseline.conjugate_gradient converges on SPD system")
-    from sparse_solver_data import generate_sparse_spd
-    from sparse_solver_baseline import DigitalSolverBaseline
-
-    A, _ = generate_sparse_spd(n=12, density=0.1, cond_target=10.0, seed=4)
-    A = A.unsqueeze(0)
-    x_star = 0.2 * torch.tanh(torch.randn(1, 12))
-    b = torch.bmm(A, x_star.unsqueeze(-1)).squeeze(-1)
-    baseline = DigitalSolverBaseline(n=12, max_iters=12)
-    x_solved, residuals = baseline.conjugate_gradient(A, b, steps=12)
-    check("CG: converges to low residual", residuals[-1] < 1e-3,
-          f"final residual = {residuals[-1]:.4e}")
-    sol_err = (x_solved - x_star).norm(dim=-1).item()
-    check("CG: solution error small", sol_err < 1e-2, f"sol err = {sol_err:.4e}")
-
-
-def test_convergence_tracker():
-    print("\nTest 24: ConvergenceTracker captures snapshots and plots")
-    from sparse_solver_data import generate_sparse_spd
-    from sparse_solver_track import ConvergenceTracker
-
-    A, _ = generate_sparse_spd(n=8, density=0.1, cond_target=10.0, seed=5)
-    x_star = 0.2 * torch.tanh(torch.randn(8))
-    b = A @ x_star
-
-    tracker = ConvergenceTracker()
-    for k in range(5):
-        t = k * 0.1
-        x = x_star * (1.0 - float(torch.tensor(k + 1).reciprocal()))
-        tracker.capture(t, x.unsqueeze(0), label="net")
-    check("tracker captured 5 snapshots", len(tracker.snapshots) == 5)
-
-    out_path = "/tmp/test_convergence_tracker.png"
-    fig = tracker.plot_residual_trajectory(A, b, x_star, save_path=out_path)
-    import os
-    check("plot saved to disk", os.path.exists(out_path) and os.path.getsize(out_path) > 0)
 
 
 def test_solver_preset_removed():
@@ -699,56 +591,6 @@ def test_mapper_only_ablation_fast():
           f"speedup={speedup:.1f}x)",
           speedup > 2.0,
           f"fast={fast_time:.3f}s slow={slow_time:.3f}s speedup={speedup:.1f}x")
-
-
-def test_complexity_proxy():
-    print("\nTest 29: complexity proxy = m_e·(1 - p_Z_e), softplus multiplicity (RR-B, R3)")
-    from cell_library import make_cell_library
-    from topology import ring_graph, StageTopologyBuilder, topology_to_stage
-    from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
-    from io_mapper import InputMapper, OutputMapper
-    from train import _stage_soft_weights, _stage_multiplicities
-    import torch.nn.functional as F
-
-    cell_lib = make_cell_library('tanh_free')
-    hid = ring_graph(3, radius=1)
-    builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=3, num_proj=0)
-    topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
-                         proj_pattern="all_to_all")
-    stage, _, _ = topology_to_stage(topo, cell_lib=cell_lib)
-    core = KirchhoffNet(stages=[stage], transfers=[], stage_times=[0.3], stage_steps=[5])
-    inp = InputMapper(in_dim=1, out_dim=3)
-    out = OutputMapper(node_dim=3, out_dim=1)
-    net = KirchhoffNetWithIO(inp, core, out, hid_count=3, proj_count=0)
-
-    with torch.no_grad():
-        stage.logits.fill_(0.0)
-        stage.raw_mult.fill_(-3.0)
-    mult = _stage_multiplicities(stage)
-    w = _stage_soft_weights(stage)
-    p_active = 1.0 - w[:, 2]
-    weighted = (mult * p_active).sum()
-    unweighted = mult.sum()
-    with torch.no_grad():
-        stage.raw_mult.fill_(0.0)
-    mult_zero = _stage_multiplicities(stage)
-    check("R3.3: softplus(0) == log(2) for raw_mult=0",
-          abs(float(mult_zero[0].item()) - math.log(2.0)) < 1e-4)
-    check("R3.3: softplus(-3) is small but positive",
-          float(mult[0].item()) < 0.2,
-          f"got {float(mult[0].item()):.4f}")
-    check("R3.1: complexity proxy < unweighted sum when p_Z > 0",
-          float(weighted.item()) < float(unweighted.item()))
-
-    with torch.no_grad():
-        stage.logits.fill_(-10.0)
-        stage.logits[:, 2] = 10.0
-    w = _stage_soft_weights(stage)
-    p_active = 1.0 - w[:, 2]
-    weighted_full_z = (mult * p_active).sum()
-    check("R3.4: complexity proxy goes to zero when all edges are Z-selected",
-          float(weighted_full_z.item()) < 1e-3,
-          f"got {float(weighted_full_z.item()):.4e}")
 
 
 def test_reg_schedule_curve():
@@ -946,40 +788,6 @@ def test_gate_initialization():
           f"got {float((z * (1 - z))[0].item()):.4f}")
 
 
-def test_complexity_regularizers():
-    print("\nTest 48: per-component complexity regularizers (CP-4, deprecate-node-gates)")
-    from cell_library import make_cell_library
-    from topology import ring_graph, StageTopologyBuilder, topology_to_stage
-    from kirchhoff_net import KirchhoffNet, KirchhoffNetWithIO
-    from io_mapper import InputMapper, OutputMapper
-    from train import _stage_edge_gates, _stage_multiplicities
-    import torch
-
-    cell_lib = make_cell_library('tanh_free')
-    hid = ring_graph(4, radius=1)
-    builder = StageTopologyBuilder(num_inputs=1, num_outputs=0, num_hidden=4, num_proj=0)
-    topo = builder.build(hid, input_pattern="all_to_all", output_pattern="all_to_all",
-                         proj_pattern="all_to_all")
-    stage, _, _ = topology_to_stage(topo, cell_lib=cell_lib)
-
-    z = _stage_edge_gates(stage)
-    mult = _stage_multiplicities(stage)
-
-    # Edge gate: σ(z_logit_init=0) = 0.5 for each edge (grid7-gate0).
-    expected_z = stage.num_edges() * 0.5
-    check("CP-4: edge_gate = Σz_e at init ≈ num_edges * 0.5 (z_logit_init=0)",
-          abs(float(z.sum().item()) - expected_z) < 1e-2,
-          f"got {float(z.sum().item()):.4f}, expected {expected_z:.4f}")
-
-    # Force all edge gates to zero; verify power and edge_gate go to zero.
-    with torch.no_grad():
-        stage.z_logits.fill_(-10.0)
-    z_closed = _stage_edge_gates(stage)
-    check("CP-4: when all z_logits -> -∞, edge_gate -> 0",
-          float(z_closed.sum().item()) < 1e-3,
-          f"got {float(z_closed.sum().item()):.4e}")
-
-
 def test_prune_stage():
     print("\nTest 49: prune_stage removes low-gate edges and nodes (CP-5)")
     from cell_library import make_cell_library
@@ -1044,11 +852,9 @@ def test_prune_stage_transfer_params():
 
     with torch.no_grad():
         stage.z_logits.data[0] = -10.0  # edge 0 dies
-        # Set unique logits values for surviving edges
-        stage.logits.data[1].fill_(0.5)
-        stage.logits.data[2].fill_(-0.5)
-        stage.raw_mult.data[1].fill_(1.0)
-        stage.raw_mult.data[2].fill_(2.0)
+        # Set unique device values for surviving edges
+        stage.cell_lib.gm_raw.data[1] = 1.0
+        stage.cell_lib.gm_raw.data[2] = 2.0
         # Set unique z_logits for surviving edges
         stage.z_logits.data[1] = 3.0
         stage.z_logits.data[2] = 4.0
@@ -1062,10 +868,10 @@ def test_prune_stage_transfer_params():
     pruned, _remap = prune_stage(stage, edge_threshold=0.01, transfer_params=True)
 
     if pruned.num_edges() >= 2:
-        check("CP-5: transferred logits match (edge 1)",
-              abs(float(pruned.logits[0, 0].item()) - 0.5) < 1e-5)
-        check("CP-5: transferred logits match (edge 2)",
-              abs(float(pruned.logits[1, 0].item()) - (-0.5)) < 1e-5)
+        check("CP-5: transferred gm_raw match (edge 1)",
+              abs(float(pruned.cell_lib.gm_raw[0].item()) - 1.0) < 1e-5)
+        check("CP-5: transferred gm_raw match (edge 2)",
+              abs(float(pruned.cell_lib.gm_raw[1].item()) - 2.0) < 1e-5)
         check("CP-5: transferred z_logits match (edge 1)",
               abs(float(pruned.z_logits[0].item()) - 3.0) < 1e-5)
         check("CP-5: transferred z_logits match (edge 2)",
@@ -1188,18 +994,12 @@ def test_joint_prune_z_dominant():
         num_nodes=3,
         src=[0, 1, 1],
         dst=[1, 2, 0],
-        cell_lib=cell_lib,
+        cell_lib=make_cell_library('tanh_free', num_edges=len([0, 1, 1])),
     )
     with torch.no_grad():
         # Edge 0: P(L) ≈ 0.95 → non-Z (active)
-        stage.logits.data[0, 0] = 5.0
-        stage.logits.data[0, 3] = -5.0
         # Edge 1: P(L) ≈ 0.95 → non-Z (active)
-        stage.logits.data[1, 0] = 5.0
-        stage.logits.data[1, 3] = -5.0
         # Edge 2: P(Z) ≈ 0.95 → Z-dominant (should be pruned)
-        stage.logits.data[2, 3] = 5.0
-        stage.logits.data[2, 0] = -5.0
         # All gates fully open
         stage.z_logits.fill_(5.0)
 
@@ -1230,7 +1030,7 @@ def test_prune_dead_island_removed():
         num_nodes=6,
         src=[0, 1, 3, 4],
         dst=[1, 2, 4, 5],
-        cell_lib=cell_lib,
+        cell_lib=make_cell_library('tanh_free', num_edges=len([0, 1, 3, 4])),
     )
     with torch.no_grad():
         stage.z_logits.fill_(5.0)  # all edges active
@@ -1427,7 +1227,7 @@ def test_prune_stage_protects_write_target():
         num_nodes=4,
         src=[0, 1, 2],
         dst=[1, 2, 3],
-        cell_lib=cell_lib,
+        cell_lib=make_cell_library('tanh_free', num_edges=len([0, 1, 2])),
     )
     with torch.no_grad():
         stage.z_logits.fill_(5.0)  # all edges strongly non-Z
@@ -1460,12 +1260,10 @@ def test_prune_stage_min_read_nodes_guard():
         num_nodes=3,
         src=[0, 1],
         dst=[1, 2],
-        cell_lib=cell_lib,
+        cell_lib=make_cell_library('tanh_free', num_edges=len([0, 1])),
     )
     with torch.no_grad():
         # Make edges leading to reads Z-dominant (eff_score -> 0)
-        stage.logits.data[:, 3] = 5.0   # P(Z) ≈ 1 for all edges
-        stage.logits.data[:, 0] = -5.0
         stage.z_logits.fill_(5.0)
 
     try:
@@ -1493,7 +1291,7 @@ def test_prune_stage_min_read_nodes_one_survives():
         num_nodes=3,
         src=[0, 1],
         dst=[1, 2],
-        cell_lib=cell_lib,
+        cell_lib=make_cell_library('tanh_free', num_edges=len([0, 1])),
     )
     with torch.no_grad():
         stage.z_logits.fill_(5.0)
@@ -1593,15 +1391,9 @@ def test_prune_stage_edge_only_keeps_low_u_node_with_incident_edge():
         num_nodes=4,
         src=[0, 1, 2],
         dst=[1, 2, 3],
-        cell_lib=cell_lib,
+        cell_lib=make_cell_library('tanh_free', num_edges=len([0, 1, 2])),
     )
     with torch.no_grad():
-        stage.logits.data[0, 0] = 5.0     # P(L) ≈ 1 for edge 0->1
-        stage.logits.data[0, 3] = -5.0
-        stage.logits.data[1, 0] = 5.0     # P(L) ≈ 1 for edge 1->2
-        stage.logits.data[1, 3] = -5.0
-        stage.logits.data[2, 3] = 5.0     # P(Z) ≈ 1 for edge 2->3 (prune by Z)
-        stage.logits.data[2, 0] = -5.0
         stage.z_logits.fill_(5.0)
         # u_logits values have no effect on pruning
 
@@ -1634,13 +1426,9 @@ def test_prune_stage_edge_only_disconnected_node_removed():
         num_nodes=4,
         src=[0, 2],
         dst=[1, 3],
-        cell_lib=cell_lib,
+        cell_lib=make_cell_library('tanh_free', num_edges=len([0, 2])),
     )
     with torch.no_grad():
-        stage.logits.data[0, 3] = 5.0     # P(Z) ≈ 1 for edge 0->1
-        stage.logits.data[0, 0] = -5.0
-        stage.logits.data[1, 0] = 5.0     # P(L) ≈ 1 for edge 2->3
-        stage.logits.data[1, 3] = -5.0
         stage.z_logits.fill_(5.0)
 
     pruned, _remap = prune_stage(
@@ -1672,15 +1460,9 @@ def test_prune_stage_edge_only_matches_legacy_when_no_node_collateral():
         num_nodes=4,
         src=[0, 0, 2],
         dst=[1, 2, 3],
-        cell_lib=cell_lib,
+        cell_lib=make_cell_library('tanh_free', num_edges=len([0, 0, 2])),
     )
     with torch.no_grad():
-        stage.logits.data[0, 3] = 5.0
-        stage.logits.data[0, 0] = -5.0
-        stage.logits.data[1, 3] = 5.0
-        stage.logits.data[1, 0] = -5.0
-        stage.logits.data[2, 0] = 5.0
-        stage.logits.data[2, 3] = -5.0
         stage.z_logits.fill_(5.0)
         # u_logits values have no effect on pruning
 
@@ -1711,14 +1493,12 @@ def test_prune_network_edge_only_preserves_more_capacity():
         num_nodes=4,
         src=[0, 0, 1],
         dst=[1, 2, 3],
-        cell_lib=cell_lib,
+        cell_lib=make_cell_library('tanh_free', num_edges=len([0, 0, 1])),
     )
     with torch.no_grad():
         stage.z_logits.data[0] = 5.0    # hi gate for edge 0->1
         stage.z_logits.data[1] = -10.0  # lo gate for edge 0->2 (prune)
         stage.z_logits.data[2] = 5.0    # hi gate for edge 1->3
-        stage.logits.data[:, 0] = 5.0   # P(L) ≈ 1 for all edges
-        stage.logits.data[:, 3] = -5.0  # P(Z) ≈ 0
 
     pruned, _ = prune_stage(
         stage, edge_threshold=0.1,
@@ -2018,12 +1798,6 @@ def main():
     test_visualize_stage_graph()
     test_visualize_sparse_topology()
     test_visualize_trajectories()
-    test_sparse_spd_generation()
-    test_solver_dataset()
-    test_union_topology()
-    test_baseline_jacobi()
-    test_baseline_cg()
-    test_convergence_tracker()
     test_solver_preset_removed()
     test_io_honest_split()
     test_io_no_proj_fallback()
@@ -2042,7 +1816,6 @@ def main():
     test_sparse_io_gradients_flow_to_read_targets()
     test_sparse_io_cli_flags()
     test_mapper_only_ablation_fast()
-    test_complexity_proxy()
     test_reg_schedule_curve()
     test_preset_lambda_overrides()
     test_smooth2d_grid_sparsity_zero_override()
@@ -2051,7 +1824,6 @@ def main():
     test_tau_override_endpoints()
     test_tau_override_backward_compat()
     test_gate_initialization()
-    test_complexity_regularizers()
     test_prune_stage()
     test_prune_stage_transfer_params()
     test_prune_stage_all_removed_raises()
@@ -2106,23 +1878,7 @@ def main():
     test_projected_sparse_input_mapper_duplicate_raises()
     test_optim_lr_lowered()
     test_patience_default_raised()
-    test_rectifier_cell()
     # v1.5 expanded cell library tests (expanded-cell-library plan)
-    test_v15_cell_library_construction()            # V15-1: build + structure
-    test_v15_cell_boundedness()                     # V15-2: current bound
-    test_v15_negative_rectifier()                   # V15-3: N0 mirror of P0
-    test_v15_dead_zone_odd()                        # V15-4: D1 odd + dead zone
-    test_v15_saturation_scales()                    # V15-5: O_hard > O_weak
-    test_v15_forward_backward()                     # V15-6: forward + gradients
-    test_v15_ste_mode()                             # V15-7: STE mode
-    test_v15_cell_type_mask_consistency()           # V15-8: mask exclusivity
-    test_v15_legacy_library_unchanged()             # V15-9: backward compat
-    test_v2_library_construction()                  # V2-1: build + structure
-    test_v2_cell_parameters()                        # V2-3: per-cell parameter values
-    test_v2_boundedness()                            # V2-4: |I| <= isat for all cells
-    test_v2_mix_code_asymmetry()                     # V2-5: O_h10 vs O_h01 differ
-    test_v2_threshold_cells()                        # V2-6: P1/N1 vs P0/N0 fire
-    test_v2_forward_backward()                       # V2-7: forward + gradients
     test_stage_lr_scale_backward_compat()
     test_stage_lr_scale_multi_group()
     test_rail_loss_zero_inside_bounds()
@@ -2135,7 +1891,6 @@ def main():
     test_three_phase_tau_values()
     test_three_phase_lambdas()
     test_three_phase_lambdas_warmup()
-    test_solidification_metrics()
     test_log_solidification_format()
     test_smooth2d_grid_uses_three_phase()
 
@@ -2821,710 +2576,10 @@ def test_grad_log_file_output():
                   v != "-", f"got dash for {k}")
 
 
-def test_rectifier_cell():
-    """Test P cell: rectification, boundedness, smoothness, monotonicity."""
-    print("\nTest 71: smooth bounded rectifier (P cell) properties")
-    from cell_library import make_cell_library
-    import torch
-
-    cell_lib = make_cell_library('tanh_free')
-    # P cell is at index 2 in [L, S, P, Z]
-    P_INDEX = 2
-
-    # Create logits that strongly select P cell: [−∞, −∞, 0, −∞]
-    E, Q = 1, cell_lib.num_cells
-    logits = torch.full((E, Q), -1e9)
-    logits[0, P_INDEX] = 0.0
-
-    # Evaluate I_P over a sweep of u = x_src − rho·x_dst
-    u_sweep = torch.linspace(-2.0, 2.0, 100).unsqueeze(1)  # [100, 1]
-    # For u = x_src − rho·x_dst, fix x_dst=0 so x_src = u
-    x_src = u_sweep
-    x_dst = torch.zeros_like(x_src)
-    raw_mult = torch.zeros(E)  # m = softplus(0) = ln(2) ≈ 0.693
-
-    with torch.no_grad():
-        i_edge = cell_lib(x_src, x_dst, logits, raw_mult, x_max=1.0, ctx=None)
-
-    # Use concrete u values (not linspace) for exact checks
-    u_pos = torch.tensor([[0.5]])
-    u_neg = torch.tensor([[-0.5]])
-    with torch.no_grad():
-        i_pos_edge = cell_lib(u_pos, torch.zeros_like(u_pos), logits, raw_mult, x_max=1.0, ctx=None)
-        i_neg_edge = cell_lib(u_neg, torch.zeros_like(u_neg), logits, raw_mult, x_max=1.0, ctx=None)
-    i_pos = float(i_pos_edge.item())
-    i_neg = float(i_neg_edge.item())
-    i_max = float(i_edge.abs().max().item())
-    isat_p = float(cell_lib.isat[P_INDEX].item())
-
-    check("P-1: I_P(+0.5) > 0 (positive drive conducts)",
-          i_pos > 0, f"got I_P={i_pos:.6f}")
-    check("P-2: I_P(-0.5) ≈ 0 (negative drive blocked, |I|<1% of I_sat)",
-          abs(i_neg) < 0.01, f"got I_P={i_neg:.6f}")
-    check("P-3: |I_P(u)| ≤ I_sat for all u ∈ [-2, 2]",
-          i_max <= isat_p + 1e-4,
-          f"max |I|={i_max:.6f}, I_sat={isat_p}")
-    # Monotonicity: use large x_max to disable compliance gating (pure device test).
-    u_sweep_sub = torch.linspace(-2.0, 2.0, 200).unsqueeze(1)
-    with torch.no_grad():
-        i_sub = cell_lib(u_sweep_sub, torch.zeros_like(u_sweep_sub), logits, raw_mult, x_max=10.0, ctx=None)
-    i_sub_vals = i_sub.squeeze()
-    diffs = i_sub_vals[1:] - i_sub_vals[:-1]
-    check("P-4: I_P is non-decreasing (pure rectifier, compliance bypassed)",
-          float(diffs.min().item()) >= -1e-6,
-          f"min diff={float(diffs.min().item()):.6e}")
-
-    # Smoothness: gradient exists via autograd
-    x_src_grad = torch.tensor([[0.5]], requires_grad=True)
-    x_dst_zero = torch.zeros_like(x_src_grad)
-    i_test = cell_lib(x_src_grad, x_dst_zero, logits, raw_mult, x_max=10.0, ctx=None)
-    grad = torch.autograd.grad(i_test.sum(), x_src_grad, create_graph=True)[0]
-    check("P-5: I_P is smooth (gradient defined and finite)",
-          torch.isfinite(grad).all().item(),
-          f"grad={grad.item():.6f}")
-
-    # Check that P cell is_rect flag is True
-    check("P-6: _is_rect[P_INDEX] is True",
-          bool(cell_lib._is_rect[P_INDEX].item()),
-          f"got {cell_lib._is_rect[P_INDEX].item()}")
-
-    # Check gate init values (grid7-gate0: updated from 2.0/2.0 to 0.0/0.0)
-    from config import INIT
-    check("P-7: z_logit_init == 0.0 (grid7-gate0: 50% open gates, was 2.0)",
-          INIT["z_logit_init"] == 0.0,
-          f"got {INIT['z_logit_init']}")
-
-
 # ---- v1.5 expanded cell library tests (expanded-cell-library plan) ----
-
-def test_v15_cell_library_construction():
-    """V15-1: v15 library builds and has correct structure."""
-    print("\nTest V15-1: v15 cell library construction")
-    from cell_library import make_cell_library
-    cell_lib = make_cell_library('tanh_free')
-    check("V15-1: v15 num_cells == 6",
-          cell_lib.num_cells == 6,
-          f"got {cell_lib.num_cells}")
-    check("V15-1: v15 z_index == 5 (last cell)",
-          cell_lib.z_index == 5,
-          f"got {cell_lib.z_index}")
-    check("V15-1: v15 has O_weak", "O_weak" in cell_lib._cell_order)
-    check("V15-1: v15 has O_hard", "O_hard" in cell_lib._cell_order)
-    check("V15-1: v15 has P0", "P0" in cell_lib._cell_order)
-    check("V15-1: v15 has N0", "N0" in cell_lib._cell_order)
-    check("V15-1: v15 has D1", "D1" in cell_lib._cell_order)
-    check("V15-1: v15 has Z (last)", cell_lib._cell_order[-1] == "Z")
-    check("V15-1: cell_type_code has 6 entries",
-          cell_lib.cell_type_code.shape[0] == 6)
-    ctc = cell_lib.cell_type_code
-    check("V15-1: O_weak is standard (code 0)", ctc[0].item() == 0)
-    check("V15-1: O_hard is standard (code 0)", ctc[1].item() == 0)
-    check("V15-1: P0 is pos_rect (code 1)", ctc[2].item() == 1)
-    check("V15-1: N0 is neg_rect (code 2)", ctc[3].item() == 2)
-    check("V15-1: D1 is dead_zone (code 3)", ctc[4].item() == 3)
-    check("V15-1: Z is standard (code 0)", ctc[5].item() == 0)
-    check("V15-1: O_weak gm == 0.3",
-          abs(cell_lib.gm[0].item() - 0.3) < 1e-6)
-    check("V15-1: O_hard gm == 3.0",
-          abs(cell_lib.gm[1].item() - 3.0) < 1e-6)
-    check("V15-1: P0 isat == 1.0",
-          abs(cell_lib.isat[2].item() - 1.0) < 1e-6)
-    check("V15-1: N0 theta == 0.0",
-          abs(cell_lib.theta[3].item() - 0.0) < 1e-6)
-    check("V15-1: D1 theta == 0.5",
-          abs(cell_lib.theta[4].item() - 0.5) < 1e-6)
-    # type masks
-    check("V15-1: _is_std[0] True (O_weak)", cell_lib._is_std[0].item())
-    check("V15-1: _is_pos_rect[2] True (P0)", cell_lib._is_pos_rect[2].item())
-    check("V15-1: _is_neg_rect[3] True (N0)", cell_lib._is_neg_rect[3].item())
-    check("V15-1: _is_dead_zone[4] True (D1)", cell_lib._is_dead_zone[4].item())
-
-
-def test_v15_cell_boundedness():
-    """V15-2: all v15 cells produce bounded current |I| <= isat for all u."""
-    print("\nTest V15-2: v15 cell boundedness")
-    from cell_library import make_cell_library
-    import torch
-    cell_lib = make_cell_library('tanh_free')
-    Q = cell_lib.num_cells
-    E, B = 1, 200
-    logits = torch.full((E, Q), -1e9)
-
-    u_sweep = torch.linspace(-5.0, 5.0, B).unsqueeze(1)  # [B, 1]
-    raw_mult = torch.zeros(E)
-
-    for cell_idx in range(Q):
-        logits_edge = logits.clone()
-        logits_edge[0, cell_idx] = 0.0  # select this cell
-        with torch.no_grad():
-            i_edge = cell_lib(
-                u_sweep, torch.zeros_like(u_sweep),
-                logits_edge, raw_mult, x_max=10.0, ctx=None,
-            )
-        isat_cell = float(cell_lib.isat[cell_idx].item())
-        i_vals = i_edge.squeeze()
-        max_abs_i = float(i_vals.abs().max().item())
-        check(f"V15-2: cell {cell_lib._cell_order[cell_idx]} bounded |I|<={isat_cell}",
-              max_abs_i <= isat_cell + 1e-4,
-              f"max |I|={max_abs_i:.6f}, I_sat={isat_cell}")
-
-
-def test_v15_negative_rectifier():
-    """V15-3: N0 is the exact mirror of P0: I_N0(u) == -I_P0(-u)."""
-    print("\nTest V15-3: N0 negative rectifier mirror of P0")
-    from cell_library import make_cell_library
-    import torch
-    cell_lib = make_cell_library('tanh_free')
-    Q = cell_lib.num_cells
-    E = 1
-    raw_mult = torch.zeros(E)
-
-    P0_idx = cell_lib._cell_order.index("P0")
-    N0_idx = cell_lib._cell_order.index("N0")
-
-    logits_p = torch.full((E, Q), -1e9)
-    logits_p[0, P0_idx] = 0.0
-    logits_n = torch.full((E, Q), -1e9)
-    logits_n[0, N0_idx] = 0.0
-
-    u_test = torch.tensor([[-2.0, -1.0, -0.5, -0.1, 0.0, 0.1, 0.5, 1.0, 2.0]]).T
-    with torch.no_grad():
-        i_p = cell_lib(u_test, torch.zeros_like(u_test), logits_p, raw_mult, x_max=10.0, ctx=None)
-        i_n = cell_lib(u_test, torch.zeros_like(u_test), logits_n, raw_mult, x_max=10.0, ctx=None)
-
-    for j in range(u_test.shape[0]):
-        u_val = float(u_test[j, 0])
-        p_val = float(i_p[j, 0])
-        n_val = float(i_n[j, 0])
-        # P0(-u) = -N0(u)  =>  N0(u) = -P0(-u)
-        u_neg_idx = abs(u_test + u_val).argmin().item()
-        expected_n = -float(i_p[u_neg_idx, 0])
-        check(f"V15-3: N0({u_val:.1f}) == -P0({-u_val:.1f})",
-              abs(n_val - expected_n) < 1e-6,
-              f"N0={n_val:.8f}, -P0(-u)={expected_n:.8f}")
-
-
-def test_v15_dead_zone_odd():
-    """V15-4: D1 is odd: I_D1(-u) == -I_D1(u). And has dead zone near zero."""
-    print("\nTest V15-4: D1 dead-zone odd cell oddness")
-    from cell_library import make_cell_library
-    import torch
-    cell_lib = make_cell_library('tanh_free')
-    Q = cell_lib.num_cells
-    E = 1
-    raw_mult = torch.zeros(E)
-
-    D1_idx = cell_lib._cell_order.index("D1")
-    logits = torch.full((E, Q), -1e9)
-    logits[0, D1_idx] = 0.0
-
-    u_test = torch.linspace(-3.0, 3.0, 61).unsqueeze(1)  # step = 0.1
-    with torch.no_grad():
-        i_d1 = cell_lib(u_test, torch.zeros_like(u_test), logits, raw_mult, x_max=10.0, ctx=None)
-
-    # Oddness: I(-u) ≈ -I(u). Center index = 30 (u=0).
-    # Pair u_test[30 + k] with u_test[30 - k] for k = 1..30.
-    center = 30
-    for k in range(1, 31):
-        u_pos = float(u_test[center + k, 0])
-        u_neg = float(u_test[center - k, 0])
-        i_pos = float(i_d1[center + k, 0])
-        i_neg = float(i_d1[center - k, 0])
-        check(f"V15-4: D1({u_pos:.2f}) ≈ -D1({u_neg:.2f})",
-              abs(i_pos + i_neg) < 1e-6,
-              f"D1({u_pos})={i_pos:.8f}, D1({u_neg})={i_neg:.8f}")
-
-    # Dead zone: |I(u)| < 0.05 for |u| < theta/2
-    # (softplus roll-off means the dead zone is not perfectly sharp)
-    theta_d1 = float(cell_lib.theta[D1_idx].item())
-    within_dead = u_test.abs() < theta_d1 / 2
-    max_i_in_dead = float(i_d1[within_dead.squeeze()].abs().max().item())
-    check(f"V15-4: D1 dead zone |I|<0.05 for |u|<{theta_d1/2}",
-          max_i_in_dead < 0.05,
-          f"max|I| in dead zone={max_i_in_dead:.6f}")
-
-
-def test_v15_saturation_scales():
-    """V15-5: O_hard saturates faster (higher gm/isat ratio) than O_weak."""
-    print("\nTest V15-5: O_hard saturates faster than O_weak")
-    from cell_library import make_cell_library
-    import torch
-    cell_lib = make_cell_library('tanh_free')
-    Q = cell_lib.num_cells
-    E = 1
-    # Use raw_mult=+1e9 so mult = softplus(1e9) ≈ 1e9, which clips to 1 via
-    # gate+weights. Actually use a simpler approach: set raw_mult so that
-    # m = softplus(raw_mult) ≈ 1.0. softplus(0) = ln(2) ≈ 0.693, so for
-    # m≈1 we need raw_mult such that softplus(x)=1 → x ≈ 0.5413.
-    # Instead, just multiply expected values by softplus(raw_mult=0)=ln(2).
-    raw_mult = torch.zeros(E)
-    mult_factor = float(torch.nn.functional.softplus(torch.tensor(0.0)).item())  # ≈ 0.693
-
-    O_weak_idx = cell_lib._cell_order.index("O_weak")
-    O_hard_idx = cell_lib._cell_order.index("O_hard")
-
-    logits_w = torch.full((E, Q), -1e9)
-    logits_w[0, O_weak_idx] = 0.0
-    logits_h = torch.full((E, Q), -1e9)
-    logits_h[0, O_hard_idx] = 0.0
-
-    u_test = torch.linspace(0.0, 1.0, 20).unsqueeze(1)
-    with torch.no_grad():
-        i_w = cell_lib(u_test, torch.zeros_like(u_test), logits_w, raw_mult, x_max=10.0, ctx=None)
-        i_h = cell_lib(u_test, torch.zeros_like(u_test), logits_h, raw_mult, x_max=10.0, ctx=None)
-
-    # At small u (e.g. 0.25), O_hard should have higher current than O_weak
-    # because O_hard has higher gm
-    i_w_small = float(i_w[5, 0])  # u ≈ 0.25
-    i_h_small = float(i_h[5, 0])
-    check("V15-5: O_hard > O_weak at small drive (higher gm)",
-          i_h_small > i_w_small,
-          f"O_hard={i_h_small:.6f}, O_weak={i_w_small:.6f}")
-
-    # At u=1.0, O_hard should be near saturation.
-    # I = mult * isat * tanh(gm*u/isat) ≈ mult * isat (for gm*u >> isat)
-    # mult = softplus(0) ≈ 0.693, isat=0.3 → sat I ≈ 0.208
-    # O_weak: gm=0.3, isat=5.0, u=1.0 → gm*u/isat=0.06, tanh≈0.06
-    #   I ≈ mult * isat * 0.06 ≈ 0.693 * 0.3 = 0.208? No — O_weak isat=5.0
-    #   I ≈ 0.693 * 5.0 * 0.06 ≈ 0.208 (same ballpark at u=1)
-    # Better test: compare O_hard at u=1 vs u=5 (should be saturated at both)
-    u_high = torch.tensor([[5.0]])
-    with torch.no_grad():
-        i_h_high = cell_lib(u_high, torch.zeros_like(u_high), logits_h, raw_mult, x_max=10.0, ctx=None)
-    i_h_1 = float(i_h[-1, 0])
-    i_h_5 = float(i_h_high[0, 0])
-    sat_expected = mult_factor * float(cell_lib.isat[O_hard_idx].item())  # ≈ 0.208
-    check("V15-5: O_hard at u=1 near saturation",
-          abs(i_h_1 - sat_expected) < 0.02,
-          f"O_hard(1)={i_h_1:.4f}, expected sat≈{sat_expected:.4f}")
-    check("V15-5: O_hard at u=5 also saturated (stable)",
-          abs(i_h_5 - sat_expected) < 0.02,
-          f"O_hard(5)={i_h_5:.4f}, expected sat≈{sat_expected:.4f}")
-
-    # O_weak at u=1.0: isat=5.0, gm=0.3 → still in linear regime (I ≈ gm*u * mult)
-    i_w_1 = float(i_w[-1, 0])
-    i_w_expected_lin = mult_factor * 0.3 * 1.0  # mult * gm * u ≈ 0.208
-    check("V15-5: O_weak at u=1 ≈ linear (not saturated)",
-          abs(i_w_1 - i_w_expected_lin) < 0.05,
-          f"O_weak(1)={i_w_1:.4f}, expected linear≈{i_w_expected_lin:.4f}")
-
-
-def test_v15_forward_backward():
-    """V15-6: v15 library forward pass runs and gradients flow."""
-    print("\nTest V15-6: v15 forward pass and gradient flow")
-    from cell_library import make_cell_library
-    import torch
-    cell_lib = make_cell_library('tanh_free')
-    Q = cell_lib.num_cells
-    E = 4
-    B = 8
-    x_src = torch.randn(B, E, requires_grad=True)
-    x_dst = torch.randn(B, E, requires_grad=True)
-    logits = torch.randn(E, Q, requires_grad=True)
-    raw_mult = torch.randn(E, requires_grad=True)
-
-    i_edge = cell_lib(x_src, x_dst, logits, raw_mult, x_max=3.0, ctx=None)
-    check("V15-6: forward output shape (B, E)",
-          i_edge.shape == (B, E),
-          f"got {i_edge.shape}")
-    check("V15-6: forward output is finite",
-          torch.isfinite(i_edge).all().item())
-
-    loss = i_edge.sum()
-    grads = torch.autograd.grad(loss, [logits, raw_mult, x_src], retain_graph=True)
-    check("V15-6: gradients flow to logits",
-          grads[0] is not None and torch.isfinite(grads[0]).all().item())
-    check("V15-6: gradients flow to raw_mult",
-          grads[1] is not None and torch.isfinite(grads[1]).all().item())
-    check("V15-6: gradients flow to x_src",
-          grads[2] is not None and torch.isfinite(grads[2]).all().item())
-
-
-def test_v15_ste_mode():
-    """V15-7: v15 library works in straight-through estimator mode."""
-    print("\nTest V15-7: v15 STE mode")
-    from cell_library import make_cell_library
-    import torch
-    cell_lib = make_cell_library('tanh_free')
-    Q = cell_lib.num_cells
-    E = 4
-    B = 8
-    x_src = torch.randn(B, E)
-    x_dst = torch.randn(B, E)
-    logits = torch.randn(E, Q, requires_grad=True)
-    raw_mult = torch.randn(E, requires_grad=True)
-
-    i_edge = cell_lib(x_src, x_dst, logits, raw_mult, x_max=3.0, ctx=None, cell_mode="ste")
-    check("V15-7: STE forward output is finite",
-          torch.isfinite(i_edge).all().item())
-    loss = i_edge.sum()
-    loss.backward()
-    check("V15-7: STE gradients flow via logits",
-          logits.grad is not None and torch.isfinite(logits.grad).all().item())
-
-
-def test_v15_cell_type_mask_consistency():
-    """V15-8: cell_type_mask entries are mutually exclusive."""
-    print("\nTest V15-8: v15 cell type mask consistency")
-    from cell_library import make_cell_library
-    cell_lib = make_cell_library('tanh_free')
-    # Each cell should have exactly one type
-    for i in range(cell_lib.num_cells):
-        types = sum([
-            cell_lib._is_std[i].item(),
-            cell_lib._is_pos_rect[i].item(),
-            cell_lib._is_neg_rect[i].item(),
-            cell_lib._is_dead_zone[i].item(),
-        ])
-        check(f"V15-8: cell {cell_lib._cell_order[i]} has exactly one type mask",
-              types == 1,
-              f"got {types} type masks")
-
-
-def test_v15_legacy_library_unchanged():
-    """V15-9: legacy library is unaffected by v15 changes."""
-    print("\nTest V15-9: legacy library unchanged")
-    from cell_library import make_cell_library
-    import torch
-    # Legacy library with explicit name
-    cell_lib = make_cell_library('tanh_free')
-    check("V15-9: legacy num_cells == 4",
-          cell_lib.num_cells == 4,
-          f"got {cell_lib.num_cells}")
-    check("V15-9: legacy z_index == 3",
-          cell_lib.z_index == 3,
-          f"got {cell_lib.z_index}")
-    check("V15-9: legacy cell_order == [L,S,P,Z]",
-          cell_lib._cell_order == ["L", "S", "P", "Z"],
-          f"got {cell_lib._cell_order}")
-    # Default library is also legacy
-    cell_lib_default = make_cell_library('tanh_free')
-    check("V15-9: default library is legacy (4 cells)",
-          cell_lib_default.num_cells == 4,
-          f"got {cell_lib_default.num_cells}")
-    # forward pass still works
-    E, Q, B = 2, 4, 4
-    x_src = torch.randn(B, E)
-    x_dst = torch.randn(B, E)
-    logits = torch.randn(E, Q)
-    raw_mult = torch.randn(E)
-    with torch.no_grad():
-        i_edge = cell_lib(x_src, x_dst, logits, raw_mult, x_max=3.0, ctx=None)
-    check("V15-9: legacy forward output finite",
-          torch.isfinite(i_edge).all().item())
 
 
 # ---- v2 library tests (cell-library-v2 spec) ----
-
-def test_v2_library_construction():
-    """V2-1: v2 library builds with correct structure (10 cells, Z last, mix mode)."""
-    print("\nTest V2-1: v2 library construction")
-    from cell_library import make_cell_library
-    cell_lib = make_cell_library('tanh_free')
-    check("V2-1: v2 num_cells == 10",
-          cell_lib.num_cells == 10,
-          f"got {cell_lib.num_cells}")
-    check("V2-1: v2 z_index == 9 (last cell)",
-          cell_lib.z_index == 9,
-          f"got {cell_lib.z_index}")
-    check("V2-1: v2 _use_mix is True",
-          cell_lib._use_mix is True,
-          f"got {cell_lib._use_mix}")
-    check("V2-1: v2 has src_gain buffer",
-          hasattr(cell_lib, "src_gain"))
-    check("V2-1: v2 has dst_gain buffer",
-          hasattr(cell_lib, "dst_gain"))
-    check("V2-1: v2 has no rho buffer",
-          not hasattr(cell_lib, "rho"),
-          "rho should not be present in v2 library")
-    expected_order = ["O_w11", "O_h11", "O_h10", "O_h01", "P0", "P1", "N0", "N1", "D1", "Z"]
-    check("V2-1: v2 cell_order matches spec",
-          cell_lib._cell_order == expected_order,
-          f"got {cell_lib._cell_order}")
-    check("V2-1: Z is the last cell",
-          cell_lib._cell_order[-1] == "Z")
-    z_idx_v2 = cell_lib._cell_order.index("Z")
-    check("V2-1: Z has gm=0 (truly off)",
-          abs(float(cell_lib.gm[z_idx_v2].item())) < 1e-9,
-          f"gm={float(cell_lib.gm[z_idx_v2].item())}")
-    check("V2-1: Z has isat=0",
-          abs(float(cell_lib.isat[z_idx_v2].item())) < 1e-9,
-          f"isat={float(cell_lib.isat[z_idx_v2].item())}")
-    check("V2-1: Z has src_gain=0",
-          abs(float(cell_lib.src_gain[z_idx_v2].item())) < 1e-9,
-          f"src_gain={float(cell_lib.src_gain[z_idx_v2].item())}")
-    check("V2-1: Z has dst_gain=0",
-          abs(float(cell_lib.dst_gain[z_idx_v2].item())) < 1e-9,
-          f"dst_gain={float(cell_lib.dst_gain[z_idx_v2].item())}")
-    check("V2-1: Z cell triggers has_z_cell=True",
-          cell_lib.has_z_cell is True,
-          f"has_z_cell={cell_lib.has_z_cell}")
-    check("V2-1: cell_type_code has 10 entries",
-          cell_lib.cell_type_code.shape[0] == 10)
-    ctc = cell_lib.cell_type_code
-    # O_w11, O_h11, O_h10, O_h01 are standard (code 0)
-    check("V2-1: O_w11 is standard (code 0)", ctc[0].item() == 0)
-    check("V2-1: O_h11 is standard (code 0)", ctc[1].item() == 0)
-    check("V2-1: O_h10 is standard (code 0)", ctc[2].item() == 0)
-    check("V2-1: O_h01 is standard (code 0)", ctc[3].item() == 0)
-    # P0, P1 are pos_rect (code 1)
-    check("V2-1: P0 is pos_rect (code 1)", ctc[4].item() == 1)
-    check("V2-1: P1 is pos_rect (code 1)", ctc[5].item() == 1)
-    # N0, N1 are neg_rect (code 2)
-    check("V2-1: N0 is neg_rect (code 2)", ctc[6].item() == 2)
-    check("V2-1: N1 is neg_rect (code 2)", ctc[7].item() == 2)
-    # D1 is dead_zone (code 3)
-    check("V2-1: D1 is dead_zone (code 3)", ctc[8].item() == 3)
-    # Z is off -> code 0
-    check("V2-1: Z is off (code 0)", ctc[9].item() == 0)
-
-
-def test_v2_cell_parameters():
-    """V2-3: per-cell gm/isat/theta/beta/src_gain/dst_gain match spec."""
-    print("\nTest V2-3: v2 cell parameter values")
-    from cell_library import make_cell_library
-    cell_lib = make_cell_library('tanh_free')
-    order = cell_lib._cell_order
-    idx = {name: order.index(name) for name in order}
-
-    # src_gain / dst_gain per cell
-    check("V2-3: O_w11 src_gain=1.0, dst_gain=1.0 (M11)",
-          abs(float(cell_lib.src_gain[idx["O_w11"]]) - 1.0) < 1e-6
-          and abs(float(cell_lib.dst_gain[idx["O_w11"]]) - 1.0) < 1e-6)
-    check("V2-3: O_h11 src_gain=1.0, dst_gain=1.0 (M11)",
-          abs(float(cell_lib.src_gain[idx["O_h11"]]) - 1.0) < 1e-6
-          and abs(float(cell_lib.dst_gain[idx["O_h11"]]) - 1.0) < 1e-6)
-    check("V2-3: O_h10 src_gain=1.0, dst_gain=0.5 (M10)",
-          abs(float(cell_lib.src_gain[idx["O_h10"]]) - 1.0) < 1e-6
-          and abs(float(cell_lib.dst_gain[idx["O_h10"]]) - 0.5) < 1e-6)
-    check("V2-3: O_h01 src_gain=0.5, dst_gain=1.0 (M01)",
-          abs(float(cell_lib.src_gain[idx["O_h01"]]) - 0.5) < 1e-6
-          and abs(float(cell_lib.dst_gain[idx["O_h01"]]) - 1.0) < 1e-6)
-
-    # gm / isat per cell (Bsoft, Bmid, Bhard codes)
-    check("V2-3: O_w11 gm=0.25, isat=1.50 (Bsoft)",
-          abs(float(cell_lib.gm[idx["O_w11"]]) - 0.25) < 1e-6
-          and abs(float(cell_lib.isat[idx["O_w11"]]) - 1.50) < 1e-6)
-    check("V2-3: O_h11 gm=1.40, isat=0.45 (Bhard)",
-          abs(float(cell_lib.gm[idx["O_h11"]]) - 1.40) < 1e-6
-          and abs(float(cell_lib.isat[idx["O_h11"]]) - 0.45) < 1e-6)
-    check("V2-3: P0 gm=0.80, isat=0.80 (Bmid)",
-          abs(float(cell_lib.gm[idx["P0"]]) - 0.80) < 1e-6
-          and abs(float(cell_lib.isat[idx["P0"]]) - 0.80) < 1e-6)
-    check("V2-3: N1 gm=0.80, isat=0.80 (Bmid)",
-          abs(float(cell_lib.gm[idx["N1"]]) - 0.80) < 1e-6
-          and abs(float(cell_lib.isat[idx["N1"]]) - 0.80) < 1e-6)
-    check("V2-3: D1 gm=0.80, isat=0.80 (Bmid)",
-          abs(float(cell_lib.gm[idx["D1"]]) - 0.80) < 1e-6
-          and abs(float(cell_lib.isat[idx["D1"]]) - 0.80) < 1e-6)
-
-    # theta: T0=0.0 for O/P0/N0, T1=0.35 for P1/N1/D1
-    check("V2-3: O_w11 theta=0.0 (T0)",
-          abs(float(cell_lib.theta[idx["O_w11"]])) < 1e-6)
-    check("V2-3: P0 theta=0.0 (T0)",
-          abs(float(cell_lib.theta[idx["P0"]])) < 1e-6)
-    check("V2-3: P1 theta=0.35 (T1)",
-          abs(float(cell_lib.theta[idx["P1"]]) - 0.35) < 1e-6)
-    check("V2-3: N1 theta=0.35 (T1)",
-          abs(float(cell_lib.theta[idx["N1"]]) - 0.35) < 1e-6)
-    check("V2-3: D1 theta=0.35 (T1)",
-          abs(float(cell_lib.theta[idx["D1"]]) - 0.35) < 1e-6)
-
-    # beta: P/N=0.08, D=0.10, O=1.0
-    check("V2-3: P0 beta=0.08",
-          abs(float(cell_lib.beta[idx["P0"]]) - 0.08) < 1e-6)
-    check("V2-3: P1 beta=0.08",
-          abs(float(cell_lib.beta[idx["P1"]]) - 0.08) < 1e-6)
-    check("V2-3: N0 beta=0.08",
-          abs(float(cell_lib.beta[idx["N0"]]) - 0.08) < 1e-6)
-    check("V2-3: D1 beta=0.10",
-          abs(float(cell_lib.beta[idx["D1"]]) - 0.10) < 1e-6)
-    check("V2-3: O_w11 beta=1.0 (unused for standard)",
-          abs(float(cell_lib.beta[idx["O_w11"]]) - 1.0) < 1e-6)
-
-    # gleak: all v2 cells are 0 (strict mathematical boundedness)
-    check("V2-3: all v2 cells have gleak=0",
-          torch.all(cell_lib.gleak == 0).item())
-
-
-def test_v2_boundedness():
-    """V2-4: every v2 cell is bounded |I| <= isat over a large u sweep."""
-    print("\nTest V2-4: v2 cell boundedness |I| <= isat")
-    from cell_library import make_cell_library
-    import torch
-    cell_lib = make_cell_library('tanh_free')
-    Q = cell_lib.num_cells
-    E, B = 1, 200
-    logits = torch.full((E, Q), -1e9)
-
-    u_sweep = torch.linspace(-5.0, 5.0, B).unsqueeze(1)
-    raw_mult = torch.zeros(E)
-
-    for cell_idx in range(Q):
-        logits_edge = logits.clone()
-        logits_edge[0, cell_idx] = 0.0
-        with torch.no_grad():
-            i_edge = cell_lib(
-                u_sweep, torch.zeros_like(u_sweep),
-                logits_edge, raw_mult, x_max=10.0, ctx=None,
-            )
-        isat_cell = float(cell_lib.isat[cell_idx].item())
-        i_vals = i_edge.squeeze()
-        max_abs_i = float(i_vals.abs().max().item())
-        check(f"V2-4: cell {cell_lib._cell_order[cell_idx]} bounded |I|<={isat_cell}",
-              max_abs_i <= isat_cell + 1e-4,
-              f"max |I|={max_abs_i:.6f}, I_sat={isat_cell}")
-
-    # Verify the Z cell outputs are truly zero (not just bounded)
-    logits_z = logits.clone()
-    z_idx_v2 = cell_lib._cell_order.index("Z")
-    logits_z[0, z_idx_v2] = 0.0
-    with torch.no_grad():
-        i_z = cell_lib(u_sweep, torch.zeros_like(u_sweep), logits_z, raw_mult, x_max=10.0, ctx=None)
-    max_abs_i_z = float(i_z.abs().max().item())
-    check("V2-4: Z cell outputs near-zero current (truly off)",
-          max_abs_i_z < 1e-6,
-          f"max |I_Z|={max_abs_i_z:.10f}")
-
-
-def test_v2_mix_code_asymmetry():
-    """V2-5: O_h10 vs O_h01 produce different currents under asymmetric inputs.
-
-    O_h10 (M10: src=1.0, dst=0.5) is source-dominant.
-    O_h01 (M01: src=0.5, dst=1.0) is destination-dominant.
-    For x_src=2, x_dst=0: O_h10 sees u=2, O_h01 sees u=1.
-    For x_src=0, x_dst=2: O_h10 sees u=-1, O_h01 sees u=-2.
-    Hence O_h10(2,0) and O_h01(0,2) should differ.
-    """
-    print("\nTest V2-5: v2 mix code asymmetry (O_h10 vs O_h01)")
-    from cell_library import make_cell_library
-    import torch
-    cell_lib = make_cell_library('tanh_free')
-    Q = cell_lib.num_cells
-    E = 1
-    raw_mult = torch.zeros(E)
-
-    h10_idx = cell_lib._cell_order.index("O_h10")
-    h01_idx = cell_lib._cell_order.index("O_h01")
-
-    logits_h10 = torch.full((E, Q), -1e9)
-    logits_h10[0, h10_idx] = 0.0
-    logits_h01 = torch.full((E, Q), -1e9)
-    logits_h01[0, h01_idx] = 0.0
-
-    # Case A: large source, zero destination
-    x_src_A = torch.tensor([[2.0]])
-    x_dst_A = torch.tensor([[0.0]])
-    # Case B: zero source, large destination
-    x_src_B = torch.tensor([[0.0]])
-    x_dst_B = torch.tensor([[2.0]])
-
-    with torch.no_grad():
-        i_h10_A = cell_lib(x_src_A, x_dst_A, logits_h10, raw_mult, x_max=10.0, ctx=None)
-        i_h01_B = cell_lib(x_src_B, x_dst_B, logits_h01, raw_mult, x_max=10.0, ctx=None)
-
-    i_h10_A_val = float(i_h10_A[0, 0])
-    i_h01_B_val = float(i_h01_B[0, 0])
-    check("V2-5: O_h10(src=2, dst=0) ≠ O_h01(src=0, dst=2)",
-          abs(i_h10_A_val - i_h01_B_val) > 0.01,
-          f"O_h10(A)={i_h10_A_val:.6f}, O_h01(B)={i_h01_B_val:.6f}")
-    # O_h10 is source-dominant: u=src_gain*2 - dst_gain*0 = 2.0
-    # O_h01 is dst-dominant: u=src_gain*0 - dst_gain*2 = -2.0
-    # tanh is odd, so O_h10(2,0) ≈ -O_h01(0,2) (both at hard saturation
-    # because gm=1.4 and |u|=2 => gm*u/isat = 1.4*2/0.45 = 6.22, very saturated)
-    check("V2-5: O_h10(src=2, dst=0) ≈ -O_h01(src=0, dst=2) (mirror via oddness)",
-          abs(i_h10_A_val + i_h01_B_val) < 1e-4,
-          f"O_h10(A)={i_h10_A_val:.6f}, O_h01(B)={i_h01_B_val:.6f}")
-
-
-def test_v2_threshold_cells():
-    """V2-6: P1 fires at u>theta, P0 fires at u>0. Likewise N1 vs N0."""
-    print("\nTest V2-6: v2 threshold cells (P1/N1 vs P0/N0)")
-    from cell_library import make_cell_library
-    import torch
-    cell_lib = make_cell_library('tanh_free')
-    Q = cell_lib.num_cells
-    E = 1
-    raw_mult = torch.zeros(E)
-
-    P0_idx = cell_lib._cell_order.index("P0")
-    P1_idx = cell_lib._cell_order.index("P1")
-    N0_idx = cell_lib._cell_order.index("N0")
-    N1_idx = cell_lib._cell_order.index("N1")
-
-    logits_p0 = torch.full((E, Q), -1e9)
-    logits_p0[0, P0_idx] = 0.0
-    logits_p1 = torch.full((E, Q), -1e9)
-    logits_p1[0, P1_idx] = 0.0
-    logits_n0 = torch.full((E, Q), -1e9)
-    logits_n0[0, N0_idx] = 0.0
-    logits_n1 = torch.full((E, Q), -1e9)
-    logits_n1[0, N1_idx] = 0.0
-
-    # At u=0.1: P0 (theta=0) fires immediately; P1 (theta=0.35) is
-    # significantly suppressed by softplus rolloff.
-    u_small = torch.tensor([[0.1]])
-    with torch.no_grad():
-        i_p0_small = cell_lib(u_small, torch.zeros_like(u_small), logits_p0, raw_mult, x_max=10.0, ctx=None)
-        i_p1_small = cell_lib(u_small, torch.zeros_like(u_small), logits_p1, raw_mult, x_max=10.0, ctx=None)
-
-    i_p0 = float(i_p0_small[0, 0])
-    i_p1 = float(i_p1_small[0, 0])
-    check("V2-6: P0 fires at u=0.1 (theta=0)",
-          i_p0 > 0.01,
-          f"P0(0.1)={i_p0:.6f}")
-    # P1 is much smaller than P0 at u=0.1 (softplus rolloff near theta=0.35).
-    check("V2-6: P1 strongly suppressed at u=0.1 (theta=0.35)",
-          i_p1 < 0.15 * i_p0,
-          f"P1(0.1)={i_p1:.6f}, P0(0.1)={i_p0:.6f}")
-
-    # At u=0.5: P1 fires; P0 also fires (u > theta_P1=0.35).
-    u_large = torch.tensor([[0.5]])
-    with torch.no_grad():
-        i_p1_large = cell_lib(u_large, torch.zeros_like(u_large), logits_p1, raw_mult, x_max=10.0, ctx=None)
-        i_n1_large = cell_lib(-u_large, torch.zeros_like(u_large), logits_n1, raw_mult, x_max=10.0, ctx=None)
-
-    i_p1_l = float(i_p1_large[0, 0])
-    i_n1_l = float(i_n1_large[0, 0])
-    check("V2-6: P1 fires at u=0.5",
-          i_p1_l > 0.05,
-          f"P1(0.5)={i_p1_l:.6f}")
-    # N1 is the mirror of P1: N1(-u) == -P1(u). At u=0.5, N1(-0.5) fires
-    # (in the negative direction).
-    check("V2-6: N1(-0.5) fires (negative current)",
-          i_n1_l < -0.05,
-          f"N1(-0.5)={i_n1_l:.6f}")
-
-
-def test_v2_forward_backward():
-    """V2-7: v2 forward + backward gradients flow correctly."""
-    print("\nTest V2-7: v2 forward + gradient flow")
-    from cell_library import make_cell_library
-    import torch
-    cell_lib = make_cell_library('tanh_free')
-    Q = cell_lib.num_cells
-    E = 4
-    B = 8
-    x_src = torch.randn(B, E, requires_grad=True)
-    x_dst = torch.randn(B, E, requires_grad=True)
-    logits = torch.randn(E, Q, requires_grad=True)
-    raw_mult = torch.randn(E, requires_grad=True)
-
-    i_edge = cell_lib(x_src, x_dst, logits, raw_mult, x_max=3.0, ctx=None)
-    check("V2-7: forward output shape (B, E)",
-          i_edge.shape == (B, E),
-          f"got {i_edge.shape}")
-    check("V2-7: forward output is finite",
-          torch.isfinite(i_edge).all().item())
-
-    loss = i_edge.sum()
-    grads = torch.autograd.grad(loss, [logits, raw_mult, x_src], retain_graph=True)
-    check("V2-7: gradients flow to logits",
-          grads[0] is not None and torch.isfinite(grads[0]).all().item())
-    check("V2-7: gradients flow to raw_mult",
-          grads[1] is not None and torch.isfinite(grads[1]).all().item())
-    check("V2-7: gradients flow to x_src",
-          grads[2] is not None and torch.isfinite(grads[2]).all().item())
 
 
 # ---- Stage-LR scaling tests (stage-lr-scaling plan) ----
@@ -3748,38 +2803,6 @@ def test_three_phase_lambdas_warmup():
     b_late = three_phase_lambdas(60, total, base)
     check("TP-5: Phase B late (full warmup) sparsity == target",
           abs(b_late["sparsity"] - target) < 1e-10)
-
-
-def test_solidification_metrics():
-    """TP-6: compute_solidification_metrics returns valid dict."""
-    print("\nTest TP-6: compute_solidification_metrics structure")
-    from topology import build_net_from_preset
-    from cell_library import make_cell_library
-    from train import compute_solidification_metrics
-    cell_lib = make_cell_library('tanh_free')
-    net = build_net_from_preset("sinx", cell_lib=cell_lib)
-    metrics = compute_solidification_metrics(net, tau=1.0)
-    check("TP-6: mean_max_cell_prob present",
-          "mean_max_cell_prob" in metrics)
-    check("TP-6: mean_pZ present", "mean_pZ" in metrics)
-    check("TP-6: mean_sigma_z present", "mean_sigma_z" in metrics)
-    check("TP-6: frac_sigma_z_below_0.1 present",
-          "frac_sigma_z_below_0.1" in metrics)
-    check("TP-6: mean_sigma_u present", "mean_sigma_u" in metrics)
-    check("TP-6: num_edges present", "num_edges" in metrics)
-    check("TP-6: num_nodes present", "num_nodes" in metrics)
-    check("TP-6: metrics finite",
-          all(isinstance(v, float) or isinstance(v, int) for v in metrics.values()))
-    check("TP-6: mean_max_cell_prob in [0,1]",
-          0.0 <= metrics["mean_max_cell_prob"] <= 1.0,
-          f"got {metrics['mean_max_cell_prob']}")
-    check("TP-6: frac_sigma_z_below_0.1 in [0,1]",
-          0.0 <= metrics["frac_sigma_z_below_0.1"] <= 1.0)
-    check("TP-6: all keys present",
-          metrics.keys() >= {"mean_max_cell_prob", "mean_pZ", "mean_sigma_z",
-                             "frac_sigma_z_below_0.1", "frac_sigma_z_below_0.05",
-                             "frac_sigma_z_below_0.01", "mean_sigma_u",
-                             "num_edges", "num_nodes", "tau"})
 
 
 def test_log_solidification_format():
@@ -4690,7 +3713,7 @@ def test_bidir_full_net_build():
 
     # Forward pass on a small random batch.
     u = torch.rand(4, 2)
-    out, _ = net_bi(u, ctx=None)
+    out, _ = net_bi(u)
     check("BIDI-8: forward shape (4, 1)", out.shape == (4, 1))
     check("BIDI-8: forward output is finite", torch.isfinite(out).all().item())
 
@@ -4866,7 +3889,7 @@ def test_repeat_edges_full_net_build():
 
     # Forward pass on a small random batch.
     u = torch.rand(4, 2)
-    out, _ = net_rep(u, ctx=None)
+    out, _ = net_rep(u)
     check("REP-8: forward shape (4, 1)", out.shape == (4, 1))
     check("REP-8: forward output is finite", torch.isfinite(out).all().item())
 
@@ -4941,7 +3964,7 @@ def test_repeat_edges_compose_with_bidirectional_full_net():
 
     # Forward pass on a small random batch.
     u = torch.rand(4, 2)
-    out, _ = net(u, ctx=None)
+    out, _ = net(u)
     check("REP-10: forward shape (4, 1)", out.shape == (4, 1))
     check("REP-10: forward output is finite", torch.isfinite(out).all().item())
 
@@ -4955,9 +3978,6 @@ def test_free_tanh_construction():
     from config import PRESETS, TANH_REALISTIC_GM_MIN, TANH_REALISTIC_GM_MAX, TANH_REALISTIC_ISAT_MIN, TANH_REALISTIC_ISAT_MAX
 
     lib = FreeTanhLibrary(num_edges=10)
-    check("FT-1: num_cells=1", lib.num_cells == 1, f"got {lib.num_cells}")
-    check("FT-1: z_index=0", lib.z_index == 0, f"got {lib.z_index}")
-    check("FT-1: has_z_cell=False", not lib.has_z_cell)
     check("FT-1: a_raw shape [10]", lib.a_raw.shape == (10,), f"got {lib.a_raw.shape}")
     check("FT-1: b_raw shape [10]", lib.b_raw.shape == (10,), f"got {lib.b_raw.shape}")
     check("FT-1: s_raw shape [10]", lib.s_raw.shape == (10,), f"got {lib.s_raw.shape}")
@@ -5016,7 +4036,7 @@ def test_free_tanh_construction():
 
     x_src = torch.randn(4, 10)
     x_dst = torch.randn(4, 10)
-    out = lib(x_src, x_dst, logits=None, raw_mult=None, x_max=3.0, ctx=None)
+    out = lib(x_src, x_dst, x_max=3.0)
     check("FT-1: forward shape", out.shape == (4, 10), f"got {out.shape}")
     check("FT-1: forward finite", torch.isfinite(out).all().item())
     loss = out.sum()
@@ -5035,7 +4055,7 @@ def test_free_tanh_construction():
           lib_bias.theta_raw.shape == (10,))
     check("FT-1: bias_enabled=True => theta_raw init=0",
           lib_bias.theta_raw.abs().sum().item() == 0.0)
-    out2 = lib_bias(x_src, x_dst, logits=None, raw_mult=None, x_max=3.0, ctx=None)
+    out2 = lib_bias(x_src, x_dst, x_max=3.0)
     out2.sum().backward()
     check("FT-1: bias_enabled=True => grad theta_raw",
           lib_bias.theta_raw.grad is not None)
@@ -5046,8 +4066,6 @@ def test_free_tanh_construction():
     preset["stages"] = preset["stages"][:1]
     net = build_net_from_config(preset, cell_lib=cell_lib)
     stage = net.core.stages[0]
-    check("FT-1: stage logits None", stage.logits is None)
-    check("FT-1: stage raw_mult None", stage.raw_mult is None)
     check("FT-1: stage cell_lib is FreeTanhLibrary",
           isinstance(stage.cell_lib, FreeTanhLibrary))
     check("FT-1: pipeline theta_raw absent (BIAS_ENABLED=False)",

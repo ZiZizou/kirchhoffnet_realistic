@@ -1,0 +1,23 @@
+`include "constants.vams"
+`include "disciplines.vams"
+`include "hrknet_constants.vams"
+// Holds a stage node at its interstage-transferred predecessor value until release.
+// The strong conductance tracks the predecessor during the transfer boundary; it
+// vanishes smoothly at release, leaving the stage's own ODE unperturbed.
+module stage_gate(node,source);
+  inout node; input source; electrical node,source;
+  parameter real w1=1.0,w2=0.0,w3=0.0,vth=0.0,x_hard=5.714;
+  parameter integer activation=0; // 0 residual-ReLU-tanh, 1 ReLU, 2 residual
+  parameter real Vcm=`HRK_VCM,Vu=`HRK_VU;
+  parameter real release_s=1e-6,smooth_s=1e-12,g_clamp=1.0;
+  real x,y,hold;
+  analog begin
+    x=(V(source)-Vcm)/Vu;
+    if (activation==1) y=max(x,0.0);
+    else if (activation==2) y=w1*x+w2*tanh(x);
+    else y=w1*x+w2*tanh(x)+w3*max(x-vth,0.0);
+    y=min(max(y,-x_hard),x_hard);
+    hold=transition(($abstime < release_s) ? 1.0 : 0.0,0.0,smooth_s);
+    I(node) <+ g_clamp*(V(node)-(Vcm+Vu*y))*hold;
+  end
+endmodule

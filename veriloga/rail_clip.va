@@ -1,0 +1,13 @@
+`include "constants.vams"
+`include "disciplines.vams"
+`include "hrknet_constants.vams"
+module rail_clip(node);
+  inout node; electrical node;
+  parameter real x_max=4.0, sharp=0.02, Iclip=0.05;
+  parameter real Vcm=0.4, Vu=0.07;
+  real x;
+  analog begin
+    x=(V(node)-Vcm)/Vu;
+    I(node) <+ Iclip*(1.0/(1.0+limexp(-(x-x_max)/sharp))-1.0/(1.0+limexp(-(-x-x_max)/sharp)))*`HRK_IU;
+  end
+endmodule

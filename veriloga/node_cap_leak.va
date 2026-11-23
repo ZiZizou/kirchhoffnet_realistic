@@ -1,0 +1,13 @@
+`include "constants.vams"
+`include "disciplines.vams"
+`include "hrknet_constants.vams"
+module node_cap_leak(node);
+  inout node; electrical node;
+  parameter real c_eff=1.0, g_leak=0.0486, Vcm=`HRK_VCM;
+  parameter real c_phys=0.0;
+  analog begin
+    if (c_phys>0.0) I(node) <+ c_phys*ddt(V(node));
+    else I(node) <+ c_eff*`HRK_CU*ddt(V(node));
+    I(node) <+ g_leak*`HRK_GU*(V(node)-Vcm);
+  end
+endmodule

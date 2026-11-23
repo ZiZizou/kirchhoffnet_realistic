@@ -1,0 +1,84 @@
+`include "constants.vams"
+`include "disciplines.vams"
+`include "hrknet_constants.vams"
+module crossbar_accumulator(s0p,s0n,s1p,s1n,s2p,s2n,s3p,s3n,acc0,acc1,acc2);
+  input s0p,s0n,s1p,s1n,s2p,s2n,s3p,s3n;
+  inout acc0,acc1,acc2;
+  electrical s0p,s0n,s1p,s1n,s2p,s2n,s3p,s3n,acc0,acc1,acc2;
+  // W is flattened row-major: W[j*4+k], j=output and k=sense input.
+  parameter real W[0:11] = '{0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0};
+  parameter integer hw_mode=0, hw_bits=4, hw_bound=0, acc_compliance_en=0;
+  parameter real Wmax=4.0, lambda_v=0.15, x_hard=5.714285714285714;
+  parameter real Vcm=`HRK_VCM, Vu=`HRK_VU, Ut=0.03086, k_soft=2000.0;
+  real isense[0:3], i_acc[0:2];
+  real raw_w, bounded_w, lev, code, ytop, ybot, y0, sp_top, sp_bot, sp0;
+  real ftop, fbot, xa;
+  integer j, k;
+  analog begin
+    // Ideal zero-voltage branches let an OTA/current source drive each sense input;
+    // current is sampled in the branch direction p -> n.
+    V(s0p,s0n) <+ 0.0;
+    V(s1p,s1n) <+ 0.0;
+    V(s2p,s2n) <+ 0.0;
+    V(s3p,s3n) <+ 0.0;
+    isense[0]=I(s0p,s0n);
+    isense[1]=I(s1p,s1n);
+    isense[2]=I(s2p,s2n);
+    isense[3]=I(s3p,s3n);
+    lev=(2.0**hw_bits)-1.0;
+    for (j=0;j<3;j=j+1) begin
+      i_acc[j]=0.0;
+      for (k=0;k<4;k=k+1) begin
+        raw_w=W[j*4+k];
+        bounded_w=raw_w;
+        if (hw_mode && hw_bound) bounded_w=Wmax*tanh(raw_w/Wmax);
+        if (hw_mode && hw_bits>0) begin
+          // Offset-binary: sum unipolar code-column currents, then subtract
+          // the fixed replica-column current Wmax*I_sense[k].
+          code=floor(((bounded_w+Wmax)/(2.0*Wmax))*lev+0.5);
+          if(code<0.0) code=0.0;
+          if(code>lev) code=lev;
+          i_acc[j]=i_acc[j]+(code/lev)*(2.0*Wmax)*isense[k]
+                   -Wmax*isense[k];
+        end else begin
+          i_acc[j]=i_acc[j]+bounded_w*isense[k];
+        end
+      end
+    end
+    if (acc_compliance_en) begin
+      xa=(V(acc0)-Vcm)/Vu;
+      ytop=(x_hard-xa)*Vu/Ut;
+      ybot=(x_hard+xa)*Vu/Ut;
+      y0=x_hard*Vu/Ut;
+      // beta=k_soft softplus from constraints.leg_factors; normalize to x=0.
+      sp_top=(max(ytop,0.0)+ln(1.0+exp(-abs(k_soft*ytop)))/k_soft);
+      sp_bot=(max(ybot,0.0)+ln(1.0+exp(-abs(k_soft*ybot)))/k_soft);
+      sp0=(max(y0,0.0)+ln(1.0+exp(-abs(k_soft*y0)))/k_soft);
+      ftop=max(1.0-lambda_v*Vu*xa,0.0)*(1.0-exp(-sp_top))/(1.0-exp(-sp0));
+      fbot=max(1.0+lambda_v*Vu*xa,0.0)*(1.0-exp(-sp_bot))/(1.0-exp(-sp0));
+      if(i_acc[0]>=0.0) i_acc[0]=i_acc[0]*ftop;
+      else i_acc[0]=i_acc[0]*fbot;
+      xa=(V(acc1)-Vcm)/Vu;
+      ytop=(x_hard-xa)*Vu/Ut;
+      ybot=(x_hard+xa)*Vu/Ut;
+      sp_top=(max(ytop,0.0)+ln(1.0+exp(-abs(k_soft*ytop)))/k_soft);
+      sp_bot=(max(ybot,0.0)+ln(1.0+exp(-abs(k_soft*ybot)))/k_soft);
+      ftop=max(1.0-lambda_v*Vu*xa,0.0)*(1.0-exp(-sp_top))/(1.0-exp(-sp0));
+      fbot=max(1.0+lambda_v*Vu*xa,0.0)*(1.0-exp(-sp_bot))/(1.0-exp(-sp0));
+      if(i_acc[1]>=0.0) i_acc[1]=i_acc[1]*ftop;
+      else i_acc[1]=i_acc[1]*fbot;
+      xa=(V(acc2)-Vcm)/Vu;
+      ytop=(x_hard-xa)*Vu/Ut;
+      ybot=(x_hard+xa)*Vu/Ut;
+      sp_top=(max(ytop,0.0)+ln(1.0+exp(-abs(k_soft*ytop)))/k_soft);
+      sp_bot=(max(ybot,0.0)+ln(1.0+exp(-abs(k_soft*ybot)))/k_soft);
+      ftop=max(1.0-lambda_v*Vu*xa,0.0)*(1.0-exp(-sp_top))/(1.0-exp(-sp0));
+      fbot=max(1.0+lambda_v*Vu*xa,0.0)*(1.0-exp(-sp_bot))/(1.0-exp(-sp0));
+      if(i_acc[2]>=0.0) i_acc[2]=i_acc[2]*ftop;
+      else i_acc[2]=i_acc[2]*fbot;
+    end
+    I(acc0) <+ -i_acc[0];
+    I(acc1) <+ -i_acc[1];
+    I(acc2) <+ -i_acc[2];
+  end
+endmodule

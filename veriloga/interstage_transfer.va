@@ -1,0 +1,22 @@
+`include "constants.vams"
+`include "disciplines.vams"
+`include "hrknet_constants.vams"
+module interstage_transfer(in,out,enable);
+  input in,enable; output out; electrical in,out,enable;
+  parameter real w1=1.0,w2=0.0,w3=0.0,vth=0.0,x_hard=5.714,Vcm=`HRK_VCM,Vu=`HRK_VU;
+  parameter real Ron=1e3,Roff=1e12,smooth_width=1e-4,enable_width=0.01;
+  real x,y,relu_x,g_on;
+  analog begin
+    x=(V(in)-Vcm)/Vu;
+    // Stage transfer is a discrete rewrite, so use the exact torch ReLU and
+    // hard rail clamp. The constitutive current remains continuous in V(out);
+    // only its target has the expected piecewise-smooth stage function.
+    relu_x=max(x-vth,0.0);
+    y=w1*x+w2*tanh(x)+w3*relu_x;
+    y=min(max(y,-x_hard),x_hard);
+    g_on=1.0/Roff+(1.0/Ron-1.0/Roff)/(1.0+limexp(-(V(enable)-0.5)/enable_width));
+    // During the transfer phase the capacitor is rewritten toward its new
+    // value; outside the phase only the tiny off conductance remains.
+    I(out) <+ g_on*(V(out)-(Vcm+Vu*y));
+  end
+endmodule

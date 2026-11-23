@@ -1,0 +1,21 @@
+`include "constants.vams"
+`include "disciplines.vams"
+`include "hrknet_constants.vams"
+// Frozen-read legacy OTA: evaluate from held samples, inject on live state nodes.
+module ota_edge_sampled(src_hold,dst_hold,src_live,dst_live);
+  input src_hold,dst_hold; inout src_live,dst_live;
+  electrical src_hold,dst_hold,src_live,dst_live;
+  parameter real A=1.0,B=1.0,s=1.0,theta=0.0,gm=1.0,Isat=1.0;
+  parameter real z_gate=1.0,sigma_z=1.0,vca=1.0;
+  parameter real Vcm=`HRK_VCM,Vu=`HRK_VU;
+  parameter real x_max=4.0,gate_width=0.02,floor_term=0.01;
+  real xs,xd,u,gate;
+  analog begin
+    xs=(V(src_hold)-Vcm)/Vu; xd=(V(dst_hold)-Vcm)/Vu;
+    u=gm*(s*(A*xs-B*xd)+theta);
+    gate=z_gate*sigma_z*vca;
+    gate=gate/(1.0+limexp(-(x_max-abs(xs))/gate_width));
+    gate=gate/(1.0+limexp(-(x_max-abs(xd))/gate_width));
+    I(src_live,dst_live) <+ Isat*gate*(tanh(u)+floor_term*u)*`HRK_IU;
+  end
+endmodule

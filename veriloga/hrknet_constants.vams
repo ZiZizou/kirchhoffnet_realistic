@@ -1,0 +1,11 @@
+`ifndef HRKNET_CONSTANTS_VAMS
+`define HRKNET_CONSTANTS_VAMS
+// HR-KNet model/physical unit contract (Task D, handoff session 2).
+`define HRK_VDD 0.8
+`define HRK_VCM 0.4
+`define HRK_VU 0.07
+`define HRK_CU 50e-15
+`define HRK_TU (350e-9/4.660583)
+`define HRK_IU (`HRK_CU*`HRK_VU/`HRK_TU)
+`define HRK_GU (`HRK_CU/`HRK_TU)
+`endif

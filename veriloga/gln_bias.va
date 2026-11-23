@@ -1,0 +1,15 @@
+`include "constants.vams"
+`include "disciplines.vams"
+`include "hrknet_constants.vams"
+module gln_bias(u0,u1,u2,u3,trim);
+  input u0,u1,u2,u3; output trim; electrical u0,u1,u2,u3,trim;
+  parameter real w0=0.0,w1=0.0,w2=0.0,w3=0.0,bias=0.0;
+  parameter real delta_max=1.38629436112;
+  real d;
+  analog begin
+    d=bias+w0*V(u0)+w1*V(u1)+w2*V(u2)+w3*V(u3);
+    if (d>delta_max) d=delta_max;
+    if (d< -delta_max) d= -delta_max;
+    V(trim) <+ limexp(d);
+  end
+endmodule

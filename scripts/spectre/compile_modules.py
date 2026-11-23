@@ -33,6 +33,12 @@ PORTS = {
     "phase_ctrl": ("clk", "phase", "stage"),
     "stage_gate": ("node", "source"),
     "ota_edge_sampled": ("src_hold", "dst_hold", "src_live", "dst_live"),
+    "ota_edge_banked": ("src", "dst", "stage", "en"),
+    "ota_edge_sampled_banked": ("src_hold", "dst_hold", "src_live", "dst_live", "stage", "en"),
+    "shunt_banked": ("src", "dst", "stage", "en"),
+    "boundary_sense_ota_banked": ("src", "dst", "stage", "en"),
+    "node_cap_leak_banked": ("node", "stage", "en"),
+    "rail_clip_banked": ("node", "stage", "en"),
 }
 
 

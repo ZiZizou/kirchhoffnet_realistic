@@ -1,0 +1,16 @@
+`include "constants.vams"
+`include "disciplines.vams"
+`include "hrknet_constants.vams"
+// Seven-bank shunt. Stage is nearest-volt rounded/clamped [0,6]; en is smooth.
+module shunt_banked(src,dst,stage,en);
+  inout src,dst; input stage,en; electrical src,dst,stage,en;
+  parameter real G[0:6]='{0,0,0,0,0,0,0},z_gate[0:6]='{1,1,1,1,1,1,1},vca[0:6]='{1,1,1,1,1,1,1};
+  parameter integer vca_gate_shunt=0; parameter real en_width=0.01;
+  integer k; real mult,eg;
+  analog begin
+    k=integer'(floor(V(stage)+0.5)); if(k<0) k=0; if(k>6) k=6;
+    mult=z_gate[k]; if(vca_gate_shunt!=0) mult=mult*vca[k];
+    eg=1.0/(1.0+limexp(-(V(en)-0.5)/en_width));
+    I(src,dst) <+ eg*G[k]*mult*(V(src)-V(dst))*`HRK_GU;
+  end
+endmodule

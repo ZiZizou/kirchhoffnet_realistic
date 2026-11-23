@@ -1,0 +1,14 @@
+`include "constants.vams"
+`include "disciplines.vams"
+`include "hrknet_constants.vams"
+// Seven-bank rail clamp; nearest-volt stage rounded/clamped [0,6].
+module rail_clip_banked(node,stage,en);
+  inout node; input stage,en; electrical node,stage,en;
+  parameter real x_max[0:6]='{4,4,4,4,4,4,4},sharp[0:6]='{0.02,0.02,0.02,0.02,0.02,0.02,0.02},Iclip[0:6]='{0.05,0.05,0.05,0.05,0.05,0.05,0.05};
+  parameter real Vcm=`HRK_VCM,Vu=`HRK_VU,en_width=0.01; integer k; real x,eg;
+  analog begin
+    k=integer'(floor(V(stage)+0.5)); if(k<0) k=0; if(k>6) k=6;
+    x=(V(node)-Vcm)/Vu; eg=1.0/(1.0+limexp(-(V(en)-0.5)/en_width));
+    I(node) <+ eg*Iclip[k]*(1.0/(1.0+limexp(-(x-x_max[k])/sharp[k]))-1.0/(1.0+limexp(-(-x-x_max[k])/sharp[k])))*`HRK_IU;
+  end
+endmodule

@@ -11,6 +11,7 @@ def test_paper_copies_netlist_has_expected_instance_counts(tmp_path):
     assert sum(bool(re.match(r"q0_s\d+_e\d+ ", line)) for line in lines) == 7 * 22
     assert sum(" node_cap_leak " in line for line in lines) == 7 * 18
     assert sum(" boundary_sense_ota " in line and "_r" in line.split()[0] for line in lines) == 7 * 22
+    assert sum(" ota_edge_sampled " in line for line in lines) == 7 * 22
     assert sum(" crossbar_accumulator_22x7 " in line for line in lines) == 7
     assert sum(" rail_clip " in line for line in lines) == 7 * 18
     assert sum(" stage_gate " in line for line in lines) == 6 * 18

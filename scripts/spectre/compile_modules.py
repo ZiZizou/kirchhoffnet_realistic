@@ -32,6 +32,7 @@ PORTS = {
     "gln_bias": ("u0", "u1", "u2", "u3", "trim"),
     "phase_ctrl": ("clk", "phase", "stage"),
     "stage_gate": ("node", "source"),
+    "ota_edge_sampled": ("src_hold", "dst_hold", "src_live", "dst_live"),
 }
 
 

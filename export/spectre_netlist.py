@@ -61,7 +61,7 @@ def render(params, out, inputs=None, stages=None, transient=True):
     selected = range(len(resolved["stages"])) if stages is None else list(stages)
     va = Path(__file__).resolve().parents[1] / "veriloga"
     lines = ["// Legacy copies deck: sequential stage releases use cumulative t_span; earlier copies continue evolving but are not read again.", "simulator lang=spectre", f'ahdl_include "{va}/hrknet_constants.vams"']
-    for module in ("ota_edge", "shunt", "node_cap_leak", "rail_clip", "sample_hold", "boundary_sense_ota", "interstage_transfer", "phase_ctrl", "stage_gate"):
+    for module in ("ota_edge", "shunt", "node_cap_leak", "rail_clip", "sample_hold", "boundary_sense_ota", "interstage_transfer", "phase_ctrl", "stage_gate", "ota_edge_sampled"):
         lines.append(f'ahdl_include "{va}/{module}.va"')
     lines += ["parameters Vcm=0.4", "simulator lang=spectre", f"Vcm_ref (vcm_ref 0) vsource dc={_fmt(vcm)}"]
     readout_stages=[resolved["stages"][i] for i in selected]
@@ -111,7 +111,14 @@ def render(params, out, inputs=None, stages=None, transient=True):
                 held_nodes=[f"n{spec_i}_{stage_idx}_{i}" for i in range(n)]
             for edge,(src,dst) in enumerate(zip(top["src"],top["dst"])):
                 gate=_at(st["gates"]["core"],edge); vca=1.0 if vca_core is None else float(vca_core[edge])
-                lines.append(_inst(prefix+f"e{edge}",[held_nodes[src],held_nodes[dst]],"ota_edge",mode=0,A=_at(core["A"],edge),B=_at(core["B"],edge),s=_at(core["sign"],edge),theta=_at(core["theta"],edge),gm=_at(core["gm"],edge),Isat=_at(core["isat"],edge),z_gate=gate,sigma_z=1.0,vca=vca,x_max=float(setting["x_max"]),gate_width=float(core["beta_softness"]),floor_term=float(core["alpha"])))
+                if setting["freeze_read"]:
+                    ota_nodes=[held_nodes[src],held_nodes[dst],f"n{spec_i}_{stage_idx}_{src}",f"n{spec_i}_{stage_idx}_{dst}"]
+                    ota_module="ota_edge_sampled"
+                    ota_params=dict(A=_at(core["A"],edge),B=_at(core["B"],edge),s=_at(core["sign"],edge),theta=_at(core["theta"],edge),gm=_at(core["gm"],edge),Isat=_at(core["isat"],edge),z_gate=gate,sigma_z=1.0,vca=vca,x_max=float(setting["x_max"]),gate_width=float(core["beta_softness"]),floor_term=float(core["alpha"]))
+                else:
+                    ota_nodes=[held_nodes[src],held_nodes[dst]]; ota_module="ota_edge"
+                    ota_params=dict(mode=0,A=_at(core["A"],edge),B=_at(core["B"],edge),s=_at(core["sign"],edge),theta=_at(core["theta"],edge),gm=_at(core["gm"],edge),Isat=_at(core["isat"],edge),z_gate=gate,sigma_z=1.0,vca=vca,x_max=float(setting["x_max"]),gate_width=float(core["beta_softness"]),floor_term=float(core["alpha"]))
+                lines.append(_inst(prefix+f"e{edge}",ota_nodes,ota_module,**ota_params))
                 g=_at(core["conductance"],edge)
                 if g:
                     lines.append(_inst(prefix+f"sh{edge}",[f"n{spec_i}_{stage_idx}_{src}",f"n{spec_i}_{stage_idx}_{dst}"],"shunt",G=g,z_gate=gate,vca=vca,vca_gate_shunt=int(st["vca"]["gate_shunt"])))
@@ -135,7 +142,7 @@ def render(params, out, inputs=None, stages=None, transient=True):
             for sense,src in enumerate(sense_src):
                 sn=f"sense{spec_i}_{stage_idx}_{sense}"; sense_nodes.append(sn)
                 vref=_at(st["readout"]["vref"],sense)
-                ref=f"vref{spec_i}_{stage_idx}_{sense}"
+                ref=f"sense{spec_i}_{stage_idx}_{sense}n"
                 lines.append(f"{ref} ({ref} 0) vsource dc={_fmt(vcm+vu*vref)}")
                 gm=float(_gln_gm(st,"readout",rc,torch.tensor([u],dtype=torch.float64))[0,sense]); gate=_at(st["gates"]["readout"],sense); vca=1 if rvg is None else float(rvg[sense])
                 lines.append(_inst(prefix+f"r{sense}",[f"n{spec_i}_{stage_idx}_{src}",sn],"boundary_sense_ota",gm=gm,Isat=_at(rc["isat"],sense),A=_at(rc["A"],sense),B=_at(rc["B"],sense),theta=_at(rc["theta"],sense),s=_at(rc["sign"],sense),z_gate=gate*vca,alpha=float(rc["alpha"]),x_max=float(setting["x_max"]),gate_width=float(rc["beta_softness"])))

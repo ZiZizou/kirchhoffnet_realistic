@@ -94,7 +94,7 @@ def test_spectre_network_single_spec_matches_true_ode():
 
 
 def test_paper_timemux_netlist_uses_shared_fabric_and_recurring_windows(tmp_path):
-    export(DEFAULT_CKPT, tmp_path, mode="legacy", fabric="timemux", specs=1)
+    params = export(DEFAULT_CKPT, tmp_path, mode="legacy", fabric="timemux", specs=1)
     text = (tmp_path / "hrknet.scs").read_text()
     lines = text.splitlines()
     assert "shared 18-node state; seven parameter banks" in text
@@ -106,3 +106,31 @@ def test_paper_timemux_netlist_uses_shared_fabric_and_recurring_windows(tmp_path
     assert "V0_win" in text and "V0_xfer_en" in text and "V0_stage" in text
     assert "t_span[k]*Tu" in text
     assert (tmp_path / "crossbar_accumulator_banked_22x7.va").is_file()
+
+    # Parse generated control PWLs: every transition is a true step, and
+    # controls stay enabled / unclamped through each stage's evolve window.
+    waveforms = {}
+    for name in ("stage", "en", "win", "xfer_en"):
+        match = re.search(rf"^V0_{name} \({name}0 0\) vsource type=pwl wave=\[([^]]+)\]", text, re.M)
+        assert match, name
+        values = [float(v) for v in match.group(1).split()]
+        pts = list(zip(values[::2], values[1::2]))
+        waveforms[name] = pts
+        for previous, edge in zip(pts, pts[1:]):
+            if previous[1] != edge[1]:
+                assert edge[0] - previous[0] <= 1.01e-12, (name, previous, edge)
+    def at(pts, time):
+        for (t0, v0), (t1, v1) in zip(pts, pts[1:]):
+            if t0 <= time <= t1:
+                return v0 + (v1 - v0) * (time - t0) / (t1 - t0)
+        return pts[-1][1]
+    spans = [float(s["solver"]["t_span"]) * params["units"]["Tu_s"]
+             for s in params["resolved"]["stages"]]
+    evolve_start = 0.0
+    for stage, span in enumerate(spans):
+        middle = evolve_start + span / 2
+        assert at(waveforms["en"], middle) == 1.0
+        assert at(waveforms["win"], middle) == 0.0
+        assert at(waveforms["stage"], middle) == float(stage)
+        assert at(waveforms["xfer_en"], middle) == 0.0
+        evolve_start += span + min(2e-9, min(spans) / 100) * 2 + min(0.2e-9, min(spans) / 1000)

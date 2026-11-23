@@ -246,13 +246,22 @@ def render_timemux(params, out, inputs=None, stages=None, transient=True):
     capture = min(2e-9, min(spans) / 100.0)
     xfer = min(2e-9, min(spans) / 100.0)
     settle = min(0.2e-9, capture / 10.0)
-    boundary_times = [sum(spans[:k+1]) for k in range(6)]
+    boundary_overhead = capture + xfer + settle
+    boundary_times = [sum(spans[:k+1]) + k * boundary_overhead for k in range(6)]
     evolve_starts = [0.0]
     for k, tb in enumerate(boundary_times):
         evolve_starts.append(tb + capture + xfer + settle)
     stop = evolve_starts[-1] + spans[-1]
     def pwl(points):
         return "type=pwl wave=[" + " ".join(f"{_fmt(t)} {_fmt(v)}" for t,v in points) + "]"
+    def step_points(points):
+        """Expand control transitions into near-vertical PWL steps."""
+        stepped = [points[0]]
+        for edge, level in points[1:]:
+            previous_time, previous_level = stepped[-1]
+            delta = min(1e-12, (edge - previous_time) / 2.0)
+            stepped.extend(((edge - delta, previous_level), (edge, level)))
+        return stepped
     for si, u in enumerate(u_rows):
         for b, uv in enumerate(u):
             lines.append(f"V{si}_input{b} (in{si}_{b} 0) vsource dc={_fmt(vcm+vu*uv)}")
@@ -272,7 +281,7 @@ def render_timemux(params, out, inputs=None, stages=None, transient=True):
         st_points.append((stop, 6.0)); en_points.append((stop, 1.0)); win_points.append((stop, 0.0))
         xfer_points.append((stop, 0.0))
         for name, pts in (("stage", st_points), ("en", en_points), ("win", win_points), ("xfer_en", xfer_points)):
-            lines.append(f"V{si}_{name} ({name}{si} 0) vsource {pwl(pts)}")
+            lines.append(f"V{si}_{name} ({name}{si} 0) vsource {pwl(step_points(pts))}")
         # Stage-state devices are banked on the shared fabric nodes.
         for node in range(18):
             node_name=f"n{si}_{node}"

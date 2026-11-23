@@ -143,11 +143,14 @@ Run all decks and compile jobs only under `/home/annaik/Documents/kirchhoffnet_r
 
 | Comparison | Spectre | Interpreter-10 | Interpreter-1000 | Result |
 |---|---:|---:|---:|---|
-| Stage 0, canonical test row 0, node 3 at 50 ns | −0.04515359 x | −0.00894644 x | −0.00894646 x | 0.0362071 x error; unresolved |
-| Seven stages, row 0; max node error per stage | 0.03587 / 0.05109 / 0.16913 / 0.37243 / 0.99277 / 1.94579 / 2.66984 x | — | — | fails tolerance |
-| Sixteen canonical specs / logits CSV | not run | — | — | blocked by stage-0 mismatch |
+| Stage 0, canonical test row 0; maximum across all 18 nodes | trajectory | — | — | 1.23e-7 x maximum error |
+| Seven stages, row 0; max node error per stage | trajectory | — | — | 1.23e-7 / 1.90e-6 / 3.17e-6 / 4.95e-6 / 7.00e-6 / 1.03e-5 / 1.32e-5 x |
+| Sixteen canonical test specs; maximum absolute logit error | mapped final-stage voltages | 3.37e-2 | 2.72e-2 | row 12 dominates; see CSV |
+| Sixteen canonical test specs; max trajectory error per stage (vs interp-1000) | 1.06e-6 / 3.13e-6 / 1.13e-5 / 1.27e-5 / 2.81e-5 / 5.64e-5 / 1.67e-2 x | — | — | stage 6 is dominated by row 12 readout accumulators |
 
-The all-stage run completed in 18.9 s with 0 Spectre errors. Stage-0 error grows nearly linearly from 1 ns and interpreter-10/1000 agree closely, pointing to a circuit/table mapping issue rather than integration truncation. These values are diagnostic only; do not claim network equivalence.
+The stage-0 and all-stage single-spec comparisons are within 1e-4 x. Spectre completed the 16-spec deck with 0 errors in 49.6 s. Its outputs were converted off-chip using the resolved readout mapper and post-transfer. The per-spec logits and per-stage errors are recorded in [phase4_netlist_validation.csv](phase4_netlist_validation.csv). One difficult canonical spec (test row 12) still has a stage-6 readout-accumulator trajectory error of 1.67e-2 x, leading to the max logit errors above; do not claim full 16-spec network equivalence until that case is resolved.
+
+The mismatch that initially prevented stage-0 validation was missing readout conductance: the Python interpreter applies `G*(src-vref)` inside `_cell`, before readout gate and VCA. The Spectre writer now passes G into the high-impedance `boundary_sense_ota` destination-current equation in the same factor order. A separate shunt was rejected because it loads the hidden sense source. Later stages also needed each sample-and-hold clock delayed to acquire the final transferred state before release; the pulse now provides 20 RC constants of settling. The remaining test-row-12 late-stage discrepancy is not explained by per-sense current or crossbar wiring: at local stage-6 time 0.333 Tu, all 22 saved `I(dst)` values agree with the generated OTA equation to <1e-8 Iu, the flattened W parameter array matches the table to <4.5e-16, and the measured accumulator-node derivatives agree with `stage_rhs` at the measured state within 3.6e-5 x/Tu. The error is concentrated in stage-6 accumulator trajectories (up to 1.67e-2 x); its precise cause remains open.
 
 
 Stage-gate standalone characterization (Spectre 23.1, 50 fF node, 1 S clamp, 10 ns release): after the initial 1 ns settling interval, maximum pre-release error was 2.27e-9 x; measured series-probe current after release (>11 ns) was 0 A. `compile_modules.py --module stage_gate` passed with 0 errors / 0 warnings.

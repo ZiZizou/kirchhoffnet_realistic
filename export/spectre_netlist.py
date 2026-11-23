@@ -50,9 +50,31 @@ def _spec_inputs(resolved, count, inputs):
 
 def render(params, out, inputs=None, stages=None, transient=True):
     """Render a legacy copies deck. ``inputs`` are the raw physical spec rows."""
-    if params.get("mode") != "legacy" or params.get("fabric") != "copies":
-        raise ValueError("Spectre network writer supports only legacy/copies")
+    mode = params.get("mode", "legacy")
+    if mode not in {"legacy", "hw"} or params.get("fabric") != "copies":
+        raise ValueError("Spectre network writer supports legacy|hw copies")
     resolved = params.get("resolved", params)
+    if mode == "hw":
+        # First validated hardware slice: phase3a_core only. Keep this an
+        # explicit allowlist; unsupported forward-affecting flags must never
+        # silently fall through to legacy equations.
+        flags = resolved.get("hw_flags", {})
+        expected = {"hw_slope_bound": True, "hw_ic_coupling": True,
+                    "hw_no_alpha": True, "hw_ab_mode": "cap_divider",
+                    "hw_ab_bits": 3, "hw_ab_rmax": 2.0}
+        for key, value in expected.items():
+            if flags.get(key) != value:
+                raise ValueError(f"hw netlist currently requires phase3a_core {key}={value!r}")
+        allowed = set(expected)
+        defaults = {"hw_ab_mode": None, "hw_ab_bits": 3, "hw_ab_rmax": 2.0,
+                    "hw_slope_g_min": 0.0625, "hw_xbar_mode": "signed",
+                    "hw_gln_delta_max": 1.3862943611198906,
+                    "hw_c_node": None, "hw_gln_mode": None,
+                    "hw_mismatch_sigma": None, "hw_vca_bits": None,
+                    "hw_vref_bits": None, "hw_xbar_bits": None}
+        active = [k for k, v in flags.items() if k not in allowed and v != defaults.get(k, False)]
+        if active:
+            raise ValueError("hw netlist does not support flags: " + ", ".join(sorted(active)))
     n_specs = int(params.get("specs", 1))
     u_rows = _spec_inputs(resolved, n_specs, inputs)
     units = params.get("units", {})
@@ -125,6 +147,18 @@ def render(params, out, inputs=None, stages=None, transient=True):
                 else:
                     ota_nodes=[held_nodes[src],held_nodes[dst]]; ota_module="ota_edge"
                     ota_params=dict(mode=0,A=_at(core["A"],edge),B=_at(core["B"],edge),s=_at(core["sign"],edge),theta=_at(core["theta"],edge),gm=_at(core["gm"],edge),Isat=_at(core["isat"],edge),z_gate=gate,sigma_z=1.0,vca=vca,x_max=float(setting["x_max"]),gate_width=float(core["beta_softness"]),floor_term=float(core["alpha"]))
+                if mode == "hw":
+                    codes=core.get("ab_codes")
+                    if not codes:
+                        raise ValueError("phase3a_core hardware export requires resolved cap-divider codes")
+                    hw_params=dict(mode=1, ab_mode=3,
+                                   cap_code_a=int(codes["k_A"][edge]),
+                                   cap_code_b=int(codes["k_B"][edge]),
+                                   cap_bits=int(codes["levels"]).bit_length(),
+                                   cap_rmax=float(codes["rmax"]), gm=1.0,
+                                   g_hw=_at(core["gm"],edge), f_ic=1.0,
+                                   floor_term=0.0)
+                    ota_params.update(hw_params)
                 lines.append(_inst(prefix+f"e{edge}",ota_nodes,ota_module,**ota_params))
                 g=_at(core["conductance"],edge)
                 if g:

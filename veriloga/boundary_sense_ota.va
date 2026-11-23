@@ -5,7 +5,7 @@
 // ideal source and Vref ports; this named module documents the block contract.
 module boundary_sense_ota(src,dst);
   inout src,dst; electrical src,dst;
-  parameter real gm=1.0,Isat=1.0,A=1.0,B=1.0,theta=0.0,s=1.0,z_gate=1.0;
+  parameter real gm=1.0,Isat=1.0,G=0.0,A=1.0,B=1.0,theta=0.0,s=1.0,z_gate=1.0;
   parameter real Vcm=`HRK_VCM,Vu=`HRK_VU;
   parameter real alpha=0.01,x_max=4.0,gate_width=0.02,sigma_z=1.0;
   real xs,xd,u,gate;
@@ -19,6 +19,9 @@ module boundary_sense_ota(src,dst);
     // High-impedance input: the sensed source voltage controls an output
     // current supplied by the rails, so only the destination receives load.
     // Negative branch current injects positive torch-convention current into dst.
-    I(dst) <+ -Isat*gate*(tanh(u)+alpha*u)*`HRK_IU;
+    // Conductive readout term is part of _cell, before its gate/VCA
+    // multiplier. Keep the source high-impedance: only the sensed output
+    // current is drawn from the destination/reference terminal.
+    I(dst) <+ -(Isat*(tanh(u)+alpha*u)+G*(xs-xd))*gate*`HRK_IU;
   end
 endmodule

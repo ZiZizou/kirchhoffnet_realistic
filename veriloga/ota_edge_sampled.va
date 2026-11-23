@@ -16,6 +16,7 @@ module ota_edge_sampled(src_hold,dst_hold,src_live,dst_live);
   analog begin
     xs=(V(src_hold)-Vcm)/Vu; xd=(V(dst_hold)-Vcm)/Vu;
     aa=A; bb=B;
+    if (mode==1 && ab_mode==2) begin aa=1.0; bb=1.0; end
     if (mode==1 && ab_mode==3) begin
       aa=1.0/cap_rmax+(1.0-1.0/cap_rmax)*cap_code_a/(2.0**cap_bits-1.0);
       bb=1.0/cap_rmax+(1.0-1.0/cap_rmax)*cap_code_b/(2.0**cap_bits-1.0);

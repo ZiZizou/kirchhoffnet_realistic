@@ -59,12 +59,21 @@ def render(params, out, inputs=None, stages=None, transient=True):
         # explicit allowlist; unsupported forward-affecting flags must never
         # silently fall through to legacy equations.
         flags = resolved.get("hw_flags", {})
-        expected = {"hw_slope_bound": True, "hw_ic_coupling": True,
-                    "hw_no_alpha": True, "hw_ab_mode": "cap_divider",
-                    "hw_ab_bits": 3, "hw_ab_rmax": 2.0}
+        ab_mode = flags.get("hw_ab_mode")
+        if ab_mode == "cap_divider":
+            expected = {"hw_slope_bound": True, "hw_ic_coupling": True,
+                        "hw_no_alpha": True, "hw_ab_mode": "cap_divider",
+                        "hw_ab_bits": 3, "hw_ab_rmax": 2.0}
+            preset_name = "phase3a_core"
+        elif ab_mode == "differential":
+            expected = {"hw_slope_bound": True, "hw_ic_coupling": True,
+                        "hw_no_alpha": True, "hw_ab_mode": "differential"}
+            preset_name = "phase3a_core_diff"
+        else:
+            raise ValueError("hw netlist currently supports phase3a_core and phase3a_core_diff only")
         for key, value in expected.items():
             if flags.get(key) != value:
-                raise ValueError(f"hw netlist currently requires phase3a_core {key}={value!r}")
+                raise ValueError(f"hw netlist currently requires {preset_name} {key}={value!r}")
         allowed = set(expected)
         defaults = {"hw_ab_mode": None, "hw_ab_bits": 3, "hw_ab_rmax": 2.0,
                     "hw_slope_g_min": 0.0625, "hw_xbar_mode": "signed",
@@ -148,16 +157,20 @@ def render(params, out, inputs=None, stages=None, transient=True):
                     ota_nodes=[held_nodes[src],held_nodes[dst]]; ota_module="ota_edge"
                     ota_params=dict(mode=0,A=_at(core["A"],edge),B=_at(core["B"],edge),s=_at(core["sign"],edge),theta=_at(core["theta"],edge),gm=_at(core["gm"],edge),Isat=_at(core["isat"],edge),z_gate=gate,sigma_z=1.0,vca=vca,x_max=float(setting["x_max"]),gate_width=float(core["beta_softness"]),floor_term=float(core["alpha"]))
                 if mode == "hw":
-                    codes=core.get("ab_codes")
-                    if not codes:
-                        raise ValueError("phase3a_core hardware export requires resolved cap-divider codes")
-                    hw_params=dict(mode=1, ab_mode=3,
-                                   cap_code_a=int(codes["k_A"][edge]),
-                                   cap_code_b=int(codes["k_B"][edge]),
-                                   cap_bits=int(codes["levels"]).bit_length(),
-                                   cap_rmax=float(codes["rmax"]), gm=1.0,
+                    if flags.get("hw_ab_mode") == "cap_divider":
+                        codes=core.get("ab_codes")
+                        if not codes:
+                            raise ValueError("phase3a_core hardware export requires resolved cap-divider codes")
+                        ab_params=dict(ab_mode=3,
+                                       cap_code_a=int(codes["k_A"][edge]),
+                                       cap_code_b=int(codes["k_B"][edge]),
+                                       cap_bits=int(codes["levels"]).bit_length(),
+                                       cap_rmax=float(codes["rmax"]))
+                    else:
+                        ab_params=dict(ab_mode=2)
+                    hw_params=dict(mode=1, gm=1.0,
                                    g_hw=_at(core["gm"],edge), f_ic=1.0,
-                                   floor_term=0.0)
+                                   floor_term=0.0, **ab_params)
                     ota_params.update(hw_params)
                 lines.append(_inst(prefix+f"e{edge}",ota_nodes,ota_module,**ota_params))
                 g=_at(core["conductance"],edge)

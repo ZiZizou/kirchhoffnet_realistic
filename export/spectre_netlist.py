@@ -297,12 +297,21 @@ def render_timemux(params, out, inputs=None, stages=None, transient=True):
             lines.append(f"ic {node_name}={_fmt(vcm)}")
             # Boundary-start sample for transfer; independent evolve-start
             # sample for freeze_read so neither overwrites the other.
+            # Sample boundary state before transfer begins. PWL point lists must
+            # use near-vertical edges; otherwise Spectre interpolates across the
+            # long interval between pulses and the sample switch stays enabled.
             bc_clock=[(0.0,0.0)]
-            for tb in boundary_times: bc_clock += [(tb+settle,1.0),(tb+settle+capture,0.0)]
-            read_clock=[(0.0,0.0)]
-            for t in evolve_starts: read_clock += [(t+settle,1.0),(t+settle+capture,0.0)]
-            lines.append(f"Vbc{si}_{node} (bcclk{si}_{node} 0) vsource {pwl(bc_clock)}")
-            lines.append(f"Vrc{si}_{node} (rclk{si}_{node} 0) vsource {pwl(read_clock)}")
+            sample_margin=min(5e-12,capture/10.0)
+            for tb in boundary_times: bc_clock += [(tb,1.0),(tb+capture-sample_margin,0.0)]
+            # Freeze-read samples the stage-entry state. For stage 0, capture
+            # the initial condition with a short pulse; subsequent stages use
+            # the settled post-transfer interval immediately before en rises.
+            read_clock=[(0.0,0.0),(1e-12,1.0),(3e-12,0.0)]
+            for k in range(1,7):
+                t=evolve_starts[k]
+                read_clock += [(t-settle,1.0),(t,0.0)]
+            lines.append(f"Vbc{si}_{node} (bcclk{si}_{node} 0) vsource {pwl(step_points(bc_clock))}")
+            lines.append(f"Vrc{si}_{node} (rclk{si}_{node} 0) vsource {pwl(step_points(read_clock))}")
             lines.append(_inst(f"q{si}_bhold{node}",[node_name,f"bhold{si}_{node}",f"bcclk{si}_{node}"],"sample_hold",C_hold=1e-15,R_on=1e3,R_off=1e12))
             lines.append(_inst(f"q{si}_rhold{node}",[node_name,f"rhold{si}_{node}",f"rclk{si}_{node}"],"sample_hold",C_hold=1e-15,R_on=1e3,R_off=1e12))
             trw1=[_at(t["residual_w1"],node) for t in resolved["transfers"]]
@@ -363,7 +372,9 @@ def render_timemux(params, out, inputs=None, stages=None, transient=True):
                 refs.append(vcm+vu*_at(s["readout"]["vref"],sense))
             refpts=[(0.0,refs[0])]
             for k,t in enumerate(boundary_times): refpts.append((evolve_starts[k+1],refs[k+1]))
-            lines.append(f"Vref{si}_{sense} (ref{si}_{sense} 0) vsource {pwl(refpts)}")
+            # Each bank's reference is a held stage constant, not a ramp over
+            # the preceding evolve window.
+            lines.append(f"Vref{si}_{sense} (ref{si}_{sense} 0) vsource {pwl(step_points(refpts))}")
             lines.append(_inst(f"q{si}_r{sense}",[f"n{si}_{src}",f"sense{si}_{sense}",f"stage{si}",f"en{si}"],"boundary_sense_ota_banked",**{k:"["+" ".join(map(_fmt,v))+"]" for k,v in rvals.items()},z_gate="["+" ".join(map(_fmt,rg))+"]",alpha=float(rcs[0]["alpha"])))
         weights=[]
         for st in all_stages:

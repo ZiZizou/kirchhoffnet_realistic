@@ -103,9 +103,16 @@ def render(params, out, inputs=None, stages=None, transient=True):
             vca_core=None if gains is None else gains[0].tolist()
             held_nodes=[]
             if setting["freeze_read"]:
+                release_time=sum(float(resolved["stages"][j]["solver"]["t_span"]) for j in range(stage_idx))*tu
+                if stage_idx:
+                    # Acquire before the stage is released so the sample tracks
+                    # the final transferred state and settles for 20 RC constants.
+                    capture_delay=max(1e-12,release_time-21e-12); capture_width="20p"
+                else:
+                    capture_delay=1e-12; capture_width="2p"
                 for node in range(n):
                     hold=f"hold{spec_i}_{stage_idx}_{node}"; held_nodes.append(hold)
-                    lines.append(f"Vclk{spec_i}_{stage_idx}_{node} (clk{spec_i}_{stage_idx}_{node} 0) vsource type=pulse val0=0 val1=1 delay=1p rise=1p fall=1p width=2p period=1e30")
+                    lines.append(f"Vclk{spec_i}_{stage_idx}_{node} (clk{spec_i}_{stage_idx}_{node} 0) vsource type=pulse val0=0 val1=1 delay={_fmt(capture_delay)} rise=1p fall=1p width={capture_width} period=1e30")
                     lines.append(_inst(prefix+f"fh{node}",[f"n{spec_i}_{stage_idx}_{node}",hold,f"clk{spec_i}_{stage_idx}_{node}"],"sample_hold",C_hold=1e-15,R_on=1e3,R_off=1e12))
             else:
                 held_nodes=[f"n{spec_i}_{stage_idx}_{i}" for i in range(n)]

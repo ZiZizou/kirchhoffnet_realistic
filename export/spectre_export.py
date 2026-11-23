@@ -276,18 +276,17 @@ def export_model(model, out, mode="legacy", fabric="timemux", specs=16, hw_confi
       "digital_offchip_keys":[k for k,v in entries.items() if v["kind"]=="digital_offchip"]}}
     out=Path(out); out.mkdir(parents=True,exist_ok=True)
     (out/"params.json").write_text(json.dumps(params,indent=2)+"\n")
-    va=Path(__file__).resolve().parents[1]/"veriloga"
-    lines=[f'// generated mode={mode} fabric={fabric}', f'ahdl_include "{va}/hrknet_constants.vams"',
-      f'ahdl_include "{va}/ota_edge.va"', 'simulator lang=spectre', 'parameters Vcm=0.4']
-    for i in range(int(specs)):
-      lines += [f'Vspec{i} (in{i} 0) vsource dc=0.4']
-    for k,v in entries.items():
-      if k.endswith("src") and v["kind"]=="topology":
-        vals=v["value"]
-        if isinstance(vals,list):
-          for j,_ in enumerate(vals): lines.append(f'// edge {j}: topology indices are recorded in params.json')
-    lines += ['tran tran stop=350n']
-    (out/"hrknet.scs").write_text("\n".join(lines)+"\n")
+    if mode == "legacy" and fabric == "copies":
+      from .spectre_netlist import render
+      render(params, out/"hrknet.scs")
+    else:
+      va=Path(__file__).resolve().parents[1]/"veriloga"
+      lines=[f'// generated mode={mode} fabric={fabric}', f'ahdl_include "{va}/hrknet_constants.vams"',
+        f'ahdl_include "{va}/ota_edge.va"', 'simulator lang=spectre', 'parameters Vcm=0.4']
+      for i in range(int(specs)):
+        lines += [f'Vspec{i} (in{i} 0) vsource dc=0.4']
+      lines += ['tran tran stop=350n']
+      (out/"hrknet.scs").write_text("\n".join(lines)+"\n")
     return params
 
 def export(checkpoint, out, mode="legacy", fabric="timemux", specs=16, hw_config=None):

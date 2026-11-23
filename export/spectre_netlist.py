@@ -1,0 +1,150 @@
+"""Spectre writer for the legacy copied-fabric network.
+
+The crossbar is tiled from the checked-in fixed 4x3 Verilog-A primitive.
+Input-dependent VCA and GLN gains are resolved in Python once per inference
+specification and passed as scalar Verilog-A instance parameters.
+"""
+from __future__ import annotations
+
+import math
+from pathlib import Path
+
+import torch
+
+from .netlist_interp import _gain, _gln_gm, _t
+
+
+def _flat(v):
+    if isinstance(v, (list, tuple)):
+        return v
+    return [v]
+
+
+def _at(v, i):
+    a = _flat(v)
+    return float(a[i if len(a) > 1 else 0])
+
+
+def _fmt(v):
+    return f"{float(v):.16g}"
+
+
+def _inst(name, nodes, module, **params):
+    p = " ".join(f"{k}={_fmt(v) if isinstance(v, (float, int)) else v}" for k, v in params.items())
+    return f"{name} ({' '.join(nodes)}) {module}" + (f" {p}" if p else "")
+
+
+def _spec_inputs(resolved, count, inputs):
+    if inputs is None:
+        return [[0.0] * len(resolved["input"]["log_min"]) for _ in range(count)]
+    rows = torch.as_tensor(inputs, dtype=torch.float64)
+    if rows.ndim == 1:
+        rows = rows.unsqueeze(0)
+    if rows.shape[0] != count:
+        raise ValueError(f"expected {count} specs, got {rows.shape[0]}")
+    log_min = _t(resolved["input"]["log_min"], rows)
+    log_max = _t(resolved["input"]["log_max"], rows)
+    u = (2 * (torch.log10(rows.clamp(min=1e-12)) - log_min) / (log_max-log_min).clamp(min=1e-8)-1).clamp(-float(resolved["input"]["input_rail"]), float(resolved["input"]["input_rail"]))
+    return u.tolist()
+
+
+def render(params, out, inputs=None, stages=None, transient=True):
+    """Render a legacy copies deck. ``inputs`` are the raw physical spec rows."""
+    if params.get("mode") != "legacy" or params.get("fabric") != "copies":
+        raise ValueError("Spectre network writer supports only legacy/copies")
+    resolved = params.get("resolved", params)
+    n_specs = int(params.get("specs", 1))
+    u_rows = _spec_inputs(resolved, n_specs, inputs)
+    units = params.get("units", {})
+    vu = float(units.get("Vu_V", 0.07)); vcm = float(units.get("Vcm_V", 0.4))
+    tu = float(units.get("Tu_s", 350e-9/4.660583)); dtmax = tu * min(float(s["solver"]["t_span"])/int(s["solver"]["num_steps"]) for s in resolved["stages"]) / 10
+    selected = range(len(resolved["stages"])) if stages is None else list(stages)
+    va = Path(__file__).resolve().parents[1] / "veriloga"
+    lines = ["simulator lang=spectre", f'ahdl_include "{va}/hrknet_constants.vams"']
+    for module in ("ota_edge", "shunt", "node_cap_leak", "rail_clip", "sample_hold", "boundary_sense_ota", "interstage_transfer", "phase_ctrl"):
+        lines.append(f'ahdl_include "{va}/{module}.va"')
+    lines += ["parameters Vcm=0.4", "simulator lang=spectre"]
+    readout_stages=[resolved["stages"][i] for i in selected]
+    sense_count=max(len(s["topology"]["readout_sense_src"]) for s in readout_stages)
+    output_count=max(len(s["readout"]["crossbar_W"]) for s in readout_stages)
+    sense_ports=[f"s{k}p,s{k}n" for k in range(sense_count)]
+    acc_ports=[f"acc{j}" for j in range(output_count)]
+    ports=",".join(sense_ports+acc_ports)
+    decl="\n".join([f"  input s{k}p,s{k}n; electrical s{k}p,s{k}n;" for k in range(sense_count)]+[f"  inout acc{j}; electrical acc{j};" for j in range(output_count)])
+    wlen=sense_count*output_count
+    sums="\n".join([f"    V(s{k}p,s{k}n) <+ 0.0; isense[{k}]=I(s{k}p,s{k}n);" for k in range(sense_count)])
+    calc="\n".join([f"    i_acc[{j}]=0.0;"+"".join([f" i_acc[{j}]=i_acc[{j}]+W[{j*sense_count+k}]*isense[{k}];" for k in range(sense_count)])+f" I(acc{j}) <+ -i_acc[{j}];" for j in range(output_count)])
+    wdefault="'{"+",".join("0.0" for _ in range(wlen))+"}"
+    crossbar_va=chr(10).join(['`include "constants.vams"', '`include "disciplines.vams"', f'`include "{va}/hrknet_constants.vams"', f"module crossbar_accumulator_{sense_count}x{output_count}({ports});", decl, f"  parameter real W[0:{wlen-1}]={wdefault};", f"  real isense[0:{sense_count-1}],i_acc[0:{output_count-1}];", "  analog begin", sums, calc, "  end", "endmodule", ""])
+    crossbar_path=Path(out).parent/f"crossbar_accumulator_{sense_count}x{output_count}.va"
+    crossbar_path.write_text(crossbar_va)
+    lines.append(f'ahdl_include "{crossbar_path}"')
+    for spec_i, u in enumerate(u_rows):
+        for b, uv in enumerate(u):
+            lines.append(f"V{spec_i}_input{b} (in{spec_i}_{b} 0) vsource dc={_fmt(vcm+vu*uv)}")
+        for stage_idx in selected:
+            st = resolved["stages"][stage_idx]; top = st["topology"]; setting=st["settings"]
+            prefix=f"q{spec_i}_s{stage_idx}_"; n=int(st["num_nodes"])
+            for node in range(n):
+                lines.append(_inst(prefix+f"cap{node}",[f"n{spec_i}_{stage_idx}_{node}"],"node_cap_leak",c_eff=float(setting["c_eff"]),g_leak=_at(setting["leak"],node)))
+                lines.append(_inst(prefix+f"clip{node}",[f"n{spec_i}_{stage_idx}_{node}"],"rail_clip",x_max=float(setting["x_max"]),sharp=float(setting["clip_sharpness"]),Iclip=float(setting["clip_current"])))
+            core=st["cells"]["core"]
+            gains=_gain(torch.tensor([u],dtype=torch.float64),st["vca"],"core")
+            vca_core=None if gains is None else gains[0].tolist()
+            held_nodes=[]
+            if setting["freeze_read"]:
+                for node in range(n):
+                    hold=f"hold{spec_i}_{stage_idx}_{node}"; held_nodes.append(hold)
+                    lines.append(f"Vclk{spec_i}_{stage_idx}_{node} (clk{spec_i}_{stage_idx}_{node} 0) vsource type=pulse val0=0 val1=1 delay=1p rise=1p fall=1p width=2p period=1e30")
+                    lines.append(_inst(prefix+f"fh{node}",[f"n{spec_i}_{stage_idx}_{node}",hold,f"clk{spec_i}_{stage_idx}_{node}"],"sample_hold",C_hold=1e-15,R_on=1e3,R_off=1e12))
+            else:
+                held_nodes=[f"n{spec_i}_{stage_idx}_{i}" for i in range(n)]
+            for edge,(src,dst) in enumerate(zip(top["src"],top["dst"])):
+                gate=_at(st["gates"]["core"],edge); vca=1.0 if vca_core is None else float(vca_core[edge])
+                lines.append(_inst(prefix+f"e{edge}",[held_nodes[src],held_nodes[dst]],"ota_edge",mode=0,A=_at(core["A"],edge),B=_at(core["B"],edge),s=_at(core["sign"],edge),theta=_at(core["theta"],edge),gm=_at(core["gm"],edge),Isat=_at(core["isat"],edge),z_gate=gate,sigma_z=1.0,vca=vca,x_max=float(setting["x_max"]),gate_width=float(core["beta_softness"]),floor_term=float(core["alpha"])))
+                g=_at(core["conductance"],edge)
+                if g:
+                    lines.append(_inst(prefix+f"sh{edge}",[f"n{spec_i}_{stage_idx}_{src}",f"n{spec_i}_{stage_idx}_{dst}"],"shunt",G=g,z_gate=gate,vca=vca,vca_gate_shunt=int(st["vca"]["gate_shunt"])))
+            # Boundary OTAs use the physical input sources and live destination.
+            bc=st["cells"]["boundary"]
+            vg=_gain(torch.tensor([u],dtype=torch.float64),st["vca"],"boundary")
+            bvg=None if vg is None else vg[0].tolist()
+            for edge,(src,dst) in enumerate(zip(top["boundary_src"],top["boundary_dst"])):
+                cell_gm=float(_gln_gm(st,"boundary",bc,torch.tensor([u],dtype=torch.float64))[0,edge])
+                gate=_at(st["gates"]["boundary"],edge); vca=1.0 if bvg is None else float(bvg[edge])
+                p=dict(gm=cell_gm,Isat=_at(bc["isat"],edge),A=_at(bc["A"],edge),B=_at(bc["B"],edge),theta=_at(bc["theta"],edge),s=_at(bc["sign"],edge),z_gate=gate*vca,alpha=float(bc["alpha"]),x_max=float(setting["x_max"]),gate_width=float(bc["beta_softness"]))
+                lines.append(_inst(prefix+f"b{edge}",[f"in{spec_i}_{src}",f"n{spec_i}_{stage_idx}_{dst}"],"boundary_sense_ota",**p))
+                g=_at(bc["conductance"],edge)
+                if g: lines.append(_inst(prefix+f"bsh{edge}",[f"in{spec_i}_{src}",f"n{spec_i}_{stage_idx}_{dst}"],"shunt",G=g,z_gate=gate*vca,vca=1.0,vca_gate_shunt=1))
+            # Shared-sense OTAs feed one sized crossbar generated from the
+            # checked-in 4x3 primitive contract (same current summation law).
+            rc=st["cells"]["readout"]; sense_src=top["readout_sense_src"]
+            rv=_gain(torch.tensor([u],dtype=torch.float64),st["vca"],"readout")
+            rvg=None if rv is None else rv[0].tolist()
+            sense_nodes=[]
+            for sense,src in enumerate(sense_src):
+                sn=f"sense{spec_i}_{stage_idx}_{sense}"; sense_nodes.append(sn)
+                vref=_at(st["readout"]["vref"],sense)
+                ref=f"vref{spec_i}_{stage_idx}_{sense}"
+                lines.append(f"{ref} ({ref} 0) vsource dc={_fmt(vcm+vu*vref)}")
+                lines.append(f"Rref{spec_i}_{stage_idx}_{sense} ({sn}n {ref}) resistor r=1000")
+                gm=float(_gln_gm(st,"readout",rc,torch.tensor([u],dtype=torch.float64))[0,sense]); gate=_at(st["gates"]["readout"],sense); vca=1 if rvg is None else float(rvg[sense])
+                lines.append(_inst(prefix+f"r{sense}",[f"n{spec_i}_{stage_idx}_{src}",sn],"boundary_sense_ota",gm=gm,Isat=_at(rc["isat"],sense),A=_at(rc["A"],sense),B=_at(rc["B"],sense),theta=_at(rc["theta"],sense),s=_at(rc["sign"],sense),z_gate=gate*vca,alpha=float(rc["alpha"]),x_max=float(setting["x_max"]),gate_width=float(rc["beta_softness"])))
+                lines.append(f"Vsense{spec_i}_{stage_idx}_{sense} ({sn} {sn}n) vsource dc=0")
+            weights=st["readout"]["crossbar_W"]; acc_start=int(top["readout_dst_start"])
+            xb_ports=[]
+            for k in range(sense_count):
+                if k<len(sense_nodes): xb_ports += [sense_nodes[k],f"sense{spec_i}_{stage_idx}_{k}n"]
+                else: xb_ports += ["0","0"]
+            for j in range(output_count):
+                xb_ports.append(f"n{spec_i}_{stage_idx}_{acc_start+j}" if j<len(weights) else "0")
+            w=[float(weights[j][k]) if j<len(weights) and k<len(weights[j]) else 0.0 for j in range(output_count) for k in range(sense_count)]
+            warr="["+",".join(_fmt(x) for x in w)+"]"
+            lines.append(f"{prefix}xb ({' '.join(xb_ports)}) crossbar_accumulator_{sense_count}x{output_count} W={warr}")
+    stop=sum(float(resolved["stages"][i]["solver"]["t_span"]) for i in selected)*tu if transient else tu
+    lines.append(f"tran tran stop={_fmt(stop)} maxstep={_fmt(dtmax)} errpreset=conservative reltol=1e-6 vabstol=1e-9 iabstol=1e-15")
+    lines.append("saveOptions options save=allpub")
+    lines.append("save " + " ".join(f"n{s}_{i}_{node}" for s in range(n_specs) for i in selected for node in range(int(resolved["stages"][i]["num_nodes"]))))
+    text="\n".join(lines)+"\n"
+    Path(out).write_text(text)
+    return text

@@ -278,25 +278,51 @@ def _timemux_boundary(x, cfg, units, boundary_idx, noise=None):
         x_hold = _uniform_quant(x_hold, bits, -rail, rail)
     return x_hold, x_transfer
 
-def simulate(table, x, noise=None):
+def simulate(table, x, noise=None, return_trajectory=False, steps_per_stage=None):
+    """Simulate the resolved table.
+
+    ``return_trajectory`` adds per-stage normalized node samples and their
+    stage-local model times, for circuit-vs-interpreter transient comparison.
+    ``steps_per_stage`` overrides the exported Heun step count (scalar or a
+    sequence) without changing the resolved model table.
+    """
     resolved=_table(table)
     x=torch.as_tensor(x)
     u=(2.0*(torch.log10(x.clamp(min=1e-12))-_t(resolved["input"]["log_min"],x))/(_t(resolved["input"]["log_max"],x)-_t(resolved["input"]["log_min"],x)).clamp(min=1e-8)-1.0).clamp(min=-float(resolved["input"]["input_rail"]),max=float(resolved["input"]["input_rail"]))
     batch=x.shape[0]
     state=x.new_zeros((batch,int(resolved["stages"][0]["num_nodes"])))
     finals=[]
+    trajectories=[]
+    trajectory_times=[]
     tm=resolved.get("timemux")
     tm_enabled=bool(tm and tm.get("enable", False))
     held_input=None
     for i,st in enumerate(resolved["stages"]):
-        t=float(st["solver"]["t_span"]); steps=int(st["solver"]["num_steps"]); dt=t/steps
+        t=float(st["solver"]["t_span"])
+        if steps_per_stage is None:
+            steps=int(st["solver"]["num_steps"])
+        elif isinstance(steps_per_stage, (tuple, list)):
+            steps=int(steps_per_stage[i])
+        else:
+            steps=int(steps_per_stage)
+        if steps < 1:
+            raise ValueError("steps_per_stage must be positive")
+        dt=t/steps
         held=held_input if tm_enabled and i > 0 else state
-        for _ in range(steps):
+        samples=[state.clone()] if return_trajectory else None
+        times=[0.0] if return_trajectory else None
+        for step in range(steps):
             k1=stage_rhs(resolved,i,state,held,u)
             pred=state+dt*k1
             k2=stage_rhs(resolved,i,pred,held,u)
             state=state+0.5*dt*(k1+k2)
+            if return_trajectory:
+                samples.append(state.clone())
+                times.append((step+1)*dt)
         finals.append(state)
+        if return_trajectory:
+            trajectories.append(torch.stack(samples, dim=1))
+            trajectory_times.append(torch.as_tensor(times, dtype=x.dtype, device=x.device))
         if i<len(resolved["transfers"]):
             clamp = resolved.get("units", {}).get("x_hard") if resolved.get("hw_flags", {}).get("hw_clamp_transfer") else None
             if tm_enabled:
@@ -314,4 +340,8 @@ def simulate(table, x, noise=None):
     rd=resolved["readout"]
     y=_t(rd["gain"],y)*y+_t(rd["bias"],y)+_t(rd["tanh_gain"],y)*torch.tanh(y)+_t(rd["relu_gain"],y)*torch.relu(y-_t(rd["relu_threshold"],y))
     y=_transfer(y,{"in_nodes":y.shape[1],"out_nodes":y.shape[1],**rd["post_transfer"]})
-    return {"logits":y,"stage_states":finals}
+    result={"logits":y,"stage_states":finals}
+    if return_trajectory:
+        result["stage_trajectories"]=trajectories
+        result["stage_times"]=trajectory_times
+    return result

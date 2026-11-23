@@ -131,3 +131,20 @@ The characterization result JSON and all raw runs are under `.agent_scratch/task
 - HW OTA compliance is a behavioral leg approximation and still needs comparison against `hw.constraints.leg_factors`/`compliance_legs` (including normalization and 85 °C thermal voltage). The specified Isat ceiling is not enforced inside this primitive.
 - S&H deterministic capture characterization is compared with `StageBoundary.capture` using kT/C disabled; stochastic kT/C remains out of scope. The Torch boundary has no C_int charge-sharing term (C_int only sets bias-settling tau), so no charge-sharing effect is claimed. Droop is the model's fixed-sign hold offset. The VA includes `inject_gain_err` and `droop_v` to represent that deterministic formula.
 - `phase_ctrl` was checked over two boundaries; `interstage_transfer` still models an algebraic rewrite, not physical event timing. Crossbar current polarity, offset-binary replica subtraction, and accumulator compliance match the selected Torch cases only; do not claim full model equivalence or use for tapeout.
+
+
+## Network netlist (legacy copies)
+
+`export.spectre_export.export(..., mode="legacy", fabric="copies")` writes a resolved `params.json`, a deck with one copy per stage, and a sized crossbar VA beside it. Scalar cell parameters, gains, gates, weights, node capacitance/leak, and transfer coefficients come from the resolved table; positive physical input specs are log-scaled off-chip as in `netlist_interp._spec_inputs`. Node voltage encodes `x=(V−Vcm)/Vu`.
+
+Stage sequencing uses `veriloga/stage_gate.va`. Stage 0 starts at Vcm; each node in stage k>0 is clamped through a strong conductance to the previous stage's nodewise transferred state until cumulative `sum(t_span[0:k])*Tu`, then the clamp transitions to zero. The preceding copy evolves for its full stage duration before transfer and may continue evolving afterward because no later stage reads it. The crossbar's internal zero-volt branch is the sole sense branch; Vref drives its return node directly (no duplicate `Vsense` or 1 mΩ `Rref`). For `freeze_read`, `ota_edge_sampled` evaluates from the held S&H outputs while applying current to live stage nodes.
+
+Run all decks and compile jobs only under `/home/annaik/Documents/kirchhoffnet_refactor/.agent_scratch/taskD3/runs/<subdir>`. Enter that directory before sourcing the GF22 setup, then invoke Spectre 23.1 with `-format psfascii`. `compile_modules.py --module stage_gate` uses the same run root. Convert node traces to x for interpreter comparison; output mapping and post-transfer are off-chip.
+
+| Comparison | Spectre | Interpreter-10 | Interpreter-1000 | Result |
+|---|---:|---:|---:|---|
+| Stage 0, canonical test row 0, node 3 at 50 ns | −0.04515359 x | −0.00894644 x | −0.00894646 x | 0.0362071 x error; unresolved |
+| Seven stages, row 0; max node error per stage | 0.03587 / 0.05109 / 0.16913 / 0.37243 / 0.99277 / 1.94579 / 2.66984 x | — | — | fails tolerance |
+| Sixteen canonical specs / logits CSV | not run | — | — | blocked by stage-0 mismatch |
+
+The all-stage run completed in 18.9 s with 0 Spectre errors. Stage-0 error grows nearly linearly from 1 ns and interpreter-10/1000 agree closely, pointing to a circuit/table mapping issue rather than integration truncation. These values are diagnostic only; do not claim network equivalence.

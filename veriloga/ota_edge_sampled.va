@@ -9,10 +9,12 @@ module ota_edge_sampled(src_hold,dst_hold,src_live,dst_live);
   parameter real A=1.0,B=1.0,s=1.0,theta=0.0,gm=1.0,Isat=1.0;
   parameter integer cap_code_a=7,cap_code_b=7,cap_bits=3;
   parameter real cap_rmax=2.0,g_hw=1.0,f_ic=1.0;
+  parameter integer compliance_en=0;
+  parameter real lambda_v=0.15,Ut=0.03086,k_soft=2000.0,x_hard=5.7142857143;
   parameter real z_gate=1.0,sigma_z=1.0,vca=1.0;
   parameter real Vcm=`HRK_VCM,Vu=`HRK_VU;
   parameter real x_max=4.0,gate_width=0.02,floor_term=0.01;
-  real xs,xd,u,gate,aa,bb;
+  real xs,xd,u,gate,aa,bb,ip,inn,xt,yt,yb,y0,spt,spb,sp0,ft,fb;
   analog begin
     xs=(V(src_hold)-Vcm)/Vu; xd=(V(dst_hold)-Vcm)/Vu;
     aa=A; bb=B;
@@ -26,6 +28,17 @@ module ota_edge_sampled(src_hold,dst_hold,src_live,dst_live);
     gate=z_gate*sigma_z*vca;
     gate=gate/(1.0+limexp(-(x_max-abs(xs))/gate_width));
     gate=gate/(1.0+limexp(-(x_max-abs(xd))/gate_width));
-    I(src_live,dst_live) <+ Isat*gate*(tanh(u)+floor_term*u)*`HRK_IU;
+    if (mode==1 && compliance_en) begin
+      ip=0.5*Isat*z_gate*sigma_z*vca*(1.0+tanh(u));
+      inn=0.5*Isat*z_gate*sigma_z*vca*(1.0-tanh(u));
+      xt=(V(dst_live)-Vcm)/Vu; yt=(x_hard-xt)*Vu/Ut; yb=(x_hard+xt)*Vu/Ut; y0=x_hard*Vu/Ut;
+      spt=max(yt,0.0)+ln(1.0+exp(-abs(k_soft*yt)))/k_soft; spb=max(yb,0.0)+ln(1.0+exp(-abs(k_soft*yb)))/k_soft; sp0=max(y0,0.0)+ln(1.0+exp(-abs(k_soft*y0)))/k_soft;
+      ft=max(1.0-lambda_v*Vu*xt,0.0)*(1.0-exp(-spt))/(1.0-exp(-sp0)); fb=max(1.0+lambda_v*Vu*xt,0.0)*(1.0-exp(-spb))/(1.0-exp(-sp0));
+      I(dst_live) <+ (ip*ft-inn*fb)*`HRK_IU;
+      xt=(V(src_live)-Vcm)/Vu; yt=(x_hard-xt)*Vu/Ut; yb=(x_hard+xt)*Vu/Ut;
+      spt=max(yt,0.0)+ln(1.0+exp(-abs(k_soft*yt)))/k_soft; spb=max(yb,0.0)+ln(1.0+exp(-abs(k_soft*yb)))/k_soft;
+      ft=max(1.0-lambda_v*Vu*xt,0.0)*(1.0-exp(-spt))/(1.0-exp(-sp0)); fb=max(1.0+lambda_v*Vu*xt,0.0)*(1.0-exp(-spb))/(1.0-exp(-sp0));
+      I(src_live) <+ (inn*ft-ip*fb)*`HRK_IU;
+    end else I(src_live,dst_live) <+ Isat*gate*(tanh(u)+floor_term*u)*`HRK_IU;
   end
 endmodule

@@ -276,7 +276,7 @@ def export_model(model, out, mode="legacy", fabric="timemux", specs=16, hw_confi
       "digital_offchip_keys":[k for k,v in entries.items() if v["kind"]=="digital_offchip"]}}
     out=Path(out); out.mkdir(parents=True,exist_ok=True)
     (out/"params.json").write_text(json.dumps(params,indent=2)+"\n")
-    if mode == "legacy" and fabric == "copies":
+    if fabric == "copies" and mode in {"legacy", "hw"}:
       from .spectre_netlist import render
       render(params, out/"hrknet.scs")
     else:

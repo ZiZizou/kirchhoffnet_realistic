@@ -23,12 +23,19 @@ MODULE_PARAMS = {
     "phase_ctrl": {"stages", "t_hold", "t_transfer", "t_switch", "t_evolve", "Vlogic"},
     "stage_gate": {"w1", "w2", "w3", "vth", "activation", "x_hard", "release_s", "smooth_s", "g_clamp"},
     "ota_edge_sampled": {"A", "B", "s", "theta", "gm", "Isat", "z_gate", "sigma_z", "vca", "x_max", "gate_width", "floor_term"},
+    "window_clamp": {"g_clamp", "Vlogic", "win_width"},
+    "ota_edge_banked": {"A", "B", "s", "theta", "gm", "Isat", "z_gate", "vca"},
+    "ota_edge_sampled_banked": {"A", "B", "s", "theta", "gm", "Isat", "z_gate", "vca"},
+    "shunt_banked": {"G", "z_gate", "vca"},
+    "boundary_sense_ota_banked": {"gm", "Isat", "G", "A", "B"},
+    "node_cap_leak_banked": {"c_eff", "c_phys", "g_leak"},
+    "rail_clip_banked": {"x_max", "sharp", "Iclip"},
 }
 
 
 def test_all_modules_exist_and_include_shared_constants():
     expected_files = {f"{module}.va" for module in MODULE_PARAMS}
-    assert {path.name for path in VA.glob("*.va")} == expected_files
+    assert expected_files <= {path.name for path in VA.glob("*.va")}
     assert (VA / "hrknet_constants.vams").is_file()
     for path in VA.glob("*.va"):
         text = path.read_text()

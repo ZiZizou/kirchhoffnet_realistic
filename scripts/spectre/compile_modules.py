@@ -39,6 +39,7 @@ PORTS = {
     "boundary_sense_ota_banked": ("src", "dst", "stage", "en"),
     "node_cap_leak_banked": ("node", "stage", "en"),
     "rail_clip_banked": ("node", "stage", "en"),
+    "window_clamp": ("node", "target", "win"),
 }
 
 

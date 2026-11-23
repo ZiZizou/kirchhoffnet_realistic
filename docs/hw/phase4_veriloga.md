@@ -178,3 +178,8 @@ The mismatch that initially prevented stage-0 validation was missing readout con
 
 
 Stage-gate standalone characterization (Spectre 23.1, 50 fF node, 1 S clamp, 10 ns release): after the initial 1 ns settling interval, maximum pre-release error was 2.27e-9 x; measured series-probe current after release (>11 ns) was 0 A. `compile_modules.py --module stage_gate` passed with 0 errors / 0 warnings.
+
+
+### Recurring window clamp characterization
+
+`window_clamp(node,target,win)` uses a smooth logistic of `V(win)` and implements `g_clamp*(V(node)-V(target))*w`; it can be opened repeatedly, unlike `stage_gate`'s one-shot absolute-time release. The scratch transient case is `/.agent_scratch/tmnet/window_clamp_characterize.scs` (ran with Spectre 23.1, 0 errors / 0 warnings): `V(win)` is low on [0,1 ns), high on [1.1,3 ns), and low thereafter, with a 0.1 V initial node-target error. The measured maximum open-window node-target error (after a 0.1 ns opening ramp) is `1.00e-10 V`; the closed-window clamp-current upper bound from measured node/control samples is `1.93e-23 A` (logistic multiplier at 0 V). Run script/log: `.agent_scratch/tmnet/compile_window_clamp.csh` and `.agent_scratch/tmnet/compile_window_clamp.log`.

@@ -279,6 +279,9 @@ def export_model(model, out, mode="legacy", fabric="timemux", specs=16, hw_confi
     if fabric == "copies" and mode in {"legacy", "hw"}:
       from .spectre_netlist import render
       render(params, out/"hrknet.scs")
+    elif mode == "legacy" and fabric == "timemux":
+      from .spectre_netlist import render_timemux
+      render_timemux(params, out/"hrknet.scs")
     else:
       va=Path(__file__).resolve().parents[1]/"veriloga"
       lines=[f'// generated mode={mode} fabric={fabric}', f'ahdl_include "{va}/hrknet_constants.vams"',

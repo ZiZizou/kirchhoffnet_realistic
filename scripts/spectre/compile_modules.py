@@ -17,7 +17,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 VA = ROOT / "veriloga"
-RUN_ROOT = Path("/home/annaik/Documents/kirchhoffnet_refactor/.agent_scratch/taskD3/runs/compile_modules")
+RUN_ROOT = Path(os.environ.get("TMNET_COMPILE_ROOT", "/home/annaik/Documents/kirchhoffnet_refactor/.agent_scratch/taskD3/runs/compile_modules"))
 SETUP = "~/workarea_GF22_FDX_EXT/kit.gf22fdx_ext.v1.0_4.1_stack19_oa.csh"
 PORTS = {
     "ota_edge": ("src", "dst"),
@@ -33,6 +33,14 @@ PORTS = {
     "phase_ctrl": ("clk", "phase", "stage"),
     "stage_gate": ("node", "source"),
     "ota_edge_sampled": ("src_hold", "dst_hold", "src_live", "dst_live"),
+    "ota_edge_banked": ("src", "dst", "stage", "en"),
+    "ota_edge_sampled_banked": ("src_hold", "dst_hold", "src_live", "dst_live", "stage", "en"),
+    "shunt_banked": ("src", "dst", "stage", "en"),
+    "boundary_sense_ota_banked": ("src", "dst", "stage", "en"),
+    "node_cap_leak_banked": ("node", "stage", "en"),
+    "rail_clip_banked": ("node", "stage", "en"),
+    "window_clamp": ("node", "target", "win"),
+    "interstage_transfer_banked": ("in", "out", "stage", "en"),
 }
 
 

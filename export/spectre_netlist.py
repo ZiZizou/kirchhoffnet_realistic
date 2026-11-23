@@ -264,3 +264,227 @@ def render(params, out, inputs=None, stages=None, transient=True):
     text="\n".join(lines)+"\n"
     Path(out).write_text(text)
     return text
+
+
+def _write_banked_crossbar(out, sense_count=22, output_count=7):
+    """Generate a seven-bank crossbar VA sized for the resolved readout."""
+    va = Path(__file__).resolve().parents[1] / "veriloga"
+    ports = [f"s{k}p,s{k}n" for k in range(sense_count)]
+    ports += [f"acc{j}" for j in range(output_count)]
+    ports += ["stage", "en"]
+    declarations = [f"  input s{k}p,s{k}n; electrical s{k}p,s{k}n;" for k in range(sense_count)]
+    declarations += [f"  inout acc{j}; electrical acc{j};" for j in range(output_count)]
+    declarations.append("  input stage,en; electrical stage,en;")
+    wlen = sense_count * output_count
+    terms = []
+    for j in range(output_count):
+        terms.append(f"    i_acc[{j}]=0.0;" + "".join(
+            f" i_acc[{j}]=i_acc[{j}]+W[k*{wlen}+{j*sense_count+kidx}]*I(s{kidx}p,s{kidx}n);"
+            for kidx in range(sense_count)) + f" I(acc{j}) <+ -eg*i_acc[{j}];")
+    body = ["`include \"constants.vams\"", "`include \"disciplines.vams\"",
+            f'`include "{va}/hrknet_constants.vams"',
+            f"module crossbar_accumulator_banked_{sense_count}x{output_count}({','.join(ports)});",
+            *declarations, f"  parameter real W[0:{7*wlen-1}]='{{" + ",".join("0.0" for _ in range(7*wlen)) + "};", 
+            "  integer k; real eg;", f"  real i_acc[0:{output_count-1}];", "  analog begin",
+            "    k=$rtoi(V(stage)+0.5); if(k<0) k=0; if(k>6) k=6;",
+            "    eg=1.0/(1.0+limexp(-(V(en)-0.5)/0.01));"]
+    body.extend(f"    V(s{k}p,s{k}n)<+0.0;" for k in range(sense_count))
+    body.extend(terms)
+    body += ["  end", "endmodule", ""]
+    path = Path(out).parent / f"crossbar_accumulator_banked_{sense_count}x{output_count}.va"
+    path.write_text("\n".join(body))
+    return path
+
+
+def render_timemux(params, out, inputs=None, stages=None, transient=True):
+    """Render one shared 18-node, seven-bank legacy fabric.
+
+    Boundary transfers capture the live fabric into S&H first, compute the
+    coefficient-bank rewrite into isolated target nodes, and clamp only during
+    a recurring win pulse. Each stage then evolves for its configured span.
+    """
+    if params.get("mode") != "legacy":
+        raise ValueError("time-multiplexed writer currently supports legacy mode")
+    resolved = params.get("resolved", params)
+    n_specs = int(params.get("specs", 1))
+    u_rows = _spec_inputs(resolved, n_specs, inputs)
+    units = params.get("units", {})
+    vu = float(units.get("Vu_V", 0.07)); vcm = float(units.get("Vcm_V", 0.4))
+    tu = float(units.get("Tu_s", 350e-9/4.660583))
+    all_stages = resolved["stages"]
+    selected = list(range(len(all_stages))) if stages is None else list(stages)
+    if selected != list(range(len(all_stages))):
+        raise ValueError("timemux requires the full ordered stage bank")
+    if len(all_stages) != 7 or any(int(s["num_nodes"]) != 18 for s in all_stages):
+        raise ValueError("timemux expects the canonical seven-stage, 18-node network")
+    va = Path(__file__).resolve().parents[1] / "veriloga"
+    includes = ("sample_hold", "ota_edge_banked", "ota_edge_sampled_banked", "shunt_banked",
+                "boundary_sense_ota_banked", "node_cap_leak_banked", "rail_clip_banked",
+                "interstage_transfer_banked", "window_clamp")
+    lines = ["// Legacy time-multiplexed fabric: shared 18-node state; seven parameter banks.",
+             "// Boundary timing: en falls at each stage-span boundary; boundary S&H captures",
+             "// immediately, transfer clamp opens after capture and closes before stage switch.",
+             "// en rises after switch; each evolve interval is exactly t_span[k]*Tu.",
+             "simulator lang=spectre", f'ahdl_include "{va}/hrknet_constants.vams"']
+    lines += [f'ahdl_include "{va}/{m}.va"' for m in includes]
+    max_sense = max(len(s["topology"]["readout_sense_src"]) for s in all_stages)
+    max_outputs = max(len(s["readout"]["crossbar_W"]) for s in all_stages)
+    crossbar = _write_banked_crossbar(Path(out), max_sense, max_outputs)
+    lines.append(f'ahdl_include "{crossbar}"')
+    lines += ["simulator lang=spectre", f"Vcm_ref (vcm_ref 0) vsource dc={_fmt(vcm)}"]
+    spans = [float(s["solver"]["t_span"]) * tu for s in all_stages]
+    # Per-stage controls have explicit sub-microsecond transfer windows. The
+    # ODE-active time itself remains exactly spans[k]; boundary overhead is not
+    # counted as evolution.
+    capture = min(2e-9, min(spans) / 100.0)
+    xfer = min(2e-9, min(spans) / 100.0)
+    settle = min(0.2e-9, capture / 10.0)
+    boundary_overhead = capture + xfer + settle
+    boundary_times = [sum(spans[:k+1]) + k * boundary_overhead for k in range(6)]
+    evolve_starts = [0.0]
+    for k, tb in enumerate(boundary_times):
+        evolve_starts.append(tb + capture + xfer + settle)
+    stop = evolve_starts[-1] + spans[-1]
+    def pwl(points):
+        return "type=pwl wave=[" + " ".join(f"{_fmt(t)} {_fmt(v)}" for t,v in points) + "]"
+    def step_points(points):
+        """Expand control transitions into near-vertical PWL steps."""
+        stepped = [points[0]]
+        for edge, level in points[1:]:
+            previous_time, previous_level = stepped[-1]
+            delta = min(1e-12, (edge - previous_time) / 2.0)
+            stepped.extend(((edge - delta, previous_level), (edge, level)))
+        return stepped
+    for si, u in enumerate(u_rows):
+        for b, uv in enumerate(u):
+            lines.append(f"V{si}_input{b} (in{si}_{b} 0) vsource dc={_fmt(vcm+vu*uv)}")
+        st_points = [(0.0, 0.0)]
+        en_points = [(0.0, 1.0)]
+        win_points = [(0.0, 0.0)]
+        xfer_points = [(0.0, 0.0)]
+        for k, tb in enumerate(boundary_times):
+            begin = tb
+            cap_end = begin + capture
+            xfer_end = cap_end + xfer
+            active = xfer_end + settle
+            en_points += [(begin, 0.0), (active, 1.0)]
+            st_points += [(begin, float(k)), (xfer_end, float(k+1))]
+            win_points += [(cap_end, 1.0), (xfer_end, 0.0)]
+            xfer_points += [(cap_end, 1.0), (xfer_end, 0.0)]
+        st_points.append((stop, 6.0)); en_points.append((stop, 1.0)); win_points.append((stop, 0.0))
+        xfer_points.append((stop, 0.0))
+        for name, pts in (("stage", st_points), ("en", en_points), ("win", win_points), ("xfer_en", xfer_points)):
+            lines.append(f"V{si}_{name} ({name}{si} 0) vsource {pwl(step_points(pts))}")
+        # Stage-state devices are banked on the shared fabric nodes.
+        for node in range(18):
+            node_name=f"n{si}_{node}"
+            caps=[]; leaks=[]; xmax=[]; sharp=[]; iclip=[]
+            for st in all_stages:
+                setting=st["settings"]
+                caps.append(float(setting["c_eff"]))
+                leaks.append(_at(setting["leak"], node))
+                xmax.append(float(setting["x_max"])); sharp.append(float(setting["clip_sharpness"]))
+                iclip.append(float(setting["clip_current"]))
+            lines.append(_inst(f"q{si}_cap{node}",[node_name,f"stage{si}",f"en{si}"],"node_cap_leak_banked",c_eff="["+" ".join(map(_fmt,caps))+"]",g_leak="["+" ".join(map(_fmt,leaks))+"]"))
+            lines.append(_inst(f"q{si}_clip{node}",[node_name,f"stage{si}",f"en{si}"],"rail_clip_banked",x_max="["+" ".join(map(_fmt,xmax))+"]",sharp="["+" ".join(map(_fmt,sharp))+"]",Iclip="["+" ".join(map(_fmt,iclip))+"]"))
+            lines.append(f"ic {node_name}={_fmt(vcm)}")
+            # Boundary-start sample for transfer; independent evolve-start
+            # sample for freeze_read so neither overwrites the other.
+            # Sample boundary state before transfer begins. PWL point lists must
+            # use near-vertical edges; otherwise Spectre interpolates across the
+            # long interval between pulses and the sample switch stays enabled.
+            bc_clock=[(0.0,0.0)]
+            sample_margin=min(5e-12,capture/10.0)
+            for tb in boundary_times: bc_clock += [(tb,1.0),(tb+capture-sample_margin,0.0)]
+            # Freeze-read samples the stage-entry state. For stage 0, capture
+            # the initial condition with a short pulse; subsequent stages use
+            # the settled post-transfer interval immediately before en rises.
+            read_clock=[(0.0,0.0),(1e-12,1.0),(3e-12,0.0)]
+            for k in range(1,7):
+                t=evolve_starts[k]
+                read_clock += [(t-settle,1.0),(t,0.0)]
+            lines.append(f"Vbc{si}_{node} (bcclk{si}_{node} 0) vsource {pwl(step_points(bc_clock))}")
+            lines.append(f"Vrc{si}_{node} (rclk{si}_{node} 0) vsource {pwl(step_points(read_clock))}")
+            lines.append(_inst(f"q{si}_bhold{node}",[node_name,f"bhold{si}_{node}",f"bcclk{si}_{node}"],"sample_hold",C_hold=1e-15,R_on=1e3,R_off=1e12))
+            lines.append(_inst(f"q{si}_rhold{node}",[node_name,f"rhold{si}_{node}",f"rclk{si}_{node}"],"sample_hold",C_hold=1e-15,R_on=1e3,R_off=1e12))
+            trw1=[_at(t["residual_w1"],node) for t in resolved["transfers"]]
+            trw2=[_at(t["residual_w2"],node) for t in resolved["transfers"]]
+            trw3=[_at(t["residual_w3"],node) for t in resolved["transfers"]]
+            trth=[_at(t["residual_vth"],node) for t in resolved["transfers"]]
+            # Transfer coefficient arrays are indexed by source stages 0..5.
+            lines.append(f"Ctarget{si}_{node} (target{si}_{node} 0) capacitor c=1f")
+            lines.append(_inst(f"q{si}_xfer{node}",[f"bhold{si}_{node}",f"target{si}_{node}",f"stage{si}",f"xfer_en{si}"],"interstage_transfer_banked",w1="["+" ".join(map(_fmt,trw1))+"]",w2="["+" ".join(map(_fmt,trw2))+"]",w3="["+" ".join(map(_fmt,trw3))+"]",vth="["+" ".join(map(_fmt,trth))+"]",x_hard=float(resolved["units"]["x_hard"])))
+            lines.append(_inst(f"q{si}_clamp{node}",[node_name,f"target{si}_{node}",f"win{si}"],"window_clamp",g_clamp=1.0))
+        # Build the banked edge cells; topology is common across seven paper stages.
+        first=all_stages[0]["topology"]
+        for edge,(src,dst) in enumerate(zip(first["src"],first["dst"])):
+            cells=[s["cells"]["core"] for s in all_stages]
+            gates=[_at(s["gates"]["core"],edge) for s in all_stages]
+            vcas=[]
+            for s in all_stages:
+                gain=_gain(torch.tensor([u],dtype=torch.float64),s["vca"],"core")
+                vcas.append(1.0 if gain is None else float(gain[0,edge]))
+            def bank(key): return "["+" ".join(_fmt(_at(c[key],edge)) for c in cells)+"]"
+            lines.append(_inst(f"q{si}_e{edge}",[f"rhold{si}_{src}",f"rhold{si}_{dst}",f"n{si}_{src}",f"n{si}_{dst}",f"stage{si}",f"en{si}"],"ota_edge_sampled_banked",A=bank("A"),B=bank("B"),s=bank("sign"),theta=bank("theta"),gm=bank("gm"),Isat=bank("isat"),z_gate="["+" ".join(map(_fmt,gates))+ "]",vca="["+" ".join(map(_fmt,vcas))+ "]",x_max=float(all_stages[0]["settings"]["x_max"]),gate_width=float(cells[0]["beta_softness"]),floor_term=float(cells[0]["alpha"])))
+            sh=[_at(c["conductance"],edge) for c in cells]
+            if any(sh):
+                shgate=[_at(s["gates"]["core"],edge) for s in all_stages]
+                shvca=[]
+                for s in all_stages:
+                    gain=_gain(torch.tensor([u],dtype=torch.float64),s["vca"],"core")
+                    shvca.append(1.0 if gain is None else float(gain[0,edge]))
+                lines.append(_inst(f"q{si}_sh{edge}",[f"n{si}_{src}",f"n{si}_{dst}",f"stage{si}",f"en{si}"],"shunt_banked",G="["+" ".join(map(_fmt,sh))+ "]",z_gate="["+" ".join(map(_fmt,shgate))+ "]",vca="["+" ".join(map(_fmt,shvca))+ "]",vca_gate_shunt=int(all_stages[0]["vca"]["gate_shunt"])))
+        for edge,(src,dst) in enumerate(zip(first["boundary_src"],first["boundary_dst"])):
+            bcs=[s["cells"]["boundary"] for s in all_stages]
+            vals={k:[] for k in ("gm","Isat","G","A","B","theta","s")}; gates=[]; vcas=[]
+            for s,bc in zip(all_stages,bcs):
+                inp=torch.tensor([u],dtype=torch.float64)
+                vals["gm"].append(float(_gln_gm(s,"boundary",bc,inp)[0,edge]))
+                for k,source in (("Isat","isat"),("G","conductance"),("A","A"),("B","B"),("theta","theta"),("s","sign")): vals[k].append(0.0 if k == "G" else _at(bc[source],edge))
+                gain=_gain(inp,s["vca"],"boundary")
+                vcas.append(1.0 if gain is None else float(gain[0,edge]))
+                gates.append(_at(s["gates"]["boundary"],edge)*(1.0 if gain is None else float(gain[0,edge])))
+            srcnode=f"in{si}_{src}"
+            lines.append(_inst(f"q{si}_b{edge}",[srcnode,f"n{si}_{dst}",f"stage{si}",f"en{si}"],"boundary_sense_ota_banked",**{k:"["+" ".join(map(_fmt,v))+"]" for k,v in vals.items()},z_gate="["+" ".join(map(_fmt,gates))+"]",alpha=float(bcs[0]["alpha"])))
+            bg=[_at(bc["conductance"],edge) for bc in bcs]
+            if any(bg):
+                bgvca=[_gain(torch.tensor([u],dtype=torch.float64),s["vca"],"boundary") for s in all_stages]
+                bgmul=[1.0 if g is None else float(g[0,edge]) for g in bgvca]
+                bggate=[_at(s["gates"]["boundary"],edge) for s in all_stages]
+                lines.append(_inst(f"q{si}_bsh{edge}",[srcnode,f"n{si}_{dst}",f"stage{si}",f"en{si}"],"shunt_banked",G="["+" ".join(map(_fmt,bg))+"]",z_gate="["+" ".join(map(_fmt,bggate))+"]",vca="["+" ".join(map(_fmt,bgmul))+"]",vca_gate_shunt=1))
+        # Banked readout sense and crossbar; Vref sources follow the stage select.
+        for sense,src in enumerate(first["readout_sense_src"]):
+            rcs=[s["cells"]["readout"] for s in all_stages]; inp=torch.tensor([u],dtype=torch.float64)
+            rvals={k:[] for k in ("gm","Isat","G","A","B","theta","s")}; rg=[]
+            refs=[]
+            for s,rc in zip(all_stages,rcs):
+                rvals["gm"].append(float(_gln_gm(s,"readout",rc,inp)[0,sense]))
+                for k,source in (("Isat","isat"),("G","conductance"),("A","A"),("B","B"),("theta","theta"),("s","sign")): rvals[k].append(_at(rc[source],sense))
+                gain=_gain(inp,s["vca"],"readout")
+                rg.append(_at(s["gates"]["readout"],sense)*(1.0 if gain is None else float(gain[0,sense])))
+                refs.append(vcm+vu*_at(s["readout"]["vref"],sense))
+            refpts=[(0.0,refs[0])]
+            for k,t in enumerate(boundary_times): refpts.append((evolve_starts[k+1],refs[k+1]))
+            # Each bank's reference is a held stage constant, not a ramp over
+            # the preceding evolve window.
+            lines.append(f"Vref{si}_{sense} (ref{si}_{sense} 0) vsource {pwl(step_points(refpts))}")
+            lines.append(_inst(f"q{si}_r{sense}",[f"n{si}_{src}",f"sense{si}_{sense}",f"stage{si}",f"en{si}"],"boundary_sense_ota_banked",**{k:"["+" ".join(map(_fmt,v))+"]" for k,v in rvals.items()},z_gate="["+" ".join(map(_fmt,rg))+"]",alpha=float(rcs[0]["alpha"])))
+        weights=[]
+        for st in all_stages:
+            for j in range(max_outputs):
+                row=st["readout"]["crossbar_W"][j] if j<len(st["readout"]["crossbar_W"]) else []
+                weights.extend(float(row[k]) if k<len(row) else 0.0 for k in range(max_sense))
+        xbports=[]
+        for k in range(max_sense): xbports += [f"sense{si}_{k}",f"ref{si}_{k}"]
+        acc=int(first["readout_dst_start"])
+        xbports += [f"n{si}_{acc+j}" if j<max_outputs else "0" for j in range(max_outputs)]
+        xbports += [f"stage{si}",f"en{si}"]
+        lines.append(f"q{si}_xb ({' '.join(xbports)}) crossbar_accumulator_banked_{max_sense}x{max_outputs} W=["+" ".join(_fmt(v) for v in weights)+"]")
+    dtmax = min(spans[k]/int(all_stages[k]["solver"]["num_steps"]) for k in range(7))/100
+    lines += ["simulatorOptions options reltol=1e-8 vabstol=1e-12 iabstol=1e-18",
+              f"tran tran stop={_fmt(stop if transient else tu)} maxstep={_fmt(dtmax)} errpreset=conservative",
+              "saveOptions options save=allpub",
+              "save "+" ".join(f"n{s}_{j}" for s in range(n_specs) for j in range(18))]
+    text="\n".join(lines)+"\n"
+    Path(out).write_text(text)
+    return text

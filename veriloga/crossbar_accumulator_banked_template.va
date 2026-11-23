@@ -1,0 +1,20 @@
+`include "constants.vams"
+`include "disciplines.vams"
+`include "hrknet_constants.vams"
+// Templated 4-sense x 3-output crossbar with seven flattened 12-weight banks.
+// Instantiate after substituting module/port counts for other topologies.
+module crossbar_accumulator_banked_4x3(s0p,s0n,s1p,s1n,s2p,s2n,s3p,s3n,acc0,acc1,acc2,stage,en);
+  input s0p,s0n,s1p,s1n,s2p,s2n,s3p,s3n,stage,en; electrical s0p,s0n,s1p,s1n,s2p,s2n,s3p,s3n,stage,en;
+  inout acc0,acc1,acc2; electrical acc0,acc1,acc2;
+  parameter real W[0:83]='{default:0.0};
+  integer k; real i0,i1,i2,eg;
+  analog begin
+    k=$rtoi(V(stage)+0.5); if(k<0) k=0; if(k>6) k=6;
+    eg=1.0/(1.0+limexp(-(V(en)-0.5)/0.01));
+    V(s0p,s0n)<+0.0; V(s1p,s1n)<+0.0; V(s2p,s2n)<+0.0; V(s3p,s3n)<+0.0;
+    i0=W[k*12+0]*I(s0p,s0n)+W[k*12+1]*I(s1p,s1n)+W[k*12+2]*I(s2p,s2n)+W[k*12+3]*I(s3p,s3n);
+    i1=W[k*12+4]*I(s0p,s0n)+W[k*12+5]*I(s1p,s1n)+W[k*12+6]*I(s2p,s2n)+W[k*12+7]*I(s3p,s3n);
+    i2=W[k*12+8]*I(s0p,s0n)+W[k*12+9]*I(s1p,s1n)+W[k*12+10]*I(s2p,s2n)+W[k*12+11]*I(s3p,s3n);
+    I(acc0)<+ -eg*i0; I(acc1)<+ -eg*i1; I(acc2)<+ -eg*i2;
+  end
+endmodule

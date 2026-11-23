@@ -1,0 +1,15 @@
+`include "constants.vams"
+`include "disciplines.vams"
+`include "hrknet_constants.vams"
+// Smoothly enabled clamp for recurring time-multiplexed transfer windows.
+module window_clamp(node,target,win);
+  inout node; input target,win; electrical node,target,win;
+  parameter real g_clamp=1.0;
+  parameter real Vlogic=0.5, win_width=0.01;
+  real w;
+  analog begin
+    // At 0 V the logistic is effectively zero; at 1 V it is effectively one.
+    w=1.0/(1.0+limexp(-(V(win)-Vlogic)/win_width));
+    I(node) <+ g_clamp*(V(node)-V(target))*w;
+  end
+endmodule

@@ -1,0 +1,24 @@
+`include "constants.vams"
+`include "disciplines.vams"
+`include "hrknet_constants.vams"
+// Seven-bank legacy OTA. Stage selects nearest integer volt, clamped [0,6].
+// Selection changes at half-integer volts (no hysteresis); en is a smooth 0..1 gate.
+module ota_edge_banked(src,dst,stage,en);
+  inout src,dst; input stage,en; electrical src,dst,stage,en;
+  parameter real A[0:6]='{1,1,1,1,1,1,1}, B[0:6]='{1,1,1,1,1,1,1};
+  parameter real s[0:6]='{1,1,1,1,1,1,1}, theta[0:6]='{0,0,0,0,0,0,0};
+  parameter real gm[0:6]='{1,1,1,1,1,1,1}, Isat[0:6]='{1,1,1,1,1,1,1};
+  parameter real z_gate[0:6]='{1,1,1,1,1,1,1}, sigma_z[0:6]='{1,1,1,1,1,1,1}, vca[0:6]='{1,1,1,1,1,1,1};
+  parameter real Vcm=`HRK_VCM, Vu=`HRK_VU, gate_width=0.02, x_max=4.0, floor_term=0.01, en_width=0.01;
+  integer k; real xs,xd,u,gate,eg;
+  analog begin
+    k=$rtoi(V(stage)+0.5); if(k<0) k=0; if(k>6) k=6;
+    xs=(V(src)-Vcm)/Vu; xd=(V(dst)-Vcm)/Vu;
+    u=gm[k]*(s[k]*(A[k]*xs-B[k]*xd)+theta[k]);
+    gate=z_gate[k]*sigma_z[k]*vca[k];
+    gate=gate/(1.0+limexp(-(x_max-abs(xs))/gate_width));
+    gate=gate/(1.0+limexp(-(x_max-abs(xd))/gate_width));
+    eg=1.0/(1.0+limexp(-(V(en)-0.5)/en_width));
+    I(src,dst) <+ eg*Isat[k]*gate*(tanh(u)+floor_term*u)*`HRK_IU;
+  end
+endmodule

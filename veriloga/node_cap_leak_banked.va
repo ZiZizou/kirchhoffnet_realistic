@@ -1,0 +1,15 @@
+`include "constants.vams"
+`include "disciplines.vams"
+`include "hrknet_constants.vams"
+// Seven-bank node C/leak. Leakage is phase-gated so held nodes retain charge.
+module node_cap_leak_banked(node,stage,en);
+  inout node; input stage,en; electrical node,stage,en;
+  parameter real c_eff[0:6]='{1,1,1,1,1,1,1},c_phys[0:6]='{0,0,0,0,0,0,0},g_leak[0:6]='{0,0,0,0,0,0,0};
+  parameter real Vcm=`HRK_VCM,en_width=0.01; integer k; real eg;
+  analog begin
+    k=$rtoi(V(stage)+0.5); if(k<0) k=0; if(k>6) k=6;
+    eg=1.0/(1.0+limexp(-(V(en)-0.5)/en_width));
+    I(node) <+ ((c_phys[k]>0.0) ? c_phys[k] : c_eff[k]*`HRK_CU)*ddt(V(node));
+    I(node) <+ eg*g_leak[k]*`HRK_GU*(V(node)-Vcm);
+  end
+endmodule

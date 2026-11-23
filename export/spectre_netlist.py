@@ -60,10 +60,10 @@ def render(params, out, inputs=None, stages=None, transient=True):
     tu = float(units.get("Tu_s", 350e-9/4.660583)); dtmax = tu * min(float(s["solver"]["t_span"])/int(s["solver"]["num_steps"]) for s in resolved["stages"]) / 10
     selected = range(len(resolved["stages"])) if stages is None else list(stages)
     va = Path(__file__).resolve().parents[1] / "veriloga"
-    lines = ["simulator lang=spectre", f'ahdl_include "{va}/hrknet_constants.vams"']
+    lines = ["// Legacy copies deck: sequential stage releases use cumulative t_span; earlier copies continue evolving but are not read again.", "simulator lang=spectre", f'ahdl_include "{va}/hrknet_constants.vams"']
     for module in ("ota_edge", "shunt", "node_cap_leak", "rail_clip", "sample_hold", "boundary_sense_ota", "interstage_transfer", "phase_ctrl", "stage_gate"):
         lines.append(f'ahdl_include "{va}/{module}.va"')
-    lines += ["parameters Vcm=0.4", "simulator lang=spectre"]
+    lines += ["parameters Vcm=0.4", "simulator lang=spectre", f"Vcm_ref (vcm_ref 0) vsource dc={_fmt(vcm)}"]
     readout_stages=[resolved["stages"][i] for i in selected]
     sense_count=max(len(s["topology"]["readout_sense_src"]) for s in readout_stages)
     output_count=max(len(s["readout"]["crossbar_W"]) for s in readout_stages)
@@ -94,9 +94,10 @@ def render(params, out, inputs=None, stages=None, transient=True):
                 else:
                     prev=resolved["stages"][stage_idx-1]
                     tr=resolved["transfers"][stage_idx-1]
-                    src_node=f"n{spec_i}_{stage_idx-1}_{node}" if node<int(prev["num_nodes"]) else "0"
+                    src_node=f"n{spec_i}_{stage_idx-1}_{node}" if node<int(prev["num_nodes"]) else "vcm_ref"
                     release=sum(float(resolved["stages"][j]["solver"]["t_span"]) for j in range(stage_idx))*tu
-                    lines.append(_inst(prefix+f"gate{node}",[node_name,src_node],"stage_gate",w1=_at(tr["residual_w1"],node),w2=_at(tr["residual_w2"],node),w3=_at(tr["residual_w3"],node),vth=_at(tr["residual_vth"],node),x_hard=float(resolved["units"]["x_hard"]),release_s=release,smooth_s=max(tu*1e-8,1e-13),g_clamp=1.0))
+                    activation={"residual-relu-tanh":0,"relu":1,"residual":2,"residual_mixing":2}.get(tr["activation"],0)
+                    lines.append(_inst(prefix+f"gate{node}",[node_name,src_node],"stage_gate",w1=_at(tr["residual_w1"],node),w2=_at(tr["residual_w2"],node),w3=_at(tr["residual_w3"],node),vth=_at(tr["residual_vth"],node),activation=activation,x_hard=float(resolved["units"]["x_hard"]),release_s=release,smooth_s=max(tu*1e-8,1e-13),g_clamp=1.0))
             core=st["cells"]["core"]
             gains=_gain(torch.tensor([u],dtype=torch.float64),st["vca"],"core")
             vca_core=None if gains is None else gains[0].tolist()

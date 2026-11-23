@@ -148,3 +148,6 @@ Run all decks and compile jobs only under `/home/annaik/Documents/kirchhoffnet_r
 | Sixteen canonical specs / logits CSV | not run | — | — | blocked by stage-0 mismatch |
 
 The all-stage run completed in 18.9 s with 0 Spectre errors. Stage-0 error grows nearly linearly from 1 ns and interpreter-10/1000 agree closely, pointing to a circuit/table mapping issue rather than integration truncation. These values are diagnostic only; do not claim network equivalence.
+
+
+Stage-gate standalone characterization (Spectre 23.1, 50 fF node, 1 S clamp, 10 ns release): after the initial 1 ns settling interval, maximum pre-release error was 2.27e-9 x; measured series-probe current after release (>11 ns) was 0 A. `compile_modules.py --module stage_gate` passed with 0 errors / 0 warnings.

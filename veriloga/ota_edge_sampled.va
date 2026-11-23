@@ -34,11 +34,11 @@ module ota_edge_sampled(src_hold,dst_hold,src_live,dst_live);
       xt=(V(dst_live)-Vcm)/Vu; yt=(x_hard-xt)*Vu/Ut; yb=(x_hard+xt)*Vu/Ut; y0=x_hard*Vu/Ut;
       spt=max(yt,0.0)+ln(1.0+exp(-abs(k_soft*yt)))/k_soft; spb=max(yb,0.0)+ln(1.0+exp(-abs(k_soft*yb)))/k_soft; sp0=max(y0,0.0)+ln(1.0+exp(-abs(k_soft*y0)))/k_soft;
       ft=max(1.0-lambda_v*Vu*xt,0.0)*(1.0-exp(-spt))/(1.0-exp(-sp0)); fb=max(1.0+lambda_v*Vu*xt,0.0)*(1.0-exp(-spb))/(1.0-exp(-sp0));
-      I(dst_live) <+ (ip*ft-inn*fb)*`HRK_IU;
+      I(dst_live) <+ -(ip*ft-inn*fb)*`HRK_IU;
       xt=(V(src_live)-Vcm)/Vu; yt=(x_hard-xt)*Vu/Ut; yb=(x_hard+xt)*Vu/Ut;
       spt=max(yt,0.0)+ln(1.0+exp(-abs(k_soft*yt)))/k_soft; spb=max(yb,0.0)+ln(1.0+exp(-abs(k_soft*yb)))/k_soft;
       ft=max(1.0-lambda_v*Vu*xt,0.0)*(1.0-exp(-spt))/(1.0-exp(-sp0)); fb=max(1.0+lambda_v*Vu*xt,0.0)*(1.0-exp(-spb))/(1.0-exp(-sp0));
-      I(src_live) <+ (inn*ft-ip*fb)*`HRK_IU;
+      I(src_live) <+ -(inn*ft-ip*fb)*`HRK_IU;
     end else I(src_live,dst_live) <+ Isat*gate*(tanh(u)+floor_term*u)*`HRK_IU;
   end
 endmodule

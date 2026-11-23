@@ -21,6 +21,8 @@ MODULE_PARAMS = {
     "vca_bias": {"w0", "w1", "w2", "w3", "bias"},
     "gln_bias": {"w0", "w1", "w2", "w3", "bias", "delta_max"},
     "phase_ctrl": {"stages", "t_hold", "t_transfer", "t_switch", "t_evolve", "Vlogic"},
+    "stage_gate": {"w1", "w2", "w3", "vth", "activation", "x_hard", "release_s", "smooth_s", "g_clamp"},
+    "ota_edge_sampled": {"A", "B", "s", "theta", "gm", "Isat", "z_gate", "sigma_z", "vca", "x_max", "gate_width", "floor_term"},
 }
 
 

@@ -19,9 +19,9 @@ module boundary_sense_ota(src,dst);
     // High-impedance input: the sensed source voltage controls an output
     // current supplied by the rails, so only the destination receives load.
     // Negative branch current injects positive torch-convention current into dst.
-    // Conductive readout term is part of _cell, before its gate/VCA
-    // multiplier. Keep the source high-impedance: only the sensed output
-    // current is drawn from the destination/reference terminal.
-    I(dst) <+ -(Isat*(tanh(u)+alpha*u)+G*(xs-xd))*gate*`HRK_IU;
+    // Match _cell: endpoint-compliance gates multiply the nonlinear OTA
+    // current, not the parallel conductance. Both retain stage gate/VCA.
+    // Keep the source high-impedance; only the destination receives load.
+    I(dst) <+ -(Isat*(tanh(u)+alpha*u)*gate + G*(xs-xd)*z_gate*sigma_z)*`HRK_IU;
   end
 endmodule

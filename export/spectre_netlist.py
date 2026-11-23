@@ -57,7 +57,7 @@ def render(params, out, inputs=None, stages=None, transient=True):
     u_rows = _spec_inputs(resolved, n_specs, inputs)
     units = params.get("units", {})
     vu = float(units.get("Vu_V", 0.07)); vcm = float(units.get("Vcm_V", 0.4))
-    tu = float(units.get("Tu_s", 350e-9/4.660583)); dtmax = tu * min(float(s["solver"]["t_span"])/int(s["solver"]["num_steps"]) for s in resolved["stages"]) / 10
+    tu = float(units.get("Tu_s", 350e-9/4.660583)); dtmax = tu * min(float(s["solver"]["t_span"])/int(s["solver"]["num_steps"]) for s in resolved["stages"]) / 100
     selected = range(len(resolved["stages"])) if stages is None else list(stages)
     va = Path(__file__).resolve().parents[1] / "veriloga"
     lines = ["// Legacy copies deck: sequential stage releases use cumulative t_span; earlier copies continue evolving but are not read again.", "simulator lang=spectre", f'ahdl_include "{va}/hrknet_constants.vams"']
@@ -164,7 +164,8 @@ def render(params, out, inputs=None, stages=None, transient=True):
             warr="["+",".join(_fmt(x) for x in w)+"]"
             lines.append(f"{prefix}xb ({' '.join(xb_ports)}) crossbar_accumulator_{sense_count}x{output_count} W={warr}")
     stop=sum(float(resolved["stages"][i]["solver"]["t_span"]) for i in selected)*tu if transient else tu
-    lines.append(f"tran tran stop={_fmt(stop)} maxstep={_fmt(dtmax)} errpreset=conservative reltol=1e-6 vabstol=1e-9 iabstol=1e-15")
+    lines.append("simulatorOptions options reltol=1e-8 vabstol=1e-12 iabstol=1e-18")
+    lines.append(f"tran tran stop={_fmt(stop)} maxstep={_fmt(dtmax)} errpreset=conservative")
     lines.append("saveOptions options save=allpub")
     lines.append("save " + " ".join(f"n{s}_{i}_{node}" for s in range(n_specs) for i in selected for node in range(int(resolved["stages"][i]["num_nodes"]))))
     text="\n".join(lines)+"\n"

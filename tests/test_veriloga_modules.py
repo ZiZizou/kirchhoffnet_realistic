@@ -15,7 +15,7 @@ MODULE_PARAMS = {
     "node_cap_leak": {"c_eff", "c_phys", "g_leak"},
     "rail_clip": {"x_max", "sharp", "Iclip"},
     "sample_hold": {"C_hold", "R_on", "R_off", "inject_v", "inject_gain_err", "droop_v", "droop_time", "droop_tau"},
-    "boundary_sense_ota": {"gm", "Isat", "A", "B", "theta", "s", "z_gate"},
+    "boundary_sense_ota": {"gm", "Isat", "G", "A", "B", "theta", "s", "z_gate", "alpha", "x_max", "gate_width"},
     "crossbar_accumulator": {"W", "hw_mode", "hw_bits", "hw_bound", "acc_compliance_en", "Wmax", "lambda_v", "x_hard", "Vcm", "Vu", "Ut", "k_soft"},
     "interstage_transfer": {"w1", "w2", "w3", "vth", "x_hard"},
     "vca_bias": {"w0", "w1", "w2", "w3", "bias"},
@@ -47,6 +47,13 @@ def test_exporter_parameter_contract_is_declared():
                 declared.update(re.findall(r"[A-Za-z_]\w*", item.split("=", 1)[0]))
         missing = expected - declared
         assert not missing, f"{module} lacks exporter parameters: {sorted(missing)}"
+
+
+def test_readout_conductance_bypasses_endpoint_compliance_gate():
+    text = (VA / "boundary_sense_ota.va").read_text()
+    # _cell gates its nonlinear current by endpoint compliance, but adds
+    # G*(src-dst) outside those endpoint gates; z_gate/VCA still multiply it.
+    assert "Isat*(tanh(u)+alpha*u)*gate + G*(xs-xd)*z_gate*sigma_z" in text
 
 
 def test_shared_unit_constants_match_hw_units_contract():

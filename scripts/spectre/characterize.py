@@ -22,7 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 ROOT = Path(__file__).resolve().parents[2]
-RUN_ROOT = Path("/home/annaik/Documents/kirchhoffnet_refactor/.agent_scratch/taskD2/runs")
+RUN_ROOT = Path("/home/annaik/Documents/kirchhoffnet_refactor/.agent_scratch/taskD3/runs")
 SETUP = "~/workarea_GF22_FDX_EXT/kit.gf22fdx_ext.v1.0_4.1_stack19_oa.csh"
 VU, VCM, IU = 0.07, 0.4, 50e-15 * 0.07 / (350e-9 / 4.660583)
 VA = ROOT / "veriloga"
@@ -406,11 +406,19 @@ def run(args):
     hw_units = __import__("hw.units", fromlist=["HWUnits"]).HWUnits()
     for i,c in enumerate(cs):
         module = c["module"]
+        ota_input_current = None
         if module in ("ota_edge", "shunt", "boundary_sense_ota"):
             vs, vd = nodes[f"src{i}"], nodes[f"dst{i}"]
             measured = nodes[f"Vbias{i}:p"]
             if module == "ota_edge" and c["params"].get("mode") == 1:
                 measured = -measured  # HW has an independent sink/source leg at dst.
+            input_current = nodes.get(f"Vsrc{i}:p", 0.0)
+            if module == "boundary_sense_ota":
+                ota_input_current = input_current / IU
+                if abs(ota_input_current) > 1e-9:
+                    raise AssertionError(
+                        f"{c['mode']} OTA input loaded: {ota_input_current:.6g} Iu"
+                    )
             values = {"src": vs, "dst": vd}
         elif module in ("vca_bias", "gln_bias"):
             measured = nodes[f"out{i}"]
@@ -444,7 +452,9 @@ def run(args):
         rows.append({"module": module, "mode": c["mode"], "error_units": units,
                      "abs_error_model_units": abs_err, "rel_error": rel_err,
                      "measured_model_units": measured/scale,
-                     "reference_model_units": expected/scale})
+                     "reference_model_units": expected/scale,
+                     **({"input_current_model_units": ota_input_current}
+                        if ota_input_current is not None else {})})
     for i, c in enumerate(cs):
         if c["module"] != "node_cap_leak":
             continue

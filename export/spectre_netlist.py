@@ -61,7 +61,7 @@ def render(params, out, inputs=None, stages=None, transient=True):
     selected = range(len(resolved["stages"])) if stages is None else list(stages)
     va = Path(__file__).resolve().parents[1] / "veriloga"
     lines = ["simulator lang=spectre", f'ahdl_include "{va}/hrknet_constants.vams"']
-    for module in ("ota_edge", "shunt", "node_cap_leak", "rail_clip", "sample_hold", "boundary_sense_ota", "interstage_transfer", "phase_ctrl"):
+    for module in ("ota_edge", "shunt", "node_cap_leak", "rail_clip", "sample_hold", "boundary_sense_ota", "interstage_transfer", "phase_ctrl", "stage_gate"):
         lines.append(f'ahdl_include "{va}/{module}.va"')
     lines += ["parameters Vcm=0.4", "simulator lang=spectre"]
     readout_stages=[resolved["stages"][i] for i in selected]
@@ -86,8 +86,17 @@ def render(params, out, inputs=None, stages=None, transient=True):
             st = resolved["stages"][stage_idx]; top = st["topology"]; setting=st["settings"]
             prefix=f"q{spec_i}_s{stage_idx}_"; n=int(st["num_nodes"])
             for node in range(n):
-                lines.append(_inst(prefix+f"cap{node}",[f"n{spec_i}_{stage_idx}_{node}"],"node_cap_leak",c_eff=float(setting["c_eff"]),g_leak=_at(setting["leak"],node)))
-                lines.append(_inst(prefix+f"clip{node}",[f"n{spec_i}_{stage_idx}_{node}"],"rail_clip",x_max=float(setting["x_max"]),sharp=float(setting["clip_sharpness"]),Iclip=float(setting["clip_current"])))
+                node_name=f"n{spec_i}_{stage_idx}_{node}"
+                lines.append(_inst(prefix+f"cap{node}",[node_name],"node_cap_leak",c_eff=float(setting["c_eff"]),g_leak=_at(setting["leak"],node)))
+                lines.append(_inst(prefix+f"clip{node}",[node_name],"rail_clip",x_max=float(setting["x_max"]),sharp=float(setting["clip_sharpness"]),Iclip=float(setting["clip_current"])))
+                if stage_idx == 0:
+                    lines.append(f"ic {node_name}={_fmt(vcm)}")
+                else:
+                    prev=resolved["stages"][stage_idx-1]
+                    tr=resolved["transfers"][stage_idx-1]
+                    src_node=f"n{spec_i}_{stage_idx-1}_{node}" if node<int(prev["num_nodes"]) else "0"
+                    release=sum(float(resolved["stages"][j]["solver"]["t_span"]) for j in range(stage_idx))*tu
+                    lines.append(_inst(prefix+f"gate{node}",[node_name,src_node],"stage_gate",w1=_at(tr["residual_w1"],node),w2=_at(tr["residual_w2"],node),w3=_at(tr["residual_w3"],node),vth=_at(tr["residual_vth"],node),x_hard=float(resolved["units"]["x_hard"]),release_s=release,smooth_s=max(tu*1e-8,1e-13),g_clamp=1.0))
             core=st["cells"]["core"]
             gains=_gain(torch.tensor([u],dtype=torch.float64),st["vca"],"core")
             vca_core=None if gains is None else gains[0].tolist()
@@ -127,10 +136,8 @@ def render(params, out, inputs=None, stages=None, transient=True):
                 vref=_at(st["readout"]["vref"],sense)
                 ref=f"vref{spec_i}_{stage_idx}_{sense}"
                 lines.append(f"{ref} ({ref} 0) vsource dc={_fmt(vcm+vu*vref)}")
-                lines.append(f"Rref{spec_i}_{stage_idx}_{sense} ({sn}n {ref}) resistor r=1000")
                 gm=float(_gln_gm(st,"readout",rc,torch.tensor([u],dtype=torch.float64))[0,sense]); gate=_at(st["gates"]["readout"],sense); vca=1 if rvg is None else float(rvg[sense])
                 lines.append(_inst(prefix+f"r{sense}",[f"n{spec_i}_{stage_idx}_{src}",sn],"boundary_sense_ota",gm=gm,Isat=_at(rc["isat"],sense),A=_at(rc["A"],sense),B=_at(rc["B"],sense),theta=_at(rc["theta"],sense),s=_at(rc["sign"],sense),z_gate=gate*vca,alpha=float(rc["alpha"]),x_max=float(setting["x_max"]),gate_width=float(rc["beta_softness"])))
-                lines.append(f"Vsense{spec_i}_{stage_idx}_{sense} ({sn} {sn}n) vsource dc=0")
             weights=st["readout"]["crossbar_W"]; acc_start=int(top["readout_dst_start"])
             xb_ports=[]
             for k in range(sense_count):

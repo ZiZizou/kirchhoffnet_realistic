@@ -17,7 +17,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 VA = ROOT / "veriloga"
-RUN_ROOT = Path("/home/annaik/Documents/kirchhoffnet_refactor/.agent_scratch/taskD2/runs")
+RUN_ROOT = Path("/home/annaik/Documents/kirchhoffnet_refactor/.agent_scratch/taskD3/runs/compile_modules")
 SETUP = "~/workarea_GF22_FDX_EXT/kit.gf22fdx_ext.v1.0_4.1_stack19_oa.csh"
 PORTS = {
     "ota_edge": ("src", "dst"),
@@ -31,6 +31,7 @@ PORTS = {
     "vca_bias": ("u0", "u1", "u2", "u3", "gain"),
     "gln_bias": ("u0", "u1", "u2", "u3", "trim"),
     "phase_ctrl": ("clk", "phase", "stage"),
+    "stage_gate": ("node", "source"),
 }
 
 

@@ -30,6 +30,7 @@ MODULE_PARAMS = {
     "boundary_sense_ota_banked": {"gm", "Isat", "G", "A", "B"},
     "node_cap_leak_banked": {"c_eff", "c_phys", "g_leak"},
     "rail_clip_banked": {"x_max", "sharp", "Iclip"},
+    "interstage_transfer_banked": {"w1", "w2", "w3", "vth", "x_hard", "Ron", "Roff"},
 }
 
 

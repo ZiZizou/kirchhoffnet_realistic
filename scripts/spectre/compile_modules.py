@@ -40,6 +40,7 @@ PORTS = {
     "node_cap_leak_banked": ("node", "stage", "en"),
     "rail_clip_banked": ("node", "stage", "en"),
     "window_clamp": ("node", "target", "win"),
+    "interstage_transfer_banked": ("in", "out", "stage", "en"),
 }
 
 

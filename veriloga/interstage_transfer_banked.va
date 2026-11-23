@@ -1,0 +1,19 @@
+`include "constants.vams"
+`include "disciplines.vams"
+`include "hrknet_constants.vams"
+// Six boundary-transfer coefficient banks, selected by the source stage.
+module interstage_transfer_banked(in,out,stage,en);
+  input in,stage,en; output out; electrical in,out,stage,en;
+  parameter real w1[0:5]='{1,1,1,1,1,1},w2[0:5]='{0,0,0,0,0,0},w3[0:5]='{0,0,0,0,0,0};
+  parameter real vth[0:5]='{0,0,0,0,0,0},x_hard=5.714,Vcm=`HRK_VCM,Vu=`HRK_VU;
+  parameter real Ron=1e3,Roff=1e12,enable_width=0.01;
+  integer k; real x,y,relu_x,g_on;
+  analog begin
+    k=$rtoi(V(stage)+0.5); if(k<0) k=0; if(k>5) k=5;
+    x=(V(in)-Vcm)/Vu; relu_x=max(x-vth[k],0.0);
+    y=w1[k]*x+w2[k]*tanh(x)+w3[k]*relu_x;
+    y=min(max(y,-x_hard),x_hard);
+    g_on=1.0/Roff+(1.0/Ron-1.0/Roff)/(1.0+limexp(-(V(en)-0.5)/enable_width));
+    I(out) <+ g_on*(V(out)-(Vcm+Vu*y));
+  end
+endmodule

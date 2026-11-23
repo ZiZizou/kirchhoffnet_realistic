@@ -91,3 +91,18 @@ def test_spectre_network_single_spec_matches_true_ode():
                 max_error = max(max_error, float(np.max(np.abs(measured[mask] - expected))))
         offset += span * tu
     assert max_error < 1e-4, f"max node trajectory error {max_error:.6g} x; run={run_dir}"
+
+
+def test_paper_timemux_netlist_uses_shared_fabric_and_recurring_windows(tmp_path):
+    export(DEFAULT_CKPT, tmp_path, mode="legacy", fabric="timemux", specs=1)
+    text = (tmp_path / "hrknet.scs").read_text()
+    lines = text.splitlines()
+    assert "shared 18-node state; seven parameter banks" in text
+    assert sum(" ota_edge_sampled_banked " in line for line in lines) == 22
+    assert sum(" boundary_sense_ota_banked " in line for line in lines) == 30
+    assert sum(" node_cap_leak_banked " in line for line in lines) == 18
+    assert sum("window_clamp " in line for line in lines) == 18
+    assert sum("interstage_transfer_banked " in line for line in lines) == 18
+    assert "V0_win" in text and "V0_xfer_en" in text and "V0_stage" in text
+    assert "t_span[k]*Tu" in text
+    assert (tmp_path / "crossbar_accumulator_banked_22x7.va").is_file()

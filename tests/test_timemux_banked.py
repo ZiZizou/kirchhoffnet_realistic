@@ -18,7 +18,7 @@ def test_banked_primitives_select_nearest_volt_and_gate_currents():
         text = (VA / f"{module}.va").read_text()
         assert f"module {module}(" in text
         assert "stage,en" in text
-        assert "floor(V(stage)+0.5)" in text and "if(k>6) k=6" in text
+        assert "$rtoi(V(stage)+0.5)" in text and "if(k>6) k=6" in text
         assert "V(en)-0.5" in text
         for name in params:
             assert re.search(rf"\b{name}\[0:6\]", text), (module, name)

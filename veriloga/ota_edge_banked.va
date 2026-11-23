@@ -12,7 +12,7 @@ module ota_edge_banked(src,dst,stage,en);
   parameter real Vcm=`HRK_VCM, Vu=`HRK_VU, gate_width=0.02, x_max=4.0, floor_term=0.01, en_width=0.01;
   integer k; real xs,xd,u,gate,eg;
   analog begin
-    k=integer'(floor(V(stage)+0.5)); if(k<0) k=0; if(k>6) k=6;
+    k=$rtoi(V(stage)+0.5); if(k<0) k=0; if(k>6) k=6;
     xs=(V(src)-Vcm)/Vu; xd=(V(dst)-Vcm)/Vu;
     u=gm[k]*(s[k]*(A[k]*xs-B[k]*xd)+theta[k]);
     gate=z_gate[k]*sigma_z[k]*vca[k];

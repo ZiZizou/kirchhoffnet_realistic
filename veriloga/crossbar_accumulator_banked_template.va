@@ -9,7 +9,7 @@ module crossbar_accumulator_banked_4x3(s0p,s0n,s1p,s1n,s2p,s2n,s3p,s3n,acc0,acc1
   parameter real W[0:83]='{default:0.0};
   integer k; real i0,i1,i2,eg;
   analog begin
-    k=integer'(floor(V(stage)+0.5)); if(k<0) k=0; if(k>6) k=6;
+    k=$rtoi(V(stage)+0.5); if(k<0) k=0; if(k>6) k=6;
     eg=1.0/(1.0+limexp(-(V(en)-0.5)/0.01));
     V(s0p,s0n)<+0.0; V(s1p,s1n)<+0.0; V(s2p,s2n)<+0.0; V(s3p,s3n)<+0.0;
     i0=W[k*12+0]*I(s0p,s0n)+W[k*12+1]*I(s1p,s1n)+W[k*12+2]*I(s2p,s2n)+W[k*12+3]*I(s3p,s3n);

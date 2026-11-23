@@ -17,7 +17,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 VA = ROOT / "veriloga"
-RUN_ROOT = Path("/home/annaik/Documents/kirchhoffnet_refactor/.agent_scratch/taskD3/runs/compile_modules")
+RUN_ROOT = Path(os.environ.get("TMNET_COMPILE_ROOT", "/home/annaik/Documents/kirchhoffnet_refactor/.agent_scratch/taskD3/runs/compile_modules"))
 SETUP = "~/workarea_GF22_FDX_EXT/kit.gf22fdx_ext.v1.0_4.1_stack19_oa.csh"
 PORTS = {
     "ota_edge": ("src", "dst"),

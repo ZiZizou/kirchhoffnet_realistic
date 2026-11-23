@@ -171,3 +171,33 @@ def render(params, out, inputs=None, stages=None, transient=True):
     text="\n".join(lines)+"\n"
     Path(out).write_text(text)
     return text
+
+
+def _write_banked_crossbar(out, sense_count=22, output_count=7):
+    """Generate a seven-bank crossbar VA sized for the resolved readout."""
+    va = Path(__file__).resolve().parents[1] / "veriloga"
+    ports = [f"s{k}p,s{k}n" for k in range(sense_count)]
+    ports += [f"acc{j}" for j in range(output_count)]
+    ports += ["stage", "en"]
+    declarations = [f"  input s{k}p,s{k}n; electrical s{k}p,s{k}n;" for k in range(sense_count)]
+    declarations += [f"  inout acc{j}; electrical acc{j};" for j in range(output_count)]
+    declarations.append("  input stage,en; electrical stage,en;")
+    wlen = sense_count * output_count
+    terms = []
+    for j in range(output_count):
+        terms.append(f"    i_acc[{j}]=0.0;" + "".join(
+            f" i_acc[{j}]=i_acc[{j}]+W[k*{wlen}+{j*sense_count+kidx}]*I(s{kidx}p,s{kidx}n);"
+            for kidx in range(sense_count)) + f" I(acc{j}) <+ -eg*i_acc[{j}];")
+    body = ["`include \"constants.vams\"", "`include \"disciplines.vams\"",
+            f'`include "{va}/hrknet_constants.vams"',
+            f"module crossbar_accumulator_banked_{sense_count}x{output_count}({','.join(ports)});",
+            *declarations, f"  parameter real W[0:{7*wlen-1}]='{{" + ",".join("0.0" for _ in range(7*wlen)) + "};", 
+            "  integer k; real eg;", f"  real i_acc[0:{output_count-1}];", "  analog begin",
+            "    k=$rtoi(V(stage)+0.5); if(k<0) k=0; if(k>6) k=6;",
+            "    eg=1.0/(1.0+limexp(-(V(en)-0.5)/0.01));"]
+    body.extend(f"    V(s{k}p,s{k}n)<+0.0;" for k in range(sense_count))
+    body.extend(terms)
+    body += ["  end", "endmodule", ""]
+    path = Path(out).parent / f"crossbar_accumulator_banked_{sense_count}x{output_count}.va"
+    path.write_text("\n".join(body))
+    return path

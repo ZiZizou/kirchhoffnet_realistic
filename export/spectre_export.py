@@ -281,6 +281,11 @@ def export_model(model, out, mode="legacy", fabric="timemux", specs=16, hw_confi
       render(params, out/"hrknet.scs")
     else:
       va=Path(__file__).resolve().parents[1]/"veriloga"
+      if mode == "legacy" and fabric == "timemux":
+        from .spectre_netlist import _write_banked_crossbar
+        max_sense=max(len(s["topology"]["readout_sense_src"]) for s in resolved["stages"])
+        max_outputs=max(len(s["readout"]["crossbar_W"]) for s in resolved["stages"])
+        _write_banked_crossbar(out/"hrknet.scs", max_sense, max_outputs)
       lines=[f'// generated mode={mode} fabric={fabric}', f'ahdl_include "{va}/hrknet_constants.vams"',
         f'ahdl_include "{va}/ota_edge.va"', 'simulator lang=spectre', 'parameters Vcm=0.4']
       for i in range(int(specs)):

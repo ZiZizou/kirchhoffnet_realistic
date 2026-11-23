@@ -48,11 +48,65 @@ def _spec_inputs(resolved, count, inputs):
     return u.tolist()
 
 
+def _gln_tail_scale(stage, family, u):
+    gln=stage.get("gln")
+    if not gln or gln.get("mode")!="tail" or family not in gln.get("families",{}):
+        return None
+    ref=torch.as_tensor(u,dtype=torch.float64).reshape(1,-1)
+    rails=torch.tanh(_t(gln["alpha"],ref)*(ref@_t(gln["a"],ref).T+_t(gln["c"],ref)))
+    delta=rails@_t(gln["families"][family]["W"],ref).T
+    return torch.exp(torch.clamp(delta,-float(gln["delta_max"]),float(gln["delta_max"])))[0].tolist()
+
+
 def render(params, out, inputs=None, stages=None, transient=True):
     """Render a legacy copies deck. ``inputs`` are the raw physical spec rows."""
-    if params.get("mode") != "legacy" or params.get("fabric") != "copies":
-        raise ValueError("Spectre network writer supports only legacy/copies")
+    mode = params.get("mode", "legacy")
+    if mode not in {"legacy", "hw"} or params.get("fabric") != "copies":
+        raise ValueError("Spectre network writer supports legacy|hw copies")
     resolved = params.get("resolved", params)
+    if mode == "hw":
+        # First validated hardware slice: phase3a_core only. Keep this an
+        # explicit allowlist; unsupported forward-affecting flags must never
+        # silently fall through to legacy equations.
+        flags = resolved.get("hw_flags", {})
+        ab_mode = flags.get("hw_ab_mode")
+        if ab_mode == "cap_divider":
+            expected = {"hw_slope_bound": True, "hw_ic_coupling": True,
+                        "hw_no_alpha": True, "hw_ab_mode": "cap_divider",
+                        "hw_ab_bits": 3, "hw_ab_rmax": 2.0}
+            preset_name = "phase3a_core"
+        elif ab_mode == "differential":
+            expected = {"hw_slope_bound": True, "hw_ic_coupling": True,
+                        "hw_no_alpha": True, "hw_ab_mode": "differential"}
+            preset_name = "phase3a_core_diff"
+        else:
+            raise ValueError("hw netlist currently supports phase3a_core and phase3a_core_diff only")
+        for key, value in expected.items():
+            if flags.get(key) != value:
+                raise ValueError(f"hw netlist currently requires {preset_name} {key}={value!r}")
+        allowed = set(expected)
+        defaults = {"hw_ab_mode": None, "hw_ab_bits": 3, "hw_ab_rmax": 2.0,
+                    "hw_slope_g_min": 0.0625, "hw_xbar_mode": "signed",
+                    "hw_gln_delta_max": 1.3862943611198906,
+                    "hw_c_node": None, "hw_gln_mode": None,
+                    "hw_mismatch_sigma": None, "hw_vca_bits": None,
+                    "hw_vref_bits": None, "hw_xbar_bits": None}
+        # M3 feature groups have fixed, audited settings. Other values remain
+        # refused rather than being silently ignored by the deck writer.
+        feature_values = {"hw_vref_symmetric": True, "hw_vref_bits": 6,
+                          "hw_xbar_bound": True, "hw_xbar_bits": 5,
+                          "hw_xbar_mode": "signed", "hw_clamp_transfer": True,
+                          "hw_c_node": "physical", "hw_gln_mode": "tail",
+                          "hw_gln_delta_max": 1.3862943611198906,
+                          "hw_compliance": True}
+        for key, value in feature_values.items():
+            if flags.get(key) not in (defaults.get(key, False), value):
+                raise ValueError(f"hw netlist does not support {key}={flags.get(key)!r}")
+        feature_keys = set(feature_values)
+        active = [k for k, v in flags.items() if k not in allowed and k not in feature_keys
+                  and v != defaults.get(k, False)]
+        if active:
+            raise ValueError("hw netlist does not support flags: " + ", ".join(sorted(active)))
     n_specs = int(params.get("specs", 1))
     u_rows = _spec_inputs(resolved, n_specs, inputs)
     units = params.get("units", {})
@@ -73,9 +127,14 @@ def render(params, out, inputs=None, stages=None, transient=True):
     decl="\n".join([f"  input s{k}p,s{k}n; electrical s{k}p,s{k}n;" for k in range(sense_count)]+[f"  inout acc{j}; electrical acc{j};" for j in range(output_count)])
     wlen=sense_count*output_count
     sums="\n".join([f"    V(s{k}p,s{k}n) <+ 0.0; isense[{k}]=I(s{k}p,s{k}n);" for k in range(sense_count)])
-    calc="\n".join([f"    i_acc[{j}]=0.0;"+"".join([f" i_acc[{j}]=i_acc[{j}]+W[{j*sense_count+k}]*isense[{k}];" for k in range(sense_count)])+f" I(acc{j}) <+ -i_acc[{j}];" for j in range(output_count)])
+    calc_lines=[]
+    for j in range(output_count):
+        calc_lines.append(f"    i_acc[{j}]=0.0;"+"".join([f" i_acc[{j}]=i_acc[{j}]+W[{j*sense_count+k}]*isense[{k}];" for k in range(sense_count)]))
+        calc_lines.extend([f"    if (acc_compliance_en) begin",f"      xa=(V(acc{j})-Vcm)/Vu; yt=(x_hard-xa)*Vu/Ut; yb=(x_hard+xa)*Vu/Ut; y0=x_hard*Vu/Ut;", "      spt=max(yt,0.0)+ln(1.0+exp(-abs(k_soft*yt)))/k_soft; spb=max(yb,0.0)+ln(1.0+exp(-abs(k_soft*yb)))/k_soft; sp0=max(y0,0.0)+ln(1.0+exp(-abs(k_soft*y0)))/k_soft;", "      ft=max(1.0-lambda_v*Vu*xa,0.0)*(1.0-exp(-spt))/(1.0-exp(-sp0)); fb=max(1.0+lambda_v*Vu*xa,0.0)*(1.0-exp(-spb))/(1.0-exp(-sp0));", f"      if (i_acc[{j}]>=0.0) i_acc[{j}]=i_acc[{j}]*ft; else i_acc[{j}]=i_acc[{j}]*fb;", "    end"])
+        calc_lines.append(f"    I(acc{j}) <+ -i_acc[{j}];")
+    calc="\n".join(calc_lines)
     wdefault="'{"+",".join("0.0" for _ in range(wlen))+"}"
-    crossbar_va=chr(10).join(['`include "constants.vams"', '`include "disciplines.vams"', f'`include "{va}/hrknet_constants.vams"', f"module crossbar_accumulator_{sense_count}x{output_count}({ports});", decl, f"  parameter real W[0:{wlen-1}]={wdefault};", f"  real isense[0:{sense_count-1}],i_acc[0:{output_count-1}];", "  analog begin", sums, calc, "  end", "endmodule", ""])
+    crossbar_va=chr(10).join(['`include "constants.vams"', '`include "disciplines.vams"', f'`include "{va}/hrknet_constants.vams"', f"module crossbar_accumulator_{sense_count}x{output_count}({ports});", decl, f"  parameter real W[0:{wlen-1}]={wdefault};", "  parameter integer acc_compliance_en=0;", "  parameter real x_hard=5.7142857143,Vu=0.07,Vcm=0.4,Ut=0.03086,lambda_v=0.15,k_soft=2000.0;", f"  real isense[0:{sense_count-1}],i_acc[0:{output_count-1}];", "  real xa,yt,yb,y0,spt,spb,sp0,ft,fb;", "  analog begin", sums, calc, "  end", "endmodule", ""])
     crossbar_path=Path(out).parent/f"crossbar_accumulator_{sense_count}x{output_count}.va"
     crossbar_path.write_text(crossbar_va)
     lines.append(f'ahdl_include "{crossbar_path}"')
@@ -87,7 +146,10 @@ def render(params, out, inputs=None, stages=None, transient=True):
             prefix=f"q{spec_i}_s{stage_idx}_"; n=int(st["num_nodes"])
             for node in range(n):
                 node_name=f"n{spec_i}_{stage_idx}_{node}"
-                lines.append(_inst(prefix+f"cap{node}",[node_name],"node_cap_leak",c_eff=float(setting["c_eff"]),g_leak=_at(setting["leak"],node)))
+                cap_params=dict(c_eff=float(setting["c_eff"]),g_leak=_at(setting["leak"],node))
+                if mode=="hw" and resolved.get("hw_flags",{}).get("hw_c_node")=="physical":
+                    cap_params["c_phys"]=_at(st["physical"]["C_node_F"],node)
+                lines.append(_inst(prefix+f"cap{node}",[node_name],"node_cap_leak",**cap_params))
                 lines.append(_inst(prefix+f"clip{node}",[node_name],"rail_clip",x_max=float(setting["x_max"]),sharp=float(setting["clip_sharpness"]),Iclip=float(setting["clip_current"])))
                 if stage_idx == 0:
                     lines.append(f"ic {node_name}={_fmt(vcm)}")
@@ -97,7 +159,7 @@ def render(params, out, inputs=None, stages=None, transient=True):
                     src_node=f"n{spec_i}_{stage_idx-1}_{node}" if node<int(prev["num_nodes"]) else "vcm_ref"
                     release=sum(float(resolved["stages"][j]["solver"]["t_span"]) for j in range(stage_idx))*tu
                     activation={"residual-relu-tanh":0,"relu":1,"residual":2,"residual_mixing":2}.get(tr["activation"],0)
-                    lines.append(_inst(prefix+f"gate{node}",[node_name,src_node],"stage_gate",w1=_at(tr["residual_w1"],node),w2=_at(tr["residual_w2"],node),w3=_at(tr["residual_w3"],node),vth=_at(tr["residual_vth"],node),activation=activation,x_hard=float(resolved["units"]["x_hard"]),release_s=release,smooth_s=max(tu*1e-8,1e-13),g_clamp=1.0))
+                    lines.append(_inst(prefix+f"gate{node}",[node_name,src_node],"stage_gate",w1=_at(tr["residual_w1"],node),w2=_at(tr["residual_w2"],node),w3=_at(tr["residual_w3"],node),vth=_at(tr["residual_vth"],node),activation=activation,x_hard=float(resolved["units"]["x_hard"]),release_s=release,smooth_s=max(tu*1e-8,1e-13),g_clamp=1.0,clamp_enable=int(mode=="legacy" or bool(resolved.get("hw_flags",{}).get("hw_clamp_transfer",False)))))
             core=st["cells"]["core"]
             gains=_gain(torch.tensor([u],dtype=torch.float64),st["vca"],"core")
             vca_core=None if gains is None else gains[0].tolist()
@@ -125,6 +187,24 @@ def render(params, out, inputs=None, stages=None, transient=True):
                 else:
                     ota_nodes=[held_nodes[src],held_nodes[dst]]; ota_module="ota_edge"
                     ota_params=dict(mode=0,A=_at(core["A"],edge),B=_at(core["B"],edge),s=_at(core["sign"],edge),theta=_at(core["theta"],edge),gm=_at(core["gm"],edge),Isat=_at(core["isat"],edge),z_gate=gate,sigma_z=1.0,vca=vca,x_max=float(setting["x_max"]),gate_width=float(core["beta_softness"]),floor_term=float(core["alpha"]))
+                if mode == "hw":
+                    if flags.get("hw_ab_mode") == "cap_divider":
+                        codes=core.get("ab_codes")
+                        if not codes:
+                            raise ValueError("phase3a_core hardware export requires resolved cap-divider codes")
+                        ab_params=dict(ab_mode=3,
+                                       cap_code_a=int(codes["k_A"][edge]),
+                                       cap_code_b=int(codes["k_B"][edge]),
+                                       cap_bits=int(codes["levels"]).bit_length(),
+                                       cap_rmax=float(codes["rmax"]))
+                    else:
+                        ab_params=dict(ab_mode=2)
+                    hw_params=dict(mode=1, gm=1.0,
+                                   g_hw=_at(core["gm"],edge), f_ic=1.0,
+                                   floor_term=0.0, **ab_params)
+                    if resolved.get("hw_flags",{}).get("hw_compliance"):
+                        hw_params.update(compliance_en=1,lambda_v=float(resolved["units"]["lambda_v"]),Ut=float(resolved["units"]["u_t"]),x_hard=float(resolved["units"]["x_hard"]))
+                    ota_params.update(hw_params)
                 lines.append(_inst(prefix+f"e{edge}",ota_nodes,ota_module,**ota_params))
                 g=_at(core["conductance"],edge)
                 if g:
@@ -133,10 +213,14 @@ def render(params, out, inputs=None, stages=None, transient=True):
             bc=st["cells"]["boundary"]
             vg=_gain(torch.tensor([u],dtype=torch.float64),st["vca"],"boundary")
             bvg=None if vg is None else vg[0].tolist()
+            btail=_gln_tail_scale(st,"boundary",u)
             for edge,(src,dst) in enumerate(zip(top["boundary_src"],top["boundary_dst"])):
-                cell_gm=float(_gln_gm(st,"boundary",bc,torch.tensor([u],dtype=torch.float64))[0,edge])
+                cell_gm=float(torch.as_tensor(_gln_gm(st,"boundary",bc,torch.tensor([u],dtype=torch.float64))).reshape(-1)[edge])
                 gate=_at(st["gates"]["boundary"],edge); vca=1.0 if bvg is None else float(bvg[edge])
-                p=dict(gm=cell_gm,Isat=_at(bc["isat"],edge),A=_at(bc["A"],edge),B=_at(bc["B"],edge),theta=_at(bc["theta"],edge),s=_at(bc["sign"],edge),z_gate=gate*vca,alpha=float(bc["alpha"]),x_max=float(setting["x_max"]),gate_width=float(bc["beta_softness"]))
+                isat=_at(bc["isat"],edge)*(1.0 if btail is None else float(btail[edge]))
+                p=dict(gm=cell_gm,Isat=isat,A=_at(bc["A"],edge),B=_at(bc["B"],edge),theta=_at(bc["theta"],edge),s=_at(bc["sign"],edge),z_gate=gate*vca,alpha=float(bc["alpha"]),x_max=float(setting["x_max"]),gate_width=float(bc["beta_softness"]))
+                if mode=="hw" and resolved.get("hw_flags",{}).get("hw_compliance"):
+                    p.update(compliance_en=1,x_hard=float(resolved["units"]["x_hard"]),lambda_v=float(resolved["units"]["lambda_v"]),Ut=float(resolved["units"]["u_t"]))
                 lines.append(_inst(prefix+f"b{edge}",[f"in{spec_i}_{src}",f"n{spec_i}_{stage_idx}_{dst}"],"boundary_sense_ota",**p))
                 g=_at(bc["conductance"],edge)
                 if g: lines.append(_inst(prefix+f"bsh{edge}",[f"in{spec_i}_{src}",f"n{spec_i}_{stage_idx}_{dst}"],"shunt",G=g,z_gate=gate*vca,vca=1.0,vca_gate_shunt=1))
@@ -145,14 +229,19 @@ def render(params, out, inputs=None, stages=None, transient=True):
             rc=st["cells"]["readout"]; sense_src=top["readout_sense_src"]
             rv=_gain(torch.tensor([u],dtype=torch.float64),st["vca"],"readout")
             rvg=None if rv is None else rv[0].tolist()
+            rtail=_gln_tail_scale(st,"readout",u)
             sense_nodes=[]
             for sense,src in enumerate(sense_src):
                 sn=f"sense{spec_i}_{stage_idx}_{sense}"; sense_nodes.append(sn)
                 vref=_at(st["readout"]["vref"],sense)
                 ref=f"sense{spec_i}_{stage_idx}_{sense}n"
                 lines.append(f"{ref} ({ref} 0) vsource dc={_fmt(vcm+vu*vref)}")
-                gm=float(_gln_gm(st,"readout",rc,torch.tensor([u],dtype=torch.float64))[0,sense]); gate=_at(st["gates"]["readout"],sense); vca=1 if rvg is None else float(rvg[sense])
-                lines.append(_inst(prefix+f"r{sense}",[f"n{spec_i}_{stage_idx}_{src}",sn],"boundary_sense_ota",gm=gm,Isat=_at(rc["isat"],sense),G=_at(rc["conductance"],sense),A=_at(rc["A"],sense),B=_at(rc["B"],sense),theta=_at(rc["theta"],sense),s=_at(rc["sign"],sense),z_gate=gate*vca,alpha=float(rc["alpha"]),x_max=float(setting["x_max"]),gate_width=float(rc["beta_softness"])))
+                gm=float(torch.as_tensor(_gln_gm(st,"readout",rc,torch.tensor([u],dtype=torch.float64))).reshape(-1)[sense]); gate=_at(st["gates"]["readout"],sense); vca=1 if rvg is None else float(rvg[sense])
+                risat=_at(rc["isat"],sense)*(1.0 if rtail is None else float(rtail[sense]))
+                rp=dict(gm=gm,Isat=risat,G=_at(rc["conductance"],sense),A=_at(rc["A"],sense),B=_at(rc["B"],sense),theta=_at(rc["theta"],sense),s=_at(rc["sign"],sense),z_gate=gate*vca,alpha=float(rc["alpha"]),x_max=float(setting["x_max"]),gate_width=float(rc["beta_softness"]))
+                if mode=="hw" and resolved.get("hw_flags",{}).get("hw_compliance"):
+                    rp.update(compliance_en=1,x_hard=float(resolved["units"]["x_hard"]),lambda_v=float(resolved["units"]["lambda_v"]),Ut=float(resolved["units"]["u_t"]))
+                lines.append(_inst(prefix+f"r{sense}",[f"n{spec_i}_{stage_idx}_{src}",sn],"boundary_sense_ota",**rp))
             weights=st["readout"]["crossbar_W"]; acc_start=int(top["readout_dst_start"])
             xb_ports=[]
             for k in range(sense_count):
@@ -162,7 +251,11 @@ def render(params, out, inputs=None, stages=None, transient=True):
                 xb_ports.append(f"n{spec_i}_{stage_idx}_{acc_start+j}" if j<len(weights) else "0")
             w=[float(weights[j][k]) if j<len(weights) and k<len(weights[j]) else 0.0 for j in range(output_count) for k in range(sense_count)]
             warr="["+",".join(_fmt(x) for x in w)+"]"
-            lines.append(f"{prefix}xb ({' '.join(xb_ports)}) crossbar_accumulator_{sense_count}x{output_count} W={warr}")
+            xb_params=""
+            if mode=="hw" and resolved.get("hw_flags",{}).get("hw_compliance"):
+                xb_params=(f" acc_compliance_en=1 x_hard={_fmt(resolved['units']['x_hard'])}"
+                           f" lambda_v={_fmt(resolved['units']['lambda_v'])} Ut={_fmt(resolved['units']['u_t'])}")
+            lines.append(f"{prefix}xb ({' '.join(xb_ports)}) crossbar_accumulator_{sense_count}x{output_count} W={warr}{xb_params}")
     stop=sum(float(resolved["stages"][i]["solver"]["t_span"]) for i in selected)*tu if transient else tu
     lines.append("simulatorOptions options reltol=1e-8 vabstol=1e-12 iabstol=1e-18")
     lines.append(f"tran tran stop={_fmt(stop)} maxstep={_fmt(dtmax)} errpreset=conservative")

@@ -1,0 +1,7 @@
+preset,feature_group,configuration,n_specs,stage_max_errors_x,overall_max_x,result,notes
+phase3a_core,core_base,phase3a_core,1,"8.40117279e-09;7.40322308e-09",8.40117279e-09,PASS,"Seeded perturbed TOY_NET, 1000-step interp, Spectre PSFASCII"
+phase3a_core_diff,core_diff,phase3a_core_diff,1,"9.26453781e-09;8.47375777e-09",9.26453781e-09,PASS,"Seeded perturbed TOY_NET, 1000-step interp, Spectre PSFASCII"
+phase3a_full,noncompliance_groups,"symmetric Vref + signed xbar + transfer clamp + physical c_node + GLN tail; compliance disabled",1,"8.40156760e-09;7.84980942e-09",8.40156760e-09,PASS,"Combined groups validated together; not an isolated per-group measurement"
+phase3a_full,hw_compliance,phase3a_full,1,"1.08354029e-08;1.04585804e-08",1.08354029e-08,PASS,"Final run after correcting sampled-OTA explicit node-current polarity; all stages, 1000-step interp"
+phase3a_core_diff,paper_checkpoint_16_spec,phase3a_core_diff,16,"9.99044427e-07;1.85615945e-06;3.30691246e-06;6.66605216e-06;8.23101795e-06;8.40146033e-06;1.65367084e-05",1.65367084e-05,PASS,"Spectre 23.1 0 errors; canonical 16-spec transient vs 1000-step interp"
+phase3a_full,diagnostic_core_compliance_disabled,"diagnostic run before polarity fix",1,"3.15799066e-05;1.19495735e-04",1.19495735e-04,DIAGNOSTIC,"Superseded by final passing full-compliance run"

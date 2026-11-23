@@ -178,3 +178,19 @@ The mismatch that initially prevented stage-0 validation was missing readout con
 
 
 Stage-gate standalone characterization (Spectre 23.1, 50 fF node, 1 S clamp, 10 ns release): after the initial 1 ns settling interval, maximum pre-release error was 2.27e-9 x; measured series-probe current after release (>11 ns) was 0 A. `compile_modules.py --module stage_gate` passed with 0 errors / 0 warnings.
+
+
+## HW-mode netlist
+
+`export.spectre_netlist.render(..., mode="hw")` now emits a copied-fabric behavioral deck for `phase3a_core` and `phase3a_core_diff`, and the exact `phase3a_full` feature settings. The exporter rejects other active forward-affecting flags or altered values instead of silently selecting legacy equations. Core OTA instances use `mode=1`, cap-divider codes or differential `ab_mode`, the table-resolved hardware slope/current-coupling factor, and zero floor term. Frozen-read cores use the four-terminal sampled OTA so held values drive the nonlinearity while live nodes receive current. The physical capacitance path uses table `C_node_F`; tail GLN scales resolved boundary/readout Isat; resolved symmetric Vref and signed crossbar parameters are emitted; transfer hard clamp is flag gated. Boundary/sense and accumulator compliance parameters are wired when enabled.
+
+### Measured HW-mode status
+
+The phase3a_core seeded/perturbed TOY_NET case was run with Spectre 23.1 (`-format psfascii`) across both stages and compared at Spectre sample times to `netlist_interp.simulate(..., steps_per_stage=1000)`: max trajectory errors were `8.40117279e-9 x` and `7.40322308e-9 x`. `phase3a_core_diff` measured `9.26453781e-9 x` and `8.47375777e-9 x`. The complete phase3a_full deck compiles with zero Spectre errors and now meets the ≤1e-4 x trajectory target: maximum errors are `1.08354029e-8 x` and `1.04585804e-8 x` per stage. A diagnostic run first exposed a polarity inversion in the sampled OTA's explicit node-current legs; negating the branch contributions fixed the full compliance result. With compliance disabled, the other full-preset groups together matched at `8.40e-9 x` maximum. Full preset compliance is now covered by a real Spectre trajectory, but remains behavioral Verilog-A and is not a tapeout qualification. Per-run details are in [phase4_hw_validation.csv](phase4_hw_validation.csv); reproducible M1/M2/M3 logs are in `.agent_scratch/hwnet/M1.log`, `M2.log`, `M3.log`, and `M3NC.log`.
+
+`tests/test_hw_spectre_netlist.py` adds fast structural coverage and a slow Spectre/interpreter test which skips when the GF22 kit or Spectre is unavailable. The M1/M2 measured runs used one seeded spec. The explicit-checkpoint M4 run on the paper checkpoint, `phase3a_core_diff`, and 16 canonical test specs passed with 0 Spectre errors; per-stage maximum errors were `9.99e-7, 1.86e-6, 3.31e-6, 6.67e-6, 8.23e-6, 8.40e-6, 1.65e-5 x`. These measurements are included in the CSV.
+
+
+### Reproduction runner
+
+`/home/annaik/Documents/kirchhoffnet_refactor/.agent_scratch/hwnet/RUN_ALL_hwnet.csh` runs the default pytest suite when invoked without arguments, then the phase3a_core_diff audit, 16-spec export, Spectre PSFASCII transient, and trajectory comparison. The runner uses core_diff so the checked-in paper checkpoint loads without cap-divider-only tensors. Passing a checkpoint path skips the default suite and performs that audit/export/16-spec Spectre/compare sequence. It writes the complete log to `.agent_scratch/hwnet/RUN_ALL_hwnet.log` and keeps all generated Cadence files beneath `.agent_scratch/hwnet/RUN_ALL_run/`. Launch long runs with `bash -c 'cd /home/annaik/Documents/kirchhoffnet_refactor/.agent_scratch/hwnet && nohup tcsh RUN_ALL_hwnet.csh > /dev/null 2>&1 &'`; source the kit only after entering the run directory.

@@ -276,7 +276,7 @@ def export_model(model, out, mode="legacy", fabric="timemux", specs=16, hw_confi
       "digital_offchip_keys":[k for k,v in entries.items() if v["kind"]=="digital_offchip"]}}
     out=Path(out); out.mkdir(parents=True,exist_ok=True)
     (out/"params.json").write_text(json.dumps(params,indent=2)+"\n")
-    if mode == "legacy" and fabric == "copies":
+    if fabric == "copies" and mode in {"legacy", "hw"}:
       from .spectre_netlist import render
       render(params, out/"hrknet.scs")
     else:
@@ -289,13 +289,20 @@ def export_model(model, out, mode="legacy", fabric="timemux", specs=16, hw_confi
       (out/"hrknet.scs").write_text("\n".join(lines)+"\n")
     return params
 
+def _load_checkpoint_for_hw(checkpoint, hw):
+    if hw is None or getattr(hw, "is_off", lambda: False)():
+        return load_paper_checkpoint(checkpoint, dtype=torch.float64)
+    from hw.audit import load_model
+    return load_model(checkpoint, hw, dtype=torch.float64)
+
+
 def export(checkpoint, out, mode="legacy", fabric="timemux", specs=16, hw_config=None):
     """Paper-checkpoint compatibility wrapper around :func:`export_model`."""
-    model = load_paper_checkpoint(checkpoint, dtype=torch.float64)
     hw = None
     if hw_config:
         from hw import HWConfig
         hw = HWConfig.from_json(hw_config)
+    model = _load_checkpoint_for_hw(checkpoint, hw if mode == "hw" else None)
     return export_model(model, out, mode, fabric, specs, hw_config, hw)
 
 def main():
@@ -307,6 +314,6 @@ def main():
     from hw import parse_hw_args, hw_config_from_args
     parse_hw_args(p)
     a=p.parse_args(); cfg=hw_config_from_args(a)
-    model=load_paper_checkpoint(a.checkpoint,dtype=torch.float64)
+    model=_load_checkpoint_for_hw(a.checkpoint,cfg if a.mode=="hw" else None)
     export_model(model,a.out,a.mode,a.fabric,a.specs,cfg.to_dict(),cfg)
 if __name__=="__main__": main()

@@ -8,7 +8,9 @@ module boundary_sense_ota(src,dst);
   parameter real gm=1.0,Isat=1.0,G=0.0,A=1.0,B=1.0,theta=0.0,s=1.0,z_gate=1.0;
   parameter real Vcm=`HRK_VCM,Vu=`HRK_VU;
   parameter real alpha=0.01,x_max=4.0,gate_width=0.02,sigma_z=1.0;
-  real xs,xd,u,gate;
+  parameter integer compliance_en=0;
+  parameter real x_hard=5.7142857143,lambda_v=0.15,Ut=0.03086,k_soft=2000.0;
+  real xs,xd,u,gate,ip,inn,yt,yb,y0,spt,spb,sp0,ft,fb;
   analog begin
     // A and B are exported after torch softplus; alpha*u is additive to tanh.
     xs=(V(src)-Vcm)/Vu; xd=(V(dst)-Vcm)/Vu;
@@ -22,6 +24,17 @@ module boundary_sense_ota(src,dst);
     // Match _cell: endpoint-compliance gates multiply the nonlinear OTA
     // current, not the parallel conductance. Both retain stage gate/VCA.
     // Keep the source high-impedance; only the destination receives load.
-    I(dst) <+ -(Isat*(tanh(u)+alpha*u)*gate + G*(xs-xd)*z_gate*sigma_z)*`HRK_IU;
+    if (compliance_en) begin
+      ip=0.5*Isat*z_gate*sigma_z*(1.0+tanh(u));
+      inn=0.5*Isat*z_gate*sigma_z*(1.0-tanh(u));
+      yt=(x_hard-xd)*`HRK_VU/Ut; yb=(x_hard+xd)*`HRK_VU/Ut; y0=x_hard*`HRK_VU/Ut;
+      spt=max(yt,0.0)+ln(1.0+exp(-abs(k_soft*yt)))/k_soft;
+      spb=max(yb,0.0)+ln(1.0+exp(-abs(k_soft*yb)))/k_soft;
+      sp0=max(y0,0.0)+ln(1.0+exp(-abs(k_soft*y0)))/k_soft;
+      ft=max(1.0-lambda_v*`HRK_VU*xd,0.0)*(1.0-exp(-spt))/(1.0-exp(-sp0));
+      fb=max(1.0+lambda_v*`HRK_VU*xd,0.0)*(1.0-exp(-spb))/(1.0-exp(-sp0));
+      I(dst) <+ -(ip*ft-inn*fb+G*(xs-xd)*z_gate*sigma_z)*`HRK_IU;
+    end else
+      I(dst) <+ -(Isat*(tanh(u)+alpha*u)*gate + G*(xs-xd)*z_gate*sigma_z)*`HRK_IU;
   end
 endmodule

@@ -207,3 +207,18 @@ The phase3a_core seeded/perturbed TOY_NET case was run with Spectre 23.1 (`-form
 For one canonical test spec, after the timing corrections the maximum node error against `netlist_interp.simulate(..., steps_per_stage=1000)` was `8.9e-8 x` in stage 0 and `3.02e-5 x` in stage 1 (stage-1 entry transfer mismatch `2.56e-5 x`). The seven-stage transient was also run. Across the 16 canonical test specs, maximum trajectory errors by stage were `4.87e-7 / 5.04e-5 / 1.54e-4 / 6.77e-4 / 1.08e-3 / 2.19e-3 / 3.46e-3 x`; maximum post-readout logit error was `1.58e-3`. The 10% ZIG pass/fail flags remain `P,P,P,F,P,P,P,P,P,P,P,P,P,P,F,P`. Per-spec stage errors and flags are recorded in [phase4_timemux_validation.csv](phase4_timemux_validation.csv).
 
 The slow Spectre regression `tests/test_timemux_spectre.py` checks stage 0–1 against interp-1000 and skips when tcsh, the GF22 kit, Spectre, or the canonical dataset is unavailable. Run it with `pytest -m 'slow and spectre' tests/test_timemux_spectre.py`. The one-spec debug transient is under `/home/annaik/Documents/kirchhoffnet_refactor/.agent_scratch/tmnet/timemux_try`; the 16-spec validation log is `/home/annaik/Documents/kirchhoffnet_refactor/.agent_scratch/tmnet/compile_timemux_16.log`.
+
+
+## CTLE closure
+
+The closure runner compares the 10%-rule failure rate after scoring the same canonical test specs with (1) CTLE knobs decoded from the Spectre-exported network and (2) knobs from the PyTorch checkpoint. From the repository root, start it manually in a disconnect-safe background shell:
+
+```sh
+nohup tcsh scripts/ctle_closure/RUN_CTLE_CLOSURE.csh [N_SPECS] [copies|timemux] >& /dev/null &
+```
+
+Defaults are 64 canonical test specs and the legacy paper checkpoint on `copies`. The runner writes to `.agent_scratch/ctle_closure/<timestamp>/`; it logs timestamped step start/completion/failure and exit codes in `ctle_closure.log`. Generated Spectre decks, raw databases and Cadence setup artifacts stay under this excluded run directory. `predict_knobs.py` also supports `--mode hw --hw-preset ...`; current time-multiplexed export is legacy-only.
+
+Prediction CSVs are in `prediction/pred_spectre.csv` and `prediction/pred_torch.csv`. Both use the exact spice harness columns `fW,current,ind,Rd,Cs,Rs,VDD`, in log10 physical units; the matching selected input rows and canonical row ids are beside them. The two scoring runs are under `spice/spectre/` and `spice/torch/`. Final `summary/summary.md` reports each failure rate, label disagreements, and largest absolute physical knob deltas; `summary/summary.csv` gives each selected spec's pass/fail, simulator-error flags, and per-knob deltas. A nonzero error flag means a spec's scoring result may be incomplete and should be considered when interpreting rates.
+
+The time estimate is approximate: 64 copies specs need four 16-spec decks (about 560 s each at the checked-in `reltol=1e-8`, based on the measured 16-spec run), plus two Ocean scoring runs. Ocean runtime is host/license dependent; `spice_failure_check.py` allows 600 s per spec but no separate measured per-spec runtime was found in the checked-in logs/docs. Timemux is expected to take somewhat longer.

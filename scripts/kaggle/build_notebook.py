@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Build the clean Kaggle HW retraining notebook using only stdlib json."""
+import hashlib
 import json
 from pathlib import Path
 
@@ -7,26 +8,53 @@ ROOT = Path(__file__).resolve().parents[2]
 OUT = ROOT / "notebooks" / "kaggle_hw_retrain.ipynb"
 
 def cell(kind, text):
-    return {"cell_type": kind, "metadata": {}, "source": text.splitlines(True),
+    cell_id = hashlib.sha1((kind + "\\0" + text).encode("utf-8")).hexdigest()[:8]
+    return {"cell_type": kind, "id": cell_id, "metadata": {}, "source": text.splitlines(True),
             **({"execution_count": None, "outputs": []} if kind == "code" else {})}
 
 cells = [
 cell("markdown", "# KirchhoffNet hardware retraining ladder\nOne rung per session; set `KNB_*` environment variables before headless execution.\n"),
 cell("code", '''import os
+from pathlib import Path
 RUNG = os.getenv("KNB_RUNG", "R0")
 EPOCHS = int(os.getenv("KNB_EPOCHS", "300"))
 SEED = int(os.getenv("KNB_SEED", "100"))
 LR = float(os.getenv("KNB_LR", "0.007069359" if RUNG == "R0" else "0.03"))
 STEPS_PER_STAGE = int(os.getenv("KNB_STEPS_PER_STAGE", "40"))  # 4x paper's 10 steps/stage on HW rungs
-DATA_ROOT = os.getenv("KNB_DATA_ROOT", "/kaggle/input")
 OUT_DIR = os.getenv("KNB_OUT_DIR", "/kaggle/working/out")
 RESUME = os.getenv("KNB_RESUME", "")
 SMOKE = os.getenv("KNB_SMOKE", "0").lower() in ("1", "true", "yes")
 RUN_TOY_ABLATION = os.getenv("KNB_RUN_TOY_ABLATION", "0").lower() in ("1", "true", "yes")
+TEACHER_CKPT = Path(os.getenv("KNB_TEACHER_CKPT", "/kaggle/input/models/awekill/improved-zig-nf-spline/pytorch/default/4/dagger_student_plain.pt"))
+TEACHER_DIR = Path(os.getenv("KNB_TEACHER_DIR", str(TEACHER_CKPT.parent)))
+CSV_DIR = Path(os.getenv("KNB_CSV_DIR", "/kaggle/input/datasets/awekill/augmented-cvae-ctle"))
+CANONICAL = Path(os.getenv("KNB_CANONICAL", "/kaggle/working/kirchhoffnet_realistic/assets/canonical/canonical_ctle_phase_a_v2.npz"))
 if SMOKE:
     EPOCHS, LR = 1, float(os.getenv("KNB_LR", "0.03"))
 '''),
-cell("code", '''import glob, os, shutil, subprocess, sys, zipfile
+cell("code", '''import os, sys
+from kaggle_secrets import UserSecretsClient
+
+# Retrieve the token securely
+user_secrets = UserSecretsClient()
+token = user_secrets.get_secret("GITHUB_TOKEN")
+branch = "hw-refactor"  # <--- Specify your branch here ("main" or "deq")
+
+# Define your GitHub details
+username = "ZiZizou"
+repo = "kirchhoffnet_realistic"
+
+# Clone the specific branch using the -b flag
+os.system(f"git clone -b {branch} https://{username}:{token}@github.com/{username}/{repo}.git")
+
+
+# The exact path to your cloned repository
+repo_path = "/kaggle/working/"+repo
+
+if repo_path not in sys.path:
+    sys.path.insert(0, repo_path)
+'''),
+cell("code", '''import os, shutil, subprocess, sys
 from pathlib import Path
 import torch
 print("torch", torch.__version__, "CUDA", torch.cuda.is_available())
@@ -34,28 +62,50 @@ if torch.cuda.is_available():
     print(torch.cuda.get_device_name(0), torch.cuda.get_device_properties(0))
 # Kaggle images may omit these runtime dependencies; torch is normally preinstalled.
 subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "torchdiffeq", "optuna", "joblib", "scikit-learn", "scipy", "matplotlib"])
-data_root = Path(DATA_ROOT)
-repo = Path("/kaggle/working/repo") if Path("/kaggle").exists() else Path(OUT_DIR) / "repo"
-repo.parent.mkdir(parents=True, exist_ok=True)
-inputs = list(data_root.glob("*"))
-archives = [p for p in inputs if p.is_file() and p.suffix.lower() == ".zip"]
-extracted = [p for p in inputs if p.is_dir() and ((p / "repo").is_dir() or (p / "MANIFEST.txt").exists())]
-if archives:
-    with zipfile.ZipFile(archives[0]) as zf: zf.extractall(repo.parent)
-    if not repo.exists(): repo.mkdir(parents=True, exist_ok=True)
-    bundle_root = repo.parent
-elif extracted:
-    bundle_root = extracted[0]
-    if (bundle_root / "repo").is_dir(): repo = bundle_root / "repo"
-else:
-    raise FileNotFoundError(f"No bundle archive/directory found under {DATA_ROOT}")
-DATA_CANONICAL = str(bundle_root / "data/canonical/canonical_ctle_phase_a_v2.npz")
-TEACHER_DIR = str(bundle_root / "data/zig")
-CSV_DIR = str(bundle_root / "data/ctle_csv")
-assert Path(DATA_CANONICAL).is_file(), DATA_CANONICAL
-assert Path(TEACHER_DIR).is_dir() and Path(CSV_DIR).is_dir()
+repo = Path(repo_path)
 os.chdir(repo)
-print("repository", repo, "canonical", DATA_CANONICAL, "teacher/ZIG", TEACHER_DIR, "CSV", CSV_DIR)
+print("repository", repo, "canonical", CANONICAL, "teacher/ZIG", TEACHER_DIR, "CSV", CSV_DIR)
+'''),
+cell("code", '''# Required Kaggle inputs: verify files before evaluation or training.
+import hashlib
+CSV_FILES = [
+    "dataset_log_part_1_may3.csv", "dataset_log_part_1_may4.csv",
+    "dataset_log_part_2_may3.csv", "dataset_log_part_2_may4.csv",
+    "dataset_log_part_3_may3.csv", "dataset_log_part_3_may4.csv",
+    "dataset_log_part_4_may3.csv", "dataset_log_part_4_may4.csv",
+    "dataset_log_part_5_may3.csv", "dataset_log_part_5_may4.csv",
+    "dataset_log_part_6_may3.csv", "dataset_log_part_6_may4.csv",
+    "dataset_log_may_7.csv", "dataset_log_march12.csv", "dataset_log_may_18.csv",
+]
+TEACHER_FILES = [
+    "ctle_conditional_flow.pt", "flow_scaler_X.pkl", "flow_scaler_C.pkl",
+    "hybrid_hurdle_ctle_model.pt", "hybrid_hurdle_scaler_X.pkl",
+    "hybrid_hurdle_scaler_y_power.pkl", "hybrid_hurdle_config.pkl",
+]
+EXPECTED_INPUT_HASHES = {
+    "dagger_student_plain.pt": "fa7391fc70be8818b6b89c2199447d2651c47f77f57a9fe087cf230c82d9c142",
+    "ctle_conditional_flow.pt": "1d942852ac96bcfed08a76edee77179fed6f4863c1ca5bf6e8a81608c7c8e726",
+    "flow_scaler_X.pkl": "109c6c45b889a7df652be4abe1ee411fd152f94aa6d7982b06e54848f579f685",
+    "flow_scaler_C.pkl": "deee8f5125b4196cf3fbcd1a5ffc7bf6e90471bbb2b88a3b4f802b9571a00c7b",
+    "hybrid_hurdle_ctle_model.pt": "9ea4d46a1e1b96dbc2ffcb18d9626b539ac52de0aa3f1cd4af331be362c5fda7",
+    "hybrid_hurdle_scaler_X.pkl": "109c6c45b889a7df652be4abe1ee411fd152f94aa6d7982b06e54848f579f685",
+    "hybrid_hurdle_scaler_y_power.pkl": "898dd523a3d6f66e3b7f9328fccf6e0f296f6a3e9c95dae1ef2aad4a6e21e9c1",
+    "hybrid_hurdle_config.pkl": "1456a0d09140f9c36ae5e696e78de34525777e76432bf06bdd0a39792c1e395f",
+}
+required = [TEACHER_CKPT, CANONICAL] + [TEACHER_DIR / name for name in TEACHER_FILES] + [CSV_DIR / name for name in CSV_FILES]
+missing = [str(path) for path in required if not path.is_file()]
+if missing:
+    raise FileNotFoundError("Missing required Kaggle inputs:\\n" + "\\n".join(missing))
+for path in [TEACHER_CKPT] + [TEACHER_DIR / name for name in TEACHER_FILES]:
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    expected = EXPECTED_INPUT_HASHES.get(str(path), EXPECTED_INPUT_HASHES.get(path.name, "not recorded"))
+    print(f"sha256 {path}: {digest} (expected reference: {expected})")
+    if expected != "not recorded" and digest != expected:
+        print(f"WARNING: {path.name} hash differs from ssr0 reference; Kaggle model version 4 may differ.")
+DATA_CANONICAL = str(CANONICAL)
+TEACHER_CKPT = str(TEACHER_CKPT)
+TEACHER_DIR = str(TEACHER_DIR)
+CSV_DIR = str(CSV_DIR)
 '''),
 cell("code", '''# Fast plumbing checks and exact paper-checkpoint validation.
 subprocess.check_call([sys.executable, "-m", "pytest", "-q", "tests/test_hw_cli.py", "tests/test_kaggle_cli_resume.py"], cwd=repo)
@@ -80,7 +130,7 @@ cmd = [sys.executable, "dagger-nuance-distillation-kirchhoffnet.py",
  "--phase-a-mlp-weight", "1", "--phase-a-fwd-weight", "1", "--phase-a-power-weight", "0.0005", "--phase-a-power-norm", "train_mean",
  "--kn-readout", "shared-x2", "--kn-learnable-clip-sharpness", "--kn-gln-rails", "--kn-gln-B", "4", "--kn-gln-rank", "2", "--kn-gln-families", "boundary,readout",
  "--t-span", "4.660583", "--boundary-fan-out", '{"0": [0, 4], "1": [1, 5], "2": [2, 6], "3": [3, 7]}',
- "--phase-a-mlp-teacher-ckpt", str(repo / "assets/teachers/trial_0019/dagger_student_plain.pt"),
+ "--phase-a-mlp-teacher-ckpt", str(TEACHER_CKPT),
  "--teacher-dir", TEACHER_DIR, "--data-dir", CSV_DIR, "--device", "cuda" if torch.cuda.is_available() else "cpu",
  "--seed", str(SEED), "--output", str(run_dir)]
 if RUNG != "R0": cmd += ["--kn-steps-per-stage", str(STEPS_PER_STAGE)]
@@ -108,7 +158,7 @@ for split in ("train", "val", "test"):
 best = run_dir / "phase_a_best.pt"
 if rungs[RUNG]:
     audit = [sys.executable, "-m", "hw.audit", "--checkpoint", str(best), "--kn-isat-max", "16", "--kn-gm-max", "4.241970", "--canonical", DATA_CANONICAL, "--json", str(run_dir / "hw_audit.json")]
-    subprocess.run(audit, cwd=repo, check=True
+    subprocess.run(audit, cwd=repo, check=True)
 try:
     import matplotlib.pyplot as plt
     h = hist["history"]

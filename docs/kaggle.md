@@ -1,14 +1,19 @@
 # Kaggle retraining guide
 
-## Build and upload the input dataset
+## Kaggle setup and inputs
 
-From the repository root on ssr0, build the bundle (the script follows the configured external-data paths and includes the repository archive, canonical dataset, ZIG v2 files, CSVs, and `MANIFEST.txt`):
+The notebook clones the GitHub repository directly; `scripts/kaggle/make_kaggle_bundle.sh` is no longer needed (it remains in the tree for reference). **Before running the clone cell, push branch `hw-refactor` to GitHub `origin` (`ZiZizou/kirchhoffnet_realistic`).** The cell fetches that branch and cannot see local, unpushed commits. Create a Kaggle secret named `GITHUB_TOKEN` with permission to read the repository; the clone cell reads it with `kaggle_secrets.UserSecretsClient` and never puts a plaintext token in notebook source.
 
-```bash
-scripts/kaggle/make_kaggle_bundle.sh HEAD /tmp/kirchhoffnet-kaggle.zip
-```
+Attach these Kaggle inputs to the notebook:
 
-Check the reported size (the builder enforces 100 MB), then create a Kaggle Dataset, upload that ZIP, and attach the Dataset to a new notebook. Rebuild from the desired merged commit when refreshing the dataset. To regenerate the committed notebook after changing its generator, run `python scripts/kaggle/build_notebook.py`.
+- Model `awekill/improved-zig-nf-spline`, version 4. Its model directory supplies `dagger_student_plain.pt` and the flow/ZIG/scaler files listed below.
+- Dataset `awekill/augmented-cvae-ctle`, mounted at `/kaggle/input/datasets/awekill/augmented-cvae-ctle`.
+
+The notebook defaults are overridable with `KNB_TEACHER_CKPT`, `KNB_TEACHER_DIR`, `KNB_CSV_DIR`, and `KNB_CANONICAL`. It checks all expected files at startup, prints SHA-256 values for the teacher and flow/scaler files, and warns (rather than failing) if they differ from the ssr0 reference hashes. To regenerate the notebook after changing its generator, run `python scripts/kaggle/build_notebook.py`.
+
+The paper's `canonical_ctle_phase_a_v2.npz` is included at `assets/canonical/canonical_ctle_phase_a_v2.npz` (SHA-256 `8429ed258c8d05a330c45fe6aee48eea096c98149c6b8d9a908127d8c0a1808`). The notebook uses this exact file by default because its sanity check asserts the paper checkpoint results (validation 8.05%, test 8.15%). The dagger script has a `--prepare-canonical-dataset` path that builds a canonical NPZ from the teacher flow/ZIG using a seed for spec sampling and split generation. Flow candidate sampling and the supplied model/runtime can vary, so the option is not guaranteed to reproduce this exact paper file; the notebook does not rely on it.
+
+The early input check requires these files under `TEACHER_DIR` (used for both `--teacher-dir` and `--zig-dir`): `ctle_conditional_flow.pt`, `flow_scaler_X.pkl`, `flow_scaler_C.pkl`, `hybrid_hurdle_ctle_model.pt`, `hybrid_hurdle_scaler_X.pkl`, `hybrid_hurdle_scaler_y_power.pkl`, and `hybrid_hurdle_config.pkl`. It also requires `dagger_student_plain.pt` at `TEACHER_CKPT`. Under `CSV_DIR`, the DAgger script currently names 15 files: `dataset_log_part_{1..6}_may3.csv`, `dataset_log_part_{1..6}_may4.csv`, `dataset_log_may_7.csv`, `dataset_log_march12.csv`, and `dataset_log_may_18.csv`.
 
 ## Notebook settings and run order
 

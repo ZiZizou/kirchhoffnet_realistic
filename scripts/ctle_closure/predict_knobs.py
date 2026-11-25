@@ -5,6 +5,7 @@ import argparse
 import csv
 import json
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 
@@ -139,8 +140,21 @@ def main(argv=None):
         spectre_log=bounded_params(torch.as_tensor(all_logits,dtype=model.log_lo.dtype),model).cpu().numpy()
         write_params(a.out/"pred_spectre.csv",spectre_log)
     else:
-        # Deck-only mode cannot make predicted Spectre knobs; clearly mark the absent file.
+        # Deck-only mode cannot make predicted Spectre knobs; show the exact commands
+        # that the manual closure driver will run after Spectre creates its CSV.
         print(f"Deck-only mode: predicted Spectre CSV will be created after --run-spectre; Torch CSV: {a.out/'pred_torch.csv'}")
+        spice = ROOT / "spice_failure_check.py"
+        data_path = a.dataset.expanduser().resolve()
+        ckpt = Path(a.checkpoint).expanduser().resolve()
+        work_root = a.out.resolve().parent / "spice"
+        for kind in ("spectre", "torch"):
+            pred_csv = a.out.resolve() / f"pred_{kind}.csv"
+            cmd = [sys.executable, str(spice), "--model-kind", "mlp",
+                   "--ckpt", str(ckpt), "--specs-npz", str(data_path),
+                   "--specs-idx-key", split + "_idx", "--n-specs", str(n),
+                   "--seed", "100", "--pred-params-csv", str(pred_csv),
+                   "--enable-ocean", "--work-root", str(work_root), "--run-tag", kind]
+            print(f"Planned spice_failure_check ({kind}): {shlex.join(cmd)}")
     meta={"checkpoint":str(a.checkpoint),"mode":a.mode,"fabric":a.fabric,"split":split,"n_specs":n,"batch_specs":BATCH,"spec_ids":spec_ids.tolist(),"csv_columns":PARAM_COLS,"csv_units":"log10 physical units, per spice_failure_check.py"}
     (a.out/"prediction_manifest.json").write_text(json.dumps(meta,indent=2)+"\n")
     return 0

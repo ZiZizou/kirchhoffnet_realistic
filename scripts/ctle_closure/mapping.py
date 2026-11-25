@@ -2,13 +2,13 @@
 import csv
 from pathlib import Path
 import numpy as np
-import torch
 
 PARAM_COLS = ("fW", "current", "ind", "Rd", "Cs", "Rs", "VDD")
 
 
 def bounded_params(logits, model):
     """Match PaperStudent's sigmoid decoder into bounded log10 parameters."""
+    import torch
     logits = torch.as_tensor(logits, dtype=model.log_lo.dtype, device=model.log_lo.device)
     return model.log_lo.unsqueeze(0) + (model.log_hi-model.log_lo).unsqueeze(0)*torch.sigmoid(logits)
 

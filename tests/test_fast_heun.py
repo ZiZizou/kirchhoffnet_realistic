@@ -445,3 +445,321 @@ def test_max_hours_stops_cleanly_and_resumes(tmp_path):
     hist2 = json.loads((out_dir / "phase_a_history.json").read_text())
     assert hist2["history"]["epoch"] == [1, 2, 3, 4]
     assert configure_compiled_heun("off") is False
+
+
+def test_compiled_backward_failure_falls_back_to_eager_gradients():
+    """A compiled step whose backward raises must not kill the batch.
+
+    The forward try/except in fast_heun only covers the step call. This test
+    installs a step whose forward succeeds and whose backward raises, then
+    checks phase_a_fwd_bwd_guard disables compile and matches an eager run.
+    """
+    import fast_heun
+    from ctle_dagger_common import phase_a_fwd_bwd_guard
+    from fast_heun import compiled_heun_enabled
+
+    saved = dict(fast_heun._COMPILE_STATE)
+    calls = {"fwd": 0, "bwd": 0}
+
+    class _RaiseBwd(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, y):
+            calls["fwd"] += 1
+            return y
+
+        @staticmethod
+        def backward(ctx, grad):
+            calls["bwd"] += 1
+            raise RuntimeError("compiled heun backward failed")
+
+    def bad_step(*args, **kwargs):
+        y = fast_heun._heun_step_standard(*args, **kwargs)
+        return _RaiseBwd.apply(y)
+
+    try:
+        torch.manual_seed(0)
+        net = _build_ctle_net(None, steps_per_stage=4, num_stages=1, dtype=torch.float32)
+        stage = net.core.stages[0]
+        x0 = torch.randn(4, stage.num_nodes)
+        u = torch.randn(4, 4)
+        t_span = 0.6658
+
+        fast_heun._COMPILE_STATE["enabled"] = False
+        fast_heun._COMPILE_STATE["failed"] = False
+        fast_heun._COMPILE_STATE["standard"] = None
+        net_ref = copy.deepcopy(net)
+        stage_ref = net_ref.core.stages[0]
+        y_ref, _ = stage_ref(x0, t_span=t_span, num_steps=4, store_trajectory=False, u=u)
+        (y_ref ** 2).mean().backward()
+        ref_grads = {
+            n: p.grad.detach().clone()
+            for n, p in stage_ref.named_parameters()
+            if p.grad is not None
+        }
+
+        fast_heun._COMPILE_STATE["enabled"] = True
+        fast_heun._COMPILE_STATE["failed"] = False
+        fast_heun._COMPILE_STATE["standard"] = bad_step
+        opt = torch.optim.SGD(stage.parameters(), lr=0.0)
+
+        def run_batch():
+            opt.zero_grad(set_to_none=True)
+            y, _ = stage(x0, t_span=t_span, num_steps=4, store_trajectory=False, u=u)
+            loss = (y ** 2).mean()
+            loss.backward()
+            return loss
+
+        phase_a_fwd_bwd_guard(opt, run_batch, student=stage)
+        assert calls["fwd"] >= 1 and calls["bwd"] >= 1
+        assert compiled_heun_enabled() is False
+        assert fast_heun._COMPILE_STATE["failed"] is True
+        compared = 0
+        for n, p in stage.named_parameters():
+            if n not in ref_grads:
+                assert p.grad is None
+                continue
+            assert p.grad is not None, n
+            diff = (p.grad - ref_grads[n]).abs().max().item()
+            assert diff <= 1e-7, (n, diff)
+            compared += 1
+        assert compared > 0
+
+        # Compile off: the same backward error must propagate.
+        fast_heun._COMPILE_STATE["enabled"] = False
+        fast_heun._COMPILE_STATE["failed"] = False
+        fast_heun._COMPILE_STATE["standard"] = bad_step
+
+        def run_eager_raise():
+            raise RuntimeError("not a compile failure")
+
+        with pytest.raises(RuntimeError, match="not a compile failure"):
+            phase_a_fwd_bwd_guard(opt, run_eager_raise, student=stage)
+        assert compiled_heun_enabled() is False
+    finally:
+        fast_heun._COMPILE_STATE.clear()
+        fast_heun._COMPILE_STATE.update(saved)
+
+
+def test_phase_a_rng_round_trip_and_partial_restore():
+    import random
+    from ctle_dagger_common import capture_phase_a_rng, restore_phase_a_rng
+
+    torch.manual_seed(123)
+    np.random.seed(123)
+    random.seed(123)
+    state = capture_phase_a_rng()
+    assert set(state) == {"torch", "cuda", "numpy", "python"}
+    assert state["cuda"] is None or isinstance(state["cuda"], list)
+    a_t = torch.rand(4)
+    a_n = np.random.rand(4)
+    a_p = random.random()
+
+    torch.manual_seed(0)
+    np.random.seed(0)
+    random.seed(0)
+    restore_phase_a_rng(state)
+    torch.testing.assert_close(torch.rand(4), a_t)
+    np.testing.assert_array_equal(np.random.rand(4), a_n)
+    assert random.random() == a_p
+
+    # Missing fields and a missing blob are tolerated.
+    restore_phase_a_rng({})
+    restore_phase_a_rng(None)
+    restore_phase_a_rng({"numpy": state["numpy"]})
+
+
+def test_resume_pads_missing_history_and_warns_when_rng_absent(tmp_path, caplog):
+    import logging
+    from ctle_dagger_common import run_phase_a_training
+
+    torch.manual_seed(0)
+    n = 24
+    rng = np.random.default_rng(7)
+    specs = rng.uniform(0.05, 0.5, size=(n, 4)).astype(np.float32)
+    params = rng.uniform(1e-4, 1.0, size=(n, 7)).astype(np.float32)
+    canonical = {
+        "specs": specs,
+        "params": params,
+        "mlp_logits_trial0019": np.zeros((n, 7), dtype=np.float32),
+        "power_norm_const": np.array(1e-3, dtype=np.float32),
+        "schema_rev": np.array(2, dtype=np.int64),
+        "train_idx": np.arange(0, 12, dtype=np.int64),
+        "val_idx": np.arange(12, 18, dtype=np.int64),
+        "test_idx": np.arange(18, 24, dtype=np.int64),
+    }
+    student = _TinyPhaseAStudent()
+    zig = _DummyZig()
+    scaler_x = _DummyScaler(np.full(7, -2.5), np.full(7, 2.0))
+    scaler_yp = _DummyScaler([-3.0], [0.5])
+    out_dir = tmp_path / "run"
+    ctx = {
+        "DEVICE": torch.device("cpu"),
+        "scaler_X": scaler_x,
+        "scaler_y_p": scaler_yp,
+        "zig_model": zig,
+        "eye_scale_h": 0.1,
+        "eye_scale_w": 0.1,
+        "eye_scale_j": 0.1,
+        "canonical_dataset": canonical,
+        "epochs": 1,
+        "batch_size": 8,
+        "lr": 1e-2,
+        "weight_decay": 0.0,
+        "output_dir": str(out_dir),
+        "val_eval_every": 5,
+        "earlystop_patience": 10,
+        "compile_mode": "off",
+    }
+    run_phase_a_training(student, ctx, model_name="tiny_pad")
+    ckpt = out_dir / "phase_a_last.pt"
+    state = torch.load(ckpt, map_location="cpu", weights_only=False)
+    assert "rng" in state
+    state.pop("rng")
+    state["history"].pop("val_invalid_rate")
+    torch.save(state, ckpt)
+
+    ctx2 = dict(ctx)
+    ctx2["epochs"] = 2
+    ctx2["resume"] = str(ckpt)
+    with caplog.at_level(logging.INFO, logger="ctle_dagger"):
+        res = run_phase_a_training(_TinyPhaseAStudent(), ctx2, model_name="tiny_pad")
+    assert "checkpoint has no RNG state" in caplog.text
+    assert "val_invalid_rate" in caplog.text
+    assert res["completed_epochs"] == 2
+    hist = json.loads((out_dir / "phase_a_history.json").read_text())
+    assert len(hist["history"]["val_invalid_rate"]) == 2
+    assert hist["history"]["val_invalid_rate"][0] != hist["history"]["val_invalid_rate"][0]  # NaN pad
+    assert len(hist["history"]["epoch"]) == 2
+
+
+def test_phase_a_rng_torch_save_load_round_trip(tmp_path):
+    """torch.save -> torch.load must reproduce torch/numpy/python streams."""
+    import random
+    from ctle_dagger_common import capture_phase_a_rng, restore_phase_a_rng
+
+    torch.manual_seed(7)
+    np.random.seed(7)
+    random.seed(7)
+    torch.rand(2)
+    np.random.rand(2)
+    random.random()
+    state = capture_phase_a_rng()
+    expected_t = torch.rand(4)
+    expected_n = np.random.rand(4)
+    expected_p = random.random()
+
+    path = tmp_path / "rng.pt"
+    torch.save({"rng": state}, path)
+    loaded = torch.load(path, map_location="cpu", weights_only=False)
+
+    torch.manual_seed(1)
+    np.random.seed(1)
+    random.seed(1)
+    restore_phase_a_rng(loaded["rng"])
+    torch.testing.assert_close(torch.rand(4), expected_t)
+    np.testing.assert_array_equal(np.random.rand(4), expected_n)
+    assert random.random() == expected_p
+
+
+def test_restore_cuda_rng_slices_to_device_count(monkeypatch, caplog):
+    """A 2-GPU CUDA RNG blob resumed on 1 GPU must not IndexError."""
+    import logging
+    from ctle_dagger_common import restore_phase_a_rng
+
+    calls = {}
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+
+    def fake_set_all(states):
+        calls["states"] = list(states)
+
+    monkeypatch.setattr(torch.cuda, "set_rng_state_all", fake_set_all)
+    saved = [torch.zeros(4, dtype=torch.uint8), torch.ones(4, dtype=torch.uint8)]
+    with caplog.at_level(logging.WARNING, logger="ctle_dagger"):
+        restore_phase_a_rng({"cuda": saved})
+    assert len(calls["states"]) == 1
+    assert torch.equal(calls["states"][0], saved[0])
+    assert "device_count" in caplog.text
+
+    caplog.clear()
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    with caplog.at_level(logging.WARNING, logger="ctle_dagger"):
+        restore_phase_a_rng({"cuda": saved})
+    assert len(calls["states"]) == 2
+    assert "device_count" not in caplog.text
+
+
+def test_guard_restores_rng_before_eager_retry():
+    import fast_heun
+    from ctle_dagger_common import phase_a_fwd_bwd_guard
+
+    saved = dict(fast_heun._COMPILE_STATE)
+    try:
+        fast_heun._COMPILE_STATE["enabled"] = True
+        fast_heun._COMPILE_STATE["failed"] = False
+        torch.manual_seed(0)
+        seen = []
+        calls = {"n": 0}
+
+        def run_batch():
+            calls["n"] += 1
+            seen.append(torch.rand(1).item())
+            if calls["n"] == 1:
+                raise RuntimeError("compiled heun failed")
+            return "ok"
+
+        opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.0)
+        assert phase_a_fwd_bwd_guard(opt, run_batch) == "ok"
+        assert calls["n"] == 2
+        assert seen[0] == seen[1]
+        assert fast_heun.compiled_heun_enabled() is False
+    finally:
+        fast_heun._COMPILE_STATE.clear()
+        fast_heun._COMPILE_STATE.update(saved)
+
+
+def test_guard_reraises_cuda_oom_without_disabling_compile():
+    import fast_heun
+    from ctle_dagger_common import phase_a_fwd_bwd_guard
+
+    saved = dict(fast_heun._COMPILE_STATE)
+    try:
+        fast_heun._COMPILE_STATE["enabled"] = True
+        fast_heun._COMPILE_STATE["failed"] = False
+        calls = {"n": 0}
+
+        def run_batch():
+            calls["n"] += 1
+            raise torch.cuda.OutOfMemoryError("oom")
+
+        opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.0)
+        with pytest.raises(torch.cuda.OutOfMemoryError):
+            phase_a_fwd_bwd_guard(opt, run_batch)
+        assert calls["n"] == 1
+        assert fast_heun.compiled_heun_enabled() is True
+        assert fast_heun._COMPILE_STATE["failed"] is False
+    finally:
+        fast_heun._COMPILE_STATE.clear()
+        fast_heun._COMPILE_STATE.update(saved)
+
+
+def test_check_resume_hw_hash_warns_when_absent_and_raises_on_mismatch(caplog):
+    import logging
+    from ctle_dagger_common import check_resume_hw_hash
+
+    with caplog.at_level(logging.WARNING, logger="ctle_dagger"):
+        check_resume_hw_hash({"epoch": 1}, None, current_preset=None)
+    assert "no hw_hash" in caplog.text
+
+    check_resume_hw_hash(
+        {"hw_hash": "9c9fe3fe9ec3", "hw_preset": "phase3a_full"},
+        "9c9fe3fe9ec3",
+        current_preset="phase3a_full",
+    )
+    with pytest.raises(RuntimeError, match="eda59b5b6e0c"):
+        check_resume_hw_hash(
+            {"hw_hash": "9c9fe3fe9ec3", "hw_preset": "phase3a_full"},
+            "eda59b5b6e0c",
+            current_preset="phase3a_core",
+        )

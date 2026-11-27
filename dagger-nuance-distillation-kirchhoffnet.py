@@ -1726,6 +1726,27 @@ def _parse_boundary_fan_out(spec):
     return {int(k): list(v) for k, v in parsed.items()}
 
 
+def _add_device_counter(current, delta: torch.Tensor, device) -> torch.Tensor:
+    """Add ``delta`` onto a clip counter without a host sync.
+
+    Assignment (not in-place) so a saved reference of the previous value stays
+    unchanged. ``_hw_u_batch`` restores that snapshot after the extra scale_input.
+    """
+    delta = delta.detach().to(device=device, dtype=torch.int64)
+    if torch.is_tensor(current):
+        base = current.detach()
+        if base.device != device or base.dtype != torch.int64 or base.ndim != 0:
+            base = base.to(device=device, dtype=torch.int64).reshape(())
+        return base + delta.reshape(())
+    return torch.tensor(int(current), device=device, dtype=torch.int64) + delta.reshape(())
+
+
+def _counter_as_int(value) -> int:
+    if torch.is_tensor(value):
+        return int(value.detach().cpu().item())
+    return int(value)
+
+
 class LocalKirchhoffStudentWrapper(nn.Module):
     """Wrapper around a local KirchhoffNetWithIO that exposes the same
     `forward` / `predict` / `log_lo` / `log_hi` / `scale_input` API used by
@@ -1973,14 +1994,17 @@ class LocalKirchhoffStudentWrapper(nn.Module):
         span = (hi - lo).clamp(min=1e-8)
         u = 2.0 * (log_x - lo) / span - 1.0
         with torch.no_grad():
-            self._clip_elements += int((u.abs() >= self.input_rail).sum().item())
-            self._input_elements += int(u.numel())
+            # Device accumulators: the .item() sync is deferred to clipping_stats().
+            n_clip = (u.abs() >= self.input_rail).sum().to(dtype=torch.int64)
+            n_in = torch.tensor(u.numel(), device=u.device, dtype=torch.int64)
+            self._clip_elements = _add_device_counter(self._clip_elements, n_clip, u.device)
+            self._input_elements = _add_device_counter(self._input_elements, n_in, u.device)
         return u.clamp(min=-self.input_rail, max=self.input_rail)
 
     def clipping_stats(self) -> dict[str, float | int]:
         """Return cumulative input-rail clipping statistics for this run."""
-        clipped = self._clip_elements
-        total = self._input_elements
+        clipped = _counter_as_int(self._clip_elements)
+        total = _counter_as_int(self._input_elements)
         return {
             'clipped_elements': clipped,
             'input_elements': total,
@@ -3427,6 +3451,11 @@ if _bo_args.prepare_canonical_dataset is not None or _bo_args.canonical_dataset 
             "power_norm_const": (
                 float(_bo_args.phase_a_power_norm_const)
                 if _bo_args.phase_a_power_norm_const is not None else None),
+            # None when hardware is off; otherwise the hash logged as
+            # "[hw] HWConfig ON hash=...". Presets share parameter shapes, so
+            # resume compares this against the checkpoint and refuses a mismatch.
+            "hw_hash": None if KN_HW is None else KN_HW_CONFIG.hash(),
+            "hw_preset": _bo_args.hw_preset,
         }
         _logger.info(f"[phaseA] canonical-dataset gate engaged: {len(canonical['specs'])} specs, "
                      f"epochs={phase_a_epochs}, batch={ctx_phase_a['batch_size']}, "

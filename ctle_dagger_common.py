@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import random
 import time
 import logging
 import warnings
@@ -2929,6 +2930,174 @@ def _phase_a_split_power_and_mse(student, specs_arr, mlp_logits_arr,
     return power.astype(np.float64), mse
 
 
+_PHASE_A_HISTORY_KEYS = (
+    "epoch", "train_loss", "val_loss",
+    "train_valid_nll", "validity_w_eff",
+    "val_failure_rate", "val_boundary_failure",
+    "val_interior_failure",
+    "mlp_mse", "fwd_mse", "train_nll",
+    "train_power", "train_power_norm",
+    "loss_weights", "val_invalid_rate",
+    "val_degrade_rate", "val_valid_mean_power",
+)
+
+
+def _pad_missing_history(history: dict) -> list[str]:
+    """Add missing Phase-A history lists, padded with NaN to the current length.
+
+    Old checkpoints predate some instrumentation keys. Padding keeps the next
+    ``.append`` from raising KeyError. Returns the keys that were added.
+    """
+    if not isinstance(history, dict):
+        return []
+    if isinstance(history.get("epoch"), list):
+        n = len(history["epoch"])
+    else:
+        n = max((len(v) for v in history.values() if isinstance(v, list)), default=0)
+    padded = []
+    for key in _PHASE_A_HISTORY_KEYS:
+        if key not in history:
+            history[key] = [float("nan")] * n
+            padded.append(key)
+    return padded
+
+
+def capture_phase_a_rng() -> dict:
+    """RNG snapshot stored in ``phase_a_last.pt`` so a resume continues the shuffle."""
+    return {
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        "numpy": np.random.get_state(),
+        "python": random.getstate(),
+    }
+
+
+def restore_phase_a_rng(rng) -> None:
+    """Restore whichever RNG fields are present. Missing keys are ignored.
+
+    A checkpoint saved on more GPUs than this process has would raise IndexError
+    inside ``set_rng_state_all``. Keep only ``device_count`` states and warn when
+    the lengths differ.
+    """
+    if not rng:
+        return
+    torch_state = rng.get("torch")
+    if torch.is_tensor(torch_state):
+        torch.set_rng_state(torch_state.detach().cpu())
+    cuda_state = rng.get("cuda")
+    if cuda_state is not None and torch.cuda.is_available():
+        saved = list(cuda_state)
+        n_dev = torch.cuda.device_count()
+        if len(saved) != n_dev:
+            _logger.warning(
+                "[phaseA] resume: CUDA RNG state length %d != device_count %d; "
+                "restoring the first %d",
+                len(saved), n_dev, min(len(saved), n_dev),
+            )
+        torch.cuda.set_rng_state_all(saved[:n_dev])
+    numpy_state = rng.get("numpy")
+    if numpy_state is not None:
+        np.random.set_state(numpy_state)
+    py_state = rng.get("python")
+    if py_state is not None:
+        random.setstate(py_state)
+
+
+def _snapshot_counter(value):
+    """Copy a clip counter so a later in-place update cannot mutate the snapshot."""
+    if torch.is_tensor(value):
+        return value.detach().clone()
+    return value
+
+
+def phase_a_hw_identity(ctx, student):
+    """Return ``(hw_hash, hw_preset)`` for this run.
+
+    ``hw_hash`` is the digest printed as ``[hw] HWConfig ON hash=...``, or
+    ``None`` when hardware is off. ``hw_preset`` is the ``--hw-preset`` name,
+    or ``None``. An explicit ``ctx["hw_hash"]`` wins so the saved value matches
+    the hash the entry script already logged.
+    """
+    preset = None if ctx is None else ctx.get("hw_preset")
+    if ctx is not None and "hw_hash" in ctx:
+        return ctx.get("hw_hash"), preset
+    hw = getattr(student, "hw", None)
+    if hw is None:
+        wrapped = getattr(student, "module", None)
+        hw = getattr(wrapped, "hw", None) if wrapped is not None else None
+    if hw is None or (hasattr(hw, "is_off") and hw.is_off()):
+        return None, preset
+    return hw.hash(), preset
+
+
+def check_resume_hw_hash(state, current_hash, *, current_preset=None, logger=None):
+    """Refuse a resume whose saved hardware hash disagrees with this run.
+
+    Old checkpoints omit ``hw_hash``. Those cannot be checked (presets share
+    parameter shapes, so a mismatch would otherwise load silently); log a
+    warning and continue. A present hash that differs is an error.
+    """
+    log = logger if logger is not None else _logger
+    if not isinstance(state, dict) or "hw_hash" not in state:
+        log.warning(
+            "[phaseA] resume: checkpoint has no hw_hash; cannot verify the "
+            "hardware preset matches this run (old checkpoints omit it). "
+            "Presets share parameter shapes, so a mismatched preset would "
+            "load silently."
+        )
+        return
+    saved = state.get("hw_hash")
+    if saved != current_hash:
+        raise RuntimeError(
+            "[phaseA] resume: checkpoint hw_hash=%r (preset=%r) does not match "
+            "this run hw_hash=%r (preset=%r). Refusing to load: presets share "
+            "parameter shapes and would otherwise load silently. Resume with "
+            "the same --hw-preset."
+            % (saved, state.get("hw_preset"), current_hash, current_preset)
+        )
+
+
+def phase_a_fwd_bwd_guard(optimizer, run_batch, *, student=None):
+    """Run one batch fwd+loss+bwd, falling back to eager if compiled Heun fails.
+
+    ``run_batch`` must zero grads, build the loss, and call ``backward`` (or
+    return a skip sentinel without stepping). If it raises while compiled Heun
+    is enabled, compile is disabled, grads are cleared, clip counters and the
+    torch RNG snapshot from before the attempt are restored, and the same
+    callable is run once more. ``torch.cuda.OutOfMemoryError`` is re-raised
+    without disabling compile. If compile is not enabled, the exception is
+    re-raised. The retry is not wrapped: a second failure propagates.
+    """
+    from fast_heun import compiled_heun_enabled, disable_compiled_heun
+
+    clip_c = _snapshot_counter(getattr(student, "_clip_elements", None)) if student is not None else None
+    clip_i = _snapshot_counter(getattr(student, "_input_elements", None)) if student is not None else None
+    rng_torch = torch.get_rng_state()
+    rng_cuda = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    try:
+        return run_batch()
+    except Exception as exc:
+        if isinstance(exc, torch.cuda.OutOfMemoryError):
+            raise
+        if not compiled_heun_enabled():
+            raise
+        _logger.warning(
+            "[phaseA] compiled Heun failed during batch fwd/bwd (%s: %s); "
+            "disabling compile and retrying batch eagerly",
+            type(exc).__name__, exc,
+        )
+        disable_compiled_heun(str(exc))
+        optimizer.zero_grad(set_to_none=True)
+        if student is not None and clip_c is not None:
+            student._clip_elements = clip_c
+        if student is not None and clip_i is not None:
+            student._input_elements = clip_i
+        torch.set_rng_state(rng_torch)
+        if rng_cuda is not None:
+            torch.cuda.set_rng_state_all(rng_cuda)
+        return run_batch()
+
+
 def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
     """Static, single-pass canonical-Phase-A training + ZIG evaluation.
 
@@ -3090,20 +3259,35 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
     best_path = os.path.join(output_dir, "phase_a_best.pt")
     os.makedirs(output_dir, exist_ok=True)
     start_epoch = 0
+    resume_rng = None
     resume_path = ctx.get("resume")
+    hw_hash, hw_preset = phase_a_hw_identity(ctx, student)
     if resume_path:
         state = torch.load(resume_path, map_location=DEVICE, weights_only=False)
+        check_resume_hw_hash(state, hw_hash, current_preset=hw_preset)
         student.load_state_dict(state["model"])
         optimizer.load_state_dict(state["optimizer"])
         if "scheduler" in state:
             scheduler.load_state_dict(state["scheduler"])
         history = state.get("history", history)
+        padded = _pad_missing_history(history)
+        if padded:
+            _logger.info(
+                "[phaseA] resume: padded missing history keys with NaN: %s",
+                ", ".join(padded),
+            )
         best_val_failure = state.get("best_val_failure", best_val_failure)
         best_state = state.get("best_state")
         best_val_loss = state.get("best_val_loss", best_val_loss)
         best_val_loss_state = state.get("best_val_loss_state")
         no_improve = state.get("no_improve", 0)
         start_epoch = int(state["epoch"]) + 1
+        resume_rng = state.get("rng")
+        if resume_rng is None:
+            _logger.info(
+                "[phaseA] resume: checkpoint has no RNG state; "
+                "shuffle order will differ from an uninterrupted run"
+            )
         _logger.info(f"[phaseA] resumed at epoch {start_epoch}")
 
     evaluator = StudentEvaluator(
@@ -3133,8 +3317,8 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
     def _hw_u_batch(specs):
         # the network input u of the batch, without bumping the student's
         # input-rail clipping counters (scale_input is also called by forward)
-        c0 = getattr(_hw_student, "_clip_elements", None)
-        i0 = getattr(_hw_student, "_input_elements", None)
+        c0 = _snapshot_counter(getattr(_hw_student, "_clip_elements", None))
+        i0 = _snapshot_counter(getattr(_hw_student, "_input_elements", None))
         with torch.no_grad():
             u = _hw_student.scale_input(specs)
         if c0 is not None:
@@ -3164,6 +3348,9 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
     t_train_start = time.monotonic()
 
     configure_compiled_heun(compile_mode, DEVICE, logger=_logger)
+    # After setup that might draw RNG, immediately before the epoch loop.
+    if resume_rng is not None:
+        restore_phase_a_rng(resume_rng)
     try:
         for epoch in range(start_epoch, epochs):
             t_ep0 = time.monotonic()
@@ -3173,26 +3360,26 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
                 w_eff = validity_weight * min(1.0, max(0.0, ramp_frac))
             else:
                 w_eff = validity_weight
-            total_loss = 0.0
-            total_huber = 0.0
-            total_valid_nll = 0.0
-            total_mlp_mse = 0.0
-            total_fwd_mse = 0.0
-            total_power = 0.0
-            total_hw_power = 0.0
+            acc_dtype = torch.float64
+            total_loss = torch.zeros((), device=DEVICE, dtype=acc_dtype)
+            total_huber = torch.zeros((), device=DEVICE, dtype=acc_dtype)
+            total_valid_nll = torch.zeros((), device=DEVICE, dtype=acc_dtype)
+            total_mlp_mse = torch.zeros((), device=DEVICE, dtype=acc_dtype)
+            total_fwd_mse = torch.zeros((), device=DEVICE, dtype=acc_dtype)
+            total_power = torch.zeros((), device=DEVICE, dtype=acc_dtype)
+            total_hw_power = torch.zeros((), device=DEVICE, dtype=acc_dtype)
             n_batches = 0
             first_batch_ratios = None
             perm = (
                 torch.randperm(n_train, device=DEVICE)
                 if n_train > 0 else torch.empty(0, dtype=torch.long, device=DEVICE)
             )
-            for b_start in range(0, n_train, batch_size):
-                idx_b = perm[b_start:b_start + batch_size]
-                specs_batch = train_specs_t[idx_b]
-                params_target = train_params_t[idx_b]
-                mlp_logits_target = train_mlp_t[idx_b]
+
+            def _run_batch(specs_batch, params_target, mlp_logits_target):
+                nonlocal first_batch_ratios
                 optimizer.zero_grad(set_to_none=True)
                 logits = student(specs_batch)
+                hw_pow = None
                 if mlp_guided:
                     mse_mlp = torch.mean((logits - mlp_logits_target) ** 2)
                     pred_p, pred_j, pred_h, pred_w, bounded_log, valid_nll_out = (
@@ -3255,54 +3442,87 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
                 if _hw_pow_on:
                     hw_pow = hw_power_penalty(_hw_net, _hw_cfg, u=_hw_u_batch(specs_batch))
                     loss = loss + hw_pow
-                    total_hw_power += float(hw_pow.detach().item())
-                    if epoch == 0 and n_batches == 0:
-                        _logger.info(f"[phaseA] epoch-1 hw_power_penalty={float(hw_pow.detach()):.4g}")
                 if not torch.isfinite(loss):
                     _logger.warning(
                         f"[phaseA] non-finite loss at epoch {epoch+1}, batch {n_batches}; skipping"
                     )
+                    return {"skip": True, "hw_pow": None if hw_pow is None else hw_pow.detach()}
+                loss.backward()
+                return {
+                    "skip": False,
+                    "loss": loss.detach(),
+                    "huber": huber_term.detach(),
+                    "valid_nll": None if valid_nll is None else valid_nll.detach(),
+                    "mse_mlp": None if mse_mlp is None else mse_mlp.detach(),
+                    "fwd_mse": None if fwd_mse is None else fwd_mse.detach(),
+                    "power_term": None if power_term is None else power_term.detach(),
+                    "hw_pow": None if hw_pow is None else hw_pow.detach(),
+                }
+
+            for b_start in range(0, n_train, batch_size):
+                idx_b = perm[b_start:b_start + batch_size]
+                specs_batch = train_specs_t[idx_b]
+                params_target = train_params_t[idx_b]
+                mlp_logits_target = train_mlp_t[idx_b]
+                out = phase_a_fwd_bwd_guard(
+                    optimizer,
+                    lambda sb=specs_batch, pt=params_target, mt=mlp_logits_target: _run_batch(sb, pt, mt),
+                    student=_hw_student,
+                )
+                if _hw_pow_on and out["hw_pow"] is not None:
+                    total_hw_power = total_hw_power + out["hw_pow"].to(dtype=acc_dtype)
+                    if epoch == 0 and n_batches == 0:
+                        _logger.info(
+                            f"[phaseA] epoch-1 hw_power_penalty={float(out['hw_pow']):.4g}"
+                        )
+                if out["skip"]:
                     n_batches += 1
                     continue
-                loss.backward()
                 if grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(student.parameters(), grad_clip)
                 optimizer.step()
-                total_loss += loss.item()
-                total_huber += huber_term.item()
-                if valid_nll is not None:
-                    total_valid_nll += valid_nll.item()
+                total_loss = total_loss + out["loss"].to(dtype=acc_dtype)
+                total_huber = total_huber + out["huber"].to(dtype=acc_dtype)
+                if out["valid_nll"] is not None:
+                    total_valid_nll = total_valid_nll + out["valid_nll"].to(dtype=acc_dtype)
                 if mlp_guided:
-                    total_mlp_mse += float(mse_mlp.item())
-                    total_fwd_mse += float(fwd_mse.item())
-                    total_power += float(power_term.item()) * power_norm_const
+                    total_mlp_mse = total_mlp_mse + out["mse_mlp"].to(dtype=acc_dtype)
+                    total_fwd_mse = total_fwd_mse + out["fwd_mse"].to(dtype=acc_dtype)
+                    total_power = total_power + out["power_term"].to(dtype=acc_dtype) * power_norm_const
                 n_batches += 1
             scheduler.step()
-            avg_train = total_loss / max(1, n_batches)
-            avg_huber = total_huber / max(1, n_batches)
-            avg_valid_nll = total_valid_nll / max(1, n_batches) if w_eff > 0 else float("nan")
-            avg_mlp_mse = total_mlp_mse / max(1, n_batches) if mlp_guided else float("nan")
-            avg_fwd_mse = total_fwd_mse / max(1, n_batches) if mlp_guided else float("nan")
-            avg_power = total_power / max(1, n_batches) if mlp_guided else float("nan")
+            avg_train = float(total_loss.item()) / max(1, n_batches)
+            avg_huber = float(total_huber.item()) / max(1, n_batches)
+            avg_valid_nll = float(total_valid_nll.item()) / max(1, n_batches) if w_eff > 0 else float("nan")
+            avg_mlp_mse = float(total_mlp_mse.item()) / max(1, n_batches) if mlp_guided else float("nan")
+            avg_fwd_mse = float(total_fwd_mse.item()) / max(1, n_batches) if mlp_guided else float("nan")
+            avg_power = float(total_power.item()) / max(1, n_batches) if mlp_guided else float("nan")
             if _hw_pow_on:
                 _logger.info(f"[phaseA] epoch {epoch+1} mean hw_power_penalty="
-                             f"{total_hw_power / max(1, n_batches):.4g}")
-
-            val_logits = _eval_student_logits(student, val_specs_t, DEVICE, chunk_size=2048)
-            val_loss_sum, val_batches = 0.0, 0
-            with torch.no_grad():
-                for b_start in range(0, len(val_logits), batch_size):
-                    bl = huber_loss(
-                        val_logits[b_start:b_start + batch_size],
-                        val_params_t[b_start:b_start + batch_size],
-                        delta=0.5,
-                    ).mean()
-                    if torch.isfinite(bl):
-                        val_loss_sum += float(bl.item())
-                        val_batches += 1
-            avg_val = val_loss_sum / max(1, val_batches)
+                             f"{float(total_hw_power.item()) / max(1, n_batches):.4g}")
 
             eval_this_epoch = (epoch + 1) % val_eval_every == 0 or epoch == epochs - 1
+            # Validation/eval forwards go through _eval_student_logits under
+            # torch.no_grad. Compiled-step forward exceptions are already caught
+            # in fast_heun_forward; backward cannot run here, so no extra
+            # compile-fallback guard is required on the eval path.
+            if eval_this_epoch:
+                val_logits = _eval_student_logits(student, val_specs_t, DEVICE, chunk_size=2048)
+                val_loss_sum, val_batches = 0.0, 0
+                with torch.no_grad():
+                    for b_start in range(0, len(val_logits), batch_size):
+                        bl = huber_loss(
+                            val_logits[b_start:b_start + batch_size],
+                            val_params_t[b_start:b_start + batch_size],
+                            delta=0.5,
+                        ).mean()
+                        if torch.isfinite(bl):
+                            val_loss_sum += float(bl.item())
+                            val_batches += 1
+                avg_val = val_loss_sum / max(1, val_batches)
+            else:
+                val_logits = None
+                avg_val = float("nan")
             val_failure_rate = float("nan")
             boundary_failure_rate = float("nan")
             interior_failure_rate = float("nan")
@@ -3361,7 +3581,7 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
             history["val_invalid_rate"].append(val_invalid_rate)
             history["val_degrade_rate"].append(val_degrade_rate)
             history["val_valid_mean_power"].append(val_valid_mean_power)
-            if avg_val < best_val_loss:
+            if math.isfinite(avg_val) and avg_val < best_val_loss:
                 best_val_loss = avg_val
                 best_val_loss_state = {k: v.detach().cpu().clone() for k, v in student.state_dict().items()}
             torch.save(
@@ -3369,7 +3589,9 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
                  "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
                  "history": history, "best_val_failure": best_val_failure,
                  "best_state": best_state, "best_val_loss": best_val_loss,
-                 "best_val_loss_state": best_val_loss_state, "no_improve": no_improve},
+                 "best_val_loss_state": best_val_loss_state, "no_improve": no_improve,
+                 "rng": capture_phase_a_rng(),
+                 "hw_hash": hw_hash, "hw_preset": hw_preset},
                 checkpoint_path,
             )
             completed_epochs = epoch + 1
@@ -3397,10 +3619,11 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
                 )
                 eta_min = (epoch_sec * max(0, epochs - (epoch + 1))) / 60.0
                 _train_label = "train_mse_mlp" if mlp_guided else "train_huber"
+                val_huber_str = f"{avg_val:.4f}" if math.isfinite(avg_val) else "--"
                 _logger.info(
                     f"[phaseA] epoch {epoch+1:3d}/{epochs}  "
                     f"{_train_label}={avg_huber:.4f}  valid_nll={avg_valid_nll:5.4f}  "
-                    f"w_valid={w_eff:.3f}  val_huber={avg_val:.4f}  "
+                    f"w_valid={w_eff:.3f}  val_huber={val_huber_str}  "
                     f"{fail_str} patience={no_improve}/{earlystop_patience}"
                     f"{guided_str}  dt={epoch_sec:.1f}s elapsed={elapsed_sec/60:.1f}m eta={eta_min:.1f}m"
                 )
@@ -3426,6 +3649,14 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
             student.load_state_dict(best_val_loss_state)
             student.to(DEVICE)
             torch.save(best_val_loss_state, best_path)
+        else:
+            # Val Huber (and therefore best_val_loss_state) runs only on eval
+            # epochs. A time-budget stop before the first eval still needs
+            # phase_a_best.pt for the notebook audit; the weights are the last
+            # completed epoch, which is also the only candidate.
+            last_state = {k: v.detach().cpu().clone() for k, v in student.state_dict().items()}
+            torch.save(last_state, best_path)
+            _logger.info("[phaseA] no eval checkpoint yet; wrote last epoch to phase_a_best.pt")
 
         final = {}
         for split_name, loader in (("train", train_loader), ("val", val_loader), ("test", test_loader)):

@@ -28,7 +28,12 @@ from hw.constraints import (
     theta_bound,
 )
 
-__all__ = ["configure_compiled_heun", "fast_heun_forward"]
+__all__ = [
+    "configure_compiled_heun",
+    "compiled_heun_enabled",
+    "disable_compiled_heun",
+    "fast_heun_forward",
+]
 
 _COMPILE_STATE: dict = {
     "mode": "off",
@@ -259,6 +264,26 @@ def configure_compiled_heun(mode: str = "auto", device=None, logger=None) -> boo
         if logger is not None:
             logger.warning(f"[fast_heun] torch.compile setup failed ({exc}); using eager hoisted fast path")
         return False
+
+
+def compiled_heun_enabled() -> bool:
+    """True when inductor-compiled Heun steps are currently in use."""
+    return bool(_COMPILE_STATE.get("enabled"))
+
+
+def disable_compiled_heun(reason: str = "") -> None:
+    """Turn compiled Heun steps off for the rest of the process.
+
+    Sets ``_COMPILE_STATE["enabled"]=False`` and ``["failed"]=True`` so later
+    forwards use the eager hoisted step. The forward try/except in
+    ``fast_heun_forward`` only covers the step call; a backward failure inside
+    ``loss.backward()`` must call this and recompute the batch eagerly.
+    """
+    _COMPILE_STATE["enabled"] = False
+    _COMPILE_STATE["failed"] = True
+    log = _COMPILE_STATE.get("logger")
+    if log is not None and reason:
+        log.warning(f"[fast_heun] compiled Heun disabled ({reason})")
 
 
 def _get_stage_geom_cache(stage, device: torch.device, dtype: torch.dtype):

@@ -25,7 +25,8 @@ BATCH_SIZE = int(os.getenv("KNB_BATCH_SIZE", "512"))
 COMPILE = os.getenv("KNB_COMPILE", "auto")  # auto compiles on CUDA sm_70+ (T4), skips on P100/CPU
 MAX_HOURS = float(os.getenv("KNB_MAX_HOURS", "10.5"))  # clean stop before Kaggle's 12h timeout; <=0 disables
 OUT_DIR = os.getenv("KNB_OUT_DIR", "/kaggle/working/out")
-RESUME = os.getenv("KNB_RESUME", "")  # "" (fresh), "auto" (resume phase_a_last.pt if present), or explicit path
+RESUME = os.getenv("KNB_RESUME", "")  # "" (fresh), "auto" (run_dir, else search KNB_RESUME_SEARCH_ROOT), or explicit path
+RESUME_SEARCH_ROOT = os.getenv("KNB_RESUME_SEARCH_ROOT", "/kaggle/input")
 SMOKE = os.getenv("KNB_SMOKE", "0").lower() in ("1", "true", "yes")
 RUN_TOY_ABLATION = os.getenv("KNB_RUN_TOY_ABLATION", "0").lower() in ("1", "true", "yes")
 TEACHER_CKPT = Path(os.getenv("KNB_TEACHER_CKPT", "/kaggle/input/models/awekill/improved-zig-nf-spline/pytorch/default/4/dagger_student_plain.pt"))
@@ -129,7 +130,31 @@ print(eval_out)
 assert "val= 8.05%" in eval_out and "test= 8.15%" in eval_out
 '''),
 cell("code", '''# Execute one ladder rung. Stream output to console and durable log as it arrives.
+import importlib.util
+import shutil
 from datetime import datetime
+
+# Load by file path. scripts/ has no __init__.py, so a site-packages "scripts"
+# package can shadow a package import of this module.
+_resume_spec = importlib.util.spec_from_file_location("resume_lookup", repo / "scripts/kaggle/resume_lookup.py")
+_resume_mod = importlib.util.module_from_spec(_resume_spec)
+_resume_spec.loader.exec_module(_resume_mod)
+find_phase_a_checkpoints = _resume_mod.find_phase_a_checkpoints
+compare_resume_hw_config = _resume_mod.compare_resume_hw_config
+
+def _warn_resume_epoch(path):
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    ep = ckpt.get("epoch")
+    print("checkpoint epoch:", ep, "path:", path)
+    if ep is not None and int(ep) + 1 >= EPOCHS:
+        print(f"WARNING: resumed checkpoint epoch+1 ({int(ep)+1}) >= EPOCHS ({EPOCHS}); no additional epochs will run")
+    return ckpt
+
+def _check_external_hw(chosen, preset):
+    # Trainer rewrites run_dir/hw_config.json at startup, so copying the sibling
+    # is a no-op. Compare it to the preset this rung will train under instead.
+    print(compare_resume_hw_config(chosen.parent / "hw_config.json", preset))
+
 rungs = {"R0": None, "R1": "phase3a_core", "R1d": "phase3a_core_diff", "R2": "phase3a_full", "R3": "phase3b_tm"}
 if RUNG not in rungs: raise ValueError(f"RUNG must be one of {list(rungs)}")
 run_dir = Path(OUT_DIR) / f"{RUNG}_seed{SEED}"
@@ -154,13 +179,35 @@ if rungs[RUNG]: cmd += ["--hw-preset", rungs[RUNG]]
 if SMOKE: cmd += ["--phase-a-sample-limit", "32"]
 resume_path = ""
 if RESUME.strip().lower() == "auto":
-    cand = run_dir / "phase_a_last.pt"
-    if cand.is_file():
-        resume_path = str(cand)
+    local = run_dir / "phase_a_last.pt"
+    if local.is_file():
+        resume_path = str(local)
+        print("resuming from:", resume_path)
+        _warn_resume_epoch(resume_path)
+    else:
+        cands = find_phase_a_checkpoints(RESUME_SEARCH_ROOT, RUNG, SEED)
+        if not cands:
+            print(f"KNB_RESUME=auto: no phase_a_last.pt in {run_dir} or under {RESUME_SEARCH_ROOT} for {RUNG}_seed{SEED}")
+        else:
+            if len(cands) > 1:
+                print("multiple phase_a_last.pt candidates (newest first):")
+                for cand in cands:
+                    print(" ", cand, "mtime", cand.stat().st_mtime)
+            chosen = cands[0]
+            print("chosen external checkpoint:", chosen)
+            _warn_resume_epoch(chosen)
+            _check_external_hw(chosen, rungs[RUNG])
+            shutil.copy2(chosen, local)
+            resume_path = str(local)
+            print("resuming from:", resume_path)
 elif RESUME.strip():
     resume_path = RESUME.strip()
-if resume_path:
     print("resuming from:", resume_path)
+    try:
+        _warn_resume_epoch(resume_path)
+    except Exception as exc:
+        print("WARNING: could not read resume checkpoint epoch:", exc)
+if resume_path:
     cmd += ["--resume", resume_path]
 log_path = run_dir / "train.log"
 with open(log_path, "a", buffering=1) as log:
@@ -184,13 +231,17 @@ for split in ("train", "val", "test"):
     assert math.isfinite(rate), f"{split} evaluation is non-finite"
 best = run_dir / "phase_a_best.pt"
 if rungs[RUNG]:
-    audit = [sys.executable, "-m", "hw.audit", "--checkpoint", str(best), "--kn-isat-max", "16", "--kn-gm-max", "4.241970", "--canonical", DATA_CANONICAL, "--json", str(run_dir / "hw_audit.json")]
+    audit = [sys.executable, "-m", "hw.audit", "--checkpoint", str(best), "--kn-isat-max", "16", "--kn-gm-max", "4.241970", "--kn-steps-per-stage", str(STEPS_PER_STAGE), "--canonical", DATA_CANONICAL, "--json", str(run_dir / "hw_audit.json")]
     subprocess.run(audit, cwd=repo, check=True)
 try:
     import matplotlib.pyplot as plt
+    import numpy as np
     h = hist["history"]
     for key in ("train_loss", "val_loss", "val_failure_rate"):
-        plt.figure(); plt.plot(h["epoch"], h[key]); plt.xlabel("epoch"); plt.ylabel(key); plt.grid(True)
+        ep = np.asarray(h["epoch"], dtype=float)
+        y = np.asarray(h[key], dtype=float)
+        finite = np.isfinite(ep) & np.isfinite(y)
+        plt.figure(); plt.plot(ep[finite], y[finite]); plt.xlabel("epoch"); plt.ylabel(key); plt.grid(True)
         plt.savefig(run_dir / f"{key}.png", dpi=140, bbox_inches="tight"); plt.close()
 except Exception as exc: print("plot warning", exc)
 result = {"rung": RUNG, "seed": SEED, "lr": LR, "epochs": EPOCHS, **{f"{s}_failure": final[s]["failure_rate"] for s in ("train", "val", "test")}, "checkpoint": str(best)}

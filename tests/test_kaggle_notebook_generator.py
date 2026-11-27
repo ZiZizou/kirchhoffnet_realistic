@@ -103,3 +103,25 @@ def test_notebook_includes_optimization_knobs_and_valid_python():
     for idx, cell in enumerate(notebook["cells"]):
         if cell["cell_type"] == "code":
             ast.parse("".join(cell["source"]), filename=f"cell_{idx}")
+
+
+
+def test_cell7_audit_passes_steps_and_plots_finite_points():
+    notebook = json.loads(NOTEBOOK.read_text(encoding="utf-8"))
+    cell7 = "".join(notebook["cells"][7]["source"])
+    generator = GENERATOR.read_text(encoding="utf-8")
+    for text in (cell7, generator):
+        assert "--kn-steps-per-stage" in text
+        assert "str(STEPS_PER_STAGE)" in text
+        assert "np.isfinite" in text
+    assert "find_phase_a_checkpoints" in "".join(notebook["cells"][6]["source"])
+    cell6 = "".join(notebook["cells"][6]["source"])
+    assert 'spec_from_file_location("resume_lookup"' in cell6
+    assert "from scripts.kaggle.resume_lookup import" not in cell6
+    assert "compare_resume_hw_config" in cell6
+    assert "copied sibling hw_config.json" not in cell6
+    assert "if not local.is_file()" not in cell6
+    # imports and helpers sit above the rung table
+    assert cell6.index("spec_from_file_location") < cell6.index("rungs = {")
+    assert cell6.index("def _warn_resume_epoch") < cell6.index("rungs = {")
+    assert cell6.index("def _check_external_hw") < cell6.index("rungs = {")

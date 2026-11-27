@@ -141,3 +141,21 @@ def test_slurm_scripts_only_pass_existing_flags():
         flags = set(re.findall(r"(?<![\w-])(--(?:hw|zig)-[a-z0-9-]*[a-z0-9])", txt))
         assert flags, sh
         assert flags <= known, (sh, sorted(flags - known))
+
+
+def test_kn_steps_per_stage_flag_sets_stage_num_steps():
+    """--kn-steps-per-stage 40 rebuilds the paper grid; absent keeps 10."""
+    absent = A._audit_parser().parse_args(["--checkpoint", "unused.pt"])
+    arch0 = A.arch_overrides_from_args(absent)
+    assert "num_steps_per_stage" not in arch0
+    m10 = A.load_model(None, None, arch=arch0)
+    assert all(num_steps == 10 for num_steps in m10.net.core.stage_steps)
+    assert len(m10.net.core.stage_steps) == len(m10.net.core.stages) == 7
+
+    flagged = A._audit_parser().parse_args(
+        ["--checkpoint", "unused.pt", "--kn-steps-per-stage", "40"])
+    arch40 = A.arch_overrides_from_args(flagged)
+    assert arch40["num_steps_per_stage"] == 40
+    m40 = A.load_model(None, None, arch=arch40)
+    assert all(num_steps == 40 for num_steps in m40.net.core.stage_steps)
+    assert len(m40.net.core.stage_steps) == len(m40.net.core.stages)

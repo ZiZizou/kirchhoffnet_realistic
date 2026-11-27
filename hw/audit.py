@@ -428,7 +428,19 @@ def format_table(rows) -> str:
     return "\n".join([line(hdr), "|" + "|".join("-" * (n + 2) for n in w) + "|"] + [line(c) for c in body])
 
 
-def main(argv=None) -> int:
+def arch_overrides_from_args(a) -> dict:
+    """PAPER_CONFIG overrides from audit CLI flags. Absent flags are omitted."""
+    arch = {}
+    if getattr(a, "kn_isat_max", None) is not None:
+        arch["isat_max"] = float(a.kn_isat_max)
+    if getattr(a, "kn_gm_max", None) is not None:
+        arch["gm_max"] = float(a.kn_gm_max)
+    if getattr(a, "kn_steps_per_stage", None) is not None:
+        arch["num_steps_per_stage"] = int(a.kn_steps_per_stage)
+    return arch
+
+
+def _audit_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="python -m hw.audit", description=__doc__.split("\n")[0])
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--n-rows", type=int, default=256)
@@ -446,14 +458,18 @@ def main(argv=None) -> int:
                          "hardware retrain uses 16).  Not stored in the checkpoint.")
     ap.add_argument("--kn-gm-max", type=float, default=None,
                     help="cell gm upper bound the model was trained with (paper 4.24197)")
+    ap.add_argument("--kn-steps-per-stage", type=int, default=None,
+                    help="Heun steps per stage the model was trained with (paper 10; "
+                         "hardware rungs use 40). Not stored in the checkpoint. "
+                         "Default None leaves checkpoints.PAPER_CONFIG unchanged.")
     parse_hw_args(ap)
-    a = ap.parse_args(argv)
+    return ap
+
+
+def main(argv=None) -> int:
+    a = _audit_parser().parse_args(argv)
     hw, src = resolve_hw(a, a.checkpoint)
-    arch = {}
-    if a.kn_isat_max is not None:
-        arch["isat_max"] = float(a.kn_isat_max)
-    if a.kn_gm_max is not None:
-        arch["gm_max"] = float(a.kn_gm_max)
+    arch = arch_overrides_from_args(a)
     x = canonical_rows(a.n_rows, a.canonical)
     print(f"[audit] checkpoint={a.checkpoint}")
     print(f"[audit] HWConfig from {src}: {'OFF' if hw.is_off() else 'ON'} hash={hw.hash()}")

@@ -2238,18 +2238,27 @@ class StudentEvaluator:
         safe_scale = np.maximum(scaler_X.scale_, 1e-6).astype(np.float32)
         self._scaler_X_scale = safe_scale
         self._scaler_X_mean = scaler_X.mean_.astype(np.float32)
+        self._scaler_X_mean_t = None
+        self._scaler_X_scale_t = None
 
-    def identify_failures(self, val_specs, threshold=0.10):
+    def identify_failures(self, val_specs, threshold=0.10, logits=None):
         self.student.eval()
         with torch.no_grad():
-            specs_t = torch.from_numpy(val_specs).float().to(self.device)
-            logits = self.student(specs_t)
+            val_specs_np = np.asarray(val_specs, dtype=np.float32)
+            specs_t = torch.from_numpy(val_specs_np).float().to(self.device)
+            if logits is None:
+                logits = _eval_student_logits(self.student, specs_t, self.device, chunk_size=2048)
+            else:
+                logits = logits.to(self.device)
             probs = torch.sigmoid(logits)
             log_lo = self.student.log_lo.unsqueeze(0)
             log_hi = self.student.log_hi.unsqueeze(0)
             bounded_log = log_lo + (log_hi - log_lo) * probs
-            x_mean_t = torch.from_numpy(self._scaler_X_mean).to(self.device)
-            x_scale_t = torch.from_numpy(self._scaler_X_scale).to(self.device)
+            if self._scaler_X_mean_t is None or self._scaler_X_mean_t.device != bounded_log.device:
+                self._scaler_X_mean_t = torch.from_numpy(self._scaler_X_mean).to(bounded_log.device)
+                self._scaler_X_scale_t = torch.from_numpy(self._scaler_X_scale).to(bounded_log.device)
+            x_mean_t = self._scaler_X_mean_t
+            x_scale_t = self._scaler_X_scale_t
             x_scaled = (bounded_log - x_mean_t) / (x_scale_t + 1e-8)
             x_scaled = torch.clamp(x_scaled, -10.0, 10.0)
             out = self.zig(x_scaled)
@@ -2267,7 +2276,7 @@ class StudentEvaluator:
                 pred_h.detach().cpu().numpy(), pred_w.detach().cpu().numpy(),
             ], axis=1)
             metric_dict = compute_forward_errors(
-                pred_specs, val_specs, default_threshold=threshold,
+                pred_specs, val_specs_np, default_threshold=threshold,
             )
             all_errors = np.stack([
                 metric_dict['err_p'], metric_dict['err_j'],
@@ -2289,7 +2298,7 @@ class StudentEvaluator:
                    'boundary_failure': boundary_failure, 'interior_failure': interior_failure,
                    'is_boundary': is_boundary,
                    'pred_specs': pred_specs,
-                   'target_specs': val_specs.copy(),
+                   'target_specs': val_specs_np.copy(),
                    'dim_fail_rates': (all_errors >= _active_ctx.get("DEGRADE_REL_THRESHOLD", DEGRADE_REL_THRESHOLD)).mean(axis=0),
                    'degraded_dims': metric_dict['degraded_dims'],
                    'failure_mask': failure_mask,
@@ -2789,6 +2798,81 @@ def _phase_a_decode_and_forward(student, logits, scaler_X, scaler_y_p, zig_model
     return pred_p, pred_j, pred_h, pred_w, bounded_log
 
 
+def _phase_a_decode_and_forward_with_validity(
+    student, logits, x_mean_t, x_scale_t, scaler_y_p_scale, scaler_y_p_mean, zig_model,
+):
+    """Single ZIG pass returning forward predictions, bounded_log, and validity NLL."""
+    probs = torch.sigmoid(logits)
+    log_lo = student.log_lo.unsqueeze(0)
+    log_hi = student.log_hi.unsqueeze(0)
+    bounded_log = log_lo + (log_hi - log_lo) * probs
+    x_scaled = (bounded_log - x_mean_t) / (x_scale_t + 1e-8)
+    x_scaled = torch.clamp(x_scaled, -10.0, 10.0)
+    out = zig_model(x_scaled)
+    pred_h = out['pred_h_soft'].clamp(min=1e-12, max=1e12)
+    pred_w = out['pred_w_soft'].clamp(min=1e-12, max=1e12)
+    pred_j = out['pred_j_soft'].clamp(min=1e-12, max=1e12)
+    power_scaled = out['mu_power'] * float(scaler_y_p_scale) + float(scaler_y_p_mean)
+    pred_p = torch.clamp(10.0 ** power_scaled, 1e-12, 1e12)
+    if 'p_valid' in out:
+        p_valid = out['p_valid'].clamp(1e-6, 1.0 - 1e-6)
+    else:
+        p_valid = (out['p_valid_h'] * out['p_valid_w'] * out['p_valid_j']).clamp(1e-6, 1.0 - 1e-6)
+    valid_nll = (-torch.log(p_valid)).mean()
+    return pred_p, pred_j, pred_h, pred_w, bounded_log, valid_nll
+
+
+def _eval_student_logits(student, specs_arr, device, chunk_size: int = 2048):
+    """Run student inference in chunked no_grad batches and return concatenated logits."""
+    student.eval()
+    n = len(specs_arr)
+    step = max(1, int(chunk_size))
+    chunks = []
+    with torch.no_grad():
+        for start in range(0, n, step):
+            chunk = specs_arr[start:start + step]
+            if torch.is_tensor(chunk):
+                chunk_t = chunk.to(device=device, dtype=torch.float32)
+            else:
+                chunk_t = torch.from_numpy(np.asarray(chunk, dtype=np.float32)).to(device)
+            chunks.append(student(chunk_t))
+    if chunks:
+        return torch.cat(chunks, dim=0)
+    out_dim = int(getattr(student, "num_targets", 7))
+    return torch.empty((0, out_dim), device=device, dtype=torch.float32)
+
+
+def _materialize_phase_a_tensors(ds, device):
+    """Load a Phase-A split dataset into contiguous tensors on ``device`` once."""
+    if isinstance(ds, Subset) and hasattr(ds.dataset, "specs"):
+        base = ds.dataset
+        idx = np.asarray([base.indices[i] for i in ds.indices], dtype=np.int64)
+        specs_np = base.specs[idx]
+        params_np = base.params_log[idx]
+        mlp_np = base.mlp_logits[idx]
+    elif hasattr(ds, "specs") and hasattr(ds, "indices"):
+        idx = np.asarray(ds.indices, dtype=np.int64)
+        specs_np = ds.specs[idx]
+        params_np = ds.params_log[idx]
+        mlp_np = ds.mlp_logits[idx]
+    else:
+        rows = [ds[i] for i in range(len(ds))]
+        if not rows:
+            return (
+                torch.empty((0, 4), device=device, dtype=torch.float32),
+                torch.empty((0, 7), device=device, dtype=torch.float32),
+                torch.empty((0, 7), device=device, dtype=torch.float32),
+            )
+        specs_np = np.stack([np.asarray(r[0]) for r in rows]).astype(np.float32)
+        params_np = np.stack([np.asarray(r[1]) for r in rows]).astype(np.float32)
+        mlp_np = np.stack([np.asarray(r[2]) for r in rows]).astype(np.float32)
+    return (
+        torch.from_numpy(np.ascontiguousarray(specs_np, dtype=np.float32)).to(device),
+        torch.from_numpy(np.ascontiguousarray(params_np, dtype=np.float32)).to(device),
+        torch.from_numpy(np.ascontiguousarray(mlp_np, dtype=np.float32)).to(device),
+    )
+
+
 def _phase_a_student_power(bounded_log):
     """Absolute surrogate power ``4*VDD*I`` (physical W) from decoded log-params.
 
@@ -2800,31 +2884,46 @@ def _phase_a_student_power(bounded_log):
 
 
 def _phase_a_split_power_and_mse(student, specs_arr, mlp_logits_arr,
-                                 scaler_y_p, device, batch_size: int = 1024):
+                                 scaler_y_p, device, batch_size: int = 1024,
+                                 logits=None):
     """No-grad per-spec absolute power and MLP-logit MSE for a split.
 
     Chunked in ``batch_size`` blocks: the train split holds 16k specs and a
     single KNet ODE forward over the whole split risks GPU OOM.
     """
     student.eval()
-    specs_np = np.asarray(specs_arr, dtype=np.float32)
     mlp_np = (np.asarray(mlp_logits_arr, dtype=np.float32)
               if mlp_logits_arr is not None else None)
+    if logits is not None:
+        with torch.no_grad():
+            logits_d = logits.to(device)
+            probs = torch.sigmoid(logits_d)
+            bounded_log = student.log_lo.unsqueeze(0) + (
+                student.log_hi - student.log_lo) * probs
+            power = _phase_a_student_power(bounded_log).cpu().numpy().astype(np.float64)
+            if mlp_np is not None:
+                target = torch.from_numpy(mlp_np).to(device)
+                mse = float(torch.mean((logits_d - target) ** 2).item())
+            else:
+                mse = float("nan")
+        return power, mse
+
+    specs_np = np.asarray(specs_arr, dtype=np.float32)
     powers: list[np.ndarray] = []
     se_sum = 0.0
     se_count = 0
     with torch.no_grad():
         for start in range(0, len(specs_np), max(1, int(batch_size))):
             chunk = torch.from_numpy(specs_np[start:start + batch_size]).to(device)
-            logits = student(chunk)
-            probs = torch.sigmoid(logits)
+            chunk_logits = student(chunk)
+            probs = torch.sigmoid(chunk_logits)
             bounded_log = student.log_lo.unsqueeze(0) + (
                 student.log_hi - student.log_lo) * probs
             powers.append(_phase_a_student_power(bounded_log).cpu().numpy())
             if mlp_np is not None:
                 target = torch.from_numpy(mlp_np[start:start + batch_size]).to(device)
-                se_sum += float(torch.sum((logits - target) ** 2).item())
-                se_count += int(logits.numel())
+                se_sum += float(torch.sum((chunk_logits - target) ** 2).item())
+                se_count += int(chunk_logits.numel())
     power = np.concatenate(powers) if powers else np.zeros(0, dtype=np.float64)
     mse = float(se_sum / max(1, se_count)) if mlp_np is not None else float("nan")
     return power.astype(np.float64), mse
@@ -3042,324 +3141,362 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
             _hw_student._clip_elements, _hw_student._input_elements = c0, i0
         return u
 
-    for epoch in range(start_epoch, epochs):
-        student.train()
-        # Ramped validity weight (1-based epochs): 0 up to ramp start, linear
-        # ramp over ramp_epochs, full weight thereafter.  validity_weight=0.0
-        # keeps the legacy Huber-only path (ZIG forward skipped entirely).
-        if validity_weight > 0 and validity_ramp_epochs > 0:
-            ramp_frac = ((epoch + 1) - validity_ramp_start) / validity_ramp_epochs
-            w_eff = validity_weight * min(1.0, max(0.0, ramp_frac))
-        else:
-            w_eff = validity_weight
-        total_loss = 0.0
-        total_huber = 0.0
-        total_valid_nll = 0.0
-        total_mlp_mse = 0.0
-        total_fwd_mse = 0.0
-        total_power = 0.0
-        total_hw_power = 0.0
-        n_batches = 0
-        first_batch_ratios = None
-        for specs_batch, params_target, mlp_logits_target in train_loader:
-            specs_batch = specs_batch.to(DEVICE)
-            params_target = params_target.to(DEVICE)
-            # Audit fix: the schema-2 logits column loads on CPU; without this
-            # the guided MSE raises a device-mismatch error on CUDA trials.
-            mlp_logits_target = mlp_logits_target.to(DEVICE)
-            optimizer.zero_grad(set_to_none=True)
-            logits = student(specs_batch)
-            if mlp_guided:
-                # Plan phase-a-mlp-guided-knet 4-term loss. ``mse_mlp`` on raw
-                # teacher/student logits (stable anchor); ``fwd_mse`` on scaled
-                # spec space (eye scales for j/h/w, scaler_y_p for power);
-                # ``nll`` dimensionless; ``power_norm`` absolute 4*VDD*I in
-                # physical W divided by the train-mean power.
-                mse_mlp = torch.mean((logits - mlp_logits_target) ** 2)
-                pred_p, pred_j, pred_h, pred_w, bounded_log = _phase_a_decode_and_forward(
-                    student, logits, scaler_X, scaler_y_p, zig_model,
-                )
-                target_p = specs_batch[:, 0]
-                target_j = specs_batch[:, 1]
-                target_h = specs_batch[:, 2]
-                target_w = specs_batch[:, 3]
-                err_p = (torch.log10(pred_p) - torch.log10(target_p.clamp(min=1e-12))) \
-                    / max(abs(float(scaler_y_p.scale_[0])), 1e-6)
-                err_j = (pred_j - target_j) / eye_scale_j
-                err_h = (pred_h - target_h) / eye_scale_h
-                err_w = (pred_w - target_w) / eye_scale_w
-                fwd_mse = torch.mean(torch.stack([
-                    err_p ** 2, err_j ** 2, err_h ** 2, err_w ** 2], dim=0))
-                power_phys = _phase_a_student_power(bounded_log)
-                power_term = power_phys.mean() / power_norm_const
-                huber_term = mse_mlp
-                if w_eff > 0:
-                    valid_nll = _phase_a_validity_nll(
-                        student, logits, scaler_X, zig_model,
-                    )
-                else:
-                    valid_nll = None
-                # (the hw power penalty is added after both loss branches)
-                loss = (mlp_weight * mse_mlp + fwd_weight * fwd_mse
-                        + power_weight * power_term)
-                if w_eff > 0:
-                    loss = loss + w_eff * valid_nll
-                if first_batch_ratios is None and epoch == 0:
-                    # Epoch-1 weight-ratio log (plan §3/§9): shows the scale of
-                    # each term at initialisation so weight mismatches are
-                    # caught before an Alliance allocation is burned.
-                    def _f(t):
-                        return float(t.detach().item()) if torch.is_tensor(t) else float(t)
-                    first_batch_ratios = {
-                        "mse_mlp": _f(mse_mlp), "fwd_mse": _f(fwd_mse),
-                        "power_norm": _f(power_term),
-                        "nll": _f(valid_nll) if valid_nll is not None else 0.0,
-                    }
-                    contrib = {
-                        "mlp": mlp_weight * first_batch_ratios["mse_mlp"],
-                        "fwd": fwd_weight * first_batch_ratios["fwd_mse"],
-                        "power": power_weight * first_batch_ratios["power_norm"],
-                        "validity": w_eff * first_batch_ratios["nll"],
-                    }
-                    total0 = sum(contrib.values()) or 1.0
-                    _logger.info(
-                        "[phaseA] epoch-1 term magnitudes: "
-                        + ", ".join(f"{k}={v:.4g}" for k, v in first_batch_ratios.items())
-                        + " | weighted contributions: "
-                        + ", ".join(f"{k}={v:.4g} ({100*v/total0:.1f}%)"
-                                    for k, v in contrib.items())
-                    )
+    from fast_heun import configure_compiled_heun
+
+    train_specs_t, train_params_t, train_mlp_t = _materialize_phase_a_tensors(
+        train_loader.dataset, DEVICE,
+    )
+    val_specs_t, val_params_t, _ = _materialize_phase_a_tensors(
+        val_loader.dataset, DEVICE,
+    )
+    n_train = int(train_specs_t.shape[0])
+    x_mean_t = torch.from_numpy(scaler_X.mean_.astype(np.float32)).to(DEVICE)
+    x_scale_t = torch.from_numpy(np.maximum(scaler_X.scale_, 1e-6).astype(np.float32)).to(DEVICE)
+    scaler_y_p_scale = float(scaler_y_p.scale_[0])
+    scaler_y_p_mean = float(scaler_y_p.mean_[0])
+    power_scale_denom = max(abs(scaler_y_p_scale), 1e-6)
+
+    compile_mode = str(ctx.get("compile_mode", "off"))
+    max_hours = ctx.get("max_hours", None)
+    max_hours_f = float(max_hours) if max_hours is not None else None
+    completed_epochs = start_epoch
+    stopped_by_time_budget = False
+    t_train_start = time.monotonic()
+
+    configure_compiled_heun(compile_mode, DEVICE, logger=_logger)
+    try:
+        for epoch in range(start_epoch, epochs):
+            t_ep0 = time.monotonic()
+            student.train()
+            if validity_weight > 0 and validity_ramp_epochs > 0:
+                ramp_frac = ((epoch + 1) - validity_ramp_start) / validity_ramp_epochs
+                w_eff = validity_weight * min(1.0, max(0.0, ramp_frac))
             else:
-                huber_term = huber_loss(logits, params_target, delta=0.5).mean()
-                mse_mlp = fwd_mse = power_term = None
-                if w_eff > 0:
-                    valid_nll = _phase_a_validity_nll(
-                        student, logits, scaler_X, zig_model,
-                    )
-                    loss = huber_term + w_eff * valid_nll
-                else:
-                    valid_nll = None
-                    loss = huber_term
-            if _hw_pow_on:
-                # Phase 3a 3.9 / 3b W5: hw_power_lambda * P_avg / P_ref (the
-                # lambda is applied inside hw_power_penalty)
-                hw_pow = hw_power_penalty(_hw_net, _hw_cfg, u=_hw_u_batch(specs_batch))
-                loss = loss + hw_pow
-                total_hw_power += float(hw_pow.detach().item())
-                if epoch == 0 and n_batches == 0:
-                    _logger.info(f"[phaseA] epoch-1 hw_power_penalty={float(hw_pow.detach()):.4g}")
-            if not torch.isfinite(loss):
-                _logger.warning(
-                    f"[phaseA] non-finite loss at epoch {epoch+1}, batch {n_batches}; skipping"
-                )
-                n_batches += 1
-                continue
-            loss.backward()
-            if grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(student.parameters(), grad_clip)
-            optimizer.step()
-            total_loss += loss.item()
-            total_huber += huber_term.item()
-            if valid_nll is not None:
-                total_valid_nll += valid_nll.item()
-            if mlp_guided:
-                total_mlp_mse += float(mse_mlp.item())
-                total_fwd_mse += float(fwd_mse.item())
-                total_power += float(power_term.item()) * power_norm_const
-            n_batches += 1
-        scheduler.step()
-        avg_train = total_loss / max(1, n_batches)
-        avg_huber = total_huber / max(1, n_batches)
-        avg_valid_nll = total_valid_nll / max(1, n_batches) if w_eff > 0 else float("nan")
-        avg_mlp_mse = total_mlp_mse / max(1, n_batches) if mlp_guided else float("nan")
-        avg_fwd_mse = total_fwd_mse / max(1, n_batches) if mlp_guided else float("nan")
-        avg_power = total_power / max(1, n_batches) if mlp_guided else float("nan")
-        if _hw_pow_on:
-            _logger.info(f"[phaseA] epoch {epoch+1} mean hw_power_penalty="
-                         f"{total_hw_power / max(1, n_batches):.4g}")
-        avg_val = _phase_a_huber_eval(student, val_loader, DEVICE)
-        # ZIG failure eval runs only on eval epochs (or the final epoch).
-        # Patience is counted in *eval cycles*: non-eval epochs must not
-        # advance no_improve (previously they did via the nan placeholder,
-        # burning patience ~val_eval_every times too fast).
-        eval_this_epoch = (epoch + 1) % val_eval_every == 0 or epoch == epochs - 1
-        val_failure_rate = float("nan")
-        boundary_failure_rate = float("nan")
-        interior_failure_rate = float("nan")
-        val_invalid_rate = float("nan")
-        val_degrade_rate = float("nan")
-        val_valid_mean_power = float("nan")
-        if eval_this_epoch:
-            evaluator.student = student
-            val_specs = canonical["specs"][np.asarray(canonical["val_idx"], dtype=np.int64)]
-            failure_mask, metrics = evaluator.identify_failures(
-                val_specs, threshold=error_threshold,
+                w_eff = validity_weight
+            total_loss = 0.0
+            total_huber = 0.0
+            total_valid_nll = 0.0
+            total_mlp_mse = 0.0
+            total_fwd_mse = 0.0
+            total_power = 0.0
+            total_hw_power = 0.0
+            n_batches = 0
+            first_batch_ratios = None
+            perm = (
+                torch.randperm(n_train, device=DEVICE)
+                if n_train > 0 else torch.empty(0, dtype=torch.long, device=DEVICE)
             )
-            val_failure_rate = float(failure_mask.mean())
-            # Plan §2/§5: invalid-vs-degrade attribution plus valid-power.
-            invalid_mask = np.asarray(metrics.get("invalid_mask", np.zeros_like(failure_mask)), dtype=bool)
-            val_invalid_rate = float(invalid_mask.mean())
-            val_degrade_rate = float((failure_mask & ~invalid_mask).mean())
-            if mlp_guided:
-                val_power, _ = _phase_a_split_power_and_mse(
-                    student, val_specs, None, scaler_y_p, DEVICE)
-                valid_designs = (~invalid_mask) & np.isfinite(val_power)
-                if valid_designs.any():
-                    val_valid_mean_power = float(val_power[valid_designs].mean())
+            for b_start in range(0, n_train, batch_size):
+                idx_b = perm[b_start:b_start + batch_size]
+                specs_batch = train_specs_t[idx_b]
+                params_target = train_params_t[idx_b]
+                mlp_logits_target = train_mlp_t[idx_b]
+                optimizer.zero_grad(set_to_none=True)
+                logits = student(specs_batch)
+                if mlp_guided:
+                    mse_mlp = torch.mean((logits - mlp_logits_target) ** 2)
+                    pred_p, pred_j, pred_h, pred_w, bounded_log, valid_nll_out = (
+                        _phase_a_decode_and_forward_with_validity(
+                            student, logits, x_mean_t, x_scale_t,
+                            scaler_y_p_scale, scaler_y_p_mean, zig_model,
+                        )
+                    )
+                    target_p = specs_batch[:, 0]
+                    target_j = specs_batch[:, 1]
+                    target_h = specs_batch[:, 2]
+                    target_w = specs_batch[:, 3]
+                    err_p = (torch.log10(pred_p) - torch.log10(target_p.clamp(min=1e-12))) / power_scale_denom
+                    err_j = (pred_j - target_j) / eye_scale_j
+                    err_h = (pred_h - target_h) / eye_scale_h
+                    err_w = (pred_w - target_w) / eye_scale_w
+                    fwd_mse = torch.mean(torch.stack([
+                        err_p ** 2, err_j ** 2, err_h ** 2, err_w ** 2], dim=0))
+                    power_phys = _phase_a_student_power(bounded_log)
+                    power_term = power_phys.mean() / power_norm_const
+                    huber_term = mse_mlp
+                    valid_nll = valid_nll_out if w_eff > 0 else None
+                    loss = (mlp_weight * mse_mlp + fwd_weight * fwd_mse
+                            + power_weight * power_term)
+                    if w_eff > 0:
+                        loss = loss + w_eff * valid_nll
+                    if first_batch_ratios is None and epoch == 0:
+                        def _f(t):
+                            return float(t.detach().item()) if torch.is_tensor(t) else float(t)
+                        first_batch_ratios = {
+                            "mse_mlp": _f(mse_mlp), "fwd_mse": _f(fwd_mse),
+                            "power_norm": _f(power_term),
+                            "nll": _f(valid_nll) if valid_nll is not None else 0.0,
+                        }
+                        contrib = {
+                            "mlp": mlp_weight * first_batch_ratios["mse_mlp"],
+                            "fwd": fwd_weight * first_batch_ratios["fwd_mse"],
+                            "power": power_weight * first_batch_ratios["power_norm"],
+                            "validity": w_eff * first_batch_ratios["nll"],
+                        }
+                        total0 = sum(contrib.values()) or 1.0
+                        _logger.info(
+                            "[phaseA] epoch-1 term magnitudes: "
+                            + ", ".join(f"{k}={v:.4g}" for k, v in first_batch_ratios.items())
+                            + " | weighted contributions: "
+                            + ", ".join(f"{k}={v:.4g} ({100*v/total0:.1f}%)"
+                                        for k, v in contrib.items())
+                        )
+                else:
+                    huber_term = huber_loss(logits, params_target, delta=0.5).mean()
+                    mse_mlp = fwd_mse = power_term = None
+                    if w_eff > 0:
+                        valid_nll = _phase_a_validity_nll(
+                            student, logits, scaler_X, zig_model,
+                        )
+                        loss = huber_term + w_eff * valid_nll
+                    else:
+                        valid_nll = None
+                        loss = huber_term
+                if _hw_pow_on:
+                    hw_pow = hw_power_penalty(_hw_net, _hw_cfg, u=_hw_u_batch(specs_batch))
+                    loss = loss + hw_pow
+                    total_hw_power += float(hw_pow.detach().item())
+                    if epoch == 0 and n_batches == 0:
+                        _logger.info(f"[phaseA] epoch-1 hw_power_penalty={float(hw_pow.detach()):.4g}")
+                if not torch.isfinite(loss):
+                    _logger.warning(
+                        f"[phaseA] non-finite loss at epoch {epoch+1}, batch {n_batches}; skipping"
+                    )
+                    n_batches += 1
+                    continue
+                loss.backward()
+                if grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(student.parameters(), grad_clip)
+                optimizer.step()
+                total_loss += loss.item()
+                total_huber += huber_term.item()
+                if valid_nll is not None:
+                    total_valid_nll += valid_nll.item()
+                if mlp_guided:
+                    total_mlp_mse += float(mse_mlp.item())
+                    total_fwd_mse += float(fwd_mse.item())
+                    total_power += float(power_term.item()) * power_norm_const
+                n_batches += 1
+            scheduler.step()
+            avg_train = total_loss / max(1, n_batches)
+            avg_huber = total_huber / max(1, n_batches)
+            avg_valid_nll = total_valid_nll / max(1, n_batches) if w_eff > 0 else float("nan")
+            avg_mlp_mse = total_mlp_mse / max(1, n_batches) if mlp_guided else float("nan")
+            avg_fwd_mse = total_fwd_mse / max(1, n_batches) if mlp_guided else float("nan")
+            avg_power = total_power / max(1, n_batches) if mlp_guided else float("nan")
+            if _hw_pow_on:
+                _logger.info(f"[phaseA] epoch {epoch+1} mean hw_power_penalty="
+                             f"{total_hw_power / max(1, n_batches):.4g}")
+
+            val_logits = _eval_student_logits(student, val_specs_t, DEVICE, chunk_size=2048)
+            val_loss_sum, val_batches = 0.0, 0
+            with torch.no_grad():
+                for b_start in range(0, len(val_logits), batch_size):
+                    bl = huber_loss(
+                        val_logits[b_start:b_start + batch_size],
+                        val_params_t[b_start:b_start + batch_size],
+                        delta=0.5,
+                    ).mean()
+                    if torch.isfinite(bl):
+                        val_loss_sum += float(bl.item())
+                        val_batches += 1
+            avg_val = val_loss_sum / max(1, val_batches)
+
+            eval_this_epoch = (epoch + 1) % val_eval_every == 0 or epoch == epochs - 1
+            val_failure_rate = float("nan")
+            boundary_failure_rate = float("nan")
+            interior_failure_rate = float("nan")
+            val_invalid_rate = float("nan")
+            val_degrade_rate = float("nan")
+            val_valid_mean_power = float("nan")
+            if eval_this_epoch:
+                evaluator.student = student
+                val_specs = canonical["specs"][np.asarray(canonical["val_idx"], dtype=np.int64)]
+                reuse_val_logits = val_logits if len(val_specs) == len(val_logits) else None
+                failure_mask, metrics = evaluator.identify_failures(
+                    val_specs, threshold=error_threshold, logits=reuse_val_logits,
+                )
+                val_failure_rate = float(failure_mask.mean())
+                invalid_mask = np.asarray(metrics.get("invalid_mask", np.zeros_like(failure_mask)), dtype=bool)
+                val_invalid_rate = float(invalid_mask.mean())
+                val_degrade_rate = float((failure_mask & ~invalid_mask).mean())
+                if mlp_guided:
+                    val_power, _ = _phase_a_split_power_and_mse(
+                        student, val_specs, None, scaler_y_p, DEVICE, logits=reuse_val_logits)
+                    valid_designs = (~invalid_mask) & np.isfinite(val_power)
+                    if valid_designs.any():
+                        val_valid_mean_power = float(val_power[valid_designs].mean())
+                if "boundary_failure" in metrics and "is_boundary" in metrics:
+                    bm = metrics["is_boundary"]
+                    boundary_failure_rate = float(
+                        metrics["boundary_failure"].sum() / max(1, bm.sum())
+                    )
+                    interior_failure_rate = float(
+                        metrics["interior_failure"].sum() / max(1, (~bm).sum())
+                    )
+                if val_failure_rate < best_val_failure:
+                    best_val_failure = val_failure_rate
+                    best_state = {k: v.detach().cpu().clone() for k, v in student.state_dict().items()}
+                    no_improve = 0
+                else:
+                    no_improve += 1
+            history["epoch"].append(epoch + 1)
+            history["train_loss"].append(avg_train)
+            history["train_valid_nll"].append(avg_valid_nll)
+            history["validity_w_eff"].append(w_eff)
+            history["val_loss"].append(avg_val)
+            history["val_failure_rate"].append(val_failure_rate)
+            history["val_boundary_failure"].append(boundary_failure_rate)
+            history["val_interior_failure"].append(interior_failure_rate)
+            history["mlp_mse"].append(avg_mlp_mse)
+            history["fwd_mse"].append(avg_fwd_mse)
+            history["train_nll"].append(avg_valid_nll)
+            history["train_power"].append(avg_power)
+            history["train_power_norm"].append(
+                avg_power / power_norm_const if mlp_guided and np.isfinite(avg_power) else float("nan"))
+            history["loss_weights"].append({
+                "w_mlp": mlp_weight, "w_fwd": fwd_weight,
+                "w_val_eff": w_eff, "w_pwr": power_weight,
+            })
+            history["val_invalid_rate"].append(val_invalid_rate)
+            history["val_degrade_rate"].append(val_degrade_rate)
+            history["val_valid_mean_power"].append(val_valid_mean_power)
+            if avg_val < best_val_loss:
+                best_val_loss = avg_val
+                best_val_loss_state = {k: v.detach().cpu().clone() for k, v in student.state_dict().items()}
+            torch.save(
+                {"epoch": epoch, "model": student.state_dict(),
+                 "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
+                 "history": history, "best_val_failure": best_val_failure,
+                 "best_state": best_state, "best_val_loss": best_val_loss,
+                 "best_val_loss_state": best_val_loss_state, "no_improve": no_improve},
+                checkpoint_path,
+            )
+            completed_epochs = epoch + 1
+            epoch_sec = time.monotonic() - t_ep0
+            elapsed_sec = time.monotonic() - t_train_start
+            budget_stop = (
+                max_hours_f is not None
+                and max_hours_f > 0.0
+                and epoch < epochs - 1
+                and (elapsed_sec + 1.5 * epoch_sec) >= max_hours_f * 3600.0
+            )
+            if (epoch + 1) in (1, 2, 5) or (epoch + 1) % 10 == 0 or epoch == epochs - 1 or budget_stop:
+                if eval_this_epoch:
+                    fail_str = (
+                        f"val_fail={val_failure_rate*100:5.2f}% "
+                        f"(bnd={boundary_failure_rate*100:5.2f}% int={interior_failure_rate*100:5.2f}%) "
+                        f"best={best_val_failure*100:5.2f}%"
+                    )
+                else:
+                    fail_str = "val_fail=  --% (no ZIG eval this epoch)"
+                guided_str = (
+                    f"  mlp_mse={avg_mlp_mse:.4f}  fwd_mse={avg_fwd_mse:.4f}  "
+                    f"power={avg_power:.4g} ({avg_power/power_norm_const:.3f}x train-mean)"
+                    if mlp_guided else ""
+                )
+                eta_min = (epoch_sec * max(0, epochs - (epoch + 1))) / 60.0
+                _train_label = "train_mse_mlp" if mlp_guided else "train_huber"
+                _logger.info(
+                    f"[phaseA] epoch {epoch+1:3d}/{epochs}  "
+                    f"{_train_label}={avg_huber:.4f}  valid_nll={avg_valid_nll:5.4f}  "
+                    f"w_valid={w_eff:.3f}  val_huber={avg_val:.4f}  "
+                    f"{fail_str} patience={no_improve}/{earlystop_patience}"
+                    f"{guided_str}  dt={epoch_sec:.1f}s elapsed={elapsed_sec/60:.1f}m eta={eta_min:.1f}m"
+                )
+            if budget_stop:
+                _logger.info(
+                    f"[phaseA] time budget reached ({elapsed_sec/3600:.2f}h / {max_hours_f:.2f}h, "
+                    f"last_epoch={epoch_sec:.1f}s) after epoch {epoch+1}/{epochs}; stopping cleanly"
+                )
+                stopped_by_time_budget = True
+                break
+            if earlystop_patience > 0 and no_improve >= earlystop_patience:
+                _logger.info(
+                    f"[phaseA] early stop: no best-failure improvement in "
+                    f"{earlystop_patience} eval cycles; restoring best-failure checkpoint"
+                )
+                break
+
+        if best_state is not None:
+            student.load_state_dict(best_state)
+            student.to(DEVICE)
+            torch.save(best_state, best_path)
+        elif best_val_loss_state is not None:
+            student.load_state_dict(best_val_loss_state)
+            student.to(DEVICE)
+            torch.save(best_val_loss_state, best_path)
+
+        final = {}
+        for split_name, loader in (("train", train_loader), ("val", val_loader), ("test", test_loader)):
+            evaluator.student = student
+            idx_arr = canonical[f"{split_name}_idx"]
+            specs_arr = canonical["specs"][np.asarray(idx_arr, dtype=np.int64)]
+            split_logits = _eval_student_logits(student, specs_arr, DEVICE, chunk_size=2048)
+            failure_mask, metrics = evaluator.identify_failures(
+                specs_arr, threshold=error_threshold, logits=split_logits,
+            )
+            boundary_failure_rate = float("nan")
+            interior_failure_rate = float("nan")
             if "boundary_failure" in metrics and "is_boundary" in metrics:
                 bm = metrics["is_boundary"]
-                boundary_failure_rate = float(
-                    metrics["boundary_failure"].sum() / max(1, bm.sum())
-                )
-                interior_failure_rate = float(
-                    metrics["interior_failure"].sum() / max(1, (~bm).sum())
-                )
-            if val_failure_rate < best_val_failure:
-                best_val_failure = val_failure_rate
-                best_state = {k: v.detach().cpu().clone() for k, v in student.state_dict().items()}
-                no_improve = 0
-            else:
-                no_improve += 1
-        history["epoch"].append(epoch + 1)
-        history["train_loss"].append(avg_train)
-        history["train_valid_nll"].append(avg_valid_nll)
-        history["validity_w_eff"].append(w_eff)
-        history["val_loss"].append(avg_val)
-        history["val_failure_rate"].append(val_failure_rate)
-        history["val_boundary_failure"].append(boundary_failure_rate)
-        history["val_interior_failure"].append(interior_failure_rate)
-        history["mlp_mse"].append(avg_mlp_mse)
-        history["fwd_mse"].append(avg_fwd_mse)
-        history["train_nll"].append(avg_valid_nll)
-        history["train_power"].append(avg_power)
-        history["train_power_norm"].append(
-            avg_power / power_norm_const if mlp_guided and np.isfinite(avg_power) else float("nan"))
-        history["loss_weights"].append({
-            "w_mlp": mlp_weight, "w_fwd": fwd_weight,
-            "w_val_eff": w_eff, "w_pwr": power_weight,
-        })
-        history["val_invalid_rate"].append(val_invalid_rate)
-        history["val_degrade_rate"].append(val_degrade_rate)
-        history["val_valid_mean_power"].append(val_valid_mean_power)
-        if avg_val < best_val_loss:
-            best_val_loss = avg_val
-            best_val_loss_state = {k: v.detach().cpu().clone() for k, v in student.state_dict().items()}
-        torch.save(
-            {"epoch": epoch, "model": student.state_dict(),
-             "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
-             "history": history, "best_val_failure": best_val_failure,
-             "best_state": best_state, "best_val_loss": best_val_loss,
-             "best_val_loss_state": best_val_loss_state, "no_improve": no_improve},
-            checkpoint_path,
-        )
-        if (epoch + 1) % 10 == 0 or epoch == 0 or epoch == epochs - 1:
-            if eval_this_epoch:
-                fail_str = (
-                    f"val_fail={val_failure_rate*100:5.2f}% "
-                    f"(bnd={boundary_failure_rate*100:5.2f}% int={interior_failure_rate*100:5.2f}%) "
-                    f"best={best_val_failure*100:5.2f}%"
-                )
-            else:
-                fail_str = "val_fail=  --% (no ZIG eval this epoch)"
-            guided_str = (
-                f"  mlp_mse={avg_mlp_mse:.4f}  fwd_mse={avg_fwd_mse:.4f}  "
-                f"power={avg_power:.4g} ({avg_power/power_norm_const:.3f}x train-mean)"
-                if mlp_guided else ""
-            )
-            # Audit fix: in guided mode avg_huber holds MSE-to-teacher, not a
-            # Huber distance — label it honestly so Alliance logs are not
-            # misread. (val_huber stays flow-Huber in both modes by design;
-            # it feeds the best-val-loss fallback checkpoint only.)
-            _train_label = "train_mse_mlp" if mlp_guided else "train_huber"
-            _logger.info(
-                f"[phaseA] epoch {epoch+1:3d}/{epochs}  "
-                f"{_train_label}={avg_huber:.4f}  valid_nll={avg_valid_nll:5.4f}  "
-                f"w_valid={w_eff:.3f}  val_huber={avg_val:.4f}  "
-                f"{fail_str} patience={no_improve}/{earlystop_patience}"
-                f"{guided_str}"
-            )
-        if earlystop_patience > 0 and no_improve >= earlystop_patience:
-            _logger.info(
-                f"[phaseA] early stop: no best-failure improvement in "
-                f"{earlystop_patience} eval cycles; restoring best-failure checkpoint"
-            )
-            break
-
-    if best_state is not None:
-        student.load_state_dict(best_state)
-        student.to(DEVICE)
-        torch.save(best_state, best_path)
-    elif best_val_loss_state is not None:
-        student.load_state_dict(best_val_loss_state)
-        student.to(DEVICE)
-        torch.save(best_val_loss_state, best_path)
-
-    final = {}
-    for split_name, loader in (("train", train_loader), ("val", val_loader), ("test", test_loader)):
-        evaluator.student = student
-        idx_arr = canonical[f"{split_name}_idx"]
-        specs_arr = canonical["specs"][np.asarray(idx_arr, dtype=np.int64)]
-        failure_mask, metrics = evaluator.identify_failures(
-            specs_arr, threshold=error_threshold,
-        )
-        boundary_failure_rate = float("nan")
-        interior_failure_rate = float("nan")
-        if "boundary_failure" in metrics and "is_boundary" in metrics:
-            bm = metrics["is_boundary"]
-            boundary_failure_rate = float(metrics["boundary_failure"].sum() / max(1, bm.sum()))
-            interior_failure_rate = float(metrics["interior_failure"].sum() / max(1, (~bm).sum()))
-        split_entry = {
-            "failure_rate": float(failure_mask.mean()),
-            "boundary_failure_rate": boundary_failure_rate,
-            "interior_failure_rate": interior_failure_rate,
-            "dim_fail_rates": (
-                np.asarray(metrics["errors"]) >= float(ctx.get("DEGRADE_REL_THRESHOLD", DEGRADE_REL_THRESHOLD))
-            ).mean(axis=0).tolist(),
-        }
-        if mlp_guided:
-            # Plan §5: invalid/degrade split, valid-power, and MLP-logit MSE
-            # per split. ``valid`` = p_valid >= VALIDITY_THRESHOLD & finite.
-            invalid_mask = np.asarray(
-                metrics.get("invalid_mask", np.zeros_like(failure_mask)), dtype=bool)
-            split_entry["valid_rate"] = float((~invalid_mask).mean())
-            split_power, split_mlp_mse = _phase_a_split_power_and_mse(
-                student, specs_arr,
-                canonical["mlp_logits_trial0019"][np.asarray(idx_arr, dtype=np.int64)],
-                scaler_y_p, DEVICE)
-            valid_designs = (~invalid_mask) & np.isfinite(split_power)
-            split_entry["valid_mean_power"] = (
-                float(split_power[valid_designs].mean()) if valid_designs.any() else float("nan"))
-            split_entry["valid_median_power"] = (
-                float(np.median(split_power[valid_designs])) if valid_designs.any() else float("nan"))
-            split_entry["mlp_mse"] = split_mlp_mse
-        final[split_name] = split_entry
+                boundary_failure_rate = float(metrics["boundary_failure"].sum() / max(1, bm.sum()))
+                interior_failure_rate = float(metrics["interior_failure"].sum() / max(1, (~bm).sum()))
+            split_entry = {
+                "failure_rate": float(failure_mask.mean()),
+                "boundary_failure_rate": boundary_failure_rate,
+                "interior_failure_rate": interior_failure_rate,
+                "dim_fail_rates": (
+                    np.asarray(metrics["errors"]) >= float(ctx.get("DEGRADE_REL_THRESHOLD", DEGRADE_REL_THRESHOLD))
+                ).mean(axis=0).tolist(),
+            }
+            if mlp_guided:
+                invalid_mask = np.asarray(
+                    metrics.get("invalid_mask", np.zeros_like(failure_mask)), dtype=bool)
+                split_entry["valid_rate"] = float((~invalid_mask).mean())
+                split_power, split_mlp_mse = _phase_a_split_power_and_mse(
+                    student, specs_arr,
+                    canonical["mlp_logits_trial0019"][np.asarray(idx_arr, dtype=np.int64)],
+                    scaler_y_p, DEVICE, logits=split_logits)
+                valid_designs = (~invalid_mask) & np.isfinite(split_power)
+                split_entry["valid_mean_power"] = (
+                    float(split_power[valid_designs].mean()) if valid_designs.any() else float("nan"))
+                split_entry["valid_median_power"] = (
+                    float(np.median(split_power[valid_designs])) if valid_designs.any() else float("nan"))
+                split_entry["mlp_mse"] = split_mlp_mse
+            final[split_name] = split_entry
+    finally:
+        configure_compiled_heun("off")
 
     log_path = os.path.join(output_dir, "phase_a_history.json")
     with open(log_path, "w", encoding="utf-8") as handle:
-        json.dump({"history": history, "final": final, "args": {
-            "epochs": epochs, "batch_size": batch_size, "lr": lr,
-            "weight_decay": weight_decay, "model_name": model_name,
-            "fingerprint": _canonical_fingerprint_str(canonical),
-            "mapper_lr_scale": mapper_lr_scale, "struct_lr_scale": struct_lr_scale,
-            "dyn_lr_scale": dyn_lr_scale,
-            "validity_weight": validity_weight,
-            "validity_ramp_start": validity_ramp_start,
-            "validity_ramp_epochs": validity_ramp_epochs,
-            "error_threshold": error_threshold,
-            "val_eval_every": val_eval_every,
-            "earlystop_patience": earlystop_patience,
-            "mlp_weight": mlp_weight,
-            "fwd_weight": fwd_weight,
-            "power_weight": power_weight,
-            "power_norm_const": power_norm_const,
-            "schema_rev": schema_rev,
-            # B3: record which readout family the student was built with so
-            # downstream consumers (BO logs, ablation analyses) can attribute
-            # results to the right architecture without parsing the trial
-            # command. Falls back to the legacy temporal mesh when the
-            # student predates the wired-readout plan.
-            "kn_readout": getattr(student, "kn_readout", "temporal"),
-        }}, handle, indent=2, default=str)
+        json.dump({
+            "history": history,
+            "final": final,
+            "stopped_by_time_budget": stopped_by_time_budget,
+            "completed_epochs": completed_epochs,
+            "args": {
+                "epochs": epochs, "batch_size": batch_size, "lr": lr,
+                "weight_decay": weight_decay, "model_name": model_name,
+                "fingerprint": _canonical_fingerprint_str(canonical),
+                "mapper_lr_scale": mapper_lr_scale, "struct_lr_scale": struct_lr_scale,
+                "dyn_lr_scale": dyn_lr_scale,
+                "validity_weight": validity_weight,
+                "validity_ramp_start": validity_ramp_start,
+                "validity_ramp_epochs": validity_ramp_epochs,
+                "error_threshold": error_threshold,
+                "val_eval_every": val_eval_every,
+                "earlystop_patience": earlystop_patience,
+                "mlp_weight": mlp_weight,
+                "fwd_weight": fwd_weight,
+                "power_weight": power_weight,
+                "power_norm_const": power_norm_const,
+                "schema_rev": schema_rev,
+                "compile_mode": compile_mode,
+                "max_hours": max_hours_f,
+                "kn_readout": getattr(student, "kn_readout", "temporal"),
+            },
+        }, handle, indent=2, default=str)
     _logger.info(f"[phaseA] wrote {log_path}")
     _logger.info(
         f"[phaseA] final failure: train={final['train']['failure_rate']*100:5.2f}% "
@@ -3370,6 +3507,8 @@ def run_phase_a_training(student, ctx, *, model_name: str = "phase_a_student"):
         "final": final,
         "history": history,
         "checkpoint": best_path,
+        "stopped_by_time_budget": stopped_by_time_budget,
+        "completed_epochs": completed_epochs,
     }
 
 

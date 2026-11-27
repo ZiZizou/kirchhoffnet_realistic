@@ -1,4 +1,5 @@
 """Static contract checks for the generated Kaggle retraining notebook."""
+import ast
 import json
 from pathlib import Path
 
@@ -82,3 +83,23 @@ def test_generator_and_notebook_use_fixed_inputs_without_bundle_extraction():
     assert "Missing required Kaggle inputs" in source
     assert "hashlib.sha256" in source
     assert "WARNING:" in source
+
+
+def test_notebook_includes_optimization_knobs_and_valid_python():
+    notebook = json.loads(NOTEBOOK.read_text(encoding="utf-8"))
+    source = "\n".join("".join(cell.get("source", [])) for cell in notebook["cells"])
+    generator = GENERATOR.read_text(encoding="utf-8")
+    for text in (source, generator):
+        for token in (
+            "KNB_COMPILE",
+            "KNB_MAX_HOURS",
+            "KNB_BATCH_SIZE",
+            "--compile-mode",
+            "--max-hours",
+            "stopped_by_time_budget",
+            "get_device_capability",
+        ):
+            assert token in text, f"missing {token}"
+    for idx, cell in enumerate(notebook["cells"]):
+        if cell["cell_type"] == "code":
+            ast.parse("".join(cell["source"]), filename=f"cell_{idx}")

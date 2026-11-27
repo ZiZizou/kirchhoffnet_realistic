@@ -27,3 +27,14 @@ def test_smoke_sample_limit_applies_without_training():
     assert "--phase-a-sample-limit" in source
     assert '"sample_limit": _bo_args.phase_a_sample_limit' in source
     assert "Subset(ds, range(min(limit, len(ds))))" in common
+
+
+def test_compile_mode_and_max_hours_cli_and_history_fields():
+    source = (ROOT / "dagger-nuance-distillation-kirchhoffnet.py").read_text()
+    common = (ROOT / "ctle_dagger_common.py").read_text()
+    assert "--compile-mode" in source
+    assert "--max-hours" in source
+    assert '"compile_mode": _bo_args.compile_mode' in source
+    assert '"max_hours": _bo_args.max_hours' in source
+    assert '"stopped_by_time_budget": stopped_by_time_budget' in common
+    assert '"completed_epochs": completed_epochs' in common

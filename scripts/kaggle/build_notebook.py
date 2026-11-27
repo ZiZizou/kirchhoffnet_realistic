@@ -21,8 +21,11 @@ EPOCHS = int(os.getenv("KNB_EPOCHS", "300"))
 SEED = int(os.getenv("KNB_SEED", "100"))
 LR = float(os.getenv("KNB_LR", "0.007069359" if RUNG == "R0" else "0.03"))
 STEPS_PER_STAGE = int(os.getenv("KNB_STEPS_PER_STAGE", "40"))  # 4x paper's 10 steps/stage on HW rungs
+BATCH_SIZE = int(os.getenv("KNB_BATCH_SIZE", "512"))
+COMPILE = os.getenv("KNB_COMPILE", "auto")  # auto compiles on CUDA sm_70+ (T4), skips on P100/CPU
+MAX_HOURS = float(os.getenv("KNB_MAX_HOURS", "10.5"))  # clean stop before Kaggle's 12h timeout; <=0 disables
 OUT_DIR = os.getenv("KNB_OUT_DIR", "/kaggle/working/out")
-RESUME = os.getenv("KNB_RESUME", "")
+RESUME = os.getenv("KNB_RESUME", "")  # "" (fresh), "auto" (resume phase_a_last.pt if present), or explicit path
 SMOKE = os.getenv("KNB_SMOKE", "0").lower() in ("1", "true", "yes")
 RUN_TOY_ABLATION = os.getenv("KNB_RUN_TOY_ABLATION", "0").lower() in ("1", "true", "yes")
 TEACHER_CKPT = Path(os.getenv("KNB_TEACHER_CKPT", "/kaggle/input/models/awekill/improved-zig-nf-spline/pytorch/default/4/dagger_student_plain.pt"))
@@ -59,9 +62,20 @@ from pathlib import Path
 import torch
 print("torch", torch.__version__, "CUDA", torch.cuda.is_available())
 if torch.cuda.is_available():
-    print(torch.cuda.get_device_name(0), torch.cuda.get_device_properties(0))
-# Kaggle images may omit these runtime dependencies; torch is normally preinstalled.
-subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "torchdiffeq", "optuna", "joblib", "scikit-learn", "scipy", "matplotlib"])
+    print(torch.cuda.get_device_name(0), "cap", torch.cuda.get_device_capability(0), torch.cuda.get_device_properties(0))
+# Install only missing runtime packages to keep session startup fast.
+import importlib.util
+_deps = [
+    ("torchdiffeq", "torchdiffeq"),
+    ("optuna", "optuna"),
+    ("joblib", "joblib"),
+    ("sklearn", "scikit-learn"),
+    ("scipy", "scipy"),
+    ("matplotlib", "matplotlib"),
+]
+_missing = [pkg for mod, pkg in _deps if importlib.util.find_spec(mod) is None]
+if _missing:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", *_missing])
 repo = Path(repo_path)
 os.chdir(repo)
 print("repository", repo, "canonical", CANONICAL, "teacher/ZIG", TEACHER_DIR, "CSV", CSV_DIR)
@@ -125,18 +139,29 @@ cmd = [sys.executable, "dagger-nuance-distillation-kirchhoffnet.py",
  "--kn-num-stages", "7", "--kn-num-hidden", "11", "--kn-small-world-k", "2", "--kn-small-world-p", "0.2", "--kn-vca-rank", "3",
  "--kn-x-max", "4", "--kn-gm-max", "4.241970", "--kn-isat-max", "16" if rungs[RUNG] else "28.68855",
  "--kn-mapper-lr-scale", "1", "--kn-struct-lr-scale", "4", "--kn-dyn-lr-scale", "1",
- "--lr", str(LR if RUNG != "R0" else float(os.getenv("KNB_LR", "0.007069359"))), "--weight-decay", "0.006087302", "--batch-size", "512", "--earlystop-eval-every", "5",
+ "--lr", str(LR if RUNG != "R0" else float(os.getenv("KNB_LR", "0.007069359"))), "--weight-decay", "0.006087302", "--batch-size", str(BATCH_SIZE), "--earlystop-eval-every", "5",
  "--phase-a-validity-weight", "0.3", "--phase-a-validity-ramp-start", "10", "--phase-a-validity-ramp-epochs", "30",
  "--phase-a-mlp-weight", "1", "--phase-a-fwd-weight", "1", "--phase-a-power-weight", "0.0005", "--phase-a-power-norm", "train_mean",
  "--kn-readout", "shared-x2", "--kn-learnable-clip-sharpness", "--kn-gln-rails", "--kn-gln-B", "4", "--kn-gln-rank", "2", "--kn-gln-families", "boundary,readout",
  "--t-span", "4.660583", "--boundary-fan-out", '{"0": [0, 4], "1": [1, 5], "2": [2, 6], "3": [3, 7]}',
  "--phase-a-mlp-teacher-ckpt", str(TEACHER_CKPT),
  "--teacher-dir", TEACHER_DIR, "--data-dir", CSV_DIR, "--device", "cuda" if torch.cuda.is_available() else "cpu",
+ "--compile-mode", COMPILE,
  "--seed", str(SEED), "--output", str(run_dir)]
+if MAX_HOURS > 0: cmd += ["--max-hours", str(MAX_HOURS)]
 if RUNG != "R0": cmd += ["--kn-steps-per-stage", str(STEPS_PER_STAGE)]
 if rungs[RUNG]: cmd += ["--hw-preset", rungs[RUNG]]
 if SMOKE: cmd += ["--phase-a-sample-limit", "32"]
-if RESUME: cmd += ["--resume", RESUME]
+resume_path = ""
+if RESUME.strip().lower() == "auto":
+    cand = run_dir / "phase_a_last.pt"
+    if cand.is_file():
+        resume_path = str(cand)
+elif RESUME.strip():
+    resume_path = RESUME.strip()
+if resume_path:
+    print("resuming from:", resume_path)
+    cmd += ["--resume", resume_path]
 log_path = run_dir / "train.log"
 with open(log_path, "a", buffering=1) as log:
     proc = subprocess.Popen(cmd, cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
@@ -150,6 +175,8 @@ cell("code", '''# Evaluate the final best model against the canonical 10% failur
 import json, csv, math
 history_file = run_dir / "phase_a_history.json"
 hist = json.loads(history_file.read_text())
+if hist.get("stopped_by_time_budget"):
+    print(f"NOTE: stopped cleanly at wall-clock budget after {hist.get('completed_epochs')}/{EPOCHS} epochs; set KNB_RESUME='auto' (or path to {run_dir / 'phase_a_last.pt'}) in the next session to continue.")
 final = hist["final"]
 for split in ("train", "val", "test"):
     rate = final[split]["failure_rate"]

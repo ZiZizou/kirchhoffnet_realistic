@@ -694,6 +694,10 @@ try:
     _bo_parser.add_argument('--earlystop-eval-every', type=int, default=None)
     _bo_parser.add_argument('--kn-steps-per-stage', type=int, default=None, help='Override Heun steps per stage (positive integer).')
     _bo_parser.add_argument('--resume', type=str, default=None, help='Resume Phase-A training from phase_a_last.pt.')
+    _bo_parser.add_argument('--compile-mode', choices=['auto', 'on', 'off'], default='auto',
+                            help='Compile hoisted Heun step on CUDA sm_70+ GPUs like T4; auto-skips on P100/CPU.')
+    _bo_parser.add_argument('--max-hours', type=float, default=None,
+                            help='Optional wall-clock budget in hours; stops cleanly between epochs to save best checkpoint & evaluation.')
     _bo_parser.add_argument('--phase-a-sample-limit', type=int, default=None, help='Limit rows in each split for smoke tests.')
     _bo_parser.add_argument('--batch-size', type=int, default=None)
     _bo_parser.add_argument('--initial-dataset-cache-dir', type=str, default=None)
@@ -3399,6 +3403,8 @@ if _bo_args.prepare_canonical_dataset is not None or _bo_args.canonical_dataset 
             "weight_decay": float(_bo_args.weight_decay if _bo_args.weight_decay is not None else WEIGHT_DECAY),
             "output_dir": OUTPUT_DIR,
             "resume": _bo_args.resume,
+            "compile_mode": _bo_args.compile_mode,
+            "max_hours": _bo_args.max_hours,
             "sample_limit": _bo_args.phase_a_sample_limit,
             "grad_clip": 1.0,
             "val_eval_every": int(_bo_args.earlystop_eval_every if _bo_args.earlystop_eval_every is not None

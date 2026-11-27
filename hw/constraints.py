@@ -268,7 +268,9 @@ def leg_factors(x_n: torch.Tensor, units: HWUnits, rail: bool = True,
         y_bot = (units.x_hard + x_n) * scale - v_off
         # normalised by the value at x_n = 0 so the factors are exactly 1 at Vcm
         y0 = units.x_hard * scale - v_off
-        c0 = float(1.0 - torch.exp(-F.softplus(torch.tensor(y0, dtype=torch.float64), beta=k)))
+        ky0 = k * y0
+        sp0 = y0 if ky0 > 20.0 else (math.log1p(math.exp(ky0)) / k if ky0 > -700.0 else 0.0)
+        c0 = 1.0 - math.exp(-sp0)
         f_top = f_top * (1.0 - torch.exp(-F.softplus(y_top, beta=k))) / c0
         f_bot = f_bot * (1.0 - torch.exp(-F.softplus(y_bot, beta=k))) / c0
     return f_top, f_bot

@@ -1673,6 +1673,35 @@ output_ode_src: list[int] | None = None,
         # 3.8: per-node capacitance [1, N] instead of the scalar.
         return (acc - leak_term - clip_term) / self.node_capacitance(x)
 
+    def _can_use_fast_heun(
+        self,
+        x0: torch.Tensor,
+        u: torch.Tensor | None,
+        gate_core_cached: torch.Tensor | None,
+    ) -> bool:
+        """True when this stage matches the fast hoisted Heun engine invariants."""
+        if "rhs" in self.__dict__:
+            return False
+        if not self.freeze_read or self.freeze_boundary or self.freeze_temporal_read:
+            return False
+        if self._has_output_ode:
+            return False
+        if not (self._has_boundary and u is not None and self.boundary_src.numel() > 0):
+            return False
+        if not (self._has_shared_readout and self.readout_sense_src.numel() > 0):
+            return False
+        if not (
+            isinstance(self.cell_lib, FreeTanhLibrary)
+            and isinstance(self.boundary_cell_lib, FreeTanhLibrary)
+            and isinstance(self.readout_sense_cell_lib, FreeTanhLibrary)
+        ):
+            return False
+        if self._has_resistive and gate_core_cached is not None and self.vca_gate_shunt:
+            return False
+        if x0.dtype != torch.float32:
+            return False
+        return True
+
     def compile_rhs(self, backend: str = "inductor"):
         """Compile `rhs` with `torch.compile` for kernel fusion.
 
@@ -1734,6 +1763,13 @@ output_ode_src: list[int] | None = None,
         # Diagnostic attribute (not read inside compiled rhs — rhs
         # receives the gate via the explicit kwarg below).
         self._gate_core_cached = gate_core_cached
+
+        if self._can_use_fast_heun(x0, u, gate_core_cached):
+            from fast_heun import fast_heun_forward
+            return fast_heun_forward(
+                self, x0, t_span, num_steps, store_trajectory,
+                u, x_hold, gate_core_cached,
+            )
 
         # freeze_read: precompute edge currents (cell_lib + edge gate +
         # core VCA gate + KCL scatter-add) once from x0 and hold them
